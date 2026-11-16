@@ -10,6 +10,7 @@
 
 - **🖥️ 真·双屏独立扩展桌面（支持一键切换原生镜像）**
   - 自动探测物理外接显示器 (`Display.TYPE_EXTERNAL`)，在黑屏占位的物理副屏之上通过 `SurfaceControl` 投射独立的 `VirtualDisplay`（首次接入自动按外接显示器原生分辨率/刷新率适配桌面与比例 DPI，亦支持在控制台手动定制 `3840×2160`、`2560×1440`、`1920×1080` 及 EDID 多档刷新率 `60Hz ~ 165Hz`）。
+  - **四向自定义输出旋转（`0° / 90° / 180° / 270°`）与竖屏输出**：将外接便携屏/显示器物理竖立时，可在控制台或快捷面板一键旋转 `90° / 270°` 满屏点对点竖屏显示（也可在横屏上点「⇅ 对调宽高」居中显示竖屏桌面），指针/触摸板与 Dock 自适应同步。
   - 随时在 **ExtBridge DeX 独立桌面** 与 **原生镜像模式** 之间一键无缝切换，适配不同使用场景。
 - **🧩 分应用显示模式（告别部分应用适配崩坏）**
   - 每个应用可独立配置 4 种显示策略（配置持久化于 `/data/local/tmp/extbridge_apps.conf`，互不干扰，不篡改全局 `Settings.Global` 开关）：
@@ -137,6 +138,7 @@ powershell -ExecutionPolicy Bypass -File .\build_v3.ps1
 
 - 脚本会自动从 `helper/jniLibs/arm64-v8a/libadb.so` 与编译出的 `extbridge.jar` 打入 `exthelper.apk`。
 - 若仓库根目录下不存在私有的 `exthelper.p12`（亦可通过环境变量 `$env:EXTBRIDGE_KEYSTORE` 指定），脚本会自动在 `build\debug.keystore` 生成测试签名完成 APK 签名。
+- 完整版本迭代记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 

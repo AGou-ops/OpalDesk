@@ -13,7 +13,9 @@ import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
+import android.graphics.Matrix;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.graphics.drawable.Drawable;
 import android.hardware.display.DisplayManager;
@@ -103,6 +105,7 @@ public class ExtBridge implements Runnable {
     private static volatile int sVirtH = 1440;
     private static volatile int sVirtDpi = 240;
     private static volatile float sVirtFps = 60.0f;
+    private static volatile int sVirtRot = 0; // 0=0°, 1=90° CW, 2=180°, 3=270° CW
 
     private static volatile int sInputToExt = 1;
     private static volatile int sLastExtInputCnt = -1;
@@ -255,7 +258,7 @@ public class ExtBridge implements Runnable {
                     int h = Integer.parseInt(parts[1]);
                     int d = Integer.parseInt(parts[2]);
                     float fps = Float.parseFloat(parts[3]);
-                    if (w >= 640 && w <= 7680 && h >= 480 && h <= 4320 && d >= 100 && d <= 640) {
+                    if (isValidDims(w, h) && d >= 100 && d <= 640) {
                         sVirtW = w;
                         sVirtH = h;
                         sVirtDpi = d;
@@ -266,6 +269,9 @@ public class ExtBridge implements Runnable {
                     }
                     if (parts.length >= 5) {
                         sFullscreenPolicy = Integer.parseInt(parts[4].trim()) != 0 ? 1 : 0;
+                    }
+                    if (parts.length >= 6) {
+                        sVirtRot = normalizeRot(Integer.parseInt(parts[5].trim()));
                     }
                 }
             }
@@ -376,7 +382,7 @@ public class ExtBridge implements Runnable {
 
     private static void saveConf() {
         try (FileWriter fw = new FileWriter(CONF_PATH, false)) {
-            fw.write(sVirtW + "," + sVirtH + "," + sVirtDpi + "," + sVirtFps + "," + sFullscreenPolicy + "\n");
+            fw.write(sVirtW + "," + sVirtH + "," + sVirtDpi + "," + sVirtFps + "," + sFullscreenPolicy + "," + sVirtRot + "\n");
         } catch (Throwable ignored) {}
     }
 
@@ -462,6 +468,15 @@ public class ExtBridge implements Runnable {
         }
     }
 
+    private static boolean isValidDims(int w, int h) {
+        return Math.max(w, h) >= 640 && Math.max(w, h) <= 7680
+                && Math.min(w, h) >= 480 && Math.min(w, h) <= 4320;
+    }
+
+    private static int normalizeRot(int rot) {
+        return ((rot % 4) + 4) % 4;
+    }
+
     private static int computeAutoDpi(int w, int h) {
         int minEdge = Math.min(w, h);
         return Math.max(160, Math.min(320, Math.round(minEdge * 240f / 1440f)));
@@ -469,13 +484,14 @@ public class ExtBridge implements Runnable {
 
     private static void attachDisplay(int extId) {
         try {
-            if (!sHasUserConf && sPhysW >= 640 && sPhysW <= 7680 && sPhysH >= 480 && sPhysH <= 4320) {
-                sVirtW = sPhysW;
-                sVirtH = sPhysH;
+            if (!sHasUserConf && isValidDims(sPhysW, sPhysH)) {
+                boolean physSwap = (normalizeRot(sVirtRot) & 1) == 1;
+                sVirtW = physSwap ? sPhysH : sPhysW;
+                sVirtH = physSwap ? sPhysW : sPhysH;
                 sVirtDpi = computeAutoDpi(sVirtW, sVirtH);
                 sVirtFps = (sPhysFps >= 20f && sPhysFps <= 240f) ? sPhysFps : 60f;
             }
-            System.out.println("EXTBRIDGE_ATTACHING extId=" + extId + " phys=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " virt=" + sVirtW + "x" + sVirtH + "@" + sVirtDpi);
+            System.out.println("EXTBRIDGE_ATTACHING extId=" + extId + " phys=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " virt=" + sVirtW + "x" + sVirtH + "@" + sVirtDpi + " rot=" + (sVirtRot * 90));
             Class<?> scCls = Class.forName("android.view.SurfaceControl");
             Class<?> bCls = Class.forName("android.view.SurfaceControl$Builder");
             Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
@@ -601,15 +617,26 @@ public class ExtBridge implements Runnable {
             txCls.getMethod("setWindowCrop", scCls, int.class, int.class).invoke(tx, sBgSc, sPhysW, sPhysH);
             txCls.getMethod("show", scCls).invoke(tx, sBgSc);
 
-            float sx = sPhysW / (float) sVirtW;
-            float sy = sPhysH / (float) sVirtH;
+            int rot = normalizeRot(sVirtRot);
+            int rotW = ((rot & 1) == 1) ? sVirtH : sVirtW;
+            int rotH = ((rot & 1) == 1) ? sVirtW : sVirtH;
+            float sx = sPhysW / (float) Math.max(1, rotW);
+            float sy = sPhysH / (float) Math.max(1, rotH);
             float scale = Math.min(sx, sy);
-            float posX = (sPhysW - sVirtW * scale) * 0.5f;
-            float posY = (sPhysH - sVirtH * scale) * 0.5f;
+
+            Matrix mat = new Matrix();
+            mat.setRotate(rot * 90f);
+            mat.postScale(scale, scale);
+            RectF bounds = new RectF(0f, 0f, sVirtW, sVirtH);
+            mat.mapRect(bounds);
+            float posX = (sPhysW - bounds.width()) * 0.5f - bounds.left;
+            float posY = (sPhysH - bounds.height()) * 0.5f - bounds.top;
+            float[] mv = new float[9];
+            mat.getValues(mv);
 
             txCls.getMethod("setLayer", scCls, int.class).invoke(tx, sScaleSc, 1);
             txCls.getMethod("setMatrix", scCls, float.class, float.class, float.class, float.class)
-                    .invoke(tx, sScaleSc, scale, 0.0f, 0.0f, scale);
+                    .invoke(tx, sScaleSc, mv[Matrix.MSCALE_X], mv[Matrix.MSKEW_Y], mv[Matrix.MSKEW_X], mv[Matrix.MSCALE_Y]);
             txCls.getMethod("setPosition", scCls, float.class, float.class).invoke(tx, sScaleSc, posX, posY);
             txCls.getMethod("show", scCls).invoke(tx, sScaleSc);
 
@@ -621,7 +648,7 @@ public class ExtBridge implements Runnable {
 
             txCls.getMethod("setWindowCrop", scCls, int.class, int.class).invoke(tx, sRootSc, sPhysW, sPhysH);
             txCls.getMethod("apply").invoke(tx);
-            System.out.println("EXTBRIDGE_TRANSFORM virt=" + sVirtW + "x" + sVirtH + " phys=" + sPhysW + "x" + sPhysH + " scale=" + scale + " pos=" + posX + "," + posY);
+            System.out.println("EXTBRIDGE_TRANSFORM virt=" + sVirtW + "x" + sVirtH + " rot=" + (rot * 90) + " phys=" + sPhysW + "x" + sPhysH + " scale=" + scale + " pos=" + posX + "," + posY);
         } catch (Throwable t) {
             t.printStackTrace();
         }
@@ -684,9 +711,9 @@ public class ExtBridge implements Runnable {
         sRenderMode = "NONE";
     }
 
-    private static synchronized boolean applyConfig(int reqW, int reqH, int reqDpi, int reqFpsX100, int physModeId) {
+    private static synchronized boolean applyConfig(int reqW, int reqH, int reqDpi, int reqFpsX100, int physModeId, int reqRot) {
         try {
-            if (reqW < 640 || reqW > 7680 || reqH < 480 || reqH > 4320 || reqDpi < 100 || reqDpi > 640) {
+            if (!isValidDims(reqW, reqH) || reqDpi < 100 || reqDpi > 640) {
                 return false;
             }
             float fps = reqFpsX100 > 0 ? (reqFpsX100 / 100.0f) : sVirtFps;
@@ -694,6 +721,9 @@ public class ExtBridge implements Runnable {
             sVirtH = reqH;
             sVirtDpi = reqDpi;
             sVirtFps = fps;
+            if (reqRot >= 0) {
+                sVirtRot = normalizeRot(reqRot);
+            }
             sHasUserConf = true;
             saveConf();
 
@@ -734,45 +764,69 @@ public class ExtBridge implements Runnable {
             }
 
             // 2. Live resize VirtualDisplay + BBQ + hardware scale without tearing down running apps!
-            if (sVd != null && "BBQ".equals(sRenderMode) && sMirrorSc != null) {
-                try {
-                    Class<?> scCls = Class.forName("android.view.SurfaceControl");
-                    Class<?> bbqCls = Class.forName("android.graphics.BLASTBufferQueue");
-                    Object oldBbq = sBbq;
-                    Surface oldSurf = sSurf;
-
-                    Object newBbq = bbqCls.getConstructor(String.class, boolean.class).newInstance("ExtBBQ", true);
-                    bbqCls.getMethod("update", scCls, int.class, int.class, int.class).invoke(newBbq, sMirrorSc, sVirtW, sVirtH, 1);
-                    Surface newSurf = (Surface) bbqCls.getMethod("createSurface").invoke(newBbq);
-                    if (newSurf != null && Build.VERSION.SDK_INT >= 30) {
-                        try { newSurf.setFrameRate(sVirtFps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE); } catch (Throwable ignored) {}
-                    }
-                    sVd.resize(sVirtW, sVirtH, sVirtDpi);
-                    sVd.setSurface(newSurf);
-
-                    sBbq = newBbq;
-                    sSurf = newSurf;
-                    if (oldSurf != null) try { oldSurf.release(); } catch (Throwable ignored) {}
-                    if (oldBbq != null) try { bbqCls.getMethod("destroy").invoke(oldBbq); } catch (Throwable ignored) {}
-
-                    applySurfaceTransform();
-                    if (sHandler != null) sHandler.postDelayed(ExtBridge::applySurfaceTransform, 150);
-                    sCursorX = Math.min(sCursorX, sVirtW - 1f);
-                    sCursorY = Math.min(sCursorY, sVirtH - 1f);
-                    reassert();
-                    notifyHelperSync();
-                    System.out.println("EXTBRIDGE_RESIZED " + sVirtW + "x" + sVirtH + "@" + sVirtDpi + "fps=" + sVirtFps);
-                    return true;
-                } catch (Throwable t) {
-                    t.printStackTrace();
-                }
-            }
-            sForceRebuild = true;
+            liveResizeOrRebuild();
             return true;
         } catch (Throwable t) {
             t.printStackTrace();
             return false;
         }
+    }
+
+    private static synchronized int setRotation(int reqRot) {
+        int next = (reqRot < 0) ? ((sVirtRot + 1) % 4) : normalizeRot(reqRot);
+        boolean wantPortrait = (next & 1) == 1;
+        if (wantPortrait && sVirtW > sVirtH) {
+            int tmp = sVirtW;
+            sVirtW = sVirtH;
+            sVirtH = tmp;
+        } else if (!wantPortrait && sVirtH > sVirtW) {
+            int tmp = sVirtW;
+            sVirtW = sVirtH;
+            sVirtH = tmp;
+        }
+        sVirtRot = next;
+        sHasUserConf = true;
+        saveConf();
+        liveResizeOrRebuild();
+        return sVirtRot;
+    }
+
+    private static void liveResizeOrRebuild() {
+        if (sVd != null && "BBQ".equals(sRenderMode) && sMirrorSc != null) {
+            try {
+                Class<?> scCls = Class.forName("android.view.SurfaceControl");
+                Class<?> bbqCls = Class.forName("android.graphics.BLASTBufferQueue");
+                Object oldBbq = sBbq;
+                Surface oldSurf = sSurf;
+
+                Object newBbq = bbqCls.getConstructor(String.class, boolean.class).newInstance("ExtBBQ", true);
+                bbqCls.getMethod("update", scCls, int.class, int.class, int.class).invoke(newBbq, sMirrorSc, sVirtW, sVirtH, 1);
+                Surface newSurf = (Surface) bbqCls.getMethod("createSurface").invoke(newBbq);
+                if (newSurf != null && Build.VERSION.SDK_INT >= 30) {
+                    try { newSurf.setFrameRate(sVirtFps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE); } catch (Throwable ignored) {}
+                }
+                sVd.resize(sVirtW, sVirtH, sVirtDpi);
+                sVd.setSurface(newSurf);
+
+                sBbq = newBbq;
+                sSurf = newSurf;
+                if (oldSurf != null) try { oldSurf.release(); } catch (Throwable ignored) {}
+                if (oldBbq != null) try { bbqCls.getMethod("destroy").invoke(oldBbq); } catch (Throwable ignored) {}
+
+                applySurfaceTransform();
+                if (sHandler != null) sHandler.postDelayed(ExtBridge::applySurfaceTransform, 150);
+                sCursorX = Math.min(sCursorX, sVirtW - 1f);
+                sCursorY = Math.min(sCursorY, sVirtH - 1f);
+                reassert();
+                notifyHelperSync();
+                System.out.println("EXTBRIDGE_RESIZED " + sVirtW + "x" + sVirtH + "@" + sVirtDpi + "fps=" + sVirtFps + " rot=" + (sVirtRot * 90));
+                return;
+            } catch (Throwable t) {
+                t.printStackTrace();
+            }
+        }
+        sForceRebuild = true;
+        notifyHelperSync();
     }
 
     private static void unbindInput() {
@@ -970,10 +1024,11 @@ public class ExtBridge implements Runnable {
     }
 
     private static Rect calcFreeformRect() {
-        int sw = Math.max(800, sVirtW);
+        int sw = Math.max(600, sVirtW);
         int sh = Math.max(600, sVirtH);
-        int w = Math.max(540, Math.min(sw - 120, Math.round(sw * 0.44f)));
-        int h = Math.max(500, Math.min(sh - 120, Math.round(sh * 0.84f)));
+        boolean port = sh > sw;
+        int w = Math.max(540, Math.min(sw - 120, Math.round(sw * (port ? 0.78f : 0.44f))));
+        int h = Math.max(500, Math.min(sh - 120, Math.round(sh * (port ? 0.62f : 0.84f))));
         int left = (sw - w) / 2;
         int top = Math.max(24, (sh - h) / 2 - 20);
         return new Rect(left, top, left + w, top + h);
@@ -1348,6 +1403,7 @@ public class ExtBridge implements Runnable {
             b.putExtra("virtH", sVirtH);
             b.putExtra("virtDpi", sVirtDpi);
             b.putExtra("virtFps", sVirtFps);
+            b.putExtra("virtRot", sVirtRot);
             b.putExtra("inputToExt", sInputToExt);
             sCtx.sendBroadcast(b);
         } catch (Throwable ignored) {}
@@ -1411,6 +1467,7 @@ public class ExtBridge implements Runnable {
                     reply.writeString(sRenderMode);
                     reply.writeInt(sMirrorMode);
                     reply.writeInt(sFullscreenPolicy);
+                    reply.writeInt(sVirtRot);
                 }
                 return true;
             } else if (code == 16) {
@@ -1419,7 +1476,8 @@ public class ExtBridge implements Runnable {
                 int dpi = data.readInt();
                 int fpsX100 = data.readInt();
                 int physModeId = data.readInt();
-                boolean ok = applyConfig(w, h, dpi, fpsX100, physModeId);
+                int reqRot = data.dataAvail() > 0 ? data.readInt() : -1;
+                boolean ok = applyConfig(w, h, dpi, fpsX100, physModeId, reqRot);
                 if (reply != null) reply.writeInt(ok ? 1 : 0);
                 return true;
             } else if (code == 17) {
@@ -1593,6 +1651,11 @@ public class ExtBridge implements Runnable {
                 healStrayCompatOverrides(true);
                 notifyHelperSync();
                 if (reply != null) reply.writeInt(1);
+                return true;
+            } else if (code == 34) {
+                int reqRot = data.readInt();
+                int cur = setRotation(reqRot);
+                if (reply != null) reply.writeInt(cur);
                 return true;
             } else if (code == 99) {
                 sShuttingDown = true;

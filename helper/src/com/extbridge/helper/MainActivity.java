@@ -67,6 +67,7 @@ public class MainActivity extends Activity {
     private int mSelH = 1440;
     private int mSelDpi = 240;
     private float mSelFps = 60f;
+    private int mSelRot = 0;
     private int mSelPhysModeId = -1;
     private boolean mInitedFromDaemon = false;
 
@@ -99,6 +100,7 @@ public class MainActivity extends Activity {
     private TextView mTvActStatus;
 
     private final List<TextView> mResChips = new ArrayList<>();
+    private final List<TextView> mRotChips = new ArrayList<>();
     private final List<TextView> mDpiChips = new ArrayList<>();
     private final List<TextView> mFpsChips = new ArrayList<>();
 
@@ -319,10 +321,11 @@ public class MainActivity extends Activity {
             final int h = RES_PRESETS[i][1];
             TextView chip = makeChip(RES_LABELS[i]);
             chip.setOnClickListener(v -> {
-                mSelW = w;
-                mSelH = h;
-                mEdW.setText(String.valueOf(w));
-                mEdH.setText(String.valueOf(h));
+                boolean wantPortrait = (mSelRot & 1) == 1;
+                mSelW = wantPortrait ? h : w;
+                mSelH = wantPortrait ? w : h;
+                mEdW.setText(String.valueOf(mSelW));
+                mEdH.setText(String.valueOf(mSelH));
                 updateSelectionStyles();
             });
             mResChips.add(chip);
@@ -349,7 +352,54 @@ public class MainActivity extends Activity {
         customRow.addView(mEdW);
         customRow.addView(xLbl);
         customRow.addView(mEdH);
+
+        TextView btnSwapWh = makeChip("⇅ 对调宽高");
+        btnSwapWh.setTextColor(0xFF7DD3FC);
+        LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        swLp.leftMargin = 14;
+        btnSwapWh.setOnClickListener(v -> {
+            syncCustomWHFields();
+            int tmp = mSelW;
+            mSelW = mSelH;
+            mSelH = tmp;
+            mEdW.setText(String.valueOf(mSelW));
+            mEdH.setText(String.valueOf(mSelH));
+            updateSelectionStyles();
+            if (BridgeClient.getService() != null) {
+                applyChosenConfig();
+            }
+        });
+        customRow.addView(btnSwapWh, swLp);
         resCard.addView(customRow);
+
+        addCardHeaderTopPad(resCard, "输出桌面旋转方向 (竖屏显示器选 90°/270°；横屏居中看竖版可只点上面「⇅ 对调宽高」)");
+        String[] rotLabels = {"0° 正常横屏", "90° 顺时针竖屏", "180° 倒置横屏", "270° 逆时针竖屏"};
+        List<View> rotViews = new ArrayList<>();
+        mRotChips.clear();
+        for (int r = 0; r < 4; r++) {
+            final int rotVal = r;
+            TextView rChip = makeChip(rotLabels[r]);
+            rChip.setOnClickListener(v -> {
+                syncCustomWHFields();
+                mSelRot = rotVal;
+                boolean wantPortrait = (rotVal & 1) == 1;
+                if (wantPortrait && mSelW > mSelH) {
+                    int tmp = mSelW; mSelW = mSelH; mSelH = tmp;
+                } else if (!wantPortrait && mSelH > mSelW) {
+                    int tmp = mSelW; mSelW = mSelH; mSelH = tmp;
+                }
+                mEdW.setText(String.valueOf(mSelW));
+                mEdH.setText(String.valueOf(mSelH));
+                updateSelectionStyles();
+                if (BridgeClient.getService() != null) {
+                    applyChosenConfig();
+                }
+            });
+            mRotChips.add(rChip);
+            rotViews.add(rChip);
+        }
+        addChipWrap(resCard, rotViews);
         root.addView(resCard);
 
         // Card 3: DPI + Refresh Rate
@@ -398,7 +448,7 @@ public class MainActivity extends Activity {
         TextView btnPhoneTabletPreset = makeActionBtn("📱 手机推荐：一键横屏平板大屏 (1920×1080 @ 240dpi)", 0xFF0369A1);
         btnPhoneTabletPreset.setTextSize(12.5f);
         btnPhoneTabletPreset.setOnClickListener(v -> {
-            mSelW = 1920; mSelH = 1080; mSelDpi = 240; mSelFps = 60f; mSelPhysModeId = -1;
+            mSelW = 1920; mSelH = 1080; mSelDpi = 240; mSelFps = 60f; mSelRot = 0; mSelPhysModeId = -1;
             mEdW.setText("1920"); mEdH.setText("1080");
             updateSelectionStyles();
             applyChosenConfig();
@@ -413,7 +463,7 @@ public class MainActivity extends Activity {
         btnApply.setOnClickListener(v -> applyChosenConfig());
         TextView btnReset = makeActionBtn("↺ 恢复推荐默认", 0xFF334155);
         btnReset.setOnClickListener(v -> {
-            mSelW = 2560; mSelH = 1440; mSelDpi = 240; mSelFps = 60f; mSelPhysModeId = -1;
+            mSelW = 2560; mSelH = 1440; mSelDpi = 240; mSelFps = 60f; mSelRot = 0; mSelPhysModeId = -1;
             mEdW.setText("2560"); mEdH.setText("1440");
             updateSelectionStyles();
             applyChosenConfig();
@@ -458,17 +508,25 @@ public class MainActivity extends Activity {
         updateSelectionStyles();
     }
 
-    private void applyChosenConfig() {
+    private void syncCustomWHFields() {
         try {
             int cw = Integer.parseInt(mEdW.getText().toString().trim());
             int ch = Integer.parseInt(mEdH.getText().toString().trim());
-            mSelW = Math.max(640, Math.min(7680, cw));
-            mSelH = Math.max(480, Math.min(4320, ch));
+            if (Math.max(cw, ch) >= 640 && Math.max(cw, ch) <= 7680
+                    && Math.min(cw, ch) >= 480 && Math.min(cw, ch) <= 4320) {
+                mSelW = cw;
+                mSelH = ch;
+            }
         } catch (Throwable ignored) {}
+    }
 
-        boolean ok = BridgeClient.applyConfig(mSelW, mSelH, mSelDpi, mSelFps, mSelPhysModeId);
+    private void applyChosenConfig() {
+        syncCustomWHFields();
+
+        boolean ok = BridgeClient.applyConfig(mSelW, mSelH, mSelDpi, mSelFps, mSelPhysModeId, mSelRot);
         Toast.makeText(this,
-                ok ? ("已应用：" + mSelW + "×" + mSelH + " · " + mSelDpi + "dpi · " + Math.round(mSelFps) + "Hz")
+                ok ? ("已应用：" + mSelW + "×" + mSelH + " · " + BridgeClient.rotationLabel(mSelRot)
+                        + " · " + mSelDpi + "dpi · " + Math.round(mSelFps) + "Hz")
                    : "应用失败，请确认 ExtBridge 后台服务正在运行",
                 Toast.LENGTH_SHORT).show();
         BridgeService.refreshFromReceiver(this);
@@ -500,9 +558,21 @@ public class MainActivity extends Activity {
                 mSelH = st.virtH;
                 mSelDpi = st.virtDpi;
                 mSelFps = st.virtFps;
+                mSelRot = st.virtRot;
                 mEdW.setText(String.valueOf(mSelW));
                 mEdH.setText(String.valueOf(mSelH));
                 updateSelectionStyles();
+            } else if (syncSelection || (mEdW != null && !mEdW.hasFocus() && mEdH != null && !mEdH.hasFocus()
+                    && (mSelRot != st.virtRot || mSelW != st.virtW || mSelH != st.virtH))) {
+                // Keep UI in sync when rotation or resolution is changed from quick flyout panel
+                if (st.connected && (mSelRot != st.virtRot)) {
+                    mSelW = st.virtW;
+                    mSelH = st.virtH;
+                    mSelRot = st.virtRot;
+                    mEdW.setText(String.valueOf(mSelW));
+                    mEdH.setText(String.valueOf(mSelH));
+                    updateSelectionStyles();
+                }
             }
             if (st.mirrorMode == 1 && st.extId > 0) {
                 mTvStatusTitle.setText("● 原生镜像模式 · 物理 Display #" + st.extId);
@@ -515,12 +585,12 @@ public class MainActivity extends Activity {
                 mTvStatusTitle.setTextColor(0xFF4ADE80);
                 String target = st.inputToExt == 1 ? "外接扩展屏 (按切回可在通知栏/此页切平板)" : "平板内屏";
                 mTvStatusDetail.setText("当前键鼠控制：【" + target + "】  (检测到外接设备 " + st.extInputCnt + " 个)\n"
-                        + "虚拟桌面：" + st.virtW + "×" + st.virtH + " @ " + st.virtDpi + "dpi · 请求 " + Math.round(st.virtFps) + "Hz (" + st.renderMode + ") · 全屏策略:" + (st.fullscreenPolicy == 1 ? "开" : "关") + "\n"
+                        + "虚拟桌面：" + st.virtW + "×" + st.virtH + " (" + BridgeClient.rotationLabel(st.virtRot) + ") @ " + st.virtDpi + "dpi · 请求 " + Math.round(st.virtFps) + "Hz (" + st.renderMode + ") · 锁向:" + (st.fullscreenPolicy == 1 ? "开" : "关") + "\n"
                         + "物理信号：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz");
             } else {
                 mTvStatusTitle.setText("● 后台服务待机中 · 请插入 Type-C 外接显示器");
                 mTvStatusTitle.setTextColor(0xFFFBBF24);
-                mTvStatusDetail.setText("已保存目标预设：" + st.virtW + "×" + st.virtH + " @ " + st.virtDpi + "dpi · " + Math.round(st.virtFps) + "Hz"
+                mTvStatusDetail.setText("已保存目标预设：" + st.virtW + "×" + st.virtH + " (" + BridgeClient.rotationLabel(st.virtRot) + ") @ " + st.virtDpi + "dpi · " + Math.round(st.virtFps) + "Hz"
                         + (st.mirrorMode == 1 ? " (当前开关为原生镜像模式)" : ""));
             }
             mBtnToggleInput.setText(st.inputToExt == 1 ? "⇄ 键鼠切回平板 (当前:扩展)" : "⇄ 键鼠切回扩展 (当前:平板)");
@@ -570,8 +640,11 @@ public class MainActivity extends Activity {
                     try {
                         String[] rf = desc.split("@");
                         String[] wh = rf[0].split("x");
-                        mSelW = Integer.parseInt(wh[0]);
-                        mSelH = Integer.parseInt(wh[1]);
+                        int pw = Integer.parseInt(wh[0]);
+                        int ph = Integer.parseInt(wh[1]);
+                        boolean wantPortrait = (mSelRot & 1) == 1;
+                        mSelW = wantPortrait ? ph : pw;
+                        mSelH = wantPortrait ? pw : ph;
                         mSelFps = Float.parseFloat(rf[1]);
                         mEdW.setText(String.valueOf(mSelW));
                         mEdH.setText(String.valueOf(mSelH));
@@ -587,8 +660,12 @@ public class MainActivity extends Activity {
 
     private void updateSelectionStyles() {
         for (int i = 0; i < RES_PRESETS.length && i < mResChips.size(); i++) {
-            boolean sel = (RES_PRESETS[i][0] == mSelW && RES_PRESETS[i][1] == mSelH);
+            boolean sel = (RES_PRESETS[i][0] == mSelW && RES_PRESETS[i][1] == mSelH)
+                    || (RES_PRESETS[i][0] == mSelH && RES_PRESETS[i][1] == mSelW);
             styleChip(mResChips.get(i), sel);
+        }
+        for (int i = 0; i < mRotChips.size(); i++) {
+            styleChip(mRotChips.get(i), i == mSelRot);
         }
         for (int i = 0; i < DPI_PRESETS.length && i < mDpiChips.size(); i++) {
             styleChip(mDpiChips.get(i), DPI_PRESETS[i] == mSelDpi);

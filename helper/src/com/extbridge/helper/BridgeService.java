@@ -127,6 +127,7 @@ public class BridgeService extends Service {
     private TextView mPanelBattText;
     private TextView mBtnPanelFullscreen;
     private TextView mBtnPanelMirror;
+    private TextView mBtnPanelRotate;
     private TextView mBtnPanelHideDock;
 
     // Software mouse cursor window (always topmost)
@@ -400,6 +401,10 @@ public class BridgeService extends Service {
             mBtnPanelFullscreen.setText(fsOn ? "⛶ 桌面横屏:开" : "⛶ 桌面横屏:关");
             mBtnPanelFullscreen.setTextColor(fsOn ? 0xFF7DD3FC : 0xFFCBD5E1);
         }
+        if (mBtnPanelRotate != null) {
+            mBtnPanelRotate.setText("↻ 旋转: " + BridgeClient.rotationLabel(st.virtRot));
+            mBtnPanelRotate.setTextColor(st.virtRot != 0 ? 0xFF7DD3FC : 0xFFCBD5E1);
+        }
     }
 
     private void attachExtOverlays(BridgeClient.Status st) {
@@ -438,9 +443,11 @@ public class BridgeService extends Service {
 
     private static int computeOverlayDpi(BridgeClient.Status st) {
         int reqDpi = (st != null && st.virtDpi > 0) ? st.virtDpi : 240;
+        int virtW = (st != null && st.virtW > 0) ? st.virtW : 2560;
         int virtH = (st != null && st.virtH > 0) ? st.virtH : 1440;
-        int maxDpiForHeight = Math.max(120, Math.round(virtH * 160f / 720f));
-        return Math.min(reqDpi, maxDpiForHeight);
+        int minEdge = Math.min(virtW, virtH);
+        int maxDpiForEdge = Math.max(120, Math.round(minEdge * 160f / 720f));
+        return Math.min(reqDpi, maxDpiForEdge);
     }
 
     private void attachWithContext(Context dispCtx, int winType, boolean isA11y, BridgeClient.Status st) {
@@ -925,8 +932,34 @@ public class BridgeService extends Service {
             });
         });
         LinearLayout.LayoutParams dp2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        dp2.rightMargin = dp(ctx, 6);
         dexRow.addView(mBtnPanelMirror, dp2);
+
+        body.addView(dexRow);
+
+        LinearLayout dexRow2 = new LinearLayout(ctx);
+        dexRow2.setOrientation(LinearLayout.HORIZONTAL);
+        dexRow2.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams dr2Lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        dr2Lp.topMargin = dp(ctx, 6);
+        dexRow2.setLayoutParams(dr2Lp);
+
+        mBtnPanelRotate = makeFooterChip(ctx, "↻ 旋转: " + BridgeClient.rotationLabel(st.virtRot));
+        mBtnPanelRotate.setSingleLine(true);
+        mBtnPanelRotate.setGravity(Gravity.CENTER);
+        mBtnPanelRotate.setTextColor(st.virtRot != 0 ? 0xFF7DD3FC : 0xFFCBD5E1);
+        mBtnPanelRotate.setOnClickListener(v -> mBg.execute(() -> {
+            int next = BridgeClient.cycleRotation();
+            mHandler.post(() -> {
+                Toast.makeText(BridgeService.this,
+                        "输出旋转已切换为：" + BridgeClient.rotationLabel(next),
+                        Toast.LENGTH_SHORT).show();
+                pollRemoteStateAsync();
+            });
+        }));
+        LinearLayout.LayoutParams dp3a = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        dp3a.rightMargin = dp(ctx, 6);
+        dexRow2.addView(mBtnPanelRotate, dp3a);
 
         mBtnPanelHideDock = makeFooterChip(ctx, "👁 隐藏Dock");
         mBtnPanelHideDock.setSingleLine(true);
@@ -935,10 +968,10 @@ public class BridgeService extends Service {
             applyDockHidden(true);
             Toast.makeText(BridgeService.this, "Dock 已隐藏，点右下角 ⊞ 可恢复", Toast.LENGTH_SHORT).show();
         });
-        LinearLayout.LayoutParams dp3 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        dexRow.addView(mBtnPanelHideDock, dp3);
+        LinearLayout.LayoutParams dp3b = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        dexRow2.addView(mBtnPanelHideDock, dp3b);
 
-        body.addView(dexRow);
+        body.addView(dexRow2);
         mPanelCard.addView(body);
 
         // Footer Bar (Battery % left, Control Center + Settings right)

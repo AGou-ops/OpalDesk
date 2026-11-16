@@ -56,6 +56,7 @@ public class BridgeClient {
         public String renderMode = "NONE";
         public int mirrorMode = 0;
         public int fullscreenPolicy = 1;
+        public int virtRot = 0;
     }
 
     private static volatile IBinder sBinder;
@@ -124,6 +125,9 @@ public class BridgeClient {
                     st.mirrorMode = reply.readInt();
                     st.fullscreenPolicy = reply.readInt();
                 }
+                if (reply.dataAvail() > 0) {
+                    st.virtRot = reply.readInt();
+                }
             }
         } catch (Throwable ignored) {
         } finally {
@@ -160,6 +164,10 @@ public class BridgeClient {
     public static void rebuild() { simpleOneWay(21); }
 
     public static boolean applyConfig(int w, int h, int dpi, float fps, int physModeId) {
+        return applyConfig(w, h, dpi, fps, physModeId, -1);
+    }
+
+    public static boolean applyConfig(int w, int h, int dpi, float fps, int physModeId, int rot) {
         IBinder b = getService();
         if (b == null) return false;
         Parcel d = Parcel.obtain();
@@ -170,6 +178,7 @@ public class BridgeClient {
             d.writeInt(dpi);
             d.writeInt(Math.round(fps * 100f));
             d.writeInt(physModeId);
+            d.writeInt(rot);
             b.transact(16, d, r, 0);
             return r.readInt() == 1;
         } catch (Throwable t) {
@@ -442,6 +451,37 @@ public class BridgeClient {
 
     public static int toggleFullscreenPolicy() {
         return setFullscreenPolicy(-1);
+    }
+
+    public static int setRotation(int rot) {
+        IBinder b = getService();
+        if (b == null) return -1;
+        Parcel d = Parcel.obtain();
+        Parcel r = Parcel.obtain();
+        try {
+            d.writeInt(rot);
+            b.transact(34, d, r, 0);
+            return r.readInt();
+        } catch (Throwable ignored) {
+            return -1;
+        } finally {
+            d.recycle();
+            r.recycle();
+        }
+    }
+
+    public static int cycleRotation() {
+        return setRotation(-1);
+    }
+
+    public static String rotationLabel(int rot) {
+        int r = ((rot % 4) + 4) % 4;
+        switch (r) {
+            case 1: return "90° 竖屏";
+            case 2: return "180° 倒置";
+            case 3: return "270° 竖屏";
+            default: return "0° 横屏";
+        }
     }
 
     public static final int APP_MODE_DEFAULT = 0;
