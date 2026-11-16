@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+out/
+*.apk
+*.idsig
+*.jar
+*.dex
+*.class
+*.ap_
+
+# Signing keys (keep private keys out of version control)
+*.p12
+*.pk8
+*.jks
+*.keystore
+*.pem
+*.der
+
+# Temporary / debug files
+*.log
+*.tmp
+*.xml.dump
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+.gradle/
+local.properties
