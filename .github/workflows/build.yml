@@ -1,0 +1,112 @@
+name: Build ExtBridge APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish GitHub Release (public download without login)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK & Daemon JAR
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Ensure Android SDK Build-Tools & Platform 35
+        shell: pwsh
+        run: |
+          $sdk = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $sdk) { throw "ANDROID_HOME not found on runner" }
+          if (-not (Test-Path "$sdk\platforms\android-35\android.jar") -or -not (Test-Path "$sdk\build-tools\35.0.0\aapt2.exe")) {
+            $sdkmgr = Get-ChildItem -Path "$sdk\cmdline-tools" -Recurse -Filter "sdkmanager.bat" -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+            if ($sdkmgr) {
+              "y`ny`ny`ny`ny`ny`n" | & $sdkmgr "platforms;android-35" "build-tools;35.0.0"
+            }
+          }
+
+      - name: Prepare optional signing keystore from Secrets
+        shell: pwsh
+        env:
+          EXTBRIDGE_KEYSTORE_BASE64: ${{ secrets.EXTBRIDGE_KEYSTORE_BASE64 }}
+          EXTBRIDGE_KEYSTORE_PASS: ${{ secrets.EXTBRIDGE_KEYSTORE_PASS }}
+        run: |
+          if ($env:EXTBRIDGE_KEYSTORE_BASE64) {
+            $ksPath = Join-Path $env:RUNNER_TEMP "exthelper.p12"
+            [IO.File]::WriteAllBytes($ksPath, [Convert]::FromBase64String($env:EXTBRIDGE_KEYSTORE_BASE64.Trim()))
+            "EXTBRIDGE_KEYSTORE=$ksPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            if ($env:EXTBRIDGE_KEYSTORE_PASS) {
+              "EXTBRIDGE_KEYSTORE_PASS=$($env:EXTBRIDGE_KEYSTORE_PASS)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+            Write-Host "Using release keystore from GitHub Secrets."
+          } else {
+            Write-Host "No EXTBRIDGE_KEYSTORE_BASE64 secret configured; build_v3.ps1 will generate temporary debug.keystore."
+          }
+
+      - name: Build ExtBridge APK
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\build_v3.ps1
+          [xml]$manifest = Get-Content -Path ".\helper\AndroidManifest.xml" -Encoding UTF8
+          $ver = $manifest.manifest.versionName
+          if (-not $ver) { $ver = "3.1.0" }
+          Copy-Item -Path ".\build\out\exthelper.apk" -Destination ".\build\out\ExtBridge_v$ver.apk" -Force
+          "APP_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "APK_PATH=build/out/ExtBridge_v$ver.apk" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-ChildItem ".\build\out" | Select-Object Name, Length
+
+      - name: Cleanup temporary keystore
+        if: always()
+        shell: pwsh
+        run: |
+          $ksPath = Join-Path $env:RUNNER_TEMP "exthelper.p12"
+          if (Test-Path $ksPath) { Remove-Item -Force $ksPath }
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExtBridge_v${{ env.APP_VERSION }}
+          path: |
+            ${{ env.APK_PATH }}
+            build/out/extbridge.jar
+          retention-days: 90
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', env.APP_VERSION) }}
+          name: ExtBridge v${{ env.APP_VERSION }}
+          generate_release_notes: true
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+          files: |
+            ${{ env.APK_PATH }}
+            build/out/extbridge.jar

@@ -87,6 +87,7 @@ public class MainActivity extends Activity {
     private AlertDialog mActivationDialog;
     private boolean mUserSkippedDialog = false;
     private boolean mActWorking = false;
+    private boolean mAutoRootTried = false;
     private boolean mHostEdited = false;
     private boolean mPairPortEdited = false;
     private boolean mConnPortEdited = false;
@@ -116,7 +117,26 @@ public class MainActivity extends Activity {
     private final Runnable mAutoPromptCheck = () -> {
         if (isFinishing()) return;
         BridgeClient.Status st = BridgeClient.getStatus();
-        if (!st.connected && !mUserSkippedDialog && (mActivationDialog == null || !mActivationDialog.isShowing())) {
+        if (st.connected) return;
+        if (!mAutoRootTried && AdbBootstrap.isAutoRootEnabled(this)) {
+            mAutoRootTried = true;
+            Toast.makeText(this, "正在尝试自动 Root 激活 ExtBridge 服务...", Toast.LENGTH_SHORT).show();
+            AdbBootstrap.rootBootstrapAsync(this, false, new AdbBootstrap.ProgressListener() {
+                @Override
+                public void onStep(String message) {}
+
+                @Override
+                public void onResult(boolean success, String message) {
+                    refreshStatus(true);
+                    if (!success && !isFinishing() && !mUserSkippedDialog
+                            && (mActivationDialog == null || !mActivationDialog.isShowing())) {
+                        showActivationDialog();
+                    }
+                }
+            });
+            return;
+        }
+        if (!mUserSkippedDialog && (mActivationDialog == null || !mActivationDialog.isShowing())) {
             showActivationDialog();
         }
     };
@@ -192,8 +212,12 @@ public class MainActivity extends Activity {
         }
 
         // Header
+        String verName = "3.1.0";
+        try {
+            verName = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Throwable ignored) {}
         TextView appTitle = new TextView(this);
-        appTitle.setText("ExtBridge 扩展屏控制台 v3");
+        appTitle.setText("ExtBridge 扩展屏控制台 v" + verName);
         appTitle.setTextColor(Color.WHITE);
         appTitle.setTextSize(22f);
         appTitle.getPaint().setFakeBoldText(true);
@@ -275,7 +299,7 @@ public class MainActivity extends Activity {
         mBtnAppModes.setOnClickListener(v -> showAppModesDialog());
         heroBtns.add(mBtnAppModes);
 
-        mBtnActivate = makeActionBtn("⚡ 激活后台服务 (无线调试 / ADB)", 0xFFD97706);
+        mBtnActivate = makeActionBtn("⚡ 激活后台服务 (Root / 无线 / ADB)", 0xFFD97706);
         mBtnActivate.setOnClickListener(v -> {
             mUserSkippedDialog = false;
             showActivationDialog();
@@ -456,7 +480,7 @@ public class MainActivity extends Activity {
         if (!st.connected) {
             mTvStatusTitle.setText("● 未检测到 ExtBridge 后台守护进程");
             mTvStatusTitle.setTextColor(0xFFF87171);
-            mTvStatusDetail.setText("请通过「本机无线调试」或「电脑 ADB 命令」一键激活，无需手动传输任何脚本。");
+            mTvStatusDetail.setText("请通过「Root 一键激活」「本机无线调试」或「电脑 ADB 命令」一键激活，无需手动传输任何脚本。");
             mBtnToggleInput.setText("⇄ 切换键鼠方向");
             if (mBtnToggleMirror != null) mBtnToggleMirror.setText("📺 切换模式 (镜像/DeX)");
             if (mBtnFullscreenPolicy != null) mBtnFullscreenPolicy.setText("⛶ 全屏策略");
@@ -748,20 +772,59 @@ public class MainActivity extends Activity {
         sub.setPadding(0, 8, 0, 18);
         root.addView(sub);
 
-        // Two mode selector buttons
+        // Three mode selector buttons
         LinearLayout tabRow = new LinearLayout(this);
         tabRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams tabLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        tabLp1.rightMargin = 10;
+        tabLp1.rightMargin = 8;
         LinearLayout.LayoutParams tabLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        tabLp2.rightMargin = 8;
+        LinearLayout.LayoutParams tabLp3 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
 
-        final TextView btnModeWireless = makeActionBtn("📡 无线调试\n(本机免电脑)", 0xFF1E293B);
+        final TextView btnModeRoot = makeActionBtn("👑 Root 激活\n(免 ADB 权限)", 0xFF1E293B);
+        final TextView btnModeWireless = makeActionBtn("📡 无线调试\n(免 Root 免电脑)", 0xFF1E293B);
         final TextView btnModeAdb = makeActionBtn("💻 ADB 命令\n(电脑执行一句)", 0xFF1E293B);
-        btnModeWireless.setTextSize(13f);
-        btnModeAdb.setTextSize(13f);
-        tabRow.addView(btnModeWireless, tabLp1);
-        tabRow.addView(btnModeAdb, tabLp2);
+        btnModeRoot.setTextSize(12f);
+        btnModeWireless.setTextSize(12f);
+        btnModeAdb.setTextSize(12f);
+        tabRow.addView(btnModeRoot, tabLp1);
+        tabRow.addView(btnModeWireless, tabLp2);
+        tabRow.addView(btnModeAdb, tabLp3);
         root.addView(tabRow);
+
+        // Panel 0: Root One-Click
+        final LinearLayout rootPane = new LinearLayout(this);
+        rootPane.setOrientation(LinearLayout.VERTICAL);
+        rootPane.setPadding(0, 18, 0, 0);
+        rootPane.setVisibility(View.GONE);
+
+        TextView rootDesc = new TextView(this);
+        rootDesc.setText("适合已 Root 设备（Magisk / KernelSU / APatch）。无需开启「开发者选项」或「无线调试」，点击下方按钮授一次权即可一键注册并拉起服务。\n"
+                + (AdbBootstrap.hasSuBinaryHint() ? "✓ 检测到系统存在 su 可执行文件" : "ℹ 若使用 KernelSU/APatch 隐藏了 su，仍可直接点击下方按钮请求授权"));
+        rootDesc.setTextColor(0xFFCBD5E1);
+        rootDesc.setTextSize(12.5f);
+        rootDesc.setPadding(0, 0, 0, 12);
+        rootPane.addView(rootDesc);
+
+        final TextView btnRootRun = makeActionBtn("👑 一键 Root 注册并激活服务", 0xFF059669);
+        rootPane.addView(btnRootRun);
+
+        final TextView btnAutoRootToggle = makeActionBtn(
+                AdbBootstrap.isAutoRootEnabled(this) ? "🔄 启动软件时自动 Root 激活：开" : "🔄 启动软件时自动 Root 激活：关",
+                0xFF1E293B);
+        btnAutoRootToggle.setTextSize(12.5f);
+        LinearLayout.LayoutParams artLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        artLp.topMargin = 10;
+        btnAutoRootToggle.setOnClickListener(v -> {
+            boolean next = !AdbBootstrap.isAutoRootEnabled(this);
+            AdbBootstrap.setAutoRootEnabled(this, next);
+            btnAutoRootToggle.setText(next ? "🔄 启动软件时自动 Root 激活：开" : "🔄 启动软件时自动 Root 激活：关");
+            setTabSelected(btnAutoRootToggle, next);
+        });
+        setTabSelected(btnAutoRootToggle, AdbBootstrap.isAutoRootEnabled(this));
+        rootPane.addView(btnAutoRootToggle, artLp);
+        root.addView(rootPane);
 
         // Panel 1: Wireless Debugging
         final LinearLayout wirelessPane = new LinearLayout(this);
@@ -841,17 +904,6 @@ public class MainActivity extends Activity {
         runRow.addView(btnPairRun, rLp1);
         runRow.addView(btnConnRun, rLp2);
         wirelessPane.addView(runRow);
-
-        mTvActStatus = new TextView(this);
-        mTvActStatus.setText("提示：也可下拉通知栏在「ExtBridge 无线调试配对助手」里直接输入6位配对码，不会导致弹窗验证码失效。");
-        mTvActStatus.setTextColor(0xFFCBD5E1);
-        mTvActStatus.setTextSize(12f);
-        mTvActStatus.setPadding(12, 10, 12, 10);
-        GradientDrawable stBg = new GradientDrawable();
-        stBg.setColor(0xFF020617);
-        stBg.setCornerRadius(10f);
-        mTvActStatus.setBackground(stBg);
-        wirelessPane.addView(mTvActStatus);
         root.addView(wirelessPane);
 
         // Panel 2: PC ADB Command
@@ -903,6 +955,20 @@ public class MainActivity extends Activity {
         adbPane.addView(tvWait);
         root.addView(adbPane);
 
+        mTvActStatus = new TextView(this);
+        mTvActStatus.setText("提示：Root 用户直接点「👑 Root 激活」即可，无需 ADB 权限；非 Root 用户使用「📡 无线调试」或「💻 ADB 命令」。");
+        mTvActStatus.setTextColor(0xFFCBD5E1);
+        mTvActStatus.setTextSize(12f);
+        mTvActStatus.setPadding(12, 10, 12, 10);
+        GradientDrawable stBg = new GradientDrawable();
+        stBg.setColor(0xFF020617);
+        stBg.setCornerRadius(10f);
+        mTvActStatus.setBackground(stBg);
+        LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        stLp.topMargin = 14;
+        root.addView(mTvActStatus, stLp);
+
         // Skip button at bottom
         TextView btnSkip = new TextView(this);
         btnSkip.setText("暂不激活，先浏览控制台界面 →");
@@ -916,22 +982,61 @@ public class MainActivity extends Activity {
         });
         root.addView(btnSkip);
 
+        final Runnable selectRoot = () -> {
+            rootPane.setVisibility(View.VISIBLE);
+            wirelessPane.setVisibility(View.GONE);
+            adbPane.setVisibility(View.GONE);
+            setTabSelected(btnModeRoot, true);
+            setTabSelected(btnModeWireless, false);
+            setTabSelected(btnModeAdb, false);
+        };
         final Runnable selectWireless = () -> {
+            rootPane.setVisibility(View.GONE);
             wirelessPane.setVisibility(View.VISIBLE);
             adbPane.setVisibility(View.GONE);
+            setTabSelected(btnModeRoot, false);
             setTabSelected(btnModeWireless, true);
             setTabSelected(btnModeAdb, false);
             AdbBootstrap.startDiscovery(this, this::applyDiscoveryStateToUi);
         };
         final Runnable selectAdb = () -> {
+            rootPane.setVisibility(View.GONE);
             wirelessPane.setVisibility(View.GONE);
             adbPane.setVisibility(View.VISIBLE);
+            setTabSelected(btnModeRoot, false);
             setTabSelected(btnModeWireless, false);
             setTabSelected(btnModeAdb, true);
         };
 
+        btnModeRoot.setOnClickListener(v -> selectRoot.run());
         btnModeWireless.setOnClickListener(v -> selectWireless.run());
         btnModeAdb.setOnClickListener(v -> selectAdb.run());
+        if (AdbBootstrap.hasSuBinaryHint() || AdbBootstrap.isAutoRootEnabled(this)) {
+            selectRoot.run();
+        }
+
+        btnRootRun.setOnClickListener(v -> {
+            if (mActWorking) return;
+            mActWorking = true;
+            setActStatus("⏳ 正在请求 Root 权限并注册启动服务...", 0xFF38BDF8);
+            AdbBootstrap.rootBootstrapAsync(this, true, new AdbBootstrap.ProgressListener() {
+                @Override
+                public void onStep(String message) {
+                    setActStatus("⏳ " + message, 0xFF38BDF8);
+                }
+
+                @Override
+                public void onResult(boolean success, String message) {
+                    mActWorking = false;
+                    setActStatus((success ? "✅ " : "❌ ") + message, success ? 0xFF4ADE80 : 0xFFF87171);
+                    if (success) {
+                        btnAutoRootToggle.setText("🔄 启动软件时自动 Root 激活：开");
+                        setTabSelected(btnAutoRootToggle, true);
+                    }
+                    refreshStatus(true);
+                }
+            });
+        });
 
         btnPairRun.setOnClickListener(v -> {
             if (mActWorking) return;

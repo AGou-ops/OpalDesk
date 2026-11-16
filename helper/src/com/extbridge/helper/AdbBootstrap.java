@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.app.RemoteInput;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.net.wifi.WifiManager;
@@ -17,7 +18,10 @@ import android.util.Log;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -45,6 +49,8 @@ public final class AdbBootstrap {
     private static final String SERVICE_PAIRING = "_adb-tls-pairing._tcp.";
     private static final String SERVICE_CONNECT = "_adb-tls-connect._tcp.";
     private static final String ADB_SERVER_PORT = "15037";
+    private static final String PREFS_NAME = "extbridge_prefs";
+    private static final String KEY_AUTO_ROOT = "auto_root_enabled";
 
     private static final ExecutorService sExec = Executors.newSingleThreadExecutor();
     private static final Handler sMain = new Handler(Looper.getMainLooper());
@@ -452,10 +458,110 @@ public final class AdbBootstrap {
         }
 
         postStep(listener, "已连接！正在释放 extbridge.jar 并授权启动守护进程...");
-        String bootstrapCmd =
-                "APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); "
-                + "unzip -p \"$APK\" assets/extbridge.jar > /data/local/tmp/extbridge.jar && "
+        String bootstrapCmd = buildDaemonBootstrapScript(null);
+
+        CmdRes shRes = runAdb(appCtx, 18000, "-s", target, "shell", bootstrapCmd);
+        if (shRes.code != 0 || shRes.output == null || !shRes.output.contains("LAUNCH_DONE")) {
+            postResult(listener, false, "远程 Shell 启动失败:\n" + shRes.output);
+            return;
+        }
+
+        awaitDaemonBinderReady(appCtx, listener, "无线调试激活成功，ExtBridge 服务已就绪！");
+    }
+
+    public static boolean isAutoRootEnabled(Context ctx) {
+        if (ctx == null) return false;
+        SharedPreferences sp = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        return sp.getBoolean(KEY_AUTO_ROOT, false);
+    }
+
+    public static void setAutoRootEnabled(Context ctx, boolean enabled) {
+        if (ctx == null) return;
+        SharedPreferences sp = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        sp.edit().putBoolean(KEY_AUTO_ROOT, enabled).apply();
+    }
+
+    public static boolean hasSuBinaryHint() {
+        String[] paths = {
+                "/system/bin/su", "/system/xbin/su", "/sbin/su",
+                "/vendor/bin/su", "/debug_ramdisk/su",
+                "/data/adb/ksu/bin/su", "/data/adb/ap/bin/su"
+        };
+        for (String p : paths) {
+            try {
+                File f = new File(p);
+                if (f.exists()) return true;
+            } catch (Throwable ignored) {}
+        }
+        String envPath = System.getenv("PATH");
+        if (envPath != null) {
+            for (String dir : envPath.split(":")) {
+                if (dir == null || dir.isEmpty()) continue;
+                try {
+                    if (new File(dir, "su").exists()) return true;
+                } catch (Throwable ignored) {}
+            }
+        }
+        return false;
+    }
+
+    public static void rootBootstrapAsync(final Context ctx, final boolean markAutoRoot, final ProgressListener listener) {
+        final Context appCtx = ctx.getApplicationContext();
+        sExec.execute(() -> {
+            postStep(listener, "正在请求 Root (su) 权限...");
+            String stagedJar = stageBridgeJar(appCtx);
+            String script = "UID_NOW=$(id -u 2>/dev/null || echo -1); "
+                    + "if [ \"$UID_NOW\" != \"0\" ]; then echo NO_ROOT:$UID_NOW; exit 12; fi; "
+                    + buildDaemonBootstrapScript(stagedJar);
+
+            CmdRes res = runSu(18000, script);
+            String out = res.output == null ? "" : res.output.trim();
+            if (res.code != 0 || !out.contains("LAUNCH_DONE")) {
+                String hint = out.contains("NO_ROOT")
+                        ? "未获取到 Root 权限（请在 Magisk / KernelSU / APatch 弹窗中允许授权，或改用无线调试/ADB激活）。"
+                        : ("Root 执行失败（设备可能未 Root 或未对 ExtBridge 授权 Root）：\n" + out);
+                postResult(listener, false, hint);
+                return;
+            }
+
+            if (markAutoRoot) {
+                setAutoRootEnabled(appCtx, true);
+            }
+            awaitDaemonBinderReady(appCtx, listener, "Root 一键激活成功，ExtBridge 服务已就绪！");
+        });
+    }
+
+    private static String stageBridgeJar(Context ctx) {
+        File outFile = new File(ctx.getFilesDir(), "extbridge_stage.jar");
+        try (InputStream in = ctx.getAssets().open("extbridge.jar");
+             OutputStream out = new FileOutputStream(outFile, false)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+            outFile.setReadable(true, false);
+            return outFile.getAbsolutePath();
+        } catch (Throwable t) {
+            Log.w(TAG, "stageBridgeJar fallback to APK unzip", t);
+            return null;
+        }
+    }
+
+    private static String buildDaemonBootstrapScript(String stagedJarPath) {
+        String jarExtract;
+        if (stagedJarPath != null && !stagedJarPath.isEmpty()) {
+            String qStage = stagedJarPath.replace("'", "");
+            jarExtract = "if [ -s '" + qStage + "' ]; then cp '" + qStage + "' /data/local/tmp/extbridge.jar; "
+                    + "else APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); unzip -p \"$APK\" assets/extbridge.jar > /data/local/tmp/extbridge.jar; fi && ";
+        } else {
+            jarExtract = "APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); "
+                    + "unzip -p \"$APK\" assets/extbridge.jar > /data/local/tmp/extbridge.jar && ";
+        }
+        return jarExtract
                 + "chmod 644 /data/local/tmp/extbridge.jar && "
+                + "chown 2000:2000 /data/local/tmp/extbridge.jar /data/local/tmp/extbridge.conf /data/local/tmp/extbridge_apps.conf /data/local/tmp/extbridge_healed_v2 /data/local/tmp/extbridge.log 2>/dev/null; "
                 + "appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow 2>/dev/null; "
                 + "appops set com.extbridge.helper POST_NOTIFICATION allow 2>/dev/null; "
                 + "appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow 2>/dev/null; "
@@ -465,25 +571,57 @@ public final class AdbBootstrap {
                 + "sleep 0.3; "
                 + "(CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >/data/local/tmp/extbridge.log 2>&1 &); "
                 + "sleep 0.6; echo LAUNCH_DONE";
+    }
 
-        CmdRes shRes = runAdb(appCtx, 18000, "-s", target, "shell", bootstrapCmd);
-        if (shRes.code != 0 || shRes.output == null || !shRes.output.contains("LAUNCH_DONE")) {
-            postResult(listener, false, "远程 Shell 启动失败:\n" + shRes.output);
-            return;
-        }
-
+    private static void awaitDaemonBinderReady(Context appCtx, ProgressListener listener, String successMsg) {
         postStep(listener, "守护进程已拉起，正在验证 Binder 连接...");
         long deadline = System.currentTimeMillis() + 7000;
         while (System.currentTimeMillis() < deadline) {
             BridgeClient.requestBinder(appCtx);
             if (BridgeClient.getStatus().connected) {
                 cancelPairingNotification(appCtx);
-                postResult(listener, true, "无线调试激活成功，ExtBridge 服务已就绪！");
+                postResult(listener, true, successMsg);
                 return;
             }
             try { Thread.sleep(350); } catch (InterruptedException ignored) { break; }
         }
         postResult(listener, false, "守护进程命令已下发，但暂未收到 Binder 握手，请稍等几秒或查看 /data/local/tmp/extbridge.log");
+    }
+
+    private static CmdRes runSu(long timeoutMs, String shellCmd) {
+        Process p = null;
+        try {
+            p = new ProcessBuilder("su", "-c", shellCmd).redirectErrorStream(true).start();
+            try {
+                p.getOutputStream().close();
+            } catch (Throwable ignored) {}
+            final StringBuilder sb = new StringBuilder();
+            final Process proc = p;
+            Thread reader = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream()))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        if (sb.length() < 8192) {
+                            if (sb.length() > 0) sb.append('\n');
+                            sb.append(line);
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            });
+            reader.start();
+
+            boolean finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                reader.join(500);
+                return new CmdRes(-1, "Root 命令执行超时 (" + timeoutMs + "ms)\n" + sb);
+            }
+            reader.join(1000);
+            return new CmdRes(p.exitValue(), sb.toString());
+        } catch (Throwable t) {
+            if (p != null) try { p.destroyForcibly(); } catch (Throwable ignored) {}
+            return new CmdRes(-1, "未找到 su 或无 Root 权限: " + t.getMessage());
+        }
     }
 
     private static final class CmdRes {

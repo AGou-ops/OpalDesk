@@ -9,7 +9,7 @@
 ## ✨ 核心特性
 
 - **🖥️ 真·双屏独立扩展桌面（支持一键切换原生镜像）**
-  - 自动探测物理外接显示器 (`Display.TYPE_EXTERNAL`)，在黑屏占位的物理副屏之上通过 `SurfaceControl` 投射独立的 `VirtualDisplay`（支持超采样/定制分辨率，如 `3840×2160`、`2560×1440`、`1920×1080` 与硬件 EDID 多档刷新率 `60Hz ~ 165Hz`）。
+  - 自动探测物理外接显示器 (`Display.TYPE_EXTERNAL`)，在黑屏占位的物理副屏之上通过 `SurfaceControl` 投射独立的 `VirtualDisplay`（首次接入自动按外接显示器原生分辨率/刷新率适配桌面与比例 DPI，亦支持在控制台手动定制 `3840×2160`、`2560×1440`、`1920×1080` 及 EDID 多档刷新率 `60Hz ~ 165Hz`）。
   - 随时在 **ExtBridge DeX 独立桌面** 与 **原生镜像模式** 之间一键无缝切换，适配不同使用场景。
 - **🧩 分应用显示模式（告别部分应用适配崩坏）**
   - 每个应用可独立配置 4 种显示策略（配置持久化于 `/data/local/tmp/extbridge_apps.conf`，互不干扰，不篡改全局 `Settings.Global` 开关）：
@@ -24,8 +24,9 @@
 - **📱 手机端增强触摸板与输入法转发 (`TouchpadActivity`)**
   - 没有实体键鼠时，手机/平板变身**大面积全高触控板**：支持单指移动、轻触左键、双指右键、右侧边缘专属滚轮滑动区、拖拽锁定开关、灵敏度调节（`0.6x ~ 2.4x`），以及点击弹出软键盘并**直接将输入字符/回车/退格转发到外接屏焦点应用**。
   - 自动在平板/手机端启用原生导航手势保护，确保主屏侧滑返回与上滑回桌面不受影响。
-- **⚡ 单 APK 免电脑自激活（内置 `libadb.so` + 电脑 ADB 双支持）**
-  - 安装包内直接打包了 `arm64-v8a` 原生 `adb` 二进制与 `extbridge.jar`：支持通过本机 **无线调试 + mDNS 自动发现配对** 在手机内一键激活后台守护进程（自动过滤 `tun*`/`utun*` 等 VPN 虚拟网卡干扰），也支持在电脑端执行一句 `adb shell` 启动。
+- **⚡ 单 APK 三模自激活（Root 一键 / 本机无线调试 / 电脑 ADB）**
+  - 已 Root 设备（Magisk / KernelSU / APatch）：完全不需要开启开发者选项或 ADB 权限，App 内点一下 **「👑 一键 Root 注册并激活服务」** 即可自动完成授权与守护进程拉起（拉起后自动降权为 `uid 2000 shell` 身份运行），并支持下次打开软件自动静默重激活。
+  - 未 Root 设备：安装包内直接打包了 `arm64-v8a` 原生 `adb` 二进制与 `extbridge.jar`，支持通过本机 **无线调试 + mDNS 自动发现配对** 在手机内一键激活（自动过滤 `tun*`/`utun*` 等 VPN 虚拟网卡干扰），也支持在电脑端执行一句 `adb shell` 启动。
 
 ---
 
@@ -64,6 +65,7 @@
 │       ├── AdbBootstrap.java                # mDNS 自动发现、无线调试配对连接、守护进程拉起
 │       └── AdbPairingReceiver.java          # 通知栏输入 6 位配对码快捷激活
 ├── docs/images/                             # 项目图文说明截图
+├── .github/workflows/build.yml              # GitHub Actions 云端自动编译打包与 Release 工作流
 ├── build_v3.ps1                             # Windows 一键编译打包脚本（无需 Gradle，直接调 javac/d8/aapt2）
 └── start_extbridge.sh                       # 手机/ADB 手动启动守护进程脚本
 ```
@@ -96,15 +98,20 @@
 - 安装后建议授予：**悬浮窗权限**（显示扩展屏桌面 Dock 与光标）、**允许后台运行 / 电池无限制**、**通知权限**（快捷控制与无线调试快捷配对）。
 
 ### 2. 安装与激活后台守护进程
-安装编译好的 `exthelper.apk` 后，守护进程会在系统重启后失效，需要通过 **ADB Shell** 激活一次（二选一）：
+安装编译好的 `exthelper.apk` 后，守护进程会在系统重启后失效，需要激活一次（三选一）：
 
-#### 方式 A：免电脑，App 内本机无线调试激活
+#### 方式 A：已 Root 设备（无需 ADB / 开发者选项）
+1. 打开 **ExtBridge**，在激活弹窗选择 **「👑 Root 激活 (免 ADB 权限)」**。
+2. 点击 **「👑 一键 Root 注册并激活服务」**，在 Magisk / KernelSU / APatch 弹窗中允许授权即可秒连。
+3. 开启 **「启动软件时自动 Root 激活」**（首次激活后默认自动开启）后，今后重启手机再点开 ExtBridge 即可自动静默拉起后台服务。
+
+#### 方式 B：免 Root 免电脑，App 内本机无线调试激活
 1. 打开 **设置 → 开发者选项 → 无线调试**，开启无线调试。
 2. 打开 **ExtBridge**，点击弹窗中的「发送快捷配对通知」或在「使用配对码配对设备」查看 **端口与 6 位配对码**。
 3. 回 App 填写配对码并点击 **「配对并激活」**（若之前已配对，可直接点 **「已配对·直接连接」**）。
 > 提示：若设备开有 VPN，ExtBridge 已自动跳过 `tun*` 虚拟网卡并优先锁定物理局域网 `wlan0` IP。
 
-#### 方式 B：电脑端 ADB 一键拉起
+#### 方式 C：免 Root + 电脑端 ADB 一键拉起
 连接电脑后执行控制台弹窗中给出的一键命令即可（若同时连了多台设备，请加上 `adb -s <设备序列号>`）：
 ```bash
 adb shell "(pm path com.extbridge.helper | head -n1 | cut -d: -f2; echo assets/extbridge.jar) | xargs unzip -p > /data/local/tmp/extbridge.jar && chmod 644 /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && pkill -f '^app_process.*ExtBridge' 2>/dev/null; sleep 0.2; CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &"

@@ -116,6 +116,7 @@ public class ExtBridge implements Runnable {
     private static volatile boolean sForceRebuild = false;
     private static volatile int sMirrorMode = 0;       // 0=DeX独立桌面, 1=原生镜像
     private static volatile int sFullscreenPolicy = 1; // 1=强制横屏大屏全屏策略, 0=兼容
+    private static volatile boolean sHasUserConf = false;
     private static volatile boolean sSavedSysPrefs = false;
     private static int sOrigForceResizable = 0;
     private static int sOrigNonResizableMw = 0;
@@ -130,6 +131,15 @@ public class ExtBridge implements Runnable {
 
     public static void main(String[] args) {
         try {
+            if (android.os.Process.myUid() == 0) {
+                try {
+                    android.system.Os.setgid(2000);
+                    android.system.Os.setuid(2000);
+                    System.out.println("EXTBRIDGE_ROOT_DROPPED_TO_SHELL uid=2000");
+                } catch (Throwable t) {
+                    System.err.println("drop root to shell warning: " + t);
+                }
+            }
             Looper.prepareMainLooper();
             Class<?> atCls = Class.forName("android.app.ActivityThread");
             Object at = atCls.getMethod("systemMain").invoke(null);
@@ -252,6 +262,7 @@ public class ExtBridge implements Runnable {
                         sVirtFps = fps > 10f ? fps : 60f;
                         sCursorX = sVirtW * 0.5f;
                         sCursorY = sVirtH * 0.5f;
+                        sHasUserConf = true;
                     }
                     if (parts.length >= 5) {
                         sFullscreenPolicy = Integer.parseInt(parts[4].trim()) != 0 ? 1 : 0;
@@ -451,8 +462,19 @@ public class ExtBridge implements Runnable {
         }
     }
 
+    private static int computeAutoDpi(int w, int h) {
+        int minEdge = Math.min(w, h);
+        return Math.max(160, Math.min(320, Math.round(minEdge * 240f / 1440f)));
+    }
+
     private static void attachDisplay(int extId) {
         try {
+            if (!sHasUserConf && sPhysW >= 640 && sPhysW <= 7680 && sPhysH >= 480 && sPhysH <= 4320) {
+                sVirtW = sPhysW;
+                sVirtH = sPhysH;
+                sVirtDpi = computeAutoDpi(sVirtW, sVirtH);
+                sVirtFps = (sPhysFps >= 20f && sPhysFps <= 240f) ? sPhysFps : 60f;
+            }
             System.out.println("EXTBRIDGE_ATTACHING extId=" + extId + " phys=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " virt=" + sVirtW + "x" + sVirtH + "@" + sVirtDpi);
             Class<?> scCls = Class.forName("android.view.SurfaceControl");
             Class<?> bCls = Class.forName("android.view.SurfaceControl$Builder");
@@ -672,6 +694,7 @@ public class ExtBridge implements Runnable {
             sVirtH = reqH;
             sVirtDpi = reqDpi;
             sVirtFps = fps;
+            sHasUserConf = true;
             saveConf();
 
             // 1. Apply physical external display mode if supported & requested
@@ -1002,6 +1025,12 @@ public class ExtBridge implements Runnable {
         restoreGlobalFullscreenPrefs();
 
         if (vdId <= 0 || sWm == null) return;
+        // Defense-in-depth across ROMs/monitors: never attach system decorations to the virtual display,
+        // keeping Display 0 gesture navigation intact regardless of monitor size or resolution.
+        try {
+            sWm.getClass().getMethod("setShouldShowSystemDecors", int.class, boolean.class)
+                    .invoke(sWm, vdId, false);
+        } catch (Throwable ignored) {}
         boolean ignoredApplied = false;
         try {
             for (Method m : sWm.getClass().getMethods()) {
