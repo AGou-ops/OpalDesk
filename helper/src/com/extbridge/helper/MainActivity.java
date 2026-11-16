@@ -7,6 +7,7 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Color;
@@ -49,7 +50,7 @@ public class MainActivity extends Activity {
             {1280, 720}
     };
     private static final String[] RES_LABELS = {
-            "3840×2160\n4K 16:9",
+            "3840×2160\n4K 超采",
             "2560×1600\n2.5K 16:10",
             "2560×1440\n2K 原生★",
             "1920×1200\n16:10",
@@ -61,6 +62,15 @@ public class MainActivity extends Activity {
     private static final int[] DPI_PRESETS = {160, 200, 240, 280, 320};
     private static final String[] DPI_LABELS = {"160\n超高密", "200\n紧凑桌面", "240\n标准★", "280\n大字", "320\n超大"};
     private static final float[] FPS_PRESETS = {165f, 144f, 120f, 90f, 75f, 60f};
+    private static final String PREF_ONBOARDING = "extbridge_onboarding";
+    private static final String KEY_STARTUP_PERMS_DONE = "startup_perms_done";
+    private static final String KEY_NOTIF_ASKED = "notif_asked";
+    private static final String KEY_DEV_GUIDE_DONE = "dev_guide_done";
+    private static final int REQ_NOTIF_STARTUP = 3901;
+    private static final int REQ_NOTIF_DEV_GATE = 3902;
+    private static final int PERM_MODE_NONE = 0;
+    private static final int PERM_MODE_STARTUP = 1;
+    private static final int PERM_MODE_DEV_GATE = 2;
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
     private int mSelW = 2560;
@@ -79,13 +89,21 @@ public class MainActivity extends Activity {
     private TextView mBtnAppModes;
     private TextView mBtnActivate;
     private TextView mTvSwInfo;
+    private TextView mTvPhysNotice;
     private TextView mTvGestureStatus;
     private EditText mEdW;
     private EditText mEdH;
+    private TextView mBtnToggleEdid;
+    private LinearLayout mEdidPanel;
     private LinearLayout mPhysModesWrap;
+    private boolean mEdidExpanded = false;
     private String mLastModesRaw = "";
 
     private AlertDialog mActivationDialog;
+    private AlertDialog mPermDialog;
+    private int mPendingPermMode = PERM_MODE_NONE;
+    private boolean mStartupPermInProgress = false;
+    private boolean mWaitingSettingsReturn = false;
     private boolean mUserSkippedDialog = false;
     private boolean mActWorking = false;
     private boolean mAutoRootTried = false;
@@ -118,6 +136,7 @@ public class MainActivity extends Activity {
 
     private final Runnable mAutoPromptCheck = () -> {
         if (isFinishing()) return;
+        if (mStartupPermInProgress || (mPermDialog != null && mPermDialog.isShowing())) return;
         BridgeClient.Status st = BridgeClient.getStatus();
         if (st.connected) return;
         if (!mAutoRootTried && AdbBootstrap.isAutoRootEnabled(this)) {
@@ -147,9 +166,14 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         if (ensureOnDisplay0()) return;
+        BridgeService.sUserStopping = false;
         BridgeService.ensureStarted(this);
         buildUi();
         refreshStatus(true);
+        if (!getOnboardingPrefs().getBoolean(KEY_STARTUP_PERMS_DONE, false) && !hasAllCoreAppPerms()) {
+            mStartupPermInProgress = true;
+            mHandler.postDelayed(this::startFirstLaunchPermissions, 220);
+        }
     }
 
     private boolean ensureOnDisplay0() {
@@ -172,11 +196,29 @@ public class MainActivity extends Activity {
         super.onResume();
         BridgeClient.setOnBinderReady(() -> mHandler.post(() -> refreshStatus(true)));
         if (BridgeClient.getService() == null) BridgeClient.requestBinder(this);
+        BridgeService.sUserStopping = false;
         BridgeService.ensureStarted(this);
-        refreshStatus(false);
+        if (mWaitingSettingsReturn) {
+            mWaitingSettingsReturn = false;
+            BridgeService.refreshFromReceiver(this);
+            refreshStatus(false);
+            if (mPendingPermMode == PERM_MODE_STARTUP) {
+                finishOrPromptStartupPerms();
+            } else if (mPendingPermMode == PERM_MODE_DEV_GATE) {
+                if (hasAllCoreAppPerms()) {
+                    completeDevGateAndLaunch();
+                } else {
+                    showPermissionChecklistDialog(PERM_MODE_DEV_GATE);
+                }
+            }
+        } else {
+            refreshStatus(false);
+        }
         mHandler.post(mRefreshLoop);
         mHandler.removeCallbacks(mAutoPromptCheck);
-        mHandler.postDelayed(mAutoPromptCheck, 450);
+        if (!mStartupPermInProgress) {
+            mHandler.postDelayed(mAutoPromptCheck, 450);
+        }
     }
 
     @Override
@@ -190,10 +232,29 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        if (mPermDialog != null && mPermDialog.isShowing()) {
+            mPermDialog.dismiss();
+        }
         if (mActivationDialog != null && mActivationDialog.isShowing()) {
             mActivationDialog.dismiss();
         }
         AdbBootstrap.stopDiscovery();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        BridgeService.refreshFromReceiver(this);
+        refreshStatus(false);
+        if (requestCode == REQ_NOTIF_STARTUP) {
+            finishOrPromptStartupPerms();
+        } else if (requestCode == REQ_NOTIF_DEV_GATE) {
+            if (hasAllCoreAppPerms()) {
+                completeDevGateAndLaunch();
+            } else {
+                showPermissionChecklistDialog(PERM_MODE_DEV_GATE);
+            }
+        }
     }
 
     private void buildUi() {
@@ -308,12 +369,25 @@ public class MainActivity extends Activity {
         });
         heroBtns.add(mBtnActivate);
 
+        TextView btnExitAll = makeActionBtn("⏻ 停止服务并退出", 0xFFB91C1C);
+        btnExitAll.setOnClickListener(v -> {
+            Toast.makeText(this, "正在停止 ExtBridge 守护进程并退出…", Toast.LENGTH_SHORT).show();
+            BridgeService.stopAllAndExit(this);
+        });
+        heroBtns.add(btnExitAll);
+
         addChipWrap(statusCard, heroBtns);
         root.addView(statusCard);
 
         // Card 2: Resolution + Custom
         LinearLayout resCard = makeCard();
-        addCardHeader(resCard, "输出分辨率预设 (支持高分超采样 / 16:10 / 16:9 自适应缩放)");
+        addCardHeader(resCard, "桌面渲染分辨率预设 (控制清晰度 / 4K超采 / 降分稳帧与发热)");
+        TextView resHint = new TextView(this);
+        resHint.setText("说明：此区调节扩展桌面 VirtualDisplay 的真实渲染画布（720p/900p 可降低 GPU 负载稳帧，4K 可超采样锐化），全机型 100% 生效；外接显示器硬件物理信号受系统固件控制。");
+        resHint.setTextColor(0xFF94A3B8);
+        resHint.setTextSize(12f);
+        resHint.setPadding(0, 0, 0, 10);
+        resCard.addView(resHint);
         List<View> resViews = new ArrayList<>();
         mResChips.clear();
         for (int i = 0; i < RES_PRESETS.length; i++) {
@@ -324,6 +398,7 @@ public class MainActivity extends Activity {
                 boolean wantPortrait = (mSelRot & 1) == 1;
                 mSelW = wantPortrait ? h : w;
                 mSelH = wantPortrait ? w : h;
+                mSelPhysModeId = -1;
                 mEdW.setText(String.valueOf(mSelW));
                 mEdH.setText(String.valueOf(mSelH));
                 updateSelectionStyles();
@@ -363,6 +438,7 @@ public class MainActivity extends Activity {
             int tmp = mSelW;
             mSelW = mSelH;
             mSelH = tmp;
+            mSelPhysModeId = -1;
             mEdW.setText(String.valueOf(mSelW));
             mEdH.setText(String.valueOf(mSelH));
             updateSelectionStyles();
@@ -404,7 +480,7 @@ public class MainActivity extends Activity {
 
         // Card 3: DPI + Refresh Rate
         LinearLayout rateCard = makeCard();
-        addCardHeader(rateCard, "界面缩放 DPI");
+        addCardHeader(rateCard, "界面缩放 DPI (仅调整桌面图标与文字大小)");
         List<View> dpiViews = new ArrayList<>();
         mDpiChips.clear();
         for (int i = 0; i < DPI_PRESETS.length; i++) {
@@ -419,7 +495,35 @@ public class MainActivity extends Activity {
         }
         addChipWrap(rateCard, dpiViews);
 
-        addCardHeaderTopPad(rateCard, "目标刷新率预设 (支持多档显示器优先切硬件 EDID 刷新率)");
+        mBtnToggleEdid = new TextView(this);
+        mBtnToggleEdid.setText("▸ 高级：外接物理信号与帧率尝试 (受设备固件限制)");
+        mBtnToggleEdid.setTextColor(0xFF7DD3FC);
+        mBtnToggleEdid.setTextSize(13f);
+        mBtnToggleEdid.getPaint().setFakeBoldText(true);
+        mBtnToggleEdid.setPadding(0, 16, 0, 6);
+        mBtnToggleEdid.setOnClickListener(v -> {
+            mEdidExpanded = !mEdidExpanded;
+            if (mEdidPanel != null) {
+                mEdidPanel.setVisibility(mEdidExpanded ? View.VISIBLE : View.GONE);
+            }
+            mBtnToggleEdid.setText(mEdidExpanded
+                    ? "▾ 高级：收起外接物理信号与帧率尝试"
+                    : "▸ 高级：外接物理信号与帧率尝试 (受设备固件限制)");
+        });
+        rateCard.addView(mBtnToggleEdid);
+
+        mEdidPanel = new LinearLayout(this);
+        mEdidPanel.setOrientation(LinearLayout.VERTICAL);
+        mEdidPanel.setVisibility(View.GONE);
+
+        TextView edidHint = new TextView(this);
+        edidHint.setText("注：Xiaomi HyperOS 等系统会在底层锁死外接屏物理信号与 60Hz 上限；此区仅在允许切换外接模式的机型（或向下限帧省电）上有效，平时无需调整。");
+        edidHint.setTextColor(0xFF94A3B8);
+        edidHint.setTextSize(12f);
+        edidHint.setPadding(0, 0, 0, 10);
+        mEdidPanel.addView(edidHint);
+
+        addCardHeader(mEdidPanel, "目标刷新率预设");
         List<View> fpsViews = new ArrayList<>();
         mFpsChips.clear();
         for (float f : FPS_PRESETS) {
@@ -432,18 +536,26 @@ public class MainActivity extends Activity {
             mFpsChips.add(chip);
             fpsViews.add(chip);
         }
-        addChipWrap(rateCard, fpsViews);
+        addChipWrap(mEdidPanel, fpsViews);
 
-        addCardHeaderTopPad(rateCard, "当前连接显示器硬件报告模式 (EDID 实测可用挡位)");
+        addCardHeaderTopPad(mEdidPanel, "显示器硬件报告模式 (EDID 实测挡位)");
         mPhysModesWrap = new LinearLayout(this);
         mPhysModesWrap.setOrientation(LinearLayout.VERTICAL);
-        rateCard.addView(mPhysModesWrap);
+        mEdidPanel.addView(mPhysModesWrap);
+        rateCard.addView(mEdidPanel);
 
         mTvSwInfo = new TextView(this);
         mTvSwInfo.setTextColor(0xFF94A3B8);
         mTvSwInfo.setTextSize(12.5f);
-        mTvSwInfo.setPadding(0, 14, 0, 8);
+        mTvSwInfo.setPadding(0, 14, 0, 6);
         rateCard.addView(mTvSwInfo);
+
+        mTvPhysNotice = new TextView(this);
+        mTvPhysNotice.setTextColor(0xFFFBBF24);
+        mTvPhysNotice.setTextSize(12f);
+        mTvPhysNotice.setPadding(0, 0, 0, 8);
+        mTvPhysNotice.setVisibility(View.GONE);
+        rateCard.addView(mTvPhysNotice);
 
         TextView btnPhoneTabletPreset = makeActionBtn("📱 手机推荐：一键横屏平板大屏 (1920×1080 @ 240dpi)", 0xFF0369A1);
         btnPhoneTabletPreset.setTextSize(12.5f);
@@ -459,7 +571,7 @@ public class MainActivity extends Activity {
         applyRow.setOrientation(LinearLayout.HORIZONTAL);
         applyRow.setPadding(0, 16, 0, 0);
 
-        TextView btnApply = makeActionBtn("✓ 应用分辨率与刷新率", 0xFF16A34A);
+        TextView btnApply = makeActionBtn("✓ 应用渲染分辨率与设置", 0xFF16A34A);
         btnApply.setOnClickListener(v -> applyChosenConfig());
         TextView btnReset = makeActionBtn("↺ 恢复推荐默认", 0xFF334155);
         btnReset.setOnClickListener(v -> {
@@ -483,9 +595,13 @@ public class MainActivity extends Activity {
         gestCard.addView(mTvGestureStatus);
 
         List<View> permBtns = new ArrayList<>();
-        TextView btnA11y = makeActionBtn("辅助手势设置 (路径2备用)", 0xFF334155);
-        btnA11y.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
+        TextView btnA11y = makeActionBtn("♿ 无障碍服务 (必需)", 0xFF059669);
+        btnA11y.setOnClickListener(v -> openAccessibilitySettings(PERM_MODE_NONE));
         permBtns.add(btnA11y);
+
+        TextView btnRestricted = makeActionBtn("🔓 允许受限设置", 0xFF334155);
+        btnRestricted.setOnClickListener(v -> openAppDetailsForRestricted(PERM_MODE_NONE));
+        permBtns.add(btnRestricted);
 
         TextView btnOverlay = makeActionBtn("悬浮窗权限", 0xFF334155);
         btnOverlay.setOnClickListener(v -> startActivity(new Intent(
@@ -514,6 +630,9 @@ public class MainActivity extends Activity {
             int ch = Integer.parseInt(mEdH.getText().toString().trim());
             if (Math.max(cw, ch) >= 640 && Math.max(cw, ch) <= 7680
                     && Math.min(cw, ch) >= 480 && Math.min(cw, ch) <= 4320) {
+                if (cw != mSelW || ch != mSelH) {
+                    mSelPhysModeId = -1;
+                }
                 mSelW = cw;
                 mSelH = ch;
             }
@@ -523,12 +642,37 @@ public class MainActivity extends Activity {
     private void applyChosenConfig() {
         syncCustomWHFields();
 
-        boolean ok = BridgeClient.applyConfig(mSelW, mSelH, mSelDpi, mSelFps, mSelPhysModeId, mSelRot);
-        Toast.makeText(this,
-                ok ? ("已应用：" + mSelW + "×" + mSelH + " · " + BridgeClient.rotationLabel(mSelRot)
-                        + " · " + mSelDpi + "dpi · " + Math.round(mSelFps) + "Hz")
-                   : "应用失败，请确认 ExtBridge 后台服务正在运行",
-                Toast.LENGTH_SHORT).show();
+        BridgeClient.ApplyResult res = BridgeClient.applyConfigDetailed(mSelW, mSelH, mSelDpi, mSelFps, mSelPhysModeId, mSelRot);
+        if (!res.ok) {
+            if (mTvPhysNotice != null) mTvPhysNotice.setVisibility(View.GONE);
+            Toast.makeText(this, "应用失败，请确认 ExtBridge 后台服务正在运行", Toast.LENGTH_SHORT).show();
+        } else if (res.physResult == -1 && res.physW > 0) {
+            String hint = "ℹ️ 虚拟桌面已切换为 " + mSelW + "×" + mSelH + "；显示器 EDID 不支持 "
+                    + Math.round(mSelFps) + "Hz，外接物理输出保持 " + res.physW + "×" + res.physH
+                    + "@" + Math.round(res.physFps) + "Hz，已自动缩放适配。";
+            if (mTvPhysNotice != null) {
+                mTvPhysNotice.setText(hint);
+                mTvPhysNotice.setVisibility(View.VISIBLE);
+            }
+            Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
+        } else if ((res.physResult == -2 || res.physResult == -3) && res.physW > 0) {
+            String hint = "ℹ️ 虚拟桌面已切换为 " + mSelW + "×" + mSelH + "；当前系统固件锁定外接物理输出为 "
+                    + res.physW + "×" + res.physH + "@" + Math.round(res.physFps) + "Hz，已自动通过硬件缩放铺满。";
+            if (mTvPhysNotice != null) {
+                mTvPhysNotice.setText(hint);
+                mTvPhysNotice.setVisibility(View.VISIBLE);
+            }
+            Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
+        } else {
+            if (mTvPhysNotice != null) mTvPhysNotice.setVisibility(View.GONE);
+            String physNote = (res.physW > 0)
+                    ? (" | 物理:" + res.physW + "×" + res.physH + "@" + Math.round(res.physFps) + "Hz")
+                    : "";
+            Toast.makeText(this,
+                    "已应用虚拟渲染：" + mSelW + "×" + mSelH + " · " + BridgeClient.rotationLabel(mSelRot)
+                            + " · " + mSelDpi + "dpi" + physNote,
+                    Toast.LENGTH_SHORT).show();
+        }
         BridgeService.refreshFromReceiver(this);
         refreshStatus(false);
     }
@@ -579,14 +723,18 @@ public class MainActivity extends Activity {
                 mTvStatusTitle.setTextColor(0xFFA78BFA);
                 mTvStatusDetail.setText("外接屏正在原生同步手机/平板主屏（ExtBridge DeX 独立桌面已暂停）。\n"
                         + "点击上方「🖥 切回 DeX 模式」或下拉通知栏按钮可随时切回独立大屏。\n"
-                        + "物理信号：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz");
+                        + "外接物理输出：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz");
             } else if (st.vdId > 0) {
                 mTvStatusTitle.setText("● 已连接扩展屏 · 物理 Display #" + st.extId + " -> 扩展 Display #" + st.vdId);
                 mTvStatusTitle.setTextColor(0xFF4ADE80);
                 String target = st.inputToExt == 1 ? "外接扩展屏 (按切回可在通知栏/此页切平板)" : "平板内屏";
+                String injectWarn = st.injectStatus == -1
+                        ? "\n⚠ 输入注入被系统拦截 (INJECT_EVENTS)：请前往手机「开发者选项」开启「USB 调试（安全设置）/ 允许模拟点击」"
+                        : "";
                 mTvStatusDetail.setText("当前键鼠控制：【" + target + "】  (检测到外接设备 " + st.extInputCnt + " 个)\n"
-                        + "虚拟桌面：" + st.virtW + "×" + st.virtH + " (" + BridgeClient.rotationLabel(st.virtRot) + ") @ " + st.virtDpi + "dpi · 请求 " + Math.round(st.virtFps) + "Hz (" + st.renderMode + ") · 锁向:" + (st.fullscreenPolicy == 1 ? "开" : "关") + "\n"
-                        + "物理信号：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz");
+                        + "虚拟渲染画布：" + st.virtW + "×" + st.virtH + " (" + BridgeClient.rotationLabel(st.virtRot) + ") @ " + st.virtDpi + "dpi · 目标 " + Math.round(st.virtFps) + "Hz (" + st.renderMode + ") · 锁向:" + (st.fullscreenPolicy == 1 ? "开" : "关") + "\n"
+                        + "外接物理输出：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz (系统/EDID协商)"
+                        + injectWarn);
             } else {
                 mTvStatusTitle.setText("● 后台服务待机中 · 请插入 Type-C 外接显示器");
                 mTvStatusTitle.setTextColor(0xFFFBBF24);
@@ -609,10 +757,10 @@ public class MainActivity extends Activity {
         boolean canOverlay = Settings.canDrawOverlays(this);
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         boolean canNotif = Build.VERSION.SDK_INT < 24 || nm.areNotificationsEnabled();
-        boolean a11yOn = NavAssistService.isRunning();
+        boolean a11yOn = hasAccessibilityPermission();
         mTvGestureStatus.setText(
                 "• 路径1 (原生手势保护): 已自动启用 (无系统装饰占位，平板左右侧滑返回与底部上滑回桌面均可正常使用)\n"
-                + "• 路径2 (辅助手势服务): " + (a11yOn ? "已开启" : "未开启 (当前路径1已正常，备用)") + "\n"
+                + "• 无障碍服务 (必需): " + (a11yOn ? "已开启" : "未开启（点击下方前往「已下载的应用 → ExtBridge 平板辅助手势」开启）") + "\n"
                 + "• 悬浮窗权限: " + (canOverlay ? "已授权" : "未授权 (点击下方开启以显示鼠标光标与浮动条)") + "   |   "
                 + "通知栏开关权限: " + (canNotif ? "已授权" : "未授权"));
     }
@@ -929,23 +1077,15 @@ public class MainActivity extends Activity {
 
         TextView btnOpenDev = makeActionBtn("1. 去开启无线调试 + 配对通知", 0xFF0369A1);
         btnOpenDev.setTextSize(12f);
-        btnOpenDev.setOnClickListener(v -> {
-            ensureNotifPermAndShowPairNotif();
-            try {
-                startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
-            } catch (Throwable t) {
-                try {
-                    startActivity(new Intent(Settings.ACTION_SETTINGS));
-                } catch (Throwable ignored) {}
-            }
-        });
+        btnOpenDev.setOnClickListener(v -> openDeveloperOptionsWithGate());
         guideRow.addView(btnOpenDev, gLp1);
 
         TextView btnPairNotif = makeActionBtn("🔔 发送/刷新通知快捷配对", 0xFF334155);
         btnPairNotif.setTextSize(12f);
         btnPairNotif.setOnClickListener(v -> {
-            ensureNotifPermAndShowPairNotif();
-            Toast.makeText(this, "已发送配对通知：在系统配对弹窗上方下拉通知即可直接填6位配对码", Toast.LENGTH_LONG).show();
+            if (ensureNotifPermAndShowPairNotif()) {
+                Toast.makeText(this, "已发送配对通知：在系统配对弹窗上方下拉通知即可直接填6位配对码", Toast.LENGTH_LONG).show();
+            }
         });
         guideRow.addView(btnPairNotif, gLp2);
         wirelessPane.addView(guideRow);
@@ -1033,7 +1173,7 @@ public class MainActivity extends Activity {
         root.addView(adbPane);
 
         mTvActStatus = new TextView(this);
-        mTvActStatus.setText("提示：Root 用户直接点「👑 Root 激活」即可，无需 ADB 权限；非 Root 用户使用「📡 无线调试」或「💻 ADB 命令」。");
+        mTvActStatus.setText("提示：Root 用户点「👑 Root 激活」即可一键拉起并自动降权至 shell 身份运行（不做改系统的 Root Hook，定位纯免 Root 桌面）；非 Root 用户用「📡 无线调试」或「💻 ADB 命令」。");
         mTvActStatus.setTextColor(0xFFCBD5E1);
         mTvActStatus.setTextSize(12f);
         mTvActStatus.setPadding(12, 10, 12, 10);
@@ -1209,12 +1349,361 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void ensureNotifPermAndShowPairNotif() {
-        if (Build.VERSION.SDK_INT >= 33
-                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 3902);
+    private boolean ensureNotifPermAndShowPairNotif() {
+        if (!hasNotifPermission()) {
+            requestNotifOrOpenSettings(REQ_NOTIF_DEV_GATE);
+            return false;
         }
         AdbBootstrap.showPairingNotification(this, null);
+        return true;
+    }
+
+    private SharedPreferences getOnboardingPrefs() {
+        return getSharedPreferences(PREF_ONBOARDING, MODE_PRIVATE);
+    }
+
+    private boolean hasNotifPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            return false;
+        }
+        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        return Build.VERSION.SDK_INT < 24 || nm == null || nm.areNotificationsEnabled();
+    }
+
+    private boolean hasOverlayPermission() {
+        return Settings.canDrawOverlays(this);
+    }
+
+    private boolean hasAccessibilityPermission() {
+        if (NavAssistService.isRunning()) return true;
+        try {
+            int enabled = Settings.Secure.getInt(getContentResolver(), Settings.Secure.ACCESSIBILITY_ENABLED, 0);
+            if (enabled != 1) return false;
+            String svcs = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            if (svcs == null) return false;
+            String pkg = getPackageName();
+            return svcs.contains(pkg + "/.NavAssistService")
+                    || svcs.contains(pkg + "/" + NavAssistService.class.getName());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private boolean hasAllCoreAppPerms() {
+        return hasNotifPermission() && hasOverlayPermission() && hasAccessibilityPermission();
+    }
+
+    private void requestNotifOrOpenSettings(int reqCode) {
+        mPendingPermMode = (reqCode == REQ_NOTIF_DEV_GATE) ? PERM_MODE_DEV_GATE : PERM_MODE_STARTUP;
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            SharedPreferences sp = getOnboardingPrefs();
+            boolean asked = sp.getBoolean(KEY_NOTIF_ASKED, false);
+            boolean canShowPopup = !asked || shouldShowRequestPermissionRationale("android.permission.POST_NOTIFICATIONS");
+            sp.edit().putBoolean(KEY_NOTIF_ASKED, true).apply();
+            if (canShowPopup) {
+                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, reqCode);
+                return;
+            }
+        }
+        mWaitingSettingsReturn = true;
+        Toast.makeText(this, "请在系统设置中打开「允许通知」后返回本应用", Toast.LENGTH_LONG).show();
+        try {
+            startActivity(new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName()));
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void openSettingsWithPermReturn(int mode, String toastMsg, Intent primaryIntent) {
+        if (mode != PERM_MODE_NONE) {
+            mPendingPermMode = mode;
+            mWaitingSettingsReturn = true;
+        }
+        Toast.makeText(this, toastMsg, Toast.LENGTH_LONG).show();
+        try {
+            startActivity(primaryIntent);
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                        Uri.parse("package:" + getPackageName())));
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void openOverlayPermissionSettings(int mode) {
+        openSettingsWithPermReturn(mode,
+                "请开启「显示在其他应用上层 / 悬浮窗」权限后返回",
+                new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+    }
+
+    private void openAccessibilitySettings(int mode) {
+        openSettingsWithPermReturn(mode,
+                "请在「无障碍 → 已下载的应用」中打开「ExtBridge 平板辅助手势」后返回",
+                new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+    }
+
+    private void openAppDetailsForRestricted(int mode) {
+        openSettingsWithPermReturn(mode,
+                "若无障碍开关为灰色：请点右上角「⋮」→「允许受限设置」后再开无障碍",
+                new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + getPackageName())));
+    }
+
+    private void startFirstLaunchPermissions() {
+        if (isFinishing()) return;
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED
+                && !getOnboardingPrefs().getBoolean(KEY_NOTIF_ASKED, false)) {
+            requestNotifOrOpenSettings(REQ_NOTIF_STARTUP);
+            return;
+        }
+        finishOrPromptStartupPerms();
+    }
+
+    private void finishOrPromptStartupPerms() {
+        if (isFinishing()) return;
+        if (hasAllCoreAppPerms()) {
+            completeStartupPerms(true);
+        } else {
+            showPermissionChecklistDialog(PERM_MODE_STARTUP);
+        }
+    }
+
+    private void completeStartupPerms(boolean allGranted) {
+        mStartupPermInProgress = false;
+        mPendingPermMode = PERM_MODE_NONE;
+        getOnboardingPrefs().edit().putBoolean(KEY_STARTUP_PERMS_DONE, true).apply();
+        if (mPermDialog != null && mPermDialog.isShowing()) {
+            mPermDialog.dismiss();
+        }
+        if (allGranted) {
+            BridgeService.refreshFromReceiver(this);
+            Toast.makeText(this, "✅ 所需应用权限已全部就绪", Toast.LENGTH_SHORT).show();
+        }
+        refreshStatus(false);
+        mHandler.removeCallbacks(mAutoPromptCheck);
+        mHandler.postDelayed(mAutoPromptCheck, 200);
+    }
+
+    private void openDeveloperOptionsWithGate() {
+        if (!hasAllCoreAppPerms()) {
+            showPermissionChecklistDialog(PERM_MODE_DEV_GATE);
+            return;
+        }
+        showDevGuideOrLaunchNow(false);
+    }
+
+    private void completeDevGateAndLaunch() {
+        mPendingPermMode = PERM_MODE_NONE;
+        if (mPermDialog != null && mPermDialog.isShowing()) {
+            mPermDialog.dismiss();
+        }
+        Toast.makeText(this, "✅ 权限已补齐，正在发送配对通知", Toast.LENGTH_SHORT).show();
+        showDevGuideOrLaunchNow(false);
+    }
+
+    private void showDevGuideOrLaunchNow(boolean forceDirect) {
+        SharedPreferences sp = getOnboardingPrefs();
+        if (!forceDirect && !sp.getBoolean(KEY_DEV_GUIDE_DONE, false)) {
+            sp.edit().putBoolean(KEY_DEV_GUIDE_DONE, true).apply();
+            showDevOptionsChecklistDialog();
+            return;
+        }
+        launchDeveloperOptionsNow();
+    }
+
+    private void launchDeveloperOptionsNow() {
+        AdbBootstrap.showPairingNotification(this, null);
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS));
+        } catch (Throwable t) {
+            try {
+                startActivity(new Intent(Settings.ACTION_SETTINGS));
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void showPermissionChecklistDialog(final int mode) {
+        if (isFinishing()) return;
+        if (mPermDialog != null && mPermDialog.isShowing()) {
+            mPermDialog.dismiss();
+        }
+        mPendingPermMode = mode;
+
+        final boolean notifOk = hasNotifPermission();
+        final boolean overlayOk = hasOverlayPermission();
+        final boolean a11yOk = hasAccessibilityPermission();
+        final boolean isDevGate = (mode == PERM_MODE_DEV_GATE);
+
+        ScrollView sv = new ScrollView(this);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF0F172A);
+        bg.setCornerRadius(22f);
+        bg.setStroke(2, isDevGate ? 0xFFF59E0B : 0xFF38BDF8);
+        sv.setBackground(bg);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(34, 30, 34, 26);
+        sv.addView(root);
+
+        TextView title = new TextView(this);
+        title.setText(isDevGate ? "⚠ 开启开发者选项前 · 请先补齐必需权限" : "🔐 首次启动 · 申请必需运行权限");
+        title.setTextColor(isDevGate ? 0xFFFBBF24 : Color.WHITE);
+        title.setTextSize(18f);
+        title.getPaint().setFakeBoldText(true);
+        root.addView(title);
+
+        TextView sub = new TextView(this);
+        sub.setText(isDevGate
+                ? "检测到仍有必需权限未授予（含无障碍 / 悬浮窗 / 通知）。请先点击下方完成授权后再进入开发者选项："
+                : "为确保外接扩展屏高级浮层、全局手势与设置穿透、鼠标准星及无线配对通知正常使用，请完成以下 3 项必需授权：");
+        sub.setTextColor(0xFFCBD5E1);
+        sub.setTextSize(12.5f);
+        sub.setPadding(0, 8, 0, 14);
+        root.addView(sub);
+
+        TextView statusBox = new TextView(this);
+        statusBox.setText(
+                (notifOk ? "✅ 通知权限：已允许（可弹出常驻栏与快捷配对输入框）\n"
+                        : "❌ 通知权限：未开启（无线配对弹窗时顶部无法填配对码）\n")
+                + (overlayOk ? "✅ 悬浮窗权限：已允许（可显示外接屏鼠标与浮动控制条）\n"
+                        : "❌ 悬浮窗权限：未开启（无法显示鼠标光标与控制悬浮条）\n")
+                + (a11yOk ? "✅ 无障碍权限：已开启（外接屏高级浮层、手势与系统设置穿透正常）"
+                        : "❌ 无障碍权限（必需）：未开启（外接屏浮层、返回桌面手势及直接打开设置依赖此权限）"));
+        statusBox.setTextColor(0xFFE2E8F0);
+        statusBox.setTextSize(12.5f);
+        statusBox.setPadding(16, 14, 16, 14);
+        GradientDrawable sbBg = new GradientDrawable();
+        sbBg.setColor(0xFF020617);
+        sbBg.setCornerRadius(12f);
+        sbBg.setStroke(1, 0xFF334155);
+        statusBox.setBackground(sbBg);
+        root.addView(statusBox);
+
+        if (!notifOk) {
+            TextView btnNotif = makeActionBtn("🔔 授予 / 开启通知权限", 0xFF2563EB);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = 14;
+            btnNotif.setOnClickListener(v ->
+                    requestNotifOrOpenSettings(isDevGate ? REQ_NOTIF_DEV_GATE : REQ_NOTIF_STARTUP));
+            root.addView(btnNotif, lp);
+        }
+
+        if (!overlayOk) {
+            TextView btnOverlay = makeActionBtn("🪟 去开启悬浮窗权限", 0xFF0284C7);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = 10;
+            btnOverlay.setOnClickListener(v -> openOverlayPermissionSettings(mode));
+            root.addView(btnOverlay, lp);
+        }
+
+        if (!a11yOk) {
+            TextView btnA11y = makeActionBtn("♿ 去开启无障碍权限（ExtBridge 平板辅助手势）", 0xFF059669);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = 10;
+            btnA11y.setOnClickListener(v -> openAccessibilitySettings(mode));
+            root.addView(btnA11y, lp);
+
+            TextView btnRestricted = makeActionBtn("🔓 无障碍开关呈灰色（受限设置）？点此进应用详情允许", 0xFF334155);
+            btnRestricted.setTextSize(11.5f);
+            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            rlp.topMargin = 8;
+            btnRestricted.setOnClickListener(v -> openAppDetailsForRestricted(mode));
+            root.addView(btnRestricted, rlp);
+        }
+
+        TextView tipBox = new TextView(this);
+        tipBox.setText("💡 提示：若在系统「无障碍 → 已下载的应用」点击 ExtBridge 时弹出「受限设置」，请点上方按钮进应用详情右上角「⋮ → 允许受限设置」后再开启（ADB 激活后亦会自动解锁受限设置）；进入开发者选项后请一并开启「无线调试」与「USB 调试（安全设置）」。");
+        tipBox.setTextColor(0xFF94A3B8);
+        tipBox.setTextSize(11.5f);
+        tipBox.setPadding(0, 14, 0, 4);
+        root.addView(tipBox);
+
+        TextView btnSkip = new TextView(this);
+        btnSkip.setText(isDevGate ? "暂不补齐，仍前往开发者选项 →" : "先跳过（若未激活，去开开发者选项时会再次提醒） →");
+        btnSkip.setTextColor(0xFF64748B);
+        btnSkip.setTextSize(12f);
+        btnSkip.setGravity(Gravity.CENTER);
+        btnSkip.setPadding(12, 18, 12, 4);
+        btnSkip.setOnClickListener(v -> {
+            if (isDevGate) {
+                mPendingPermMode = PERM_MODE_NONE;
+                if (mPermDialog != null) mPermDialog.dismiss();
+                showDevGuideOrLaunchNow(true);
+            } else {
+                completeStartupPerms(false);
+            }
+        });
+        root.addView(btnSkip);
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setView(sv);
+        b.setCancelable(false);
+        mPermDialog = b.create();
+        if (mPermDialog.getWindow() != null) {
+            mPermDialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+        }
+        mPermDialog.show();
+    }
+
+    private void showDevOptionsChecklistDialog() {
+        if (isFinishing()) return;
+        if (mPermDialog != null && mPermDialog.isShowing()) {
+            mPermDialog.dismiss();
+        }
+        ScrollView sv = new ScrollView(this);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF0F172A);
+        bg.setCornerRadius(22f);
+        bg.setStroke(2, 0xFF38BDF8);
+        sv.setBackground(bg);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(34, 30, 34, 26);
+        sv.addView(root);
+
+        TextView title = new TextView(this);
+        title.setText("🛠 首次前往「开发者选项」提醒");
+        title.setTextColor(Color.WHITE);
+        title.setTextSize(18f);
+        title.getPaint().setFakeBoldText(true);
+        root.addView(title);
+
+        TextView body = new TextView(this);
+        body.setText("已发送「无线调试快捷配对」通知到顶部状态栏。进入「开发者选项」后请开启以下两项：\n\n"
+                + "1. 「无线调试」：点入「使用配对码配对设备」，直接在顶部通知输入 6 位配对码即可完成配对；\n"
+                + "2. 「USB 调试（安全设置）/ 允许模拟点击」（小米/HyperOS 必看）：不开启时外接屏触摸板/鼠标可能只见点击动效却点不动软件。");
+        body.setTextColor(0xFFCBD5E1);
+        body.setTextSize(13f);
+        body.setPadding(0, 12, 0, 18);
+        root.addView(body);
+
+        TextView btnGo = makeActionBtn("我已知晓，立即打开开发者选项 →", 0xFF0284C7);
+        btnGo.setOnClickListener(v -> {
+            if (mPermDialog != null) mPermDialog.dismiss();
+            launchDeveloperOptionsNow();
+        });
+        root.addView(btnGo);
+
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setView(sv);
+        b.setCancelable(true);
+        mPermDialog = b.create();
+        if (mPermDialog.getWindow() != null) {
+            mPermDialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);
+        }
+        mPermDialog.show();
     }
 
     private void setTabSelected(TextView tv, boolean sel) {

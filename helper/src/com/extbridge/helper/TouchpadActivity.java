@@ -34,7 +34,9 @@ public class TouchpadActivity extends Activity {
 
     private TextView mTvCoord;
     private TextView mTvHint;
+    private TextView mTvInjectWarn;
     private TextView mBtnInputMode;
+    private boolean mInjectWarnToasted = false;
     private TextView mBtnSpeed;
     private TextView mBtnReach;
     private TextView mBtnDragLock;
@@ -130,6 +132,7 @@ public class TouchpadActivity extends Activity {
             mCurX = st.cursorX;
             mCurY = st.cursorY;
             updateCoordLabel();
+            updateInjectWarn(st.injectStatus);
             if (mBtnInputMode != null) {
                 mBtnInputMode.setText(st.inputToExt == 1 ? "⇄ 扩展屏" : "⇄ 本机");
             }
@@ -195,6 +198,19 @@ public class TouchpadActivity extends Activity {
         mTvHint.setEllipsize(TextUtils.TruncateAt.END);
         mTvHint.setPadding(0, dp(3), 0, 0);
         topWrap.addView(mTvHint);
+
+        mTvInjectWarn = new TextView(this);
+        mTvInjectWarn.setText("⚠ 点击/输入注入被系统拒绝 (INJECT_EVENTS)：请在「开发者选项」开启「USB 调试（安全设置）/ 允许模拟点击」");
+        mTvInjectWarn.setTextColor(0xFFFCA5A5);
+        mTvInjectWarn.setBackgroundColor(0xFF7F1D1D);
+        mTvInjectWarn.setTextSize(11.5f);
+        mTvInjectWarn.setPadding(dp(8), dp(5), dp(8), dp(5));
+        mTvInjectWarn.setVisibility(View.GONE);
+        LinearLayout.LayoutParams warnLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        warnLp.setMargins(0, dp(4), 0, 0);
+        topWrap.addView(mTvInjectWarn, warnLp);
+
         root.addView(topWrap);
 
         // Optional ergonomic upper shelf for one-handed portrait thumb reach
@@ -428,6 +444,16 @@ public class TouchpadActivity extends Activity {
         mImeInput.setText("");
     }
 
+    private void updateInjectWarn(int injectStatus) {
+        if (mTvInjectWarn == null) return;
+        boolean denied = (injectStatus == -1);
+        mTvInjectWarn.setVisibility(denied ? View.VISIBLE : View.GONE);
+        if (denied && !mInjectWarnToasted) {
+            mInjectWarnToasted = true;
+            Toast.makeText(this, "系统拦截了虚拟屏点击注入：请在开发者选项开启「USB 调试（安全设置）」", Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void sendMouseSync(int type, float a1, float a2) {
         int[] xy = BridgeClient.sendMouse(type, a1, a2);
         if (xy != null && xy.length >= 2) {
@@ -435,6 +461,7 @@ public class TouchpadActivity extends Activity {
             mCurY = xy[1];
             BridgeService.moveCursor(mCurX, mCurY, mDragLocked || type == 3);
             updateCoordLabel();
+            if (xy.length >= 3) updateInjectWarn(xy[2]);
         }
     }
 

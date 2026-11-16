@@ -9,7 +9,8 @@
 ## ✨ 核心特性
 
 - **🖥️ 真·双屏独立扩展桌面（支持一键切换原生镜像）**
-  - 自动探测物理外接显示器 (`Display.TYPE_EXTERNAL`)，在黑屏占位的物理副屏之上通过 `SurfaceControl` 投射独立的 `VirtualDisplay`（首次接入自动按外接显示器原生分辨率/刷新率适配桌面与比例 DPI，亦支持在控制台手动定制 `3840×2160`、`2560×1440`、`1920×1080` 及 EDID 多档刷新率 `60Hz ~ 165Hz`）。
+  - 自动探测物理外接显示器 (`Display.TYPE_EXTERNAL`)，在黑屏占位的物理副屏之上通过 `SurfaceControl` 投射独立的 `VirtualDisplay`（首次接入自动按外接显示器原生分辨率/刷新率适配桌面与比例 DPI）。
+  - **独立「桌面渲染分辨率」调节（100% 生效，区分于硬件物理信号）**：支持在控制台预设 `3840×2160 (4K 超采)`、`2560×1600`、`2560×1440`、`1920×1200`、`1920×1080`、`1600×900`、`1280×720 (省流)` 及自定义宽高，精准控制桌面真实的 GPU 渲染负载、超采样锐度与宽高比；同时在部分支持该 API 的机型上同步尝试下发 EDID 物理模式切换。
   - **四向自定义输出旋转（`0° / 90° / 180° / 270°`）与竖屏输出**：将外接便携屏/显示器物理竖立时，可在控制台或快捷面板一键旋转 `90° / 270°` 满屏点对点竖屏显示（也可在横屏上点「⇅ 对调宽高」居中显示竖屏桌面），指针/触摸板与 Dock 自适应同步。
   - 随时在 **ExtBridge DeX 独立桌面** 与 **原生镜像模式** 之间一键无缝切换，适配不同使用场景。
 - **🧩 分应用显示模式（告别部分应用适配崩坏）**
@@ -62,7 +63,7 @@
 │       ├── BridgeClient.java                # Binder IPC 客户端封装
 │       ├── BridgeProvider.java              # 启动阶段零延迟传递 Binder 句柄
 │       ├── ControlReceiver.java             # 通知栏快捷按钮广播响应
-│       ├── NavAssistService.java            # 可选无障碍手势兜底服务
+│       ├── NavAssistService.java            # 无障碍辅助服务（高级浮层、全局手势与设置穿透必需）
 │       ├── AdbBootstrap.java                # mDNS 自动发现、无线调试配对连接、守护进程拉起
 │       └── AdbPairingReceiver.java          # 通知栏输入 6 位配对码快捷激活
 ├── docs/images/                             # 项目图文说明截图
@@ -96,7 +97,8 @@
 ### 1. 环境要求
 - 支持 USB-C 视频输出（DP Alt Mode）的 Android 设备（**Android 11 / API 30 及以上，建议 Android 14–16**，ARM64 架构）。
 - 已在小米 HyperOS 设备（**REDMI K Pad**、**REDMI K90 Pro** 等）实测可用；其他品牌机型因系统 Hidden API 差异，部分兼容性策略效果可能有所不同。
-- 安装后建议授予：**悬浮窗权限**（显示扩展屏桌面 Dock 与光标）、**允许后台运行 / 电池无限制**、**通知权限**（快捷控制与无线调试快捷配对）。
+- 首次启动会引导授予 3 项必需权限：**通知权限**（快捷控制与无线调试快捷配对）、**悬浮窗权限**（显示扩展屏桌面 Dock 与光标）、**无障碍服务（`ExtBridge 平板辅助手势`）**（外接屏高级浮层、手势与设置穿透；若 Android 13+ 开关变灰提示“受限设置”，可点引导按钮进应用详情右上角 `⋮ → 允许受限设置`，或在 ADB 激活后自动解锁）。
+- 若使用手机触摸板时发现有点击动画但点不动图标/Dock 栏，小米 / HyperOS / 部分品牌机型请在 **「开发者选项」** 中开启 **「USB 调试（安全设置）/ 允许模拟点击」**。
 
 ### 2. 安装与激活后台守护进程
 安装编译好的 `exthelper.apk` 后，守护进程会在系统重启后失效，需要激活一次（三选一）：
@@ -115,7 +117,7 @@
 #### 方式 C：免 Root + 电脑端 ADB 一键拉起
 连接电脑后执行控制台弹窗中给出的一键命令即可（若同时连了多台设备，请加上 `adb -s <设备序列号>`）：
 ```bash
-adb shell "(pm path com.extbridge.helper | head -n1 | cut -d: -f2; echo assets/extbridge.jar) | xargs unzip -p > /data/local/tmp/extbridge.jar && chmod 644 /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && pkill -f '^app_process.*ExtBridge' 2>/dev/null; sleep 0.2; CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &"
+adb shell "(pm path com.extbridge.helper | head -n1 | cut -d: -f2; echo assets/extbridge.jar) | xargs unzip -p > /data/local/tmp/extbridge.jar && chmod 644 /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && appops set com.extbridge.helper 10021 allow 2>/dev/null; appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null; pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null; dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1; pkill -f '^app_process.*ExtBridge' 2>/dev/null; sleep 0.2; CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &"
 ```
 
 ### 3. 连接显示器并优化体验
@@ -124,6 +126,7 @@ adb shell "(pm path com.extbridge.helper | head -n1 | cut -d: -f2; echo assets/e
 3. 若发现个别应用显示错位（或无法横屏全屏）：
    - 进入控制台 **「🧩 分应用显示模式」** 或在桌面 **长按 / 右键点击图标**，按需切换「跟随系统默认 / 强制横屏全屏 / 竖屏居中兼容 / 自由小窗模式」。
    - **微信、夸克、拼多多** 等推荐保持 **「跟随系统默认」**；**红果短剧** 等默认预置为 **「强制横屏全屏」**。
+4. 不再使用外接屏时，可在控制台顶部或待机通知栏点击 **「⏻ 停止服务并退出」**，一键恢复外接屏并彻底退出后台守护进程与前台通知（强行停止 App 也不会自动拉起）。
 
 ---
 
@@ -139,6 +142,30 @@ powershell -ExecutionPolicy Bypass -File .\build_v3.ps1
 - 脚本会自动从 `helper/jniLibs/arm64-v8a/libadb.so` 与编译出的 `extbridge.jar` 打入 `exthelper.apk`。
 - 若仓库根目录下不存在私有的 `exthelper.p12`（亦可通过环境变量 `$env:EXTBRIDGE_KEYSTORE` 指定），脚本会自动在 `build\debug.keystore` 生成测试签名完成 APK 签名。
 - 完整版本迭代记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## 📖 分辨率功能详解 & 为什么不做深入 Root 系统改动
+
+### 1. 「桌面渲染分辨率」与「外接物理输出」有什么区别？为什么切了依然有意义？
+
+部分用户在控制台切换分辨率后会发现：显示器本身 OSD 菜单显示的**外接物理输出**（例如 `2560×1440 @ 60Hz` 或 `1920×1080 @ 60Hz`）没有变化。这里必须区分两个完全不同的概念：
+
+1. **外接物理输出（显示器 EDID 信号，受手机系统固件控制）**：
+   - 在 **Xiaomi HyperOS** 等系统的正式版固件中，经无线调试实测：系统 `DisplayModeDirectorImpl` 会限制外接屏 `displayId` 与帧率上限，底层 `SurfaceFlinger` 收到 `setDesiredDisplayModeSpecs` 时也会直接警告 `Attempt to set desired display modes for external display` 并丢弃外接物理屏的模式切换请求，使显示器固定停留在 EDID 默认首档（通常为 `1080p@60` 或 `2K@60`）。
+2. **桌面渲染分辨率（`VirtualDisplay` 实际画布，ExtBridge 在所有机型上 100% 生效）**：
+   - ExtBridge 的分辨率预设与自定义输入框改的是扩展桌面 **`VirtualDisplay` 的真实渲染缓冲尺寸**，再交由硬件合成器实时等比/居中缩放铺满到外接屏上。即使物理输出被系统锁死，调节它仍然具备**非常明确的实用价值**：
+     - **降分辨率减负稳帧 / 降发热**：将渲染分辨率调为 `1280×720`、`1600×900` 或 `1920×1080`，桌面内所有应用和游戏都会真实按低像素渲染（`720p` 像素量仅为 `2K` 的 `1/4`），显著降低 GPU 渲染压力与机身发热。
+     - **高分辨率超采样锐化**：将渲染分辨率设为 `3840×2160 (4K 超采)` 再下采样缩放到 `1080p / 2K` 显示器上，可获得更细腻的文字抗锯齿与画面锐度。
+     - **自由宽高比 / 平板大屏触发 / 四向竖屏适配**：`16:10`、`16:9`、带鱼屏宽高比以及 `90° / 270°` 竖屏满铺都依赖 `VirtualDisplay` 渲染宽高配合 `DPI`（触发 `sw ≥ 600dp` 平板横屏布局）。
+
+> 在控制台勾选 **「▸ 高级：外接物理信号与帧率尝试」** 可查看并尝试请求物理模式/刷新率；若系统固件锁死外接物理信号（如 Xiaomi HyperOS 固定输出 60Hz 首档），v3.2.2 起控制台会明确提示“已切换虚拟桌面，当前系统固件锁定外接物理输出”，避免主界面堆叠无法生效的刷新率档位引起困惑。
+
+### 2. 项目定位说明：为什么不提供 Root Hook（Zygisk / LSPosed）模块？
+
+* **初衷定位**：ExtBridge 的设计初衷是做一款**免 Root、单个 APK、不改系统文件即可随插即用**的便携扩展桌面工具。
+* **Root 功能的边界**：虽然理论上通过 Root + Zygisk/LSPosed Hook `SurfaceFlinger` 与系统框架可以绕开厂商对外接物理高刷/物理分辨率的限制，但这已经背离了项目“免 Root 轻量化便携”的初衷，也会引入不同 ROM、系统版本升级后变砖/黑屏/维护成本高等问题。
+* **对 Root 用户的支持**：当前保留 **「👑 一键 Root 注册并激活服务」** 仅用于帮已 Root 用户省去无线调试配对步骤（守护进程在 Root 拉起后会立即降权回 `uid=2000 shell` 身份运行），**项目不会往修改系统框架/内核的 Root Hook 方向发展**。
 
 ---
 

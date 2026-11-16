@@ -57,6 +57,7 @@ public class BridgeClient {
         public int mirrorMode = 0;
         public int fullscreenPolicy = 1;
         public int virtRot = 0;
+        public int injectStatus = 1;
     }
 
     private static volatile IBinder sBinder;
@@ -128,6 +129,9 @@ public class BridgeClient {
                 if (reply.dataAvail() > 0) {
                     st.virtRot = reply.readInt();
                 }
+                if (reply.dataAvail() > 0) {
+                    st.injectStatus = reply.readInt();
+                }
             }
         } catch (Throwable ignored) {
         } finally {
@@ -167,9 +171,22 @@ public class BridgeClient {
         return applyConfig(w, h, dpi, fps, physModeId, -1);
     }
 
+    public static class ApplyResult {
+        public boolean ok;
+        public int physResult; // 0=ok/unchanged, 1=switched, -1=edid unsupported, -2=invoke failed, -3=system locked physical mode
+        public int physW;
+        public int physH;
+        public float physFps;
+    }
+
     public static boolean applyConfig(int w, int h, int dpi, float fps, int physModeId, int rot) {
+        return applyConfigDetailed(w, h, dpi, fps, physModeId, rot).ok;
+    }
+
+    public static ApplyResult applyConfigDetailed(int w, int h, int dpi, float fps, int physModeId, int rot) {
+        ApplyResult res = new ApplyResult();
         IBinder b = getService();
-        if (b == null) return false;
+        if (b == null) return res;
         Parcel d = Parcel.obtain();
         Parcel r = Parcel.obtain();
         try {
@@ -180,12 +197,46 @@ public class BridgeClient {
             d.writeInt(physModeId);
             d.writeInt(rot);
             b.transact(16, d, r, 0);
-            return r.readInt() == 1;
+            res.ok = r.readInt() == 1;
+            if (r.dataAvail() >= 16) {
+                res.physResult = r.readInt();
+                res.physW = r.readInt();
+                res.physH = r.readInt();
+                res.physFps = r.readInt() / 100f;
+            }
+            return res;
         } catch (Throwable t) {
-            return false;
+            return res;
         } finally {
             d.recycle();
             r.recycle();
+        }
+    }
+
+    public static void shutdownDaemon(android.content.Context ctx) {
+        IBinder b = getService();
+        if (b != null) {
+            Parcel d = Parcel.obtain();
+            Parcel r = Parcel.obtain();
+            try {
+                b.transact(99, d, r, 0);
+            } catch (Throwable ignored) {
+            } finally {
+                d.recycle();
+                r.recycle();
+            }
+        }
+        sBinder = null;
+        if (ctx != null) {
+            try {
+                android.content.Intent i1 = new android.content.Intent("com.extbridge.daemon.SHUTDOWN");
+                i1.setPackage("android");
+                ctx.sendBroadcast(i1);
+                android.content.Intent i2 = new android.content.Intent("com.extbridge.daemon.SHUTDOWN");
+                i2.setPackage("com.android.shell");
+                ctx.sendBroadcast(i2);
+                ctx.sendBroadcast(new android.content.Intent("com.extbridge.daemon.SHUTDOWN"));
+            } catch (Throwable ignored) {}
         }
     }
 
@@ -199,7 +250,10 @@ public class BridgeClient {
             d.writeFloat(a1);
             d.writeFloat(a2);
             b.transact(17, d, r, 0);
-            return new int[]{r.readInt(), r.readInt()};
+            int cx = r.readInt();
+            int cy = r.readInt();
+            int inj = r.dataAvail() >= 4 ? r.readInt() : 1;
+            return new int[]{cx, cy, inj};
         } catch (Throwable t) {
             return null;
         } finally {
@@ -262,16 +316,18 @@ public class BridgeClient {
         }
     }
 
-    public static void launchComponent(String pkg, String cls) {
+    public static boolean launchComponent(String pkg, String cls) {
         IBinder b = getService();
-        if (b == null) return;
+        if (b == null) return false;
         Parcel d = Parcel.obtain();
         Parcel r = Parcel.obtain();
         try {
             d.writeString(pkg);
             d.writeString(cls);
             b.transact(20, d, r, 0);
+            return r.dataAvail() < 4 || r.readInt() == 1;
         } catch (Throwable ignored) {
+            return false;
         } finally {
             d.recycle();
             r.recycle();

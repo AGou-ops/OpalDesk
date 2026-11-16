@@ -9,6 +9,8 @@ sleep 1
 appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow 2>/dev/null
 appops set com.extbridge.helper POST_NOTIFICATION allow 2>/dev/null
 appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow 2>/dev/null
+appops set com.extbridge.helper 10021 allow 2>/dev/null
+appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null
 pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null
 dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1
 

@@ -60,9 +60,15 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public class BridgeService extends Service {
+    public static final String ACTION_EXIT_ALL = "com.extbridge.helper.EXIT_ALL";
     private static final String CH_ID = "extbridge_ctrl_v3";
     private static final int NOTIF_ID = 301;
     private static volatile BridgeService sInstance;
+    public static volatile boolean sUserStopping = false;
+
+    public static boolean isRunning() {
+        return sInstance != null;
+    }
     private static ViewGroup sLauncherHost;
     private static int sLauncherHostDisplayId = -1;
 
@@ -172,6 +178,7 @@ public class BridgeService extends Service {
     };
 
     public static void ensureStarted(Context ctx) {
+        if (sUserStopping || ctx == null) return;
         try {
             Intent i = new Intent(ctx, BridgeService.class);
             if (Build.VERSION.SDK_INT >= 26) {
@@ -183,11 +190,67 @@ public class BridgeService extends Service {
     }
 
     public static void refreshFromReceiver(Context ctx) {
+        if (sUserStopping) return;
         if (sInstance != null) {
             sInstance.mHandler.post(() -> sInstance.pollRemoteStateAsync());
-        } else {
-            ensureStarted(ctx);
         }
+    }
+
+    public static void stopAllAndExit(Context ctx) {
+        sUserStopping = true;
+        final Context appCtx = (ctx != null) ? ctx.getApplicationContext() : sInstance;
+        final BridgeService svc = sInstance;
+        if (svc != null && svc.mHandler != null) {
+            svc.mHandler.removeCallbacksAndMessages(null);
+            svc.mHandler.post(() -> {
+                try { svc.detachExtOverlays(); } catch (Throwable ignored) {}
+                try {
+                    if (svc.mNm != null) svc.mNm.cancel(NOTIF_ID);
+                } catch (Throwable ignored) {}
+                try {
+                    if (Build.VERSION.SDK_INT >= 24) {
+                        svc.stopForeground(STOP_FOREGROUND_REMOVE);
+                    } else {
+                        svc.stopForeground(true);
+                    }
+                } catch (Throwable ignored) {}
+            });
+        } else if (appCtx != null) {
+            try {
+                NotificationManager nm = (NotificationManager) appCtx.getSystemService(NOTIFICATION_SERVICE);
+                if (nm != null) nm.cancel(NOTIF_ID);
+            } catch (Throwable ignored) {}
+        }
+
+        if (appCtx != null) {
+            try {
+                android.app.ActivityManager am = (android.app.ActivityManager) appCtx.getSystemService(ACTIVITY_SERVICE);
+                if (am != null) {
+                    List<android.app.ActivityManager.AppTask> tasks = am.getAppTasks();
+                    if (tasks != null) {
+                        for (android.app.ActivityManager.AppTask t : tasks) {
+                            try { t.finishAndRemoveTask(); } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
+        new Thread(() -> {
+            try {
+                for (int i = 0; i < 8 && BridgeClient.getService() == null; i++) {
+                    Thread.sleep(200);
+                }
+                BridgeClient.shutdownDaemon(appCtx);
+            } catch (Throwable ignored) {}
+            try { Thread.sleep(160); } catch (Throwable ignored) {}
+            if (svc != null) {
+                try { svc.stopSelf(); } catch (Throwable ignored) {}
+            }
+            try { Thread.sleep(80); } catch (Throwable ignored) {}
+            android.os.Process.killProcess(android.os.Process.myPid());
+            System.exit(0);
+        }, "ExtBridgeExit").start();
     }
 
     public static void moveCursor(float x, float y, boolean pressing) {
@@ -239,6 +302,10 @@ public class BridgeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        if (sUserStopping || (intent != null && ACTION_EXIT_ALL.equals(intent.getAction()))) {
+            stopAllAndExit(this);
+            return START_NOT_STICKY;
+        }
         if (intent != null && intent.getExtras() != null) {
             IBinder cb = intent.getExtras().getBinder("cb");
             if (cb != null) BridgeClient.setBinder(cb);
@@ -247,7 +314,7 @@ public class BridgeService extends Service {
             BridgeClient.requestBinder(this);
         }
         pollRemoteStateAsync();
-        return START_STICKY;
+        return START_NOT_STICKY;
     }
 
     @Override
@@ -316,13 +383,19 @@ public class BridgeService extends Service {
         PendingIntent piMirror = PendingIntent.getBroadcast(this, 5, mirrorIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
+        Intent exitIntent = new Intent(this, ControlReceiver.class)
+                .setAction(ACTION_EXIT_ALL);
+        PendingIntent piExit = PendingIntent.getBroadcast(this, 6, exitIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
         boolean mirrorActive = st.connected && st.mirrorMode == 1 && st.extId > 0;
+        boolean standbyOrDisconnected = !st.connected || (!mirrorActive && st.vdId <= 0);
         String title;
         String body;
         String toggleLabel;
         if (!st.connected) {
             title = "ExtBridge 未连接后台服务";
-            body = "点击打开控制台查看状态，或在电脑端启动 extbridge";
+            body = "点击打开控制台激活，或点下方「⏻ 停止并退出」关闭常驻";
             toggleLabel = "⇄ 切换键鼠";
         } else if (mirrorActive) {
             title = "ExtBridge 原生镜像模式 · 物理 Display #" + st.extId;
@@ -330,7 +403,7 @@ public class BridgeService extends Service {
             toggleLabel = st.inputToExt == 1 ? "⇄ 切到本机" : "⇄ 切回外接";
         } else if (st.vdId <= 0) {
             title = "ExtBridge 待机中 · 等待 USB-C 外接屏";
-            body = "已配置预设 " + st.virtW + "×" + st.virtH + " (" + st.virtDpi + "dpi)";
+            body = "预设 " + st.virtW + "×" + st.virtH + " (" + st.virtDpi + "dpi) | 不用时可点「⏻ 停止并退出」";
             toggleLabel = st.inputToExt == 1 ? "⇄ 切到平板" : "⇄ 切回扩展屏";
         } else {
             String target = st.inputToExt == 1 ? "外接扩展屏" : "平板本机";
@@ -340,22 +413,26 @@ public class BridgeService extends Service {
             toggleLabel = st.inputToExt == 1 ? "⇄ 键鼠切回平板" : "⇄ 键鼠切回扩展屏";
         }
 
-        String act1Label = mirrorActive ? "🖥 切回DeX" : toggleLabel;
-        PendingIntent act1Pi = mirrorActive ? piMirror : piToggle;
-        String act3Label = mirrorActive ? toggleLabel : "⊞ 回扩展桌面";
-        PendingIntent act3Pi = mirrorActive ? piToggle : piExtHome;
-
-        return new Notification.Builder(this, CH_ID)
+        Notification.Builder nb = new Notification.Builder(this, CH_ID)
                 .setSmallIcon(R.drawable.ic_stat_extbridge)
                 .setContentTitle(title)
                 .setContentText(body)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
-                .setContentIntent(piMain)
-                .addAction(new Notification.Action.Builder(null, act1Label, act1Pi).build())
-                .addAction(new Notification.Action.Builder(null, "🖐 大触摸板", piTp).build())
-                .addAction(new Notification.Action.Builder(null, act3Label, act3Pi).build())
-                .build();
+                .setContentIntent(piMain);
+        if (standbyOrDisconnected) {
+            nb.addAction(new Notification.Action.Builder(null, "⊞ 打开控制台", piMain).build());
+            nb.addAction(new Notification.Action.Builder(null, "⏻ 停止并退出", piExit).build());
+        } else {
+            String act1Label = mirrorActive ? "🖥 切回DeX" : toggleLabel;
+            PendingIntent act1Pi = mirrorActive ? piMirror : piToggle;
+            String act3Label = mirrorActive ? toggleLabel : "⊞ 回扩展桌面";
+            PendingIntent act3Pi = mirrorActive ? piToggle : piExtHome;
+            nb.addAction(new Notification.Action.Builder(null, act1Label, act1Pi).build());
+            nb.addAction(new Notification.Action.Builder(null, "🖐 大触摸板", piTp).build());
+            nb.addAction(new Notification.Action.Builder(null, act3Label, act3Pi).build());
+        }
+        return nb.build();
     }
 
     private void pollRemoteStateAsync() {
@@ -587,9 +664,12 @@ public class BridgeService extends Service {
 
             mCursorView.setClickable(false);
             mCursorView.setFocusable(false);
+            mCursorView.setElevation(dp(mExtCtx, 48));
+            mCursorView.setTranslationZ(dp(mExtCtx, 48));
             FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
                     44, 44, Gravity.TOP | Gravity.LEFT);
             sLauncherHost.addView(mCursorView, clp);
+            mCursorView.bringToFront();
             if (mCursorLp != null) {
                 mCursorView.setTranslationX(mCursorLp.x);
                 mCursorView.setTranslationY(mCursorLp.y);
@@ -1087,6 +1167,8 @@ public class BridgeService extends Service {
 
     private void buildCursorOverlay(Context ctx, BridgeClient.Status st) {
         mCursorView = new CursorView(ctx);
+        mCursorView.setElevation(dp(ctx, 48));
+        mCursorView.setTranslationZ(dp(ctx, 48));
         mCursorLp = new WindowManager.LayoutParams(
                 44, 44,
                 mWinType,
@@ -1521,6 +1603,7 @@ public class BridgeService extends Service {
             if (mInLauncherHost) {
                 mCursorView.setTranslationX(mCursorLp.x);
                 mCursorView.setTranslationY(mCursorLp.y);
+                mCursorView.bringToFront();
             } else if (mExtWm != null) {
                 mExtWm.updateViewLayout(mCursorView, mCursorLp);
             }

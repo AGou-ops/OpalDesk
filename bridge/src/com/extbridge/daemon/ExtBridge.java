@@ -51,6 +51,7 @@ import java.io.FileWriter;
 import java.io.InputStreamReader;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -84,8 +85,11 @@ public class ExtBridge implements Runnable {
     private static Method sMMirrorDisplay;
     private static Method sMStartActivity;
     private static Method sMSetUserPreferredMode;
+    private static Object sSetUserPreferredTarget;
+    private static int sSetUserPreferredArgCount = 0;
 
     private static volatile int sExtId = -1;
+    private static volatile int sLastPushedExtId = -1;
     private static volatile int sVdId = -1;
     private static volatile String sVdUniqueId;
     private static volatile VirtualDisplay sVd;
@@ -115,6 +119,8 @@ public class ExtBridge implements Runnable {
     private static volatile float sCursorY = 720f;
     private static volatile int sMouseButtons = 0;
     private static long sMouseDownTime = 0L;
+    private static volatile int sLastInjectStatus = 1; // 1=ok, -1=SecurityException (INJECT_EVENTS denied), -2=other error
+    private static volatile long sLastInjectDenyLogMs = 0L;
     private static volatile boolean sShuttingDown = false;
     private static volatile boolean sForceRebuild = false;
     private static volatile int sMirrorMode = 0;       // 0=DeX独立桌面, 1=原生镜像
@@ -154,6 +160,8 @@ public class ExtBridge implements Runnable {
                 sCtx = sysCtx;
             }
             sCtx = fixShellContext(sCtx);
+            try { runCmdOut("appops", "set", "com.extbridge.helper", "10021", "allow"); } catch (Throwable ignored) {}
+            try { runCmdOut("appops", "set", "com.extbridge.helper", "ACCESS_RESTRICTED_SETTINGS", "allow"); } catch (Throwable ignored) {}
             sDm = (DisplayManager) sCtx.getSystemService(Context.DISPLAY_SERVICE);
             sIm = (InputManager) sCtx.getSystemService(Context.INPUT_SERVICE);
 
@@ -240,9 +248,74 @@ public class ExtBridge implements Runnable {
                 }
             }
         } catch (Throwable ignored) {}
+        initUserPreferredModeReflection();
+    }
+
+    private static void initUserPreferredModeReflection() {
+        // 1. DisplayManager (Android 17+ has 3-arg; some ROMs have 2-arg)
         try {
             sMSetUserPreferredMode = DisplayManager.class.getMethod("setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
+            sSetUserPreferredTarget = sDm;
+            sSetUserPreferredArgCount = 3;
+            System.out.println("EXTBRIDGE_PHYS_API=DisplayManager(3)");
+            return;
         } catch (Throwable ignored) {}
+        try {
+            sMSetUserPreferredMode = DisplayManager.class.getMethod("setUserPreferredDisplayMode", int.class, Display.Mode.class);
+            sSetUserPreferredTarget = sDm;
+            sSetUserPreferredArgCount = 2;
+            System.out.println("EXTBRIDGE_PHYS_API=DisplayManager(2)");
+            return;
+        } catch (Throwable ignored) {}
+
+        // 2. DisplayManagerGlobal (Android 13-16 standard hidden API: 2-arg / 3-arg)
+        try {
+            Class<?> dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal");
+            Object dmg = dmgCls.getMethod("getInstance").invoke(null);
+            if (dmg != null) {
+                try {
+                    sMSetUserPreferredMode = dmgCls.getMethod("setUserPreferredDisplayMode", int.class, Display.Mode.class);
+                    sSetUserPreferredTarget = dmg;
+                    sSetUserPreferredArgCount = 2;
+                    System.out.println("EXTBRIDGE_PHYS_API=DisplayManagerGlobal(2)");
+                    return;
+                } catch (Throwable ignored) {}
+                try {
+                    sMSetUserPreferredMode = dmgCls.getMethod("setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
+                    sSetUserPreferredTarget = dmg;
+                    sSetUserPreferredArgCount = 3;
+                    System.out.println("EXTBRIDGE_PHYS_API=DisplayManagerGlobal(3)");
+                    return;
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+
+        // 3. IDisplayManager Binder proxy directly (2-arg / 3-arg)
+        try {
+            Class<?> smCls = Class.forName("android.os.ServiceManager");
+            IBinder dmB = (IBinder) smCls.getMethod("getService", String.class).invoke(null, "display");
+            if (dmB != null) {
+                Object idm = Class.forName("android.hardware.display.IDisplayManager$Stub")
+                        .getMethod("asInterface", IBinder.class).invoke(null, dmB);
+                if (idm != null) {
+                    try {
+                        sMSetUserPreferredMode = idm.getClass().getMethod("setUserPreferredDisplayMode", int.class, Display.Mode.class);
+                        sSetUserPreferredTarget = idm;
+                        sSetUserPreferredArgCount = 2;
+                        System.out.println("EXTBRIDGE_PHYS_API=IDisplayManager(2)");
+                        return;
+                    } catch (Throwable ignored) {}
+                    try {
+                        sMSetUserPreferredMode = idm.getClass().getMethod("setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
+                        sSetUserPreferredTarget = idm;
+                        sSetUserPreferredArgCount = 3;
+                        System.out.println("EXTBRIDGE_PHYS_API=IDisplayManager(3)");
+                        return;
+                    } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable ignored) {}
+        System.err.println("EXTBRIDGE_PHYS_API=NONE (will fallback to cmd display)");
     }
 
     private static void loadConf() {
@@ -418,9 +491,33 @@ public class ExtBridge implements Runnable {
         }
     }
 
+    private static boolean isHelperProcessRunning() {
+        try {
+            Class<?> smCls = Class.forName("android.os.ServiceManager");
+            IBinder amB = (IBinder) smCls.getMethod("getService", String.class).invoke(null, "activity");
+            if (amB == null) return false;
+            Object am = Class.forName("android.app.IActivityManager$Stub").getMethod("asInterface", IBinder.class).invoke(null, amB);
+            if (am == null) return false;
+            @SuppressWarnings("unchecked")
+            List<ActivityManager.RunningAppProcessInfo> procs =
+                    (List<ActivityManager.RunningAppProcessInfo>) am.getClass().getMethod("getRunningAppProcesses").invoke(am);
+            if (procs == null) return false;
+            for (ActivityManager.RunningAppProcessInfo info : procs) {
+                if (info != null && "com.extbridge.helper".equals(info.processName)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     private static synchronized void tick() {
+        if ((sHelperProcToken == null || !sHelperProcToken.pingBinder()) && isHelperProcessRunning()) {
+            pushBinderToHelper();
+        }
         Display ext = findExternalDisplay();
         if (ext == null) {
+            sLastPushedExtId = -1;
             if (sExtId >= 0 || sVd != null) {
                 System.out.println("EXTBRIDGE_DETACHED");
                 cleanupDisplay(false);
@@ -428,12 +525,17 @@ public class ExtBridge implements Runnable {
             return;
         }
         int extId = ext.getDisplayId();
+        int prevPhysW = sPhysW;
+        int prevPhysH = sPhysH;
+        float prevPhysFps = sPhysFps;
         Display.Mode curMode = ext.getMode();
         if (curMode != null) {
             sPhysW = curMode.getPhysicalWidth();
             sPhysH = curMode.getPhysicalHeight();
             sPhysFps = curMode.getRefreshRate();
         }
+        boolean physSizeChanged = (prevPhysW != sPhysW || prevPhysH != sPhysH);
+        boolean physFpsChanged = Math.abs(prevPhysFps - sPhysFps) > 0.2f;
 
         if (sMirrorMode == 1) {
             if (sVd != null || sRootSc != null) {
@@ -442,8 +544,14 @@ public class ExtBridge implements Runnable {
             sExtId = extId;
             sVdId = -1;
             sRenderMode = "NATIVE_MIRROR";
-            if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
-                pushBinderToHelper();
+            if (extId != sLastPushedExtId) {
+                sLastPushedExtId = extId;
+                if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
+                    pushBinderToHelper();
+                }
+            }
+            if (physSizeChanged || physFpsChanged) {
+                notifyHelperSync();
             }
             return;
         }
@@ -456,14 +564,24 @@ public class ExtBridge implements Runnable {
         if (extId != sExtId || sVd == null) {
             cleanupDisplay(false);
             attachDisplay(extId);
+            sLastPushedExtId = extId;
         } else {
+            if (physSizeChanged) {
+                applySurfaceTransform();
+            }
+            if (physSizeChanged || physFpsChanged) {
+                notifyHelperSync();
+            }
             reassert();
             checkInput();
             if (sFullscreenPolicy == 1) {
                 enforceRunningExtTasksFullscreen();
             }
-            if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
-                pushBinderToHelper();
+            if (extId != sLastPushedExtId) {
+                sLastPushedExtId = extId;
+                if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
+                    pushBinderToHelper();
+                }
             }
         }
     }
@@ -711,8 +829,65 @@ public class ExtBridge implements Runnable {
         sRenderMode = "NONE";
     }
 
+    private static volatile int sLastPhysResult = 0; // 0=ok/unchanged, 1=switched, -1=edid unsupported, -2=invoke failed, -3=system locked physical mode
+
+    private static boolean invokeSetUserPreferredMode(int extDisplayId, Display.Mode chosenMode) {
+        if (chosenMode == null) return false;
+        if (sMSetUserPreferredMode != null && sSetUserPreferredTarget != null) {
+            try {
+                if (sSetUserPreferredArgCount == 3) {
+                    sMSetUserPreferredMode.invoke(sSetUserPreferredTarget, extDisplayId, chosenMode, false);
+                } else {
+                    sMSetUserPreferredMode.invoke(sSetUserPreferredTarget, extDisplayId, chosenMode);
+                }
+                return true;
+            } catch (Throwable t) {
+                System.err.println("EXTBRIDGE_PHYS_INVOKE_FAILED: " + t);
+                t.printStackTrace();
+            }
+        }
+        try {
+            String w = String.valueOf(chosenMode.getPhysicalWidth());
+            String h = String.valueOf(chosenMode.getPhysicalHeight());
+            String fps = String.format(java.util.Locale.US, "%.2f", chosenMode.getRefreshRate());
+            String did = String.valueOf(extDisplayId);
+            String out = runCmdOut("cmd", "display", "set-user-preferred-display-mode", w, h, fps, did, "false");
+            if (out != null && out.toLowerCase().contains("error")) {
+                out = runCmdOut("cmd", "display", "set-user-preferred-display-mode", w, h, fps, did);
+            }
+            System.out.println("EXTBRIDGE_PHYS_CMD_OUT=" + (out == null ? "" : out.trim()));
+            return out == null || !out.toLowerCase().contains("error");
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_PHYS_CMD_FAILED: " + t);
+        }
+        return false;
+    }
+
+    private static synchronized void syncPhysicalModeIfChanged() {
+        Display ext = findExternalDisplay();
+        if (ext == null || ext.getDisplayId() != sExtId) return;
+        Display.Mode curMode = ext.getMode();
+        if (curMode == null) return;
+        int cw = curMode.getPhysicalWidth();
+        int ch = curMode.getPhysicalHeight();
+        float cf = curMode.getRefreshRate();
+        boolean sizeChanged = (cw != sPhysW || ch != sPhysH);
+        boolean fpsChanged = Math.abs(cf - sPhysFps) > 0.2f;
+        if (sizeChanged || fpsChanged) {
+            sPhysW = cw;
+            sPhysH = ch;
+            sPhysFps = cf;
+            if (sizeChanged) {
+                applySurfaceTransform();
+            }
+            reassert();
+            notifyHelperSync();
+        }
+    }
+
     private static synchronized boolean applyConfig(int reqW, int reqH, int reqDpi, int reqFpsX100, int physModeId, int reqRot) {
         try {
+            sLastPhysResult = 0;
             if (!isValidDims(reqW, reqH) || reqDpi < 100 || reqDpi > 640) {
                 return false;
             }
@@ -729,35 +904,64 @@ public class ExtBridge implements Runnable {
 
             // 1. Apply physical external display mode if supported & requested
             Display ext = findExternalDisplay();
-            if (ext != null && sMSetUserPreferredMode != null) {
+            if (ext != null) {
                 Display.Mode chosenMode = null;
                 Display.Mode[] modes = ext.getSupportedModes();
-                if (modes != null) {
+                if (modes != null && modes.length > 0) {
                     if (physModeId > 0) {
                         for (Display.Mode m : modes) {
                             if (m.getModeId() == physModeId) { chosenMode = m; break; }
                         }
                     } else if (reqFpsX100 > 0) {
-                        float bestDiff = Float.MAX_VALUE;
+                        int matchW = ((sVirtRot & 1) == 1) ? reqH : reqW;
+                        int matchH = ((sVirtRot & 1) == 1) ? reqW : reqH;
+                        float bestScore = Float.MAX_VALUE;
                         for (Display.Mode m : modes) {
                             float diff = Math.abs(m.getRefreshRate() - fps);
-                            boolean resMatch = (m.getPhysicalWidth() == reqW && m.getPhysicalHeight() == reqH);
-                            float score = diff + (resMatch ? 0f : 5.0f);
-                            if (diff <= 2.5f && score < bestDiff) {
-                                bestDiff = score;
+                            if (diff > 2.5f) continue;
+                            int mw = m.getPhysicalWidth();
+                            int mh = m.getPhysicalHeight();
+                            boolean resMatch = (mw == matchW && mh == matchH) || (mw == matchH && mh == matchW);
+                            long area = (long) mw * (long) mh;
+                            float areaBias = Math.max(0f, 4.0f - (area / 2073600f));
+                            float score = diff + (resMatch ? 0f : (5.0f + areaBias));
+                            if (score < bestScore) {
+                                bestScore = score;
                                 chosenMode = m;
                             }
                         }
+                        if (chosenMode == null) {
+                            sLastPhysResult = -1;
+                            System.out.println("EXTBRIDGE_PHYS_SKIP no EDID mode near " + fps + "Hz for " + matchW + "x" + matchH);
+                        }
                     }
                     if (chosenMode != null) {
-                        try {
-                            sMSetUserPreferredMode.invoke(sDm, ext.getDisplayId(), chosenMode, true);
-                            sPhysW = chosenMode.getPhysicalWidth();
-                            sPhysH = chosenMode.getPhysicalHeight();
-                            sPhysFps = chosenMode.getRefreshRate();
-                            System.out.println("EXTBRIDGE_PHYS_MODE=" + chosenMode.getModeId() + " " + sPhysW + "x" + sPhysH + "@" + sPhysFps);
-                        } catch (Throwable t) {
-                            t.printStackTrace();
+                        boolean invoked = invokeSetUserPreferredMode(ext.getDisplayId(), chosenMode);
+                        if (invoked) {
+                            SystemClock.sleep(120);
+                            Display extNow = findExternalDisplay();
+                            Display.Mode cur = (extNow != null) ? extNow.getMode() : null;
+                            if (cur != null) {
+                                sPhysW = cur.getPhysicalWidth();
+                                sPhysH = cur.getPhysicalHeight();
+                                sPhysFps = cur.getRefreshRate();
+                            }
+                            boolean curMatched = cur == null
+                                    || (((cur.getPhysicalWidth() == chosenMode.getPhysicalWidth()
+                                            && cur.getPhysicalHeight() == chosenMode.getPhysicalHeight())
+                                        || (cur.getPhysicalWidth() == chosenMode.getPhysicalHeight()
+                                            && cur.getPhysicalHeight() == chosenMode.getPhysicalWidth()))
+                                        && Math.abs(cur.getRefreshRate() - chosenMode.getRefreshRate()) <= 2.5f);
+                            sLastPhysResult = curMatched ? 1 : -3;
+                            if (sHandler != null) {
+                                sHandler.postDelayed(ExtBridge::syncPhysicalModeIfChanged, 250);
+                                sHandler.postDelayed(ExtBridge::syncPhysicalModeIfChanged, 700);
+                            }
+                            System.out.println("EXTBRIDGE_PHYS_REQ mode=" + chosenMode.getModeId()
+                                    + " target=" + chosenMode.getPhysicalWidth() + "x" + chosenMode.getPhysicalHeight() + "@" + chosenMode.getRefreshRate()
+                                    + " actual=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " res=" + sLastPhysResult);
+                        } else {
+                            sLastPhysResult = -2;
                         }
                     }
                 }
@@ -882,18 +1086,39 @@ public class ExtBridge implements Runnable {
         } catch (Throwable ignored) {}
     }
 
+    private static boolean invokeInjectInput(InputEvent ev) {
+        if (ev == null || sVdId <= 0 || sIIm == null || sMInjectInput == null) return false;
+        try {
+            if (sMSetDisplayId != null) sMSetDisplayId.invoke(ev, sVdId);
+            Object res = sMInjectInput.invoke(sIIm, ev, 0);
+            boolean ok = !(res instanceof Boolean) || (Boolean) res;
+            if (ok) sLastInjectStatus = 1;
+            return ok;
+        } catch (Throwable t) {
+            Throwable root = (t instanceof InvocationTargetException && t.getCause() != null) ? t.getCause() : t;
+            if (root instanceof SecurityException) {
+                sLastInjectStatus = -1;
+                long now = SystemClock.uptimeMillis();
+                if (now - sLastInjectDenyLogMs > 5000L) {
+                    sLastInjectDenyLogMs = now;
+                    System.err.println("EXTBRIDGE_INJECT_SECURITY_DENIED: " + root.getMessage());
+                }
+            } else {
+                sLastInjectStatus = -2;
+                t.printStackTrace();
+            }
+            return false;
+        }
+    }
+
     private static void injectKey(int keyCode, int metaState) {
         try {
             if (sVdId <= 0 || sIIm == null || sMInjectInput == null) return;
             long now = SystemClock.uptimeMillis();
             KeyEvent kd = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, metaState, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
             KeyEvent ku = new KeyEvent(now, now + 15, KeyEvent.ACTION_UP, keyCode, 0, metaState, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
-            if (sMSetDisplayId != null) {
-                sMSetDisplayId.invoke(kd, sVdId);
-                sMSetDisplayId.invoke(ku, sVdId);
-            }
-            sMInjectInput.invoke(sIIm, kd, 0);
-            sMInjectInput.invoke(sIIm, ku, 0);
+            invokeInjectInput(kd);
+            invokeInjectInput(ku);
         } catch (Throwable t) {
             t.printStackTrace();
         }
@@ -906,8 +1131,7 @@ public class ExtBridge implements Runnable {
             KeyEvent[] evs = kcm.getEvents(text.toCharArray());
             if (evs == null) return;
             for (KeyEvent e : evs) {
-                if (sMSetDisplayId != null) sMSetDisplayId.invoke(e, sVdId);
-                sMInjectInput.invoke(sIIm, e, 0);
+                invokeInjectInput(e);
             }
         } catch (Throwable t) {
             t.printStackTrace();
@@ -926,22 +1150,22 @@ public class ExtBridge implements Runnable {
                             now, sCursorX, sCursorY, sMouseButtons, 0, 0f, 0f);
                     break;
                 case 1: // LEFT_CLICK
+                    dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now - 25, sCursorX, sCursorY, 0, 0, 0f, 0f);
+                    sMouseDownTime = now - 20;
+                    dispatchMouseMotion(MotionEvent.ACTION_DOWN, now - 20, sCursorX, sCursorY, MotionEvent.BUTTON_PRIMARY, 0, 0f, 0f);
+                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_PRESS, now - 20, sCursorX, sCursorY, MotionEvent.BUTTON_PRIMARY, MotionEvent.BUTTON_PRIMARY, 0f, 0f);
+                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, sCursorX, sCursorY, 0, MotionEvent.BUTTON_PRIMARY, 0f, 0f);
+                    dispatchMouseMotion(MotionEvent.ACTION_UP, now, sCursorX, sCursorY, 0, 0, 0f, 0f);
                     dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now, sCursorX, sCursorY, 0, 0, 0f, 0f);
-                    sMouseDownTime = now;
-                    dispatchMouseMotion(MotionEvent.ACTION_DOWN, now, sCursorX, sCursorY, MotionEvent.BUTTON_PRIMARY, 0, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_PRESS, now, sCursorX, sCursorY, MotionEvent.BUTTON_PRIMARY, MotionEvent.BUTTON_PRIMARY, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now + 20, sCursorX, sCursorY, 0, MotionEvent.BUTTON_PRIMARY, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_UP, now + 20, sCursorX, sCursorY, 0, 0, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now + 25, sCursorX, sCursorY, 0, 0, 0f, 0f);
                     break;
                 case 2: // RIGHT_CLICK
+                    dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now - 25, sCursorX, sCursorY, 0, 0, 0f, 0f);
+                    sMouseDownTime = now - 20;
+                    dispatchMouseMotion(MotionEvent.ACTION_DOWN, now - 20, sCursorX, sCursorY, MotionEvent.BUTTON_SECONDARY, 0, 0f, 0f);
+                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_PRESS, now - 20, sCursorX, sCursorY, MotionEvent.BUTTON_SECONDARY, MotionEvent.BUTTON_SECONDARY, 0f, 0f);
+                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, sCursorX, sCursorY, 0, MotionEvent.BUTTON_SECONDARY, 0f, 0f);
+                    dispatchMouseMotion(MotionEvent.ACTION_UP, now, sCursorX, sCursorY, 0, 0, 0f, 0f);
                     dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now, sCursorX, sCursorY, 0, 0, 0f, 0f);
-                    sMouseDownTime = now;
-                    dispatchMouseMotion(MotionEvent.ACTION_DOWN, now, sCursorX, sCursorY, MotionEvent.BUTTON_SECONDARY, 0, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_PRESS, now, sCursorX, sCursorY, MotionEvent.BUTTON_SECONDARY, MotionEvent.BUTTON_SECONDARY, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now + 20, sCursorX, sCursorY, 0, MotionEvent.BUTTON_SECONDARY, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_UP, now + 20, sCursorX, sCursorY, 0, 0, 0f, 0f);
-                    dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now + 25, sCursorX, sCursorY, 0, 0, 0f, 0f);
                     break;
                 case 3: // LEFT_DOWN (drag)
                     sMouseDownTime = now;
@@ -993,14 +1217,16 @@ public class ExtBridge implements Runnable {
         if (actionButton != 0) {
             try { MotionEvent.class.getMethod("setActionButton", int.class).invoke(ev, actionButton); } catch (Throwable ignored) {}
         }
-        if (sMSetDisplayId != null) sMSetDisplayId.invoke(ev, sVdId);
-        sMInjectInput.invoke(sIIm, ev, 0);
-        ev.recycle();
+        try {
+            invokeInjectInput(ev);
+        } finally {
+            ev.recycle();
+        }
     }
 
-    private static void launchComponentOnVd(String pkg, String cls) {
+    private static boolean launchComponentOnVd(String pkg, String cls) {
         try {
-            if (sVdId <= 0 || sAtm == null || sMStartActivity == null) return;
+            if (sVdId <= 0 || sAtm == null || sMStartActivity == null) return false;
             int mode = getAppMode(pkg);
             applyAppModeCompat(pkg, mode, false);
             Intent intent = new Intent();
@@ -1013,9 +1239,11 @@ public class ExtBridge implements Runnable {
                 intent.putExtra("extId", sVdId);
             }
             ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
-            sMStartActivity.invoke(sAtm, null, "com.android.shell", null, intent, null, null, null, 0, 0, null, opts.toBundle());
+            Object rc = sMStartActivity.invoke(sAtm, null, "com.android.shell", null, intent, null, null, null, 0, 0, null, opts.toBundle());
+            return !(rc instanceof Integer) || (Integer) rc >= 0;
         } catch (Throwable t) {
             t.printStackTrace();
+            return false;
         }
     }
 
@@ -1279,9 +1507,6 @@ public class ExtBridge implements Runnable {
                     try {
                         tok.linkToDeath(() -> {
                             sHelperProcToken = null;
-                            if (sHandler != null && !sShuttingDown) {
-                                sHandler.postDelayed(ExtBridge::pushBinderToHelper, 1500);
-                            }
                         }, 0);
                     } catch (Throwable ignored) {}
                 }
@@ -1392,6 +1617,8 @@ public class ExtBridge implements Runnable {
 
     private static void notifyHelperSync() {
         try {
+            if (sShuttingDown) return;
+            if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) return;
             Intent b = new Intent("com.extbridge.helper.STATE_SYNC");
             b.setPackage("com.extbridge.helper");
             b.putExtra("extId", sExtId);
@@ -1468,6 +1695,7 @@ public class ExtBridge implements Runnable {
                     reply.writeInt(sMirrorMode);
                     reply.writeInt(sFullscreenPolicy);
                     reply.writeInt(sVirtRot);
+                    reply.writeInt(sLastInjectStatus);
                 }
                 return true;
             } else if (code == 16) {
@@ -1478,7 +1706,13 @@ public class ExtBridge implements Runnable {
                 int physModeId = data.readInt();
                 int reqRot = data.dataAvail() > 0 ? data.readInt() : -1;
                 boolean ok = applyConfig(w, h, dpi, fpsX100, physModeId, reqRot);
-                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                if (reply != null) {
+                    reply.writeInt(ok ? 1 : 0);
+                    reply.writeInt(sLastPhysResult);
+                    reply.writeInt(sPhysW);
+                    reply.writeInt(sPhysH);
+                    reply.writeInt(Math.round(sPhysFps * 100f));
+                }
                 return true;
             } else if (code == 17) {
                 int actionType = data.readInt();
@@ -1488,6 +1722,7 @@ public class ExtBridge implements Runnable {
                 if (reply != null) {
                     reply.writeInt(Math.round(sCursorX));
                     reply.writeInt(Math.round(sCursorY));
+                    reply.writeInt(sLastInjectStatus);
                 }
                 return true;
             } else if (code == 18) {
@@ -1517,8 +1752,8 @@ public class ExtBridge implements Runnable {
             } else if (code == 20) {
                 String pkg = data.readString();
                 String cls = data.readString();
-                launchComponentOnVd(pkg, cls);
-                if (reply != null) reply.writeInt(1);
+                boolean ok = launchComponentOnVd(pkg, cls);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
                 return true;
             } else if (code == 21) {
                 sForceRebuild = true;

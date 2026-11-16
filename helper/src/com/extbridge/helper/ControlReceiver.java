@@ -32,6 +32,9 @@ public class ControlReceiver extends BroadcastReceiver {
             Toast.makeText(context,
                     next == 1 ? "已切换为【原生镜像模式】" : "已切换为【ExtBridge DeX 扩展模式】",
                     Toast.LENGTH_SHORT).show();
+        } else if (BridgeService.ACTION_EXIT_ALL.equals(act)) {
+            Toast.makeText(context, "正在停止 ExtBridge 后台服务并退出…", Toast.LENGTH_SHORT).show();
+            BridgeService.stopAllAndExit(context);
         }
     }
 }

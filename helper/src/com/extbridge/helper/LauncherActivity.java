@@ -536,6 +536,10 @@ public class LauncherActivity extends Activity {
                 opts.setLaunchDisplayId(0);
                 Toast.makeText(this, "未开启无障碍：已在平板打开设置", Toast.LENGTH_SHORT).show();
             } else if (dispId > 0) {
+                // Prefer daemon shell ATM launch on external VirtualDisplay so MIUIOP(10021) / background-start restrictions cannot silently drop launches.
+                if (BridgeClient.launchComponent(e.pkg, e.cls)) {
+                    return;
+                }
                 int mode = BridgeClient.prepareAppLaunch(e.pkg);
                 opts.setLaunchDisplayId(dispId);
                 try {

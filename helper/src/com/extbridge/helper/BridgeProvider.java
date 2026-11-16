@@ -19,6 +19,11 @@ public class BridgeProvider extends ContentProvider {
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
         if ("setBinder".equals(method) && extras != null) {
+            if (BridgeService.sUserStopping) {
+                Bundle denied = new Bundle();
+                denied.putBoolean("ok", false);
+                return denied;
+            }
             IBinder b = extras.getBinder("cb");
             if (b != null) {
                 BridgeClient.setBinder(b);
