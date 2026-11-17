@@ -1,10 +1,11 @@
 $ErrorActionPreference = "Stop"
 
-# Auto-detect JDK (11+ required)
+# Auto-detect JDK (17+ required to launch Gradle 9; Gradle foojay toolchain auto-provisions JDK 21)
 if (-not $env:JAVA_HOME -or -not (Test-Path (Join-Path $env:JAVA_HOME "bin\javac.exe"))) {
     $jdkCandidates = @(
-        Get-ChildItem -Path "C:\Program Files\Microsoft\jdk-*" -ErrorAction SilentlyContinue
+        Get-ChildItem -Path "$env:USERPROFILE\.gradle\jdks\*" -ErrorAction SilentlyContinue
         Get-ChildItem -Path "C:\Program Files\Eclipse Adoptium\jdk-*" -ErrorAction SilentlyContinue
+        Get-ChildItem -Path "C:\Program Files\Microsoft\jdk-*" -ErrorAction SilentlyContinue
         Get-ChildItem -Path "C:\Program Files\Java\jdk-*" -ErrorAction SilentlyContinue
     ) | Sort-Object Name -Descending
     foreach ($cand in $jdkCandidates) {
@@ -24,17 +25,19 @@ $SDK = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, (Join-Path $env:LOCALAPPDATA 
 if (-not $SDK) {
     throw "Android SDK not found. Please set ANDROID_HOME or ANDROID_SDK_ROOT."
 }
+$env:ANDROID_HOME = $SDK
+$env:ANDROID_SDK_ROOT = $SDK
 
 $BT = Get-ChildItem -Path (Join-Path $SDK "build-tools") -Directory -ErrorAction SilentlyContinue |
     Sort-Object { [version]($_.Name -replace '-.*$', '') } -Descending |
     Select-Object -First 1 -ExpandProperty FullName
-if (-not $BT -or -not (Test-Path (Join-Path $BT "aapt2.exe"))) {
-    throw "Android SDK build-tools (with aapt2.exe) not found under $SDK\build-tools"
+if (-not $BT -or -not (Test-Path (Join-Path $BT "d8.bat"))) {
+    throw "Android SDK build-tools (with d8.bat) not found under $SDK\build-tools"
 }
 
 $ANDROID_JAR = Get-ChildItem -Path (Join-Path $SDK "platforms") -Directory -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '^android-(\d+)$' -and [int]$Matches[1] -ge 30 } |
-    Sort-Object { [int]($_.Name -replace '^android-', '') } -Descending |
+    Where-Object { $_.Name -match '^android-(\d+)' -and [int]$Matches[1] -ge 30 } |
+    Sort-Object { [double]($_.Name -replace '^android-', '' -replace '-.*$', '') } -Descending |
     ForEach-Object { Join-Path $_.FullName "android.jar" } |
     Where-Object { Test-Path $_ } |
     Select-Object -First 1
@@ -47,103 +50,69 @@ Write-Host "Using JDK: $env:JAVA_HOME"
 Write-Host "Using Build-Tools: $BT"
 Write-Host "Using android.jar: $ANDROID_JAR"
 
-$V3 = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BUILD = Join-Path $V3 "build"
-if (Test-Path $BUILD) { Remove-Item -Recurse -Force $BUILD }
-New-Item -ItemType Directory -Path "$BUILD\bridge_classes" | Out-Null
-New-Item -ItemType Directory -Path "$BUILD\helper_res_zip" | Out-Null
-New-Item -ItemType Directory -Path "$BUILD\helper_gen" | Out-Null
-New-Item -ItemType Directory -Path "$BUILD\helper_classes" | Out-Null
-New-Item -ItemType Directory -Path "$BUILD\helper_dex" | Out-Null
-New-Item -ItemType Directory -Path "$BUILD\out" | Out-Null
+$ROOT = Split-Path -Parent $MyInvocation.MyCommand.Path
+$BUILD = Join-Path $ROOT "build"
+New-Item -ItemType Directory -Force "$BUILD\bridge_classes" | Out-Null
+New-Item -ItemType Directory -Force "$BUILD\out" | Out-Null
+Remove-Item -Recurse -Force "$BUILD\bridge_classes\*" -ErrorAction SilentlyContinue
 
 Write-Host "=== 1. Compiling ExtBridge daemon -> extbridge.jar ==="
-& javac -encoding UTF-8 --release 11 -cp $ANDROID_JAR -d "$BUILD\bridge_classes" "$V3\bridge\src\com\extbridge\daemon\ExtBridge.java"
+& javac -encoding UTF-8 --release 11 -cp $ANDROID_JAR -d "$BUILD\bridge_classes" "$ROOT\bridge\src\com\extbridge\daemon\ExtBridge.java"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $bridgeClasses = Get-ChildItem -Recurse -Filter "*.class" "$BUILD\bridge_classes" | ForEach-Object { $_.FullName }
 & "$BT\d8.bat" --min-api 30 --output "$BUILD\out\extbridge.jar" @bridgeClasses
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "=== 2. Compiling Android resources with aapt2 ==="
-& "$BT\aapt2.exe" compile --dir "$V3\helper\res" -o "$BUILD\res.zip"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$genAssetsDir = Join-Path $ROOT "helper\assets"
+New-Item -ItemType Directory -Force $genAssetsDir | Out-Null
+Copy-Item -Path "$BUILD\out\extbridge.jar" -Destination "$genAssetsDir\extbridge.jar" -Force
 
-& "$BT\aapt2.exe" link `
-    -o "$BUILD\unaligned.apk" `
-    --manifest "$V3\helper\AndroidManifest.xml" `
-    -I $ANDROID_JAR `
-    --min-sdk-version 30 `
-    --target-sdk-version 35 `
-    --java "$BUILD\helper_gen" `
-    "$BUILD\res.zip"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# Write local.properties for Gradle Android SDK discovery
+$sdkEscaped = $SDK -replace '\\', '\\'
+"sdk.dir=$sdkEscaped" | Set-Content -Path (Join-Path $ROOT "local.properties") -Encoding UTF8
 
-Write-Host "=== 3. Compiling Helper Java sources ==="
-$javaFiles = @(Get-ChildItem -Recurse -Filter "*.java" "$V3\helper\src" | ForEach-Object { $_.FullName })
-$javaFiles += @(Get-ChildItem -Recurse -Filter "*.java" "$BUILD\helper_gen" | ForEach-Object { $_.FullName })
-& javac -encoding UTF-8 --release 11 -cp $ANDROID_JAR -d "$BUILD\helper_classes" @javaFiles
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-& jar cf "$BUILD\helper_classes.jar" -C "$BUILD\helper_classes" .
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-& "$BT\d8.bat" --min-api 30 --lib $ANDROID_JAR --output "$BUILD\helper_dex" "$BUILD\helper_classes.jar"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-Write-Host "=== 4. Packaging, aligning, and signing exthelper.apk ==="
-python -c "
-import zipfile, os
-b = r'$BUILD'
-root = r'$V3'
-src = os.path.join(b, 'unaligned.apk')
-dst = os.path.join(b, 'withdex.apk')
-dex = os.path.join(b, 'helper_dex', 'classes.dex')
-jar = os.path.join(b, 'out', 'extbridge.jar')
-libadb = os.path.join(root, 'helper', 'jniLibs', 'arm64-v8a', 'libadb.so')
-if not os.path.exists(libadb):
-    raise FileNotFoundError('Missing native adb binary: ' + libadb)
-with zipfile.ZipFile(src, 'r') as zin, zipfile.ZipFile(dst, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-    for item in zin.infolist():
-        if item.filename in ('classes.dex', 'assets/extbridge.jar', 'lib/arm64-v8a/libadb.so'): continue
-        comp = zipfile.ZIP_STORED if item.filename.endswith(('.arsc', '.png')) else zipfile.ZIP_DEFLATED
-        zout.writestr(item.filename, zin.read(item.filename), compress_type=comp)
-    zout.write(dex, 'classes.dex', compress_type=zipfile.ZIP_STORED)
-    zout.write(jar, 'assets/extbridge.jar', compress_type=zipfile.ZIP_DEFLATED)
-    zout.write(libadb, 'lib/arm64-v8a/libadb.so', compress_type=zipfile.ZIP_DEFLATED)
-print('Packed classes.dex + assets/extbridge.jar + libadb.so OK')
-"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-& "$BT\zipalign.exe" -f -p 4 "$BUILD\withdex.apk" "$BUILD\aligned.apk"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-$customKs = Join-Path $V3 "exthelper.p12"
-if ($env:EXTBRIDGE_KEYSTORE -and (Test-Path $env:EXTBRIDGE_KEYSTORE)) {
-    $ksPath = $env:EXTBRIDGE_KEYSTORE
-    $ksPass = if ($env:EXTBRIDGE_KEYSTORE_PASS) { $env:EXTBRIDGE_KEYSTORE_PASS } else { "extbridge" }
-} elseif (Test-Path $customKs) {
-    $ksPath = $customKs
-    $ksPass = "extbridge"
-} else {
-    $ksPath = Join-Path $BUILD "debug.keystore"
-    $ksPass = "android"
-    Write-Host "No local exthelper.p12 found; generating temporary debug keystore..."
-    & keytool -genkeypair -v -keystore $ksPath -storetype PKCS12 -alias androiddebugkey `
-        -keyalg RSA -keysize 2048 -validity 10000 `
-        -storepass $ksPass -keypass $ksPass -dname "CN=ExtBridge Debug,O=ExtBridge,C=US" | Out-Null
+Write-Host "=== 2. Building Helper APK with Gradle + Jetpack Compose + Miuix ==="
+Push-Location $ROOT
+try {
+    $gradleArgs = @(":helper:assembleRelease", "--console=plain")
+    if ($env:EXTBRIDGE_ALLOW_UNSIGNED_RELEASE -eq "1") {
+        $gradleArgs += "-PallowUnsignedRelease=true"
+    }
+    & "$ROOT\gradlew.bat" @gradleArgs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} finally {
+    Pop-Location
 }
 
-& "$BT\apksigner.bat" sign `
-    --ks $ksPath `
-    --ks-type PKCS12 `
-    --ks-pass "pass:$ksPass" `
-    --v1-signing-enabled true `
-    --v2-signing-enabled true `
-    --v3-signing-enabled true `
-    --out "$BUILD\out\exthelper.apk" `
-    "$BUILD\aligned.apk"
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$EXPECTED_CERT_SHA256 = "e4f67b3012a16633006c64bfc9d5a95c7bdda10826bd729777c2a3066f49117c"
+$requireReleaseKey = ($env:EXTBRIDGE_REQUIRE_RELEASE_KEY -eq "1") -or ($env:GITHUB_REF -like "refs/tags/v*")
+Remove-Item -Force "$BUILD\out\exthelper.apk", "$BUILD\out\exthelper-unsigned.apk" -ErrorAction SilentlyContinue
+
+$signedApk = Get-ChildItem -Path "$ROOT\helper\build\outputs\apk\release" -Filter "*-release.apk" -ErrorAction SilentlyContinue | Select-Object -First 1
+$unsignedApk = Get-ChildItem -Path "$ROOT\helper\build\outputs\apk\release" -Filter "*-unsigned.apk" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+if ($signedApk) {
+    $apksigner = Join-Path $BT "apksigner.bat"
+    if (Test-Path $apksigner) {
+        $certOut = & $apksigner verify --print-certs $signedApk.FullName 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            throw "APK signature verification failed:`n$certOut"
+        }
+        if (($env:ALLOW_CUSTOM_RELEASE_CERT -ne "1") -and ($certOut -notmatch $EXPECTED_CERT_SHA256)) {
+            throw "APK signer SHA-256 does not match official release certificate ($EXPECTED_CERT_SHA256):`n$certOut"
+        }
+    }
+    Copy-Item -Path $signedApk.FullName -Destination "$BUILD\out\exthelper.apk" -Force
+} elseif ($unsignedApk) {
+    if ($requireReleaseKey) {
+        throw "Official release build requires release signing key, but only unsigned APK was produced."
+    }
+    Write-Warning "No release keystore configured; produced unsigned build\out\exthelper-unsigned.apk (for verification only)."
+    Copy-Item -Path $unsignedApk.FullName -Destination "$BUILD\out\exthelper-unsigned.apk" -Force
+} else {
+    throw "Gradle assembleRelease succeeded, but no APK found in helper\build\outputs\apk\release"
+}
 
 Write-Host "=== BUILD COMPLETE ==="
 Get-ChildItem "$BUILD\out" | Select-Object Name, Length

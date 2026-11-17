@@ -1,12 +1,17 @@
-# ExtBridge (`v3.4.2`) — Android 免 Root Type-C 类 DeX 扩展桌面与增强镜像副屏系统
+# ExtBridge (`v3.5.3`) — Android 免 Root Type-C 类 DeX 扩展桌面与增强镜像副屏系统
 
-> **无需 Root · 单个 APK 自激活 · 支持「DeX 独立扩展桌面」与「增强原生镜像信息副屏」双工作模式 · [📖 完整图文使用说明书](docs/USER_GUIDE.md) · [📝 v3.4.2 更新文档](docs/RELEASE_v3.4.2.md)**
+> **无需 Root · 单个 APK 自激活 · Xiaomi HyperOS 原生澎湃视觉 (`Compose + Miuix`) · 支持「DeX 独立扩展桌面」与「增强原生镜像信息副屏」双工作模式 · [📖 完整图文使用说明书](docs/USER_GUIDE.md) · [📝 v3.5.3 更新文档](docs/RELEASE_v3.5.3.md)**
 
 许多 Android 手机与平板（如小米 / REDMI 在 HyperOS 下）连接 Type-C 显示器时，默认仅提供画面受限的**屏幕镜像（Mirroring）**，主屏与副屏比例割裂且两侧留下大片空白黑边。**ExtBridge** 通过 Shell 权限守护进程接管外接物理屏，不仅能够呈现类似 Samsung DeX 的**独立扩展桌面、自由分屏与一键主屏黑屏省电**，还能将传统镜像模式下多出的黑边改造为**支持主题换肤、系统桌面小组件、交互控制与外置鼠标自由跨屏的增强信息侧边栏**。
 
 ---
 
-## ✨ 核心特性 & 新增功能全览 (`v3.4.2`)
+## ✨ 核心特性 & 新增功能全览 (`v3.5.3`)
+
+### 0. 🎨 全新 Xiaomi HyperOS 原生澎湃界面重构、舞台动效与全周边联动 (`v3.5.3`)
+- **主控台与大触摸板 (`Jetpack Compose + Miuix 0.9.4`)**：彻底告别单页臃肿堆砌与彩虹按钮，支持 **平板横屏左侧 `NavigationRail` 双栏工作台** 与 **手机竖屏可折叠大标题 `TopAppBar` + 底部四栏 `NavigationBar`** 自适应切换，内置**跟随系统 / 澎湃浅色 / 澎湃深色**三态外观；提供 `2×2` 控制中心快捷磁贴、可视化镜像布局示意图、关键点吸附 DPI 滑块与独立一级「分应用显示规则」搜索页。
+- **HyperOS 2.0 级窗口最小化/恢复与分屏过渡动画 (`StageTransitionView`)**：新增跨进程零拷贝 `HardwareBuffer` `TaskSnapshot` 快照通道，支持点击 Dock 图标退回后台微弧收缩形变、后台应用弹簧展开、分屏比例切换双窗同步形变与左右/上下互换立体交叉动画。
+- **全周边界面线性矢量联动（零 Emoji）**：外接屏 DeX 底部 Dock、HyperOS 风格 `#0D84FF` 快捷控制中心浮窗、自由分屏比例菜单、扩展桌面启动器顶栏、`SideControlActivity` 副屏直控以及镜像边栏全部 14 款预设信息卡片均统一采用抗锯齿线性矢量图标与澎湃圆角卡片视觉。
 
 ### 1. 🖥️ 增强原生镜像模式：把黑边改造成「信息副屏 + 小组件工作台」
 针对 `16:10` / `3:2` 平板或手机镜像至 `16:9` 显示器产生的左右黑边，ExtBridge 原生镜像模式现已全面重塑为**可定制、可交互的信息扩展副屏**：
@@ -68,29 +73,34 @@
 │   └── src/com/extbridge/daemon/
 │       └── ExtBridge.java                   # 物理屏接管、VirtualDisplay/SurfaceControl 投射、
 │                                            # Binder IPC (UID ACL 鉴权)、分屏/键鼠跨屏注入、亮度管理
-├── helper/                                  # Android 客户端 App (com.extbridge.helper)
-│   ├── AndroidManifest.xml                  # 清单声明、版本号 (v3.4.2 / code 21) 与 ControlReceiver 契约
+├── helper/                                  # Android 客户端 App (com.extbridge.helper · Kotlin + Compose + Miuix)
+│   ├── build.gradle.kts                     # AGP 9 + Compose + Miuix 0.9.4 + R8 瘦身配置 (v3.5.3 / code 25)
+│   ├── AndroidManifest.xml                  # 清单声明与 ControlReceiver 契约
 │   ├── jniLibs/arm64-v8a/libadb.so          # 内置 arm64 adb 二进制，供免电脑无线调试自激活使用
 │   ├── res/
 │   └── src/com/extbridge/helper/
-│       ├── MainActivity.java                # 控制台主界面（分辨率/DPI/旋转、镜像主题/组件、激活引导）
+│       ├── MainActivity.kt                  # HyperOS 澎湃风格主控台（响应式双栏/底栏、Miuix 抽屉与分应用规则）
+│       ├── TouchpadActivity.kt              # HyperOS 风格大触摸板与远程输入法转发
+│       ├── ui/                              # ExtVectorIcons 线性图标库、ExtHyperTheme 与 Miuix 弹窗组件
+│       ├── HyperUi.java                     # 原生 View 浮层共享线性矢量图标与澎湃色彩引擎
+│       ├── StageTransitionView.java         # HyperOS 2.0 级窗口最小化/恢复与分屏舞台过渡动效引擎
 │       ├── LauncherActivity.java            # 外接屏独立桌面启动器（壁纸同步、拼音检索、分屏/兼容菜单）
-│       ├── BridgeService.java               # 核心前台服务（Dock、Flyout、黑屏遮罩、镜像信息栏、光标/边缘捕获）
-│       ├── TouchpadActivity.java            # 手机/平板端大触摸板与软键盘输入转发
+│       ├── BridgeService.java               # 核心前台服务（澎湃 Dock、控制中心浮窗、黑屏遮罩、镜像信息栏、光标）
 │       ├── SideControlActivity.java         # 主屏镜像「副屏直控」交互页面（无键鼠手指点选侧边栏）
 │       ├── SideMouseCaptureActivity.java    # 镜像边缘物理鼠标捕获与跨屏边界协同
 │       ├── BridgeClient.java                # Binder IPC 客户端封装、主题/预设/比例模型与自动重连
 │       ├── BridgeProvider.java              # 零延迟安全分发 Binder 句柄（UID 白名单鉴权）
-│       ├── ControlReceiver.java             # `goAsync()` 异步后台广播控制接收器
+│       ├── ControlReceiver.java             # `goAsync()` 异步后台广播控制接收器（含发送方 UID 鉴权）
 │       ├── NavAssistService.java            # 无障碍辅助服务（高优先级黑屏遮罩、边缘叠加、手势穿透）
 │       ├── AdbBootstrap.java                # mDNS 自动发现、无线调试配对连接、守护进程拉起
 │       └── AdbPairingReceiver.java          # 通知栏 6 位配对码快捷响应
 ├── docs/
 │   ├── USER_GUIDE.md                        # 完整图文使用说明书
-│   ├── RELEASE_v3.4.2.md                    # v3.4.2 版本发布与更新说明
+│   ├── RELEASE_v3.5.3.md                    # v3.5.3 版本发布与更新说明
 │   └── images/                              # GitHub 文档实机截图素材
-├── .github/workflows/build.yml              # GitHub Actions 云端自动编译打包与 Release 工作流
-├── build_v3.ps1                             # Windows 一键编译打包脚本（直接调 javac/d8/aapt2，无需 Gradle）
+├── .github/workflows/build.yml              # GitHub Actions 云端自动编译打包与 Release 工作流（SHA 锁定与最小权限）
+├── THIRD_PARTY_NOTICES.md                   # 第三方开源组件与内置 libadb.so 来源、哈希及许可证声明
+├── build_v3.ps1                             # Windows 一键全自动编译打包脚本（extbridge.jar + Gradle R8 Release）
 └── start_extbridge.sh                       # 手机/ADB 手动启动守护进程脚本
 ```
 
@@ -101,27 +111,27 @@
 详细图文步骤与各模式操作说明请阅读 **[📖 docs/USER_GUIDE.md](docs/USER_GUIDE.md)**。
 
 ### 核心 3 步：
-1. 安装 `ExtBridge_v3.4.2.apk`，首次打开按提示授予 **通知**、**悬浮窗** 与 **无障碍服务 (`ExtBridge 平板辅助手势`)** 权限（小米等设备建议在开发者选项开启「USB 调试（安全设置）」以允许点击注入）。
+1. 安装 `ExtBridge_v3.5.3.apk`，首次打开按提示授予 **通知**、**悬浮窗** 与 **无障碍服务 (`ExtBridge 平板辅助手势`)** 权限（小米等设备建议在开发者选项开启「USB 调试（安全设置）」以允许点击注入）。
 2. 在激活弹窗中任选其一启动守护进程：
    - **免 Root 本机无线调试**：打开系统无线调试后在通知栏直接填 6 位配对码自激活；
-   - **电脑 ADB 一键命令**：
+   - **电脑 ADB 一键命令**（零宿主变量展开，兼容 Windows CMD / PowerShell 与 Linux / macOS Bash / Zsh）：
      ```bash
-     adb shell "(pm path com.extbridge.helper | head -n1 | cut -d: -f2; echo assets/extbridge.jar) | xargs unzip -p > /data/local/tmp/extbridge.jar && chmod 644 /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && appops set com.extbridge.helper 10021 allow 2>/dev/null; appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null; pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null; dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1; pkill -f '^app_process.*ExtBridge' 2>/dev/null; sleep 0.2; CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &"
+     adb shell "rm -f /data/local/tmp/extb_src.apk /data/local/tmp/extbridge.jar.new && pm path com.extbridge.helper | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/extb_src.apk && test -s /data/local/tmp/extb_src.apk && unzip -p /data/local/tmp/extb_src.apk assets/extbridge.jar > /data/local/tmp/extbridge.jar.new && rm -f /data/local/tmp/extb_src.apk && test -s /data/local/tmp/extbridge.jar.new && unzip -tq /data/local/tmp/extbridge.jar.new >/dev/null 2>&1 && chmod 644 /data/local/tmp/extbridge.jar.new && timeout 6 env CLASSPATH=/data/local/tmp/extbridge.jar.new app_process /data/local/tmp com.extbridge.daemon.ExtBridge --verify-helper >/dev/null 2>&1 && (timeout 8 env CLASSPATH=/data/local/tmp/extbridge.jar.new app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true) && (pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1 && (pkill -f '^app_process.*ExtBridge' 2>/dev/null || true) && sleep 1 && (pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true) || true) && rm -f /data/local/tmp/extbridge.jar && mv -f /data/local/tmp/extbridge.jar.new /data/local/tmp/extbridge.jar && test -s /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && (appops set com.extbridge.helper 10021 allow 2>/dev/null || true) && (appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null || true) && (pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null || true) && (dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1 || true) && (CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &)"
      ```
-   - **已 Root 设备**：一键授权后守护进程自动降权至 `uid=2000 shell` 运行。
+   - **已 Root 设备**：一键授权后先切至 `shell (uid=2000)` 校验哈希与证书，守护进程强制降权运行（失败即中止退出）。
 3. 插上 Type-C 显示器即可在控制台或快捷栏随时切换 **DeX 独立桌面 / 自由分屏 / 增强原生镜像 / 一键黑屏省电**。
 
 ---
 
 ## 🛠️ 从源码编译
 
-Windows 下只需 **JDK 17+** 与 **Android SDK (`build-tools` + `platforms/android-35`)**，无需 Gradle：
+Windows 下具备 **JDK 17+**（Gradle Toolchain 将自动拉取 JDK 21）与 **Android SDK (`build-tools/37.0.0` + `platforms/android-37.0`)** 即可一键编译：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build_v3.ps1
 ```
 
-输出产物位于 `build\out\extbridge.jar` 与 `build\out\exthelper.apk`。完整版本更新历史请见 [CHANGELOG.md](CHANGELOG.md)。
+输出产物位于 `build\out\extbridge.jar` 与 `build\out\exthelper.apk`（Release 构建默认要求官方签名证书 `exthelper.p12` / `EXTBRIDGE_KEYSTORE`，绝不回退 Debug 签名；如需无密钥可复现构建校验，可设置 `$env:EXTBRIDGE_ALLOW_UNSIGNED_RELEASE="1"` 生成 `exthelper-unsigned.apk`）。完整版本更新历史请见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -132,5 +142,5 @@ powershell -ExecutionPolicy Bypass -File .\build_v3.ps1
 
 ---
 
-## ⚠️ 开源协议
-基于 [MIT License](LICENSE) 开源。
+## ⚠️ 开源协议与第三方声明
+基于 [MIT License](LICENSE) 开源；内置原生 `libadb.so` 及第三方开源库来源、哈希与许可证详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

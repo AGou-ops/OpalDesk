@@ -36,7 +36,13 @@ public class BridgeProvider extends ContentProvider {
                 return denied;
             }
             IBinder b = extras.getBinder("cb");
+            boolean descOk = false;
             if (b != null && b.pingBinder()) {
+                try {
+                    descOk = BridgeClient.BINDER_DESC.equals(b.getInterfaceDescriptor());
+                } catch (Throwable ignored) {}
+            }
+            if (descOk) {
                 BridgeClient.setBinder(b);
                 BridgeService.ensureStarted(getContext());
                 BridgeService.refreshFromReceiver(getContext());
@@ -45,6 +51,27 @@ public class BridgeProvider extends ContentProvider {
                 ok.putBinder("proc", sProcToken);
                 return ok;
             }
+        } else if ("syncState".equals(method)) {
+            android.content.Context ctx = getContext();
+            if (ctx != null && !BridgeService.sUserStopping) {
+                BridgeService.refreshFromReceiver(ctx);
+                try {
+                    android.content.Intent syncIntent = new android.content.Intent("com.extbridge.helper.STATE_SYNC")
+                            .setPackage(ctx.getPackageName());
+                    ctx.sendBroadcast(syncIntent);
+                } catch (Throwable ignored) {}
+            }
+            Bundle ok = new Bundle();
+            ok.putBoolean("ok", true);
+            return ok;
+        } else if ("mirEdgeCapture".equals(method) && extras != null) {
+            if (!BridgeService.sUserStopping) {
+                boolean enter = extras.getBoolean("enter", true);
+                BridgeService.onEdgeCaptureFromDaemon(enter);
+            }
+            Bundle ok = new Bundle();
+            ok.putBoolean("ok", true);
+            return ok;
         }
         return new Bundle();
     }

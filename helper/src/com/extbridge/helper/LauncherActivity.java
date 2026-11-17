@@ -81,13 +81,46 @@ public class LauncherActivity extends Activity {
     private int mLastLayoutW = 0;
     private int mLastLayoutH = 0;
     private static String sPendingQuery = "";
+    private static volatile LauncherActivity sResumedInstance;
+    private AlertDialog mOpenDialog;
     private Map<String, Integer> mAppModes = new HashMap<>();
+    private volatile BridgeClient.Status mCachedStatus = new BridgeClient.Status();
+
+    private void refreshStatusAsync() {
+        new Thread(() -> {
+            BridgeClient.Status st = BridgeClient.getStatus();
+            mCachedStatus = st;
+            runOnUiThread(() -> {
+                if (!isFinishing() && !isDestroyed()) {
+                    adjustColumns();
+                    refreshHeader();
+                }
+            });
+        }, "ExtLauncherSync").start();
+    }
+
+    public static boolean shouldConsumeRightClickAt(int screenX, int screenY) {
+        LauncherActivity act = sResumedInstance;
+        if (act == null || act.isFinishing() || act.isDestroyed()) return false;
+        AlertDialog dlg = act.mOpenDialog;
+        if (dlg != null && dlg.isShowing()) return false;
+        GridView grid = act.mGrid;
+        if (grid == null || grid.getVisibility() != View.VISIBLE || grid.getWidth() <= 0 || grid.getHeight() <= 0) {
+            return false;
+        }
+        int[] loc = new int[2];
+        grid.getLocationOnScreen(loc);
+        int lx = screenX - loc[0];
+        int ly = screenY - loc[1];
+        if (lx < 0 || ly < 0 || lx >= grid.getWidth() || ly >= grid.getHeight()) return false;
+        int pos = grid.pointToPosition(lx, ly);
+        return pos != android.widget.AdapterView.INVALID_POSITION && pos >= 0 && pos < act.mApps.size();
+    }
 
     private final BroadcastReceiver mSyncRx = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
-            refreshHeader();
-            adjustColumns();
+            refreshStatusAsync();
             refreshAppModesAsync();
         }
     };
@@ -104,7 +137,9 @@ public class LauncherActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         mAppliedDensityDpi = getResources().getConfiguration().densityDpi;
-        extractBinder(getIntent());
+        if (BridgeClient.getService() == null) {
+            BridgeClient.requestBinder(this);
+        }
         BridgeService.ensureStarted(this);
         buildUi();
         if (!sPendingQuery.isEmpty() && mSearchInput != null) {
@@ -113,16 +148,44 @@ public class LauncherActivity extends Activity {
             mSearchInput.setText(mQuery);
         }
         try {
-            registerReceiver(mSyncRx, new IntentFilter("com.extbridge.helper.STATE_SYNC"), RECEIVER_EXPORTED);
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(mSyncRx, new IntentFilter("com.extbridge.helper.STATE_SYNC"), RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(mSyncRx, new IntentFilter("com.extbridge.helper.STATE_SYNC"));
+            }
         } catch (Throwable ignored) {}
         loadAppsAsync();
         loadWallpaperAsync(false);
         BridgeClient.setOnBinderReady(mBinderReadyCb);
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                        android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                        this::handleDesktopBack);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void handleDesktopBack() {
+        if (mQuery != null && !mQuery.isEmpty()) {
+            clearSearch();
+            return;
+        }
+        if (mSearchInput != null && mSearchInput.hasFocus()) {
+            mSearchInput.clearFocus();
+            if (mRoot != null) mRoot.requestFocus();
+        }
+        // Root DeX desktop: never finish() LauncherActivity on Back
+    }
+
+    @Override
+    public void onBackPressed() {
+        handleDesktopBack();
     }
 
     private final Runnable mBinderReadyCb = () -> runOnUiThread(() -> {
         if (!isFinishing() && !isDestroyed()) {
-            refreshHeader();
+            refreshStatusAsync();
             loadWallpaperAsync(false);
         }
     });
@@ -134,14 +197,47 @@ public class LauncherActivity extends Activity {
         BridgeService.setLauncherOverlayHost(mOverlayHost, getDisplay() != null ? getDisplay().getDisplayId() : -1);
     }
 
+    private boolean mWasStopped = false;
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        sResumedInstance = this;
+        if (mWasStopped && mContent != null) {
+            mWasStopped = false;
+            mContent.animate().cancel();
+            mContent.setScaleX(0.965f);
+            mContent.setScaleY(0.965f);
+            mContent.setAlpha(0.84f);
+            mContent.animate()
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .alpha(1f)
+                    .setDuration(220L)
+                    .setInterpolator(new android.view.animation.DecelerateInterpolator(1.6f))
+                    .start();
+        }
+        adjustColumns();
+        refreshHeader();
+        refreshStatusAsync();
+        loadWallpaperAsync(false);
+        refreshAppModesAsync();
+    }
+
     @Override
     protected void onStop() {
+        mWasStopped = true;
         BridgeService.clearLauncherOverlayHost(mOverlayHost);
         super.onStop();
     }
 
     @Override
     protected void onDestroy() {
+        if (sResumedInstance == this) sResumedInstance = null;
+        if (mOpenDialog != null) {
+            try { mOpenDialog.dismiss(); } catch (Throwable ignored) {}
+            mOpenDialog = null;
+        }
         BridgeClient.removeOnBinderReady(mBinderReadyCb);
         BridgeService.clearLauncherOverlayHost(mOverlayHost);
         try { unregisterReceiver(mSyncRx); } catch (Throwable ignored) {}
@@ -160,24 +256,15 @@ public class LauncherActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        extractBinder(intent);
-    }
-
-    private void extractBinder(Intent i) {
-        if (i != null && i.getExtras() != null) {
-            android.os.IBinder cb = i.getExtras().getBinder("cb");
-            if (cb != null) BridgeClient.setBinder(cb);
+        if (BridgeClient.getService() == null) {
+            BridgeClient.requestBinder(this);
         }
-        if (BridgeClient.getService() == null) BridgeClient.requestBinder(this);
     }
 
     @Override
-    protected void onResume() {
-        super.onResume();
-        refreshHeader();
-        adjustColumns();
-        loadWallpaperAsync(false);
-        refreshAppModesAsync();
+    protected void onPause() {
+        if (sResumedInstance == this) sResumedInstance = null;
+        super.onPause();
     }
 
     @Override
@@ -190,6 +277,7 @@ public class LauncherActivity extends Activity {
         }
         adjustColumns();
         refreshHeader();
+        refreshStatusAsync();
     }
 
     @Override
@@ -267,14 +355,16 @@ public class LauncherActivity extends Activity {
         top.addView(mTitleView, tLp);
 
         mSplitBanner = new TextView(this);
-        mSplitBanner.setTextColor(0xFFBAE6FD);
+        mSplitBanner.setTextColor(Color.WHITE);
         mSplitBanner.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f);
         mSplitBanner.getPaint().setFakeBoldText(true);
-        mSplitBanner.setPadding(dp(9), dp(4), dp(9), dp(4));
+        mSplitBanner.setGravity(Gravity.CENTER_VERTICAL);
+        mSplitBanner.setPadding(dp(10), dp(4), dp(10), dp(4));
+        HyperUi.setStartIcon(mSplitBanner, HyperUi.ICON_SPLIT, Color.WHITE, 13f, 5f);
         GradientDrawable splitBanBg = new GradientDrawable();
-        splitBanBg.setColor(0x660284C7);
-        splitBanBg.setCornerRadius(dpF(14f));
-        splitBanBg.setStroke(1, 0x8838BDF8);
+        splitBanBg.setColor(0xCC0D84FF);
+        splitBanBg.setCornerRadius(dpF(15f));
+        splitBanBg.setStroke(1, 0x66FFFFFF);
         mSplitBanner.setBackground(splitBanBg);
         mSplitBanner.setVisibility(View.GONE);
         LinearLayout.LayoutParams sbanLp = new LinearLayout.LayoutParams(
@@ -282,25 +372,25 @@ public class LauncherActivity extends Activity {
         sbanLp.rightMargin = dp(8);
         top.addView(mSplitBanner, sbanLp);
 
-        // Frosted glass Search box container
+        // Frosted glass Search box container (HyperOS capsule)
         LinearLayout searchBox = new LinearLayout(this);
         searchBox.setOrientation(LinearLayout.HORIZONTAL);
         searchBox.setGravity(Gravity.CENTER_VERTICAL);
-        searchBox.setPadding(dp(11), dp(4), dp(9), dp(4));
+        searchBox.setPadding(dp(12), dp(4), dp(10), dp(4));
         GradientDrawable sbBg = new GradientDrawable();
-        sbBg.setColor(0x66121A2A);
-        sbBg.setCornerRadius(dpF(16f));
-        sbBg.setStroke(1, 0x48FFFFFF);
+        sbBg.setColor(0x72161922);
+        sbBg.setCornerRadius(dpF(18f));
+        sbBg.setStroke(1, 0x38FFFFFF);
         searchBox.setBackground(sbBg);
 
-        TextView searchIcon = new TextView(this);
-        searchIcon.setText("🔍");
-        searchIcon.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
-        searchIcon.setPadding(0, 0, dp(6), 0);
-        searchBox.addView(searchIcon);
+        ImageView searchIcon = new ImageView(this);
+        searchIcon.setImageDrawable(HyperUi.icon(this, HyperUi.ICON_SEARCH, 0xFFCBD5E1, 14f));
+        LinearLayout.LayoutParams siLp = new LinearLayout.LayoutParams(dp(15), dp(15));
+        siLp.rightMargin = dp(7);
+        searchBox.addView(searchIcon, siLp);
 
         mSearchInput = new EditText(this);
-        mSearchInput.setHint("搜索应用名 / 拼音首字母 / 包名 (回车打开)");
+        mSearchInput.setHint("搜索应用 / 拼音首字母 / 包名 (回车启动)");
         mSearchInput.setHintTextColor(0xFFAAB8CC);
         mSearchInput.setTextColor(Color.WHITE);
         mSearchInput.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
@@ -330,9 +420,9 @@ public class LauncherActivity extends Activity {
                 0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         mBtnClear = new TextView(this);
-        mBtnClear.setText("✕");
+        mBtnClear.setText("清空");
         mBtnClear.setTextColor(0xFFCBD5E1);
-        mBtnClear.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f);
+        mBtnClear.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
         mBtnClear.setPadding(dp(8), dp(2), dp(8), dp(2));
         mBtnClear.setVisibility(View.GONE);
         mBtnClear.setOnClickListener(v -> clearSearch());
@@ -343,14 +433,16 @@ public class LauncherActivity extends Activity {
         top.addView(searchBox, sbLp);
 
         mBtnModeTip = new TextView(this);
-        mBtnModeTip.setText("🧩 显示模式");
-        mBtnModeTip.setTextColor(0xFFBAE6FD);
+        mBtnModeTip.setText("应用规则");
+        mBtnModeTip.setTextColor(0xFFE2E8F0);
         mBtnModeTip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
+        mBtnModeTip.setGravity(Gravity.CENTER_VERTICAL);
         mBtnModeTip.setPadding(dp(11), dp(5), dp(11), dp(5));
+        HyperUi.setStartIcon(mBtnModeTip, HyperUi.ICON_SLIDERS, 0xFF7AC0FF, 13f, 5f);
         GradientDrawable mtBg = new GradientDrawable();
-        mtBg.setColor(0x550C4A6E);
-        mtBg.setCornerRadius(dpF(15f));
-        mtBg.setStroke(1, 0x5538BDF8);
+        mtBg.setColor(0x66161922);
+        mtBg.setCornerRadius(dpF(16f));
+        mtBg.setStroke(1, 0x38FFFFFF);
         mBtnModeTip.setBackground(mtBg);
         mBtnModeTip.setOnClickListener(v -> showAllAppModesPicker());
         LinearLayout.LayoutParams mtLp = new LinearLayout.LayoutParams(
@@ -359,18 +451,20 @@ public class LauncherActivity extends Activity {
         top.addView(mBtnModeTip, mtLp);
 
         mBtnWpRefresh = new TextView(this);
-        mBtnWpRefresh.setText("🖼 同步壁纸");
+        mBtnWpRefresh.setText("同步壁纸");
         mBtnWpRefresh.setTextColor(0xFFE2E8F0);
         mBtnWpRefresh.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
+        mBtnWpRefresh.setGravity(Gravity.CENTER_VERTICAL);
         mBtnWpRefresh.setPadding(dp(11), dp(5), dp(11), dp(5));
+        HyperUi.setStartIcon(mBtnWpRefresh, HyperUi.ICON_WALLPAPER, 0xFFE2E8F0, 13f, 5f);
         GradientDrawable wpBg = new GradientDrawable();
-        wpBg.setColor(0x55121A2A);
-        wpBg.setCornerRadius(dpF(15f));
-        wpBg.setStroke(1, 0x3AFFFFFF);
+        wpBg.setColor(0x66161922);
+        wpBg.setCornerRadius(dpF(16f));
+        wpBg.setStroke(1, 0x38FFFFFF);
         mBtnWpRefresh.setBackground(wpBg);
         mBtnWpRefresh.setOnClickListener(v -> {
             loadWallpaperAsync(true);
-            Toast.makeText(this, "正在同步平板原机壁纸...", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "正在同步主屏壁纸…", Toast.LENGTH_SHORT).show();
         });
         LinearLayout.LayoutParams wpLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -442,6 +536,7 @@ public class LauncherActivity extends Activity {
                 mRoot.post(() -> {
                     adjustColumns();
                     refreshHeader();
+                    refreshStatusAsync();
                 });
             }
         });
@@ -449,6 +544,7 @@ public class LauncherActivity extends Activity {
         mContent.requestFocus();
         adjustColumns();
         refreshHeader();
+        refreshStatusAsync();
     }
 
     private void loadWallpaperAsync(boolean force) {
@@ -496,7 +592,7 @@ public class LauncherActivity extends Activity {
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int winW = (mRoot != null && mRoot.getWidth() > 0) ? mRoot.getWidth() : dm.widthPixels;
         int winH = (mRoot != null && mRoot.getHeight() > 0) ? mRoot.getHeight() : dm.heightPixels;
-        BridgeClient.Status st = BridgeClient.getStatus();
+        BridgeClient.Status st = mCachedStatus;
         boolean singleEmpty = st.connected && st.splitActive == 1
                 && ((st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty())
                         != (st.splitSlot1Pkg == null || st.splitSlot1Pkg.isEmpty()));
@@ -523,7 +619,7 @@ public class LauncherActivity extends Activity {
 
     private void refreshHeader() {
         if (mHeaderInfo == null) return;
-        BridgeClient.Status st = BridgeClient.getStatus();
+        BridgeClient.Status st = mCachedStatus;
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int winW = (mRoot != null && mRoot.getWidth() > 0) ? mRoot.getWidth() : dm.widthPixels;
         int winH = (mRoot != null && mRoot.getHeight() > 0) ? mRoot.getHeight() : dm.heightPixels;
@@ -546,7 +642,7 @@ public class LauncherActivity extends Activity {
                 boolean port = st.virtH > st.virtW;
                 boolean slot0Empty = st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty();
                 String side = port ? (slot0Empty ? "上屏" : "下屏") : (slot0Empty ? "左屏" : "右屏");
-                mSplitBanner.setText("◫ 点选填入" + side);
+                mSplitBanner.setText("点选填入" + side);
                 mSplitBanner.setVisibility(View.VISIBLE);
             } else {
                 mSplitBanner.setVisibility(View.GONE);
@@ -560,7 +656,8 @@ public class LauncherActivity extends Activity {
             mHeaderInfo.setText(st.virtW + "×" + st.virtH + " · " + st.virtDpi + "dpi · "
                     + Math.round(st.virtFps) + "Hz · " + (st.inputToExt == 1 ? "扩展键鼠" : "平板键鼠"));
         } else {
-            mHeaderInfo.setText("Display #" + getDisplay().getDisplayId());
+            android.view.Display disp = getDisplay();
+            mHeaderInfo.setText("Display #" + (disp != null ? disp.getDisplayId() : 0));
         }
     }
 
@@ -618,35 +715,74 @@ public class LauncherActivity extends Activity {
     }
 
     private void launchApp(AppEntry e) {
-        try {
-            int dispId = getDisplay() != null ? getDisplay().getDisplayId() : 0;
-            Intent intent = new Intent(Intent.ACTION_MAIN);
-            intent.addCategory(Intent.CATEGORY_LAUNCHER);
-            intent.setComponent(new ComponentName(e.pkg, e.cls));
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            ActivityOptions opts = ActivityOptions.makeBasic();
-            boolean routeSettingsToTablet = !NavAssistService.isRunning()
-                    && ("com.android.settings".equals(e.pkg) || "com.miui.securitycenter".equals(e.pkg));
-            if (routeSettingsToTablet) {
+        if (e == null) return;
+        final int dispId = getDisplay() != null ? getDisplay().getDisplayId() : 0;
+        final boolean routeSettingsToTablet = !NavAssistService.isRunning()
+                && ("com.android.settings".equals(e.pkg) || "com.miui.securitycenter".equals(e.pkg));
+        if (routeSettingsToTablet) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_MAIN);
+                intent.addCategory(Intent.CATEGORY_LAUNCHER);
+                intent.setComponent(new ComponentName(e.pkg, e.cls));
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                ActivityOptions opts = ActivityOptions.makeBasic();
                 opts.setLaunchDisplayId(0);
                 Toast.makeText(this, "未开启无障碍：已在平板打开设置", Toast.LENGTH_SHORT).show();
-            } else if (dispId > 0) {
-                // Prefer daemon shell ATM launch on external VirtualDisplay so MIUIOP(10021) / background-start restrictions cannot silently drop launches.
-                if (BridgeClient.launchComponent(e.pkg, e.cls)) {
+                startActivity(intent, opts.toBundle());
+            } catch (Throwable ignored) {}
+            return;
+        }
+        new Thread(() -> {
+            try {
+                if (dispId > 0) {
+                    BridgeClient.Status st = BridgeClient.getStatus();
+                    mCachedStatus = st;
+                    if (st != null && st.connected && st.splitActive == 1) {
+                        boolean s0Empty = st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty();
+                        boolean s1Empty = st.splitSlot1Pkg == null || st.splitSlot1Pkg.isEmpty();
+                        if (s0Empty != s1Empty) {
+                            BridgeService.performAssignSplitFromUi(s0Empty ? 0 : 1, -1, e.pkg, e.cls);
+                            return;
+                        }
+                    }
+                    // Prefer daemon shell ATM launch on external VirtualDisplay so MIUIOP(10021) / background-start restrictions cannot silently drop launches.
+                    if (BridgeClient.launchComponent(e.pkg, e.cls)) {
+                        return;
+                    }
+                    final int mode = BridgeClient.prepareAppLaunch(e.pkg);
+                    runOnUiThread(() -> {
+                        try {
+                            Intent intent = new Intent(Intent.ACTION_MAIN);
+                            intent.addCategory(Intent.CATEGORY_LAUNCHER);
+                            intent.setComponent(new ComponentName(e.pkg, e.cls));
+                            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                            ActivityOptions opts = ActivityOptions.makeBasic();
+                            opts.setLaunchDisplayId(dispId);
+                            try {
+                                if (mode == BridgeClient.APP_MODE_LAND_FULL) {
+                                    opts.getClass().getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
+                                }
+                            } catch (Throwable ignored) {}
+                            startActivity(intent, opts.toBundle());
+                        } catch (Throwable t2) {
+                            new Thread(() -> BridgeClient.launchComponent(e.pkg, e.cls)).start();
+                        }
+                    });
                     return;
                 }
-                int mode = BridgeClient.prepareAppLaunch(e.pkg);
-                opts.setLaunchDisplayId(dispId);
-                try {
-                    if (mode == BridgeClient.APP_MODE_LAND_FULL) {
-                        opts.getClass().getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
-                    }
-                } catch (Throwable ignored) {}
+                runOnUiThread(() -> {
+                    try {
+                        Intent intent = new Intent(Intent.ACTION_MAIN);
+                        intent.addCategory(Intent.CATEGORY_LAUNCHER);
+                        intent.setComponent(new ComponentName(e.pkg, e.cls));
+                        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                        startActivity(intent);
+                    } catch (Throwable ignored) {}
+                });
+            } catch (Throwable t) {
+                BridgeClient.launchComponent(e.pkg, e.cls);
             }
-            startActivity(intent, opts.toBundle());
-        } catch (Throwable t) {
-            BridgeClient.launchComponent(e.pkg, e.cls);
-        }
+        }, "ExtAppLaunch").start();
     }
 
     private void refreshAppModesAsync() {
@@ -678,14 +814,14 @@ public class LauncherActivity extends Activity {
         });
         int count = sorted.size();
         String[] items = new String[count + 1];
-        items[0] = "↺ 全部恢复【跟随系统默认】（清除所有自定义兼容覆盖）";
+        items[0] = "全部恢复【跟随系统默认】（清除所有自定义兼容覆盖）";
         for (int i = 0; i < count; i++) {
             AppEntry ae = sorted.get(i);
             int m = getAppModeLocal(ae.pkg);
             items[i + 1] = ae.label + "  [" + BridgeClient.appModeLabel(m) + "]";
         }
-        new AlertDialog.Builder(this)
-                .setTitle("🧩 分应用显示模式（也可以在桌面图标上长按 / 鼠标右键设置）")
+        mOpenDialog = new AlertDialog.Builder(this)
+                .setTitle("分应用显示规则（可在桌面图标长按或鼠标右键设置）")
                 .setItems(items, (d, which) -> {
                     if (which == 0) {
                         new Thread(() -> {
@@ -702,6 +838,9 @@ public class LauncherActivity extends Activity {
                     }
                 })
                 .setNegativeButton("关闭", null)
+                .setOnDismissListener(d -> {
+                    if (mOpenDialog == d) mOpenDialog = null;
+                })
                 .show();
     }
 
@@ -710,8 +849,8 @@ public class LauncherActivity extends Activity {
         int cur = getAppModeLocal(e.pkg);
         android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
         boolean port = dm.heightPixels > dm.widthPixels;
-        String slot0Label = port ? "◫ 分屏：放到上屏（支持任意比例调节）" : "◫ 分屏：放到左屏（支持任意比例调节）";
-        String slot1Label = port ? "◫ 分屏：放到下屏（支持任意比例调节）" : "◫ 分屏：放到右屏（支持任意比例调节）";
+        String slot0Label = port ? "分屏：放入上屏（支持比例调节）" : "分屏：放入左屏（支持比例调节）";
+        String slot1Label = port ? "分屏：放入下屏（支持比例调节）" : "分屏：放入右屏（支持比例调节）";
         String[] labels = {
                 slot0Label,
                 slot1Label,
@@ -719,17 +858,14 @@ public class LauncherActivity extends Activity {
                 (cur == 1 ? "● " : "") + "强制横屏全屏（适合红果短剧等竖屏视频类 App）",
                 (cur == 2 ? "● " : "") + "竖屏居中兼容（适合拼多多等固定比例竖屏页面）"
         };
-        new AlertDialog.Builder(this)
+        mOpenDialog = new AlertDialog.Builder(this)
                 .setTitle(e.label + "\n" + e.pkg)
                 .setItems(labels, (dialog, which) -> {
                     if (which == 0 || which == 1) {
                         final int slot = which;
                         String sideTxt = port ? (slot == 0 ? "上屏" : "下屏") : (slot == 0 ? "左屏" : "右屏");
                         Toast.makeText(this, "已放入分屏【" + sideTxt + "】： " + e.label, Toast.LENGTH_SHORT).show();
-                        new Thread(() -> {
-                            BridgeClient.assignSplitSlot(slot, e.pkg, e.cls);
-                            runOnUiThread(() -> BridgeService.refreshFromReceiver(this));
-                        }).start();
+                        BridgeService.performAssignSplitFromUi(slot, -1, e.pkg, e.cls);
                         return;
                     }
                     final int chosen = which - 2;
@@ -744,6 +880,9 @@ public class LauncherActivity extends Activity {
                     }).start();
                 })
                 .setNegativeButton("取消", null)
+                .setOnDismissListener(d -> {
+                    if (mOpenDialog == d) mOpenDialog = null;
+                })
                 .show();
     }
 
@@ -833,10 +972,24 @@ public class LauncherActivity extends Activity {
             } else {
                 badge.setVisibility(View.GONE);
             }
+            card.setOnTouchListener((v, ev) -> {
+                if (ev != null && ev.getActionMasked() == MotionEvent.ACTION_DOWN
+                        && (ev.getButtonState() & MotionEvent.BUTTON_SECONDARY) != 0) {
+                    AlertDialog dlg = mOpenDialog;
+                    if (dlg == null || !dlg.isShowing()) {
+                        showAppModeDialog(e);
+                    }
+                    return true;
+                }
+                return false;
+            });
             card.setOnGenericMotionListener((v, ev) -> {
                 if (ev != null && ev.getActionMasked() == MotionEvent.ACTION_BUTTON_PRESS
                         && ev.getActionButton() == MotionEvent.BUTTON_SECONDARY) {
-                    showAppModeDialog(e);
+                    AlertDialog dlg = mOpenDialog;
+                    if (dlg == null || !dlg.isShowing()) {
+                        showAppModeDialog(e);
+                    }
                     return true;
                 }
                 return false;

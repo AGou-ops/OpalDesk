@@ -1,9 +1,12 @@
 # Build artifacts
 build/
+helper/build/
+helper/assets/extbridge.jar
 out/
 *.apk
 *.idsig
 *.jar
+!gradle/wrapper/gradle-wrapper.jar
 *.dex
 *.class
 *.ap_
@@ -23,7 +26,7 @@ out/
 .DS_Store
 Thumbs.db
 
-# IDE files
+# IDE & Gradle files
 .idea/
 .vscode/
 *.iml

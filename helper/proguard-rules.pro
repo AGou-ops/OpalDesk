@@ -1,0 +1,6 @@
+-keep class com.extbridge.** { *; }
+-keep interface com.extbridge.** { *; }
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-dontwarn com.extbridge.**
+-dontwarn android.**
+-dontwarn dalvik.**

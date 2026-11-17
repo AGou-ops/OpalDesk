@@ -25,9 +25,11 @@ import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
+import java.security.MessageDigest;
 import java.util.ArrayDeque;
 import java.util.Enumeration;
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -48,9 +50,11 @@ public final class AdbBootstrap {
     private static final int PAIR_NOTIF_ID = 3901;
     private static final String SERVICE_PAIRING = "_adb-tls-pairing._tcp.";
     private static final String SERVICE_CONNECT = "_adb-tls-connect._tcp.";
-    private static final String ADB_SERVER_PORT = "15037";
     private static final String PREFS_NAME = "extbridge_prefs";
     private static final String KEY_AUTO_ROOT = "auto_root_enabled";
+    private static final String KEY_AUTO_CLOSE_WIFI_ADB = "auto_close_wifi_adb";
+    private static String sActivePairSvcName = "";
+    private static String sActiveConnSvcName = "";
 
     private static final ExecutorService sExec = Executors.newSingleThreadExecutor();
     private static final Handler sMain = new Handler(Looper.getMainLooper());
@@ -79,6 +83,7 @@ public final class AdbBootstrap {
     private static final ArrayDeque<NsdServiceInfo> sResolveQueue = new ArrayDeque<>();
     private static boolean sResolving = false;
     private static DiscoveryListener sDiscListener;
+    private static volatile boolean sPairNotifShowing = false;
 
     private AdbBootstrap() {}
 
@@ -121,6 +126,14 @@ public final class AdbBootstrap {
         }
     }
 
+    public static synchronized void stopDiscoveryIfIdle() {
+        if (sPairNotifShowing) {
+            sDiscListener = null;
+            return;
+        }
+        stopDiscovery();
+    }
+
     public static synchronized void stopDiscovery() {
         sDiscListener = null;
         if (sNsd != null) {
@@ -154,13 +167,22 @@ public final class AdbBootstrap {
 
             @Override
             public void onServiceLost(NsdServiceInfo serviceInfo) {
+                String lostName = (serviceInfo != null && serviceInfo.getServiceName() != null)
+                        ? serviceInfo.getServiceName() : "";
                 synchronized (AdbBootstrap.class) {
                     if (isPairing) {
-                        sDiscState.pairingPort = 0;
+                        if (lostName.isEmpty() || sActivePairSvcName.isEmpty() || lostName.equals(sActivePairSvcName)) {
+                            sDiscState.pairingPort = 0;
+                            sActivePairSvcName = "";
+                            notifyDiscListener();
+                        }
                     } else {
-                        sDiscState.connectPort = 0;
+                        if (lostName.isEmpty() || sActiveConnSvcName.isEmpty() || lostName.equals(sActiveConnSvcName)) {
+                            sDiscState.connectPort = 0;
+                            sActiveConnSvcName = "";
+                            notifyDiscListener();
+                        }
                     }
-                    notifyDiscListener();
                 }
             }
         };
@@ -204,24 +226,69 @@ public final class AdbBootstrap {
         }
     }
 
+    private static boolean isLocalDeviceAddress(InetAddress addr) {
+        if (addr == null) return false;
+        if (addr.isLoopbackAddress()) return true;
+        try {
+            if (NetworkInterface.getByInetAddress(addr) != null) return true;
+        } catch (Throwable ignored) {}
+        String ip = addr.getHostAddress();
+        if (ip != null && ip.contains("%")) {
+            ip = ip.substring(0, ip.indexOf('%'));
+        }
+        return ip != null && ip.equals(getLocalIpv4());
+    }
+
+    private static boolean isAllowedLocalHost(String rawHost) {
+        if (rawHost == null) return false;
+        String h = rawHost.trim();
+        if (h.startsWith("[") && h.endsWith("]") && h.length() > 2) {
+            h = h.substring(1, h.length() - 1);
+        }
+        if (h.contains("%")) {
+            h = h.substring(0, h.indexOf('%'));
+        }
+        if (h.isEmpty()) return false;
+        if ("127.0.0.1".equals(h) || "localhost".equalsIgnoreCase(h) || "::1".equals(h)) {
+            return true;
+        }
+        // Only parse numeric IPv4/IPv6 literals so crafted strings never trigger external DNS resolution
+        if (!h.matches("^[0-9a-fA-F.:]+$")) {
+            return false;
+        }
+        try {
+            return isLocalDeviceAddress(InetAddress.getByName(h));
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static void handleResolved(NsdServiceInfo resolved) {
         String type = resolved.getServiceType();
         if (type == null) type = "";
         InetAddress addr = resolved.getHost();
+        if (!isLocalDeviceAddress(addr)) return;
         String host = addr != null ? addr.getHostAddress() : "";
         if (host != null && host.contains("%")) {
             host = host.substring(0, host.indexOf('%'));
         }
+        if (host != null && host.contains(":") && !host.startsWith("[")) {
+            // Prefer local IPv4 for adb connect/pair when link-local IPv6 scope was stripped
+            host = getLocalIpv4();
+        }
         int port = resolved.getPort();
         if (port <= 0) return;
+        String svcName = resolved.getServiceName() != null ? resolved.getServiceName() : "";
 
         synchronized (AdbBootstrap.class) {
             if (type.contains("pairing")) {
                 sDiscState.pairingHost = host != null ? host : "";
                 sDiscState.pairingPort = port;
+                sActivePairSvcName = svcName;
             } else if (type.contains("connect")) {
                 sDiscState.connectHost = host != null ? host : "";
                 sDiscState.connectPort = port;
+                sActiveConnSvcName = svcName;
             }
             notifyDiscListener();
         }
@@ -268,7 +335,60 @@ public final class AdbBootstrap {
     }
 
     public static String buildPcAdbCommand() {
-        return "adb shell \"(pm path com.extbridge.helper | head -n1 | cut -d: -f2; echo assets/extbridge.jar) | xargs unzip -p > /data/local/tmp/extbridge.jar && chmod 644 /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && appops set com.extbridge.helper 10021 allow 2>/dev/null; appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null; pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null; dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1; am broadcast -a com.extbridge.daemon.SHUTDOWN -p com.android.shell 2>/dev/null; am broadcast -a com.extbridge.daemon.SHUTDOWN 2>/dev/null; sleep 0.6; pkill -f '^app_process.*ExtBridge' 2>/dev/null; sleep 0.3; CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &\"";
+        // Zero '$', zero backticks, zero escaped inner quotes: runs identically in Bash, Zsh, sh, PowerShell, and cmd.exe!
+        return "adb shell \"rm -f /data/local/tmp/extb_src.apk /data/local/tmp/extbridge.jar.new && "
+                + "pm path com.extbridge.helper | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/extb_src.apk && "
+                + "test -s /data/local/tmp/extb_src.apk && "
+                + "unzip -p /data/local/tmp/extb_src.apk assets/extbridge.jar > /data/local/tmp/extbridge.jar.new && "
+                + "rm -f /data/local/tmp/extb_src.apk && "
+                + "test -s /data/local/tmp/extbridge.jar.new && "
+                + "unzip -tq /data/local/tmp/extbridge.jar.new >/dev/null 2>&1 && "
+                + "chmod 644 /data/local/tmp/extbridge.jar.new && "
+                + "timeout 6 env CLASSPATH=/data/local/tmp/extbridge.jar.new app_process /data/local/tmp com.extbridge.daemon.ExtBridge --verify-helper >/dev/null 2>&1 && "
+                + "(timeout 8 env CLASSPATH=/data/local/tmp/extbridge.jar.new app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true) && "
+                + "(pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1 && (pkill -f '^app_process.*ExtBridge' 2>/dev/null || true) && sleep 1 && (pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true) || true) && "
+                + "rm -f /data/local/tmp/extbridge.jar && "
+                + "mv -f /data/local/tmp/extbridge.jar.new /data/local/tmp/extbridge.jar && "
+                + "test -s /data/local/tmp/extbridge.jar && "
+                + "appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && "
+                + "appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && "
+                + "(appops set com.extbridge.helper 10021 allow 2>/dev/null || true) && "
+                + "(appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null || true) && "
+                + "(pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null || true) && "
+                + "(dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1 || true) && "
+                + "(CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &)\"";
+    }
+
+    private static File getPrivateAdbSocketFile(Context ctx) {
+        File sockDir = new File(ctx.getCacheDir(), "asrv");
+        if (!sockDir.exists()) {
+            sockDir.mkdirs();
+        }
+        sockDir.setReadable(false, false);
+        sockDir.setReadable(true, true);
+        sockDir.setWritable(false, false);
+        sockDir.setWritable(true, true);
+        sockDir.setExecutable(false, false);
+        sockDir.setExecutable(true, true);
+        return new File(sockDir, "a.sock");
+    }
+
+    private static void stopLocalAdbServerSync(Context appCtx) {
+        if (appCtx == null) return;
+        if (isNativeAdbAvailable(appCtx)) {
+            try { runAdb(appCtx, 1500, "disconnect"); } catch (Throwable ignored) {}
+            try { runAdb(appCtx, 2500, "kill-server"); } catch (Throwable ignored) {}
+        }
+        try {
+            File sockFile = getPrivateAdbSocketFile(appCtx);
+            if (sockFile.exists()) sockFile.delete();
+        } catch (Throwable ignored) {}
+    }
+
+    public static void killLocalAdbServerAsync(final Context ctx) {
+        if (ctx == null) return;
+        final Context appCtx = ctx.getApplicationContext();
+        new Thread(() -> stopLocalAdbServerSync(appCtx), "ExtAdbStop").start();
     }
 
     public static boolean isNativeAdbAvailable(Context ctx) {
@@ -349,7 +469,11 @@ public final class AdbBootstrap {
                 postResult(listener, false, "请输入 6 位配对码");
                 return;
             }
-            if (pairPort <= 0) {
+            if (!isAllowedLocalHost(host)) {
+                postResult(listener, false, "安全拦截：配对地址仅允许本机 IP（拒绝外部地址 " + host + "）");
+                return;
+            }
+            if (pairPort <= 0 || pairPort > 65535) {
                 postResult(listener, false, "未自动发现配对端口，请按「配对码:端口」输入（例如 551857:36565）");
                 return;
             }
@@ -370,50 +494,58 @@ public final class AdbBootstrap {
             return;
         }
         String pHost = (pairHost == null || pairHost.trim().isEmpty()) ? getLocalIpv4() : pairHost.trim();
+        if (!isAllowedLocalHost(pHost)) {
+            postResult(listener, false, "安全拦截：配对主机必须是本机回环或本机局域网 IP");
+            return;
+        }
         String code = pairCode == null ? "" : pairCode.trim();
-        if (pairPort <= 0 || code.isEmpty()) {
+        if (pairPort <= 0 || pairPort > 65535 || code.isEmpty()) {
             postResult(listener, false, "请填写完整的配对端口和 6 位配对码");
             return;
         }
 
-        postStep(listener, "正在启动内置 ADB 服务...");
-        CmdRes startRes = runAdb(appCtx, 10000, "start-server");
-        if (startRes.code != 0) {
-            postResult(listener, false, "ADB 服务启动失败:\n" + startRes.output);
-            return;
-        }
-
-        String pairTarget = pHost + ":" + pairPort;
-        postStep(listener, "正在与 " + pairTarget + " 配对...");
-        CmdRes pairRes = runAdb(appCtx, 15000, "pair", pairTarget, code);
-        String pOut = pairRes.output == null ? "" : pairRes.output.trim();
-        boolean pairOk = pairRes.code == 0 && !pOut.toLowerCase().contains("failed") && !pOut.toLowerCase().contains("error");
-        if (!pairOk) {
-            postResult(listener, false, "配对失败 (" + pairTarget + "):\n" + pOut
-                    + "\n提示：请确保没有关闭系统的「与设备配对」弹窗导致配对码刷新。");
-            return;
-        }
-
-        postStep(listener, "配对成功！正在等待无线调试连接端口...");
-        String cHost = (connectHost != null && !connectHost.trim().isEmpty()) ? connectHost.trim() : pHost;
-        int cPort = connectPort;
-        if (cPort <= 0) {
-            long deadline = System.currentTimeMillis() + 4500;
-            while (System.currentTimeMillis() < deadline) {
-                DiscoveryState ds = getDiscoveryState();
-                if (ds.connectPort > 0) {
-                    cPort = ds.connectPort;
-                    if (!ds.connectHost.isEmpty()) cHost = ds.connectHost;
-                    break;
-                }
-                try { Thread.sleep(250); } catch (InterruptedException ignored) { break; }
+        try {
+            postStep(listener, "正在启动内置 ADB 服务...");
+            CmdRes startRes = runAdb(appCtx, 10000, "start-server");
+            if (startRes.code != 0) {
+                postResult(listener, false, "ADB 服务启动失败:\n" + startRes.output);
+                return;
             }
+
+            String pairTarget = pHost + ":" + pairPort;
+            postStep(listener, "正在与 " + pairTarget + " 配对...");
+            CmdRes pairRes = runAdb(appCtx, 15000, "pair", pairTarget, code);
+            String pOut = pairRes.output == null ? "" : pairRes.output.trim();
+            boolean pairOk = pairRes.code == 0 && !pOut.toLowerCase().contains("failed") && !pOut.toLowerCase().contains("error");
+            if (!pairOk) {
+                postResult(listener, false, "配对失败 (" + pairTarget + "):\n" + pOut
+                        + "\n提示：请确保没有关闭系统的「与设备配对」弹窗导致配对码刷新。");
+                return;
+            }
+
+            postStep(listener, "配对成功！正在等待无线调试连接端口...");
+            String cHost = (connectHost != null && !connectHost.trim().isEmpty()) ? connectHost.trim() : pHost;
+            int cPort = connectPort;
+            if (cPort <= 0) {
+                long deadline = System.currentTimeMillis() + 4500;
+                while (System.currentTimeMillis() < deadline) {
+                    DiscoveryState ds = getDiscoveryState();
+                    if (ds.connectPort > 0) {
+                        cPort = ds.connectPort;
+                        if (!ds.connectHost.isEmpty()) cHost = ds.connectHost;
+                        break;
+                    }
+                    try { Thread.sleep(250); } catch (InterruptedException ignored) { break; }
+                }
+            }
+            if (cPort <= 0) {
+                postResult(listener, true, "已成功完成设备配对！请关闭系统的配对弹窗，输入无线调试主界面显示的连接端口后点击「直接连接并启动」。");
+                return;
+            }
+            connectAndBootstrapCore(appCtx, cHost, cPort, listener, false);
+        } finally {
+            stopLocalAdbServerSync(appCtx);
         }
-        if (cPort <= 0) {
-            postResult(listener, true, "已成功完成设备配对！请关闭系统的配对弹窗，输入无线调试主界面显示的连接端口后点击「直接连接并启动」。");
-            return;
-        }
-        connectAndBootstrapSync(appCtx, cHost, cPort, listener);
     }
 
     private static void connectAndBootstrapSync(
@@ -425,15 +557,38 @@ public final class AdbBootstrap {
             postResult(listener, false, "内置 ADB 模块 (libadb.so) 不可用");
             return;
         }
-        String host = (connectHost == null || connectHost.trim().isEmpty()) ? getLocalIpv4() : connectHost.trim();
-        if (connectPort <= 0) {
+        if (connectPort <= 0 || connectPort > 65535) {
             postResult(listener, false, "请填写无线调试主页显示的端口号");
+            return;
+        }
+        try {
+            connectAndBootstrapCore(appCtx, connectHost, connectPort, listener, true);
+        } finally {
+            stopLocalAdbServerSync(appCtx);
+        }
+    }
+
+    private static void connectAndBootstrapCore(
+            Context appCtx,
+            String connectHost,
+            int connectPort,
+            ProgressListener listener,
+            boolean needStartServer) {
+        String host = (connectHost == null || connectHost.trim().isEmpty()) ? getLocalIpv4() : connectHost.trim();
+        if (!isAllowedLocalHost(host)) {
+            postResult(listener, false, "安全拦截：无线调试连接地址仅允许本机 IP");
             return;
         }
         String target = host + ":" + connectPort;
 
         postStep(listener, "正在连接无线调试 " + target + "...");
-        runAdb(appCtx, 8000, "start-server");
+        if (needStartServer) {
+            CmdRes startRes = runAdb(appCtx, 8000, "start-server");
+            if (startRes.code != 0) {
+                postResult(listener, false, "ADB 服务启动失败:\n" + startRes.output);
+                return;
+            }
+        }
         CmdRes connRes = runAdb(appCtx, 12000, "connect", target);
         String cOut = connRes.output == null ? "" : connRes.output.trim();
         String cLow = cOut.toLowerCase();
@@ -458,15 +613,32 @@ public final class AdbBootstrap {
         }
 
         postStep(listener, "已连接！正在释放 extbridge.jar 并授权启动守护进程...");
-        String bootstrapCmd = buildDaemonBootstrapScript(null);
+        String expectedSha = computeAssetJarSha256(appCtx);
+        String bootstrapCmd = buildDaemonBootstrapScript(null, expectedSha);
 
-        CmdRes shRes = runAdb(appCtx, 18000, "-s", target, "shell", bootstrapCmd);
+        CmdRes shRes = runAdb(appCtx, 22000, "-s", target, "shell", bootstrapCmd);
         if (shRes.code != 0 || shRes.output == null || !shRes.output.contains("LAUNCH_DONE")) {
             postResult(listener, false, "远程 Shell 启动失败:\n" + shRes.output);
             return;
         }
 
+        if (isAutoCloseWifiAdbEnabled(appCtx)) {
+            try { runAdb(appCtx, 2500, "-s", target, "shell", "settings put global adb_wifi_enabled 0"); } catch (Throwable ignored) {}
+        }
+
         awaitDaemonBinderReady(appCtx, listener, "无线调试激活成功，ExtBridge 服务已就绪！");
+    }
+
+    public static boolean isAutoCloseWifiAdbEnabled(Context ctx) {
+        if (ctx == null) return false;
+        SharedPreferences sp = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        return sp.getBoolean(KEY_AUTO_CLOSE_WIFI_ADB, false);
+    }
+
+    public static void setAutoCloseWifiAdbEnabled(Context ctx, boolean enabled) {
+        if (ctx == null) return;
+        SharedPreferences sp = ctx.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        sp.edit().putBoolean(KEY_AUTO_CLOSE_WIFI_ADB, enabled).apply();
     }
 
     public static boolean isAutoRootEnabled(Context ctx) {
@@ -505,16 +677,56 @@ public final class AdbBootstrap {
         return false;
     }
 
+    private static String computeAssetJarSha256(Context ctx) {
+        if (ctx == null) return "";
+        try (InputStream in = ctx.getAssets().open("extbridge.jar")) {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                md.update(buf, 0, n);
+            }
+            byte[] dig = md.digest();
+            StringBuilder hex = new StringBuilder(64);
+            for (byte b : dig) {
+                hex.append(String.format(Locale.US, "%02x", b & 0xff));
+            }
+            return hex.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
     public static void rootBootstrapAsync(final Context ctx, final boolean markAutoRoot, final ProgressListener listener) {
         final Context appCtx = ctx.getApplicationContext();
         sExec.execute(() -> {
             postStep(listener, "正在请求 Root (su) 权限...");
-            String stagedJar = stageBridgeJar(appCtx);
+            String[] staged = stageBridgeJarWithSha256(appCtx);
+            if (staged == null || staged[0] == null || staged[1] == null || staged[1].isEmpty()) {
+                postResult(listener, false, "无法从 APK 释放并校验 extbridge.jar");
+                return;
+            }
+            String qStage = staged[0].replace("'", "");
+            String expSha = staged[1].toLowerCase(Locale.US);
+            // Root ONLY copies our 0600 private staged jar into an O_EXCL mktemp file with chown -h 2000:2000,
+            // then immediately transitions to uid 2000 (u:r:shell:s0) before operating in /data/local/tmp or running app_process!
+            String shellInner = buildShellSwapAndLaunchScript("\"$ROOT_TMP\"", expSha);
+            String qShellInner = shellInner.replace("'", "'\\''");
             String script = "UID_NOW=$(id -u 2>/dev/null || echo -1); "
                     + "if [ \"$UID_NOW\" != \"0\" ]; then echo NO_ROOT:$UID_NOW; exit 12; fi; "
-                    + buildDaemonBootstrapScript(stagedJar);
+                    + "if [ ! -f '" + qStage + "' ] || [ -L '" + qStage + "' ]; then echo ERR_STAGE_MISSING; exit 21; fi; "
+                    + "SRC_SHA=$(sha256sum '" + qStage + "' 2>/dev/null | cut -d' ' -f1); "
+                    + "if [ \"$SRC_SHA\" != '" + expSha + "' ]; then echo ERR_STAGE_HASH; exit 21; fi; "
+                    + "ROOT_TMP=$(mktemp /data/local/tmp/extbridge.XXXXXX 2>/dev/null); "
+                    + "if [ -z \"$ROOT_TMP\" ] || [ -L \"$ROOT_TMP\" ]; then echo ERR_MKTEMP; exit 21; fi; "
+                    + "cp '" + qStage + "' \"$ROOT_TMP\" && chmod 644 \"$ROOT_TMP\" && chown -h 2000:2000 \"$ROOT_TMP\" "
+                    + "|| { rm -f \"$ROOT_TMP\"; echo ERR_STAGE_COPY; exit 21; }; "
+                    + "export ROOT_TMP; "
+                    + "(runcon u:r:shell:s0 su 2000 -c '" + qShellInner + "' 2>/dev/null "
+                    + "|| su 2000 -c '" + qShellInner + "' 2>/dev/null "
+                    + "|| su shell -c '" + qShellInner + "')";
 
-            CmdRes res = runSu(18000, script);
+            CmdRes res = runSu(22000, script);
             String out = res.output == null ? "" : res.output.trim();
             if (res.code != 0 || !out.contains("LAUNCH_DONE")) {
                 String hint = out.contains("NO_ROOT")
@@ -531,37 +743,62 @@ public final class AdbBootstrap {
         });
     }
 
-    private static String stageBridgeJar(Context ctx) {
+    private static String[] stageBridgeJarWithSha256(Context ctx) {
         File outFile = new File(ctx.getFilesDir(), "extbridge_stage.jar");
         try (InputStream in = ctx.getAssets().open("extbridge.jar");
              OutputStream out = new FileOutputStream(outFile, false)) {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
             byte[] buf = new byte[8192];
             int n;
             while ((n = in.read(buf)) > 0) {
+                md.update(buf, 0, n);
                 out.write(buf, 0, n);
             }
             out.flush();
-            outFile.setReadable(true, false);
-            return outFile.getAbsolutePath();
+            outFile.setReadable(false, false);
+            outFile.setReadable(true, true);
+            outFile.setWritable(false, false);
+            outFile.setWritable(true, true);
+            byte[] dig = md.digest();
+            StringBuilder hex = new StringBuilder(64);
+            for (byte b : dig) {
+                hex.append(String.format(Locale.US, "%02x", b & 0xff));
+            }
+            return new String[]{outFile.getAbsolutePath(), hex.toString()};
         } catch (Throwable t) {
-            Log.w(TAG, "stageBridgeJar fallback to APK unzip", t);
+            Log.w(TAG, "stageBridgeJar failed", t);
             return null;
         }
     }
 
-    private static String buildDaemonBootstrapScript(String stagedJarPath) {
-        String jarExtract;
-        if (stagedJarPath != null && !stagedJarPath.isEmpty()) {
-            String qStage = stagedJarPath.replace("'", "");
-            jarExtract = "if [ -s '" + qStage + "' ]; then cp '" + qStage + "' /data/local/tmp/extbridge.jar; "
-                    + "else APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); unzip -p \"$APK\" assets/extbridge.jar > /data/local/tmp/extbridge.jar; fi && ";
-        } else {
-            jarExtract = "APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); "
-                    + "unzip -p \"$APK\" assets/extbridge.jar > /data/local/tmp/extbridge.jar && ";
-        }
-        return jarExtract
-                + "chmod 644 /data/local/tmp/extbridge.jar && "
-                + "chown 2000:2000 /data/local/tmp/extbridge.jar /data/local/tmp/extbridge.conf /data/local/tmp/extbridge_apps.conf /data/local/tmp/extbridge_healed_v2 /data/local/tmp/extbridge.log 2>/dev/null; "
+    private static String buildShellSwapAndLaunchScript(String tmpJarExpr, String expectedSha256) {
+        String cleanSha = (expectedSha256 == null) ? "" : expectedSha256.trim().toLowerCase(Locale.US);
+        String shaGuard = cleanSha.matches("^[0-9a-f]{64}$")
+                ? ("ACT_SHA=$(sha256sum " + tmpJarExpr + " 2>/dev/null | cut -d' ' -f1); "
+                        + "if [ -n \"$ACT_SHA\" ] && [ \"$ACT_SHA\" != '" + cleanSha + "' ]; then "
+                        + "rm -f " + tmpJarExpr + "; echo ERR_JAR_SHA256; exit 21; fi; ")
+                : "";
+        String postSwapShaGuard = cleanSha.matches("^[0-9a-f]{64}$")
+                ? ("FINAL_SHA=$(sha256sum /data/local/tmp/extbridge.jar 2>/dev/null | cut -d' ' -f1); "
+                        + "if [ -n \"$FINAL_SHA\" ] && [ \"$FINAL_SHA\" != '" + cleanSha + "' ]; then "
+                        + "echo ERR_FINAL_SHA256; exit 22; fi; ")
+                : "";
+        return "if [ ! -f " + tmpJarExpr + " ] || [ -L " + tmpJarExpr + " ] || [ ! -s " + tmpJarExpr + " ] "
+                + "|| ! unzip -tq " + tmpJarExpr + " >/dev/null 2>&1; then "
+                + "rm -f " + tmpJarExpr + "; echo ERR_STAGE_JAR; exit 21; fi; "
+                + shaGuard
+                + "chmod 644 " + tmpJarExpr + " || { rm -f " + tmpJarExpr + "; echo ERR_CHMOD_JAR; exit 21; }; "
+                + "(CLASSPATH=" + tmpJarExpr + " app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true); "
+                + "if pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1; then "
+                + "(pkill -f '^app_process.*ExtBridge' 2>/dev/null || true); "
+                + "sleep 1.0; "
+                + "(pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true); fi; "
+                + "rm -f /data/local/tmp/extbridge.jar; "
+                + "if ! mv -f " + tmpJarExpr + " /data/local/tmp/extbridge.jar || [ -L /data/local/tmp/extbridge.jar ] || [ ! -s /data/local/tmp/extbridge.jar ]; then "
+                + "rm -f " + tmpJarExpr + "; echo ERR_SWAP_JAR; exit 22; fi; "
+                + postSwapShaGuard
+                + "chown -h 2000:2000 /data/local/tmp/extbridge.jar 2>/dev/null; "
+                + "rm -f /data/local/tmp/extbridge.log; "
                 + "appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow 2>/dev/null; "
                 + "appops set com.extbridge.helper POST_NOTIFICATION allow 2>/dev/null; "
                 + "appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow 2>/dev/null; "
@@ -569,13 +806,31 @@ public final class AdbBootstrap {
                 + "appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null; "
                 + "pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null; "
                 + "dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1; "
-                + "am broadcast -a com.extbridge.daemon.SHUTDOWN -p com.android.shell 2>/dev/null; "
-                + "am broadcast -a com.extbridge.daemon.SHUTDOWN 2>/dev/null; "
-                + "sleep 0.6; "
-                + "pkill -f '^app_process.*ExtBridge' 2>/dev/null; "
-                + "sleep 0.3; "
                 + "(CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >/data/local/tmp/extbridge.log 2>&1 &); "
-                + "sleep 0.6; echo LAUNCH_DONE";
+                + "sleep 0.6; "
+                + "if pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1; then echo LAUNCH_DONE; else echo ERR_DAEMON_DIED; cat /data/local/tmp/extbridge.log 2>/dev/null; exit 24; fi";
+    }
+
+    public static String buildDaemonBootstrapScript(String stagedJarPath) {
+        return buildDaemonBootstrapScript(stagedJarPath, "");
+    }
+
+    public static String buildDaemonBootstrapScript(String stagedJarPath, String expectedSha256) {
+        String extractLogic;
+        if (stagedJarPath != null && !stagedJarPath.isEmpty()) {
+            String qStage = stagedJarPath.replace("'", "");
+            extractLogic = "if [ -f '" + qStage + "' ] && [ ! -L '" + qStage + "' ] && [ -s '" + qStage + "' ]; then cp '" + qStage + "' \"$TMP_JAR\"; "
+                    + "else APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); "
+                    + "[ -n \"$APK\" ] && unzip -p \"$APK\" assets/extbridge.jar > \"$TMP_JAR\"; fi";
+        } else {
+            extractLogic = "APK=$(pm path com.extbridge.helper | head -n1 | cut -d: -f2); "
+                    + "[ -n \"$APK\" ] && unzip -p \"$APK\" assets/extbridge.jar > \"$TMP_JAR\"";
+        }
+        // Fail-closed BEFORE stopping any running daemon or touching /data/local/tmp/extbridge.jar
+        return "TMP_JAR=$(mktemp /data/local/tmp/extbridge.XXXXXX 2>/dev/null || echo /data/local/tmp/extbridge.jar.tmp.$$); "
+                + "if [ -L \"$TMP_JAR\" ]; then rm -f \"$TMP_JAR\"; echo ERR_TMP_SYMLINK; exit 21; fi; "
+                + "if ! ( " + extractLogic + " ); then rm -f \"$TMP_JAR\"; echo ERR_STAGE_JAR; exit 21; fi; "
+                + buildShellSwapAndLaunchScript("\"$TMP_JAR\"", expectedSha256);
     }
 
     private static void awaitDaemonBinderReady(Context appCtx, ProgressListener listener, String successMsg) {
@@ -655,12 +910,14 @@ public final class AdbBootstrap {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.directory(homeDir);
             pb.redirectErrorStream(true);
+            File sockFile = getPrivateAdbSocketFile(ctx);
             Map<String, String> env = new HashMap<>(pb.environment());
             env.put("HOME", homeDir.getAbsolutePath());
             env.put("ANDROID_USER_HOME", dotAndroid.getAbsolutePath());
             env.put("ANDROID_SDK_HOME", homeDir.getAbsolutePath());
             env.put("TMPDIR", tmpDir.getAbsolutePath());
-            env.put("ANDROID_ADB_SERVER_PORT", ADB_SERVER_PORT);
+            env.remove("ANDROID_ADB_SERVER_PORT");
+            env.put("ADB_SERVER_SOCKET", "localfilesystem:" + sockFile.getAbsolutePath());
             env.put("ADB_MDNS", "0");
             env.put("ADB_MDNS_OPENSCREEN", "0");
             pb.environment().clear();
@@ -700,6 +957,10 @@ public final class AdbBootstrap {
     }
 
     public static void showPairingNotification(Context ctx, String statusText) {
+        sPairNotifShowing = true;
+        if (sNsd == null && ctx != null) {
+            startDiscovery(ctx.getApplicationContext(), sDiscListener);
+        }
         NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm == null) return;
         if (Build.VERSION.SDK_INT >= 26) {
@@ -751,6 +1012,7 @@ public final class AdbBootstrap {
     }
 
     public static void cancelPairingNotification(Context ctx) {
+        sPairNotifShowing = false;
         NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (nm != null) nm.cancel(PAIR_NOTIF_ID);
     }

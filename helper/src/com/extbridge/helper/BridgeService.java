@@ -1,5 +1,6 @@
 package com.extbridge.helper;
 
+import android.animation.ValueAnimator;
 import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.app.Notification;
@@ -27,6 +28,7 @@ import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffColorFilter;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -58,6 +60,8 @@ import android.view.ViewParent;
 import android.view.WindowManager;
 import android.view.animation.AccelerateInterpolator;
 import android.view.animation.DecelerateInterpolator;
+import android.view.animation.OvershootInterpolator;
+import android.view.animation.PathInterpolator;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -72,9 +76,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -88,11 +94,50 @@ public class BridgeService extends Service {
     public static boolean isRunning() {
         return sInstance != null;
     }
+
+    public static boolean isBlackoutActive() {
+        BridgeService inst = sInstance;
+        return inst != null && inst.mBlackoutActive;
+    }
+
+    public static void toggleBlackoutFromUi(Context ctx) {
+        if (ctx != null) ensureStarted(ctx);
+        BridgeService inst = sInstance;
+        if (inst != null && inst.mHandler != null) {
+            inst.mHandler.post(() -> {
+                BridgeClient.Status st = inst.mLastStatus;
+                if (st != null && st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR) {
+                    if (inst.mBlackoutActive) inst.setDexBlackout(false);
+                    inst.execSysAndRefresh(BridgeClient.SYS_SCREEN_DIM, -1, null);
+                } else {
+                    inst.toggleDexBlackout();
+                }
+            });
+        } else {
+            new Thread(() -> BridgeClient.execSysAction(BridgeClient.SYS_SCREEN_DIM, -1, null)).start();
+        }
+    }
+
+    public static void performAssignSplitFromUi(int slot, int taskId, String pkg, String cls) {
+        BridgeService inst = sInstance;
+        if (inst != null && inst.mHandler != null && inst.mStageAnimView != null) {
+            int action = (slot == 0) ? BridgeClient.SPLIT_ASSIGN_LEFT_TOP : BridgeClient.SPLIT_ASSIGN_RIGHT_BOTTOM;
+            inst.mHandler.post(() -> inst.performEnterOrAssignSplitAnimated(action, slot, taskId, pkg, cls));
+        } else {
+            new Thread(() -> {
+                BridgeClient.assignSplitSlot(slot, pkg, cls);
+                if (inst != null && inst.mHandler != null) {
+                    inst.mHandler.post(inst::pollRemoteStateAsync);
+                }
+            }).start();
+        }
+    }
     private static ViewGroup sLauncherHost;
     private static int sLauncherHostDisplayId = -1;
 
     private Handler mHandler;
     private final ExecutorService mBg = Executors.newSingleThreadExecutor();
+    private final ExecutorService mInputBg = Executors.newSingleThreadExecutor();
     private volatile boolean mDestroyed = false;
     private final AtomicLong mPollSeq = new AtomicLong(0);
     private String mLastNotifSig = "";
@@ -137,6 +182,11 @@ public class BridgeService extends Service {
     private TextView mTrayBattPct;
 
     // Split-screen floating divider & popover menu
+    private StageTransitionView mStageAnimView;
+    private WindowManager.LayoutParams mStageAnimLp;
+    private boolean mForceWindowOverlaysDuringAnim = false;
+    private ValueAnimator mSplitDividerAnimator;
+    private float mDisplayedSplitRatio = 0.50f;
     private FrameLayout mSplitDividerRoot;
     private TextView mSplitDividerPill;
     private WindowManager.LayoutParams mSplitDividerLp;
@@ -273,12 +323,70 @@ public class BridgeService extends Service {
     private WindowManager.LayoutParams mEdgeLp2;
     private boolean mEdgeCapturing = false;
     private boolean mEdgePointerCaptured = false;
+    private boolean mOverlayPointerCaptureSupported = false;
+    private int mEdgeReacquireAttempts = 0;
     private final AtomicBoolean mEdgeHoverInFlight = new AtomicBoolean(false);
     private String mEdgeSensorKey = "";
+    private static final long[] EDGE_REACQUIRE_DELAYS_MS = {20L, 45L, 90L, 150L, 240L, 360L, 520L, 720L};
     private final Runnable mEdgeCaptureFallbackTask = () -> {
-        if (mEdgeCapturing && !mEdgePointerCaptured) {
+        if (mEdgeCapturing && !mEdgePointerCaptured && !mOverlayPointerCaptureSupported) {
             revertEdgeOverlayToSensor();
             SideMouseCaptureActivity.launch(BridgeService.this);
+        }
+    };
+    private final Runnable mEdgeReacquireTask = new Runnable() {
+        @Override
+        public void run() {
+            if (mDestroyed || !mEdgeCapturing || mEdgeSensorView == null || mEdgeD0Wm == null || mEdgeLp == null) {
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= 26 && mEdgeSensorView.hasPointerCapture()) {
+                mEdgePointerCaptured = true;
+                mOverlayPointerCaptureSupported = true;
+                mEdgeReacquireAttempts = 0;
+                return;
+            }
+            if (mEdgeReacquireAttempts >= EDGE_REACQUIRE_DELAYS_MS.length) {
+                exitSidePointerCapture();
+                return;
+            }
+            long nextDelay = EDGE_REACQUIRE_DELAYS_MS[mEdgeReacquireAttempts++];
+            safeInputExecute(() -> {
+                int[] res = BridgeClient.sendCapturedMirrorMouse(9, 0f, 0f, 0f);
+                if (res[0] == 0) {
+                    safePost(() -> revertEdgeOverlayToSensor());
+                }
+            });
+            try {
+                int activeFlags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+                if (!mEdgeSensorView.hasWindowFocus()) {
+                    // Pulse FLAG_NOT_FOCUSABLE -> focusable so WMS re-evaluates top Z-order focus
+                    // in favor of ExtMirEdgeSensor even after an Activity launch stole mFocusedApp!
+                    mEdgeLp.flags = activeFlags | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                    mEdgeD0Wm.updateViewLayout(mEdgeSensorView, mEdgeLp);
+                }
+                mEdgeLp.flags = activeFlags;
+                mEdgeD0Wm.updateViewLayout(mEdgeSensorView, mEdgeLp);
+                mEdgeSensorView.setFocusable(true);
+                mEdgeSensorView.setFocusableInTouchMode(true);
+                mEdgeSensorView.requestFocus();
+                if (Build.VERSION.SDK_INT >= 26) {
+                    mEdgeSensorView.requestPointerCapture();
+                    if (mEdgeSensorView.hasPointerCapture()) {
+                        mEdgePointerCaptured = true;
+                        mOverlayPointerCaptureSupported = true;
+                        mEdgeReacquireAttempts = 0;
+                        return;
+                    }
+                }
+            } catch (Throwable ignored) {}
+            if (mHandler != null && mEdgeCapturing && !mEdgePointerCaptured) {
+                mHandler.removeCallbacks(this);
+                mHandler.postDelayed(this, nextDelay);
+            }
         }
     };
     private MiniBatteryView mMirBattIcon;
@@ -321,11 +429,51 @@ public class BridgeService extends Service {
     private FrameLayout mMirLeftWidgetBox;
     private FrameLayout mMirRightWidgetBox;
 
+    private final DisplayManager.DisplayListener mDisplayListener = new DisplayManager.DisplayListener() {
+        @Override
+        public void onDisplayAdded(int displayId) {
+            safePost(BridgeService.this::pollRemoteStateAsync);
+        }
+
+        @Override
+        public void onDisplayRemoved(int displayId) {
+            safePost(() -> {
+                BridgeClient.Status st = mLastStatus;
+                boolean singleLeft = (mDm != null && mDm.getDisplays().length <= 1);
+                if (displayId == mAttachedVdId
+                        || (st != null && (displayId == st.extId || displayId == st.vdId))
+                        || singleLeft) {
+                    if (mBlackoutActive) {
+                        setDexBlackout(false);
+                    }
+                    if (displayId == mAttachedVdId || singleLeft) {
+                        detachExtOverlays(false);
+                    }
+                }
+                if (displayId == mSideAttachedVdId || singleLeft) {
+                    detachMirrorSidebars();
+                }
+                pollRemoteStateAsync();
+            });
+        }
+
+        @Override
+        public void onDisplayChanged(int displayId) {}
+    };
+
     private final BroadcastReceiver mSysRx = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (intent == null) return;
             String act = intent.getAction();
+            if (Intent.ACTION_SCREEN_OFF.equals(act) || Intent.ACTION_USER_PRESENT.equals(act)) {
+                safePost(() -> {
+                    if (mBlackoutActive) {
+                        setDexBlackout(false);
+                    }
+                });
+                return;
+            }
             if (Intent.ACTION_BATTERY_CHANGED.equals(act)) {
                 readBatteryIntent(intent);
             }
@@ -368,6 +516,15 @@ public class BridgeService extends Service {
         if (mDestroyed || r == null || mBg.isShutdown()) return;
         try {
             mBg.execute(() -> {
+                if (!mDestroyed) r.run();
+            });
+        } catch (RejectedExecutionException ignored) {}
+    }
+
+    private void safeInputExecute(Runnable r) {
+        if (mDestroyed || r == null || mInputBg.isShutdown()) return;
+        try {
+            mInputBg.execute(() -> {
                 if (!mDestroyed) r.run();
             });
         } catch (RejectedExecutionException ignored) {}
@@ -420,6 +577,11 @@ public class BridgeService extends Service {
 
     public static void ensureStarted(Context ctx) {
         if (sUserStopping || ctx == null) return;
+        BridgeService running = sInstance;
+        if (running != null && !running.mDestroyed) {
+            refreshFromReceiver(ctx);
+            return;
+        }
         try {
             Intent i = new Intent(ctx, BridgeService.class);
             if (Build.VERSION.SDK_INT >= 26) {
@@ -440,7 +602,9 @@ public class BridgeService extends Service {
 
     public static void stopAllAndExit(Context ctx) {
         sUserStopping = true;
+        SideMouseCaptureActivity.finishActiveIfAny();
         final Context appCtx = (ctx != null) ? ctx.getApplicationContext() : sInstance;
+        AdbBootstrap.killLocalAdbServerAsync(appCtx);
         final BridgeService svc = sInstance;
         if (svc != null && svc.mHandler != null) {
             svc.mHandler.removeCallbacksAndMessages(null);
@@ -506,6 +670,17 @@ public class BridgeService extends Service {
         }
     }
 
+    private void enterForegroundNow(BridgeClient.Status st) {
+        try {
+            Notification n = buildNotification(st != null ? st : new BridgeClient.Status());
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
+            } else {
+                startForeground(NOTIF_ID, n);
+            }
+        } catch (Throwable ignored) {}
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -517,19 +692,22 @@ public class BridgeService extends Service {
         mAm = (AudioManager) getSystemService(AUDIO_SERVICE);
 
         createNotificationChannel();
-        Notification n = buildNotification(BridgeClient.getStatus());
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE);
-        } else {
-            startForeground(NOTIF_ID, n);
+        enterForegroundNow(mLastStatus);
+
+        if (mDm != null) {
+            try { mDm.registerDisplayListener(mDisplayListener, mHandler); } catch (Throwable ignored) {}
         }
 
         IntentFilter flt = new IntentFilter();
         flt.addAction(Intent.ACTION_BATTERY_CHANGED);
+        flt.addAction(Intent.ACTION_SCREEN_OFF);
+        flt.addAction(Intent.ACTION_USER_PRESENT);
         flt.addAction("android.media.VOLUME_CHANGED_ACTION");
         flt.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
         flt.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
-        Intent sticky = registerReceiver(mSysRx, flt, RECEIVER_EXPORTED);
+        Intent sticky = (Build.VERSION.SDK_INT >= 33)
+                ? registerReceiver(mSysRx, flt, RECEIVER_NOT_EXPORTED)
+                : registerReceiver(mSysRx, flt);
         if (sticky != null) readBatteryIntent(sticky);
 
         NavAssistService.setOnStateChanged(() -> safePost(() -> {
@@ -542,17 +720,20 @@ public class BridgeService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (sUserStopping || (intent != null && ACTION_EXIT_ALL.equals(intent.getAction()))) {
+        // Always satisfy startForegroundService() contract on EVERY onStartCommand invocation.
+        // Note: Binder handle is ONLY accepted via UID-authenticated BridgeProvider.call("setBinder"),
+        // never from unauthenticated exported startService(Intent) extras.
+        enterForegroundNow(mLastStatus);
+        if (sUserStopping) {
             stopAllAndExit(this);
             return START_NOT_STICKY;
         }
-        if (intent != null && intent.getExtras() != null) {
-            IBinder cb = intent.getExtras().getBinder("cb");
-            if (cb != null) BridgeClient.setBinder(cb);
-        }
-        if (BridgeClient.getService() == null) {
-            BridgeClient.requestBinder(this);
-        }
+        final Context appCtx = getApplicationContext();
+        safeBgExecute(() -> {
+            if (BridgeClient.getService() == null) {
+                BridgeClient.requestBinder(appCtx);
+            }
+        });
         pollRemoteStateAsync();
         return START_NOT_STICKY;
     }
@@ -562,6 +743,9 @@ public class BridgeService extends Service {
         mDestroyed = true;
         sInstance = null;
         NavAssistService.setOnStateChanged(null);
+        if (mDm != null) {
+            try { mDm.unregisterDisplayListener(mDisplayListener); } catch (Throwable ignored) {}
+        }
         try { unregisterReceiver(mSysRx); } catch (Throwable ignored) {}
         if (mHandler != null) mHandler.removeCallbacksAndMessages(null);
         if (mBlackoutActive) {
@@ -574,6 +758,9 @@ public class BridgeService extends Service {
         removeBlackoutOverlay();
         detachExtOverlays(false);
         detachMirrorSidebars();
+        SideMouseCaptureActivity.finishActiveIfAny();
+        resetCapturedMouseMoveState();
+        mInputBg.shutdownNow();
         mBg.shutdownNow();
         super.onDestroy();
     }
@@ -623,23 +810,23 @@ public class BridgeService extends Service {
         PendingIntent piSideCtrl = PendingIntent.getActivity(this, 7, sideCtrlIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE, optBundle0);
 
-        Intent toggleIntent = new Intent(this, ControlReceiver.class)
+        Intent toggleIntent = new Intent(this, ControlReceiver.Internal.class)
                 .setAction("com.extbridge.helper.TOGGLE_INPUT");
         PendingIntent piToggle = PendingIntent.getBroadcast(this, 3, toggleIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Intent extHomeIntent = new Intent(this, ControlReceiver.class)
+        Intent extHomeIntent = new Intent(this, ControlReceiver.Internal.class)
                 .setAction("com.extbridge.helper.LAUNCH_EXT_HOME");
         PendingIntent piExtHome = PendingIntent.getBroadcast(this, 4, extHomeIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Intent mirrorIntent = new Intent(this, ControlReceiver.class)
+        Intent mirrorIntent = new Intent(this, ControlReceiver.Internal.class)
                 .setAction("com.extbridge.helper.TOGGLE_MIRROR")
                 .putExtra("mode", 0);
         PendingIntent piMirror = PendingIntent.getBroadcast(this, 5, mirrorIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
 
-        Intent exitIntent = new Intent(this, ControlReceiver.class)
+        Intent exitIntent = new Intent(this, ControlReceiver.Internal.class)
                 .setAction(ACTION_EXIT_ALL);
         PendingIntent piExit = PendingIntent.getBroadcast(this, 6, exitIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
@@ -667,7 +854,7 @@ public class BridgeService extends Service {
             title = "ExtBridge 已挂载(" + modeTag + ") · "
                     + st.virtW + "×" + st.virtH + " @" + Math.round(st.virtFps) + "Hz";
             body = "键鼠控制：【" + target + "】 | 点通知本体进控制台，右侧按钮一键回桌面";
-            toggleLabel = st.inputToExt == 1 ? "⇄ 键鼠切回平板" : "⇄ 键鼠切回扩展屏";
+            toggleLabel = st.inputToExt == 1 ? "键鼠切回本机" : "键鼠切至扩展屏";
         }
 
         Notification.Builder nb = new Notification.Builder(this, CH_ID)
@@ -678,15 +865,15 @@ public class BridgeService extends Service {
                 .setOnlyAlertOnce(true)
                 .setContentIntent(piMain);
         if (standbyOrDisconnected) {
-            nb.addAction(new Notification.Action.Builder(null, "⊞ 打开控制台", piMain).build());
-            nb.addAction(new Notification.Action.Builder(null, "⏻ 停止并退出", piExit).build());
+            nb.addAction(new Notification.Action.Builder(null, "打开控制台", piMain).build());
+            nb.addAction(new Notification.Action.Builder(null, "停止并退出", piExit).build());
         } else {
-            String act1Label = mirrorActive ? "🖥 切回DeX" : toggleLabel;
+            String act1Label = mirrorActive ? "切回 DeX" : toggleLabel;
             PendingIntent act1Pi = mirrorActive ? piMirror : piToggle;
-            String act3Label = mirrorActive ? "🪞 副屏直控" : "⊞ 回扩展桌面";
+            String act3Label = mirrorActive ? "副屏直控" : "回扩展桌面";
             PendingIntent act3Pi = mirrorActive ? piSideCtrl : piExtHome;
             nb.addAction(new Notification.Action.Builder(null, act1Label, act1Pi).build());
-            nb.addAction(new Notification.Action.Builder(null, "🖐 大触摸板", piTp).build());
+            nb.addAction(new Notification.Action.Builder(null, "大触摸板", piTp).build());
             nb.addAction(new Notification.Action.Builder(null, act3Label, act3Pi).build());
         }
         return nb.build();
@@ -793,7 +980,8 @@ public class BridgeService extends Service {
                 String memoTxt = getMirrorMemoText(this);
                 String themeSig = getMirrorThemeId(this) + ":" + Integer.toHexString(getMirrorCustomBg(this));
                 String ratioSig = getMirrorWidgetRatio(this, 0) + ":" + getMirrorWidgetRatio(this, 1);
-                if (st.sideVdId != mSideAttachedVdId
+                if ((mMirLeftRoot == null && mMirRightRoot == null)
+                        || st.sideVdId != mSideAttachedVdId
                         || st.physW != mSidePhysW
                         || st.physH != mSidePhysH
                         || st.mirX != mSideMirX
@@ -823,6 +1011,9 @@ public class BridgeService extends Service {
         detachMirrorSidebars();
 
         if (!st.connected || st.vdId <= 0) {
+            if (mBlackoutActive) {
+                setDexBlackout(false);
+            }
             detachExtOverlays(false);
             return;
         }
@@ -837,6 +1028,11 @@ public class BridgeService extends Service {
             mOverlayW = st.virtW;
             mOverlayH = st.virtH;
             mLastTaskSig = "";
+            if (mStageAnimView != null && mStageAnimLp != null && mExtWm != null) {
+                mStageAnimLp.width = mOverlayW;
+                mStageAnimLp.height = mOverlayH;
+                try { mExtWm.updateViewLayout(mStageAnimView, mStageAnimLp); } catch (Throwable ignored) {}
+            }
             repositionDock();
             repositionPanel();
             repositionSplitDivider();
@@ -862,12 +1058,17 @@ public class BridgeService extends Service {
         refreshSysViews();
         if (mBtnPanelFullscreen != null) {
             boolean fsOn = st.fullscreenPolicy == 1;
-            mBtnPanelFullscreen.setText(fsOn ? "⛶ 桌面横屏:开" : "⛶ 桌面横屏:关");
-            mBtnPanelFullscreen.setTextColor(fsOn ? 0xFF7DD3FC : 0xFFCBD5E1);
+            mBtnPanelFullscreen.setText(fsOn ? "桌面横屏: 开" : "桌面横屏: 关");
+            HyperUi.styleHyperChip(mBtnPanelFullscreen, fsOn);
+            HyperUi.setStartIcon(mBtnPanelFullscreen, HyperUi.ICON_FULLSCREEN,
+                    fsOn ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         }
         if (mBtnPanelRotate != null) {
-            mBtnPanelRotate.setText("↻ 旋转: " + BridgeClient.rotationLabel(st.virtRot));
-            mBtnPanelRotate.setTextColor(st.virtRot != 0 ? 0xFF7DD3FC : 0xFFCBD5E1);
+            boolean rotActive = st.virtRot != 0;
+            mBtnPanelRotate.setText("旋转: " + BridgeClient.rotationLabel(st.virtRot));
+            HyperUi.styleHyperChip(mBtnPanelRotate, rotActive);
+            HyperUi.setStartIcon(mBtnPanelRotate, HyperUi.ICON_ROTATE,
+                    rotActive ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         }
         updatePanelModeChips(st.mirrorMode);
         updateDockAutoHideUi();
@@ -950,6 +1151,7 @@ public class BridgeService extends Service {
         mOverlayDpi = overlayDpi;
         mLastTaskSig = "";
 
+        buildStageAnimOverlay(mExtCtx, st); // Added FIRST so stage transition sits below Dock & Cursor, above Activities
         buildSplitOverlays(mExtCtx, st);
         buildDockEdgeTriggerOverlay(mExtCtx);
         buildDockOverlay(mExtCtx, st);
@@ -957,6 +1159,27 @@ public class BridgeService extends Service {
         buildWin11PanelOverlay(mExtCtx, st);
         buildCursorOverlay(mExtCtx, st); // Added LAST so cursor stays above Dock & Flyout
         syncOverlayHostSurface(true);
+    }
+
+    private void buildStageAnimOverlay(Context ctx, BridgeClient.Status st) {
+        mStageAnimView = new StageTransitionView(ctx);
+        mStageAnimLp = new WindowManager.LayoutParams(
+                Math.max(600, st.virtW),
+                Math.max(600, st.virtH),
+                mWinType,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT);
+        mStageAnimLp.gravity = Gravity.TOP | Gravity.LEFT;
+        mStageAnimLp.x = 0;
+        mStageAnimLp.y = 0;
+        if (mExtWm != null) {
+            // Propagate BadTokenException / SecurityException so attachExtOverlays can fall back cleanly
+            mExtWm.addView(mStageAnimView, mStageAnimLp);
+        }
     }
 
     public static void setDockHidden(boolean hidden) {
@@ -1003,7 +1226,9 @@ public class BridgeService extends Service {
     }
 
     private boolean shouldHostInLauncher() {
-        return !mUsingA11yOverlay
+        return !mForceWindowOverlaysDuringAnim
+                && (mStageAnimView == null || !mStageAnimView.isAnimating())
+                && !mUsingA11yOverlay
                 && mAttachedVdId > 0
                 && sLauncherHost != null
                 && sLauncherHostDisplayId == mAttachedVdId
@@ -1020,6 +1245,17 @@ public class BridgeService extends Service {
         }
     }
 
+    private static void safeAddToHost(ViewGroup host, View child, ViewGroup.LayoutParams lp) {
+        if (host == null || child == null) return;
+        if (child.getParent() != null) {
+            ViewParent p = child.getParent();
+            if (p instanceof ViewGroup) ((ViewGroup) p).removeView(child);
+        }
+        if (child.getParent() == null) {
+            host.addView(child, lp);
+        }
+    }
+
     private void syncOverlayHostSurface(boolean forceAttach) {
         if (mDockRoot == null || mPanelRoot == null || mCursorView == null || mExtCtx == null) return;
         boolean wantHost = shouldHostInLauncher();
@@ -1028,6 +1264,38 @@ public class BridgeService extends Service {
             boolean rightParent = wantHost ? (p == sLauncherHost) : (p != null && !(p instanceof ViewGroup));
             if (rightParent) return;
         }
+        // Prevent detaching mid-close-animation from stranding an alpha=0 VISIBLE touch-eating popover
+        if (!mSplitMenuOpen && mSplitMenuRoot != null) {
+            mSplitMenuRoot.animate().cancel();
+            mSplitMenuRoot.setVisibility(View.GONE);
+            mSplitMenuRoot.setAlpha(1f);
+            mSplitMenuRoot.setTranslationY(0f);
+            mSplitMenuRoot.setScaleX(1f);
+            mSplitMenuRoot.setScaleY(1f);
+        }
+        if (!mTaskBubbleOpen && mTaskBubbleRoot != null) {
+            if (mTaskBubbleCard != null) mTaskBubbleCard.animate().cancel();
+            mTaskBubbleRoot.animate().cancel();
+            mTaskBubbleRoot.setVisibility(View.GONE);
+            mTaskBubbleRoot.setAlpha(1f);
+        }
+        if (!mPanelOpen && mPanelRoot != null) {
+            if (mPanelCard != null) {
+                mPanelCard.animate().cancel();
+                mPanelCard.setAlpha(1f);
+                mPanelCard.setTranslationY(0f);
+                mPanelCard.setScaleX(1f);
+                mPanelCard.setScaleY(1f);
+            }
+            mPanelRoot.setVisibility(View.GONE);
+        }
+        if (mDockHidden && mDockRoot != null) {
+            mDockRoot.animate().cancel();
+            mDockRoot.setVisibility(View.GONE);
+            mDockRoot.setTranslationY(0f);
+            mDockRoot.setAlpha(1f);
+        }
+
         removeOverlayView(mSplitDividerRoot);
         removeOverlayView(mDockEdgeTrigger);
         removeOverlayView(mDockRoot);
@@ -1042,32 +1310,32 @@ public class BridgeService extends Service {
                         mSplitDividerLp != null ? mSplitDividerLp.width : dp(mExtCtx, 40),
                         mSplitDividerLp != null ? mSplitDividerLp.height : dp(mExtCtx, 84),
                         Gravity.TOP | Gravity.LEFT);
-                sLauncherHost.addView(mSplitDividerRoot, sdlp);
+                safeAddToHost(sLauncherHost, mSplitDividerRoot, sdlp);
             }
             if (mDockEdgeTrigger != null) {
                 FrameLayout.LayoutParams elp = new FrameLayout.LayoutParams(
                         dp(mExtCtx, 220), dp(mExtCtx, 16), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-                sLauncherHost.addView(mDockEdgeTrigger, elp);
+                safeAddToHost(sLauncherHost, mDockEdgeTrigger, elp);
             }
             FrameLayout.LayoutParams dlp = new FrameLayout.LayoutParams(
                     mDockLp != null ? mDockLp.width : ViewGroup.LayoutParams.WRAP_CONTENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT,
                     Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
             dlp.bottomMargin = dp(mExtCtx, 10);
-            sLauncherHost.addView(mDockRoot, dlp);
+            safeAddToHost(sLauncherHost, mDockRoot, dlp);
 
             if (mSplitMenuRoot != null) {
                 FrameLayout.LayoutParams smlp = new FrameLayout.LayoutParams(
-                        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                        dp(mExtCtx, 296), ViewGroup.LayoutParams.WRAP_CONTENT,
                         Gravity.TOP | Gravity.LEFT);
-                sLauncherHost.addView(mSplitMenuRoot, smlp);
+                safeAddToHost(sLauncherHost, mSplitMenuRoot, smlp);
             }
 
             if (mTaskBubbleRoot != null) {
                 FrameLayout.LayoutParams tblp = new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                         Gravity.TOP | Gravity.LEFT);
-                sLauncherHost.addView(mTaskBubbleRoot, tblp);
+                safeAddToHost(sLauncherHost, mTaskBubbleRoot, tblp);
             }
 
             FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(
@@ -1077,7 +1345,7 @@ public class BridgeService extends Service {
                 plp.leftMargin = mPanelLp.x;
                 plp.topMargin = mPanelLp.y;
             }
-            sLauncherHost.addView(mPanelRoot, plp);
+            safeAddToHost(sLauncherHost, mPanelRoot, plp);
 
             mCursorView.setClickable(false);
             mCursorView.setFocusable(false);
@@ -1085,7 +1353,7 @@ public class BridgeService extends Service {
             mCursorView.setTranslationZ(dp(mExtCtx, 48));
             FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
                     44, 44, Gravity.TOP | Gravity.LEFT);
-            sLauncherHost.addView(mCursorView, clp);
+            safeAddToHost(sLauncherHost, mCursorView, clp);
             mCursorView.bringToFront();
             if (mCursorLp != null) {
                 mCursorView.setTranslationX(mCursorLp.x);
@@ -1150,6 +1418,57 @@ public class BridgeService extends Service {
                 && winY >= loc[1] && winY <= (loc[1] + v.getHeight());
     }
 
+    private static boolean isPointInViewOnScreen(View v, float screenX, float screenY) {
+        if (v == null || v.getVisibility() != View.VISIBLE || !v.isShown()
+                || v.getWidth() <= 0 || v.getHeight() <= 0) {
+            return false;
+        }
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        return screenX >= loc[0] && screenX <= (loc[0] + v.getWidth())
+                && screenY >= loc[1] && screenY <= (loc[1] + v.getHeight());
+    }
+
+    /**
+     * Classifies what virtual-touchpad right-click / 2-finger tap should do at (curX, curY):
+     *   1 = handled locally (dismissed an open Dock popover or toggled Split Menu)
+     *   2 = dispatch BUTTON_SECONDARY context-click (Dock task icon or DeX Desktop app icon)
+     *   0 = navigate Back on external display
+     */
+    public static int classifyRightClickTarget(int curX, int curY) {
+        BridgeService svc = sInstance;
+        if (svc == null) return 0;
+        if (svc.mPanelOpen || svc.mSplitMenuOpen || svc.mTaskBubbleOpen) {
+            Runnable closeTask = () -> {
+                svc.setPanelOpen(false);
+                svc.setSplitMenuOpen(false);
+                svc.setTaskBubbleOpen(false);
+            };
+            if (Looper.myLooper() == Looper.getMainLooper()) closeTask.run();
+            else if (svc.mHandler != null) svc.mHandler.post(closeTask);
+            return 1;
+        }
+        BridgeClient.Status st = svc.mLastStatus;
+        if (st != null && st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX) {
+            if (!svc.mDockHidden && svc.mDockRoot != null && svc.mDockRoot.getVisibility() == View.VISIBLE) {
+                if (svc.mTaskStrip != null && isPointInViewOnScreen(svc.mTaskStrip, curX, curY)) {
+                    return 2;
+                }
+                if (svc.mBtnDockSplit != null && isPointInViewOnScreen(svc.mBtnDockSplit, curX, curY)) {
+                    Runnable toggleSplitMenu = () -> svc.setSplitMenuOpen(!svc.mSplitMenuOpen);
+                    if (Looper.myLooper() == Looper.getMainLooper()) toggleSplitMenu.run();
+                    else if (svc.mHandler != null) svc.mHandler.post(toggleSplitMenu);
+                    return 1;
+                }
+            }
+            if ((svc.mIsOnLauncherHome || st.splitActive == 1)
+                    && LauncherActivity.shouldConsumeRightClickAt(curX, curY)) {
+                return 2;
+            }
+        }
+        return 0;
+    }
+
     private void buildDockOverlay(Context ctx, BridgeClient.Status st) {
         mDockRoot = new LinearLayout(ctx);
         mDockRoot.setOrientation(LinearLayout.HORIZONTAL);
@@ -1158,9 +1477,9 @@ public class BridgeService extends Service {
         mDockRoot.setPadding(dp(ctx, 10), dp(ctx, 5), dp(ctx, 10), dp(ctx, 5));
         mDockRoot.setElevation(dp(ctx, 10));
         GradientDrawable dockBg = new GradientDrawable();
-        dockBg.setColor(0xD2121926);
+        dockBg.setColor(HyperUi.DOCK_BG);
         dockBg.setCornerRadius(dp(ctx, 22));
-        dockBg.setStroke(1, 0x42FFFFFF);
+        dockBg.setStroke(1, HyperUi.DOCK_STROKE);
         mDockRoot.setBackground(dockBg);
         mDockRoot.setOnHoverListener((v, ev) -> {
             int act = ev.getActionMasked();
@@ -1175,19 +1494,26 @@ public class BridgeService extends Service {
         });
 
         // Left: App Launcher/Search, Back, Split, Input Switch
-        TextView btnHome = makeDockBtn(ctx, "⊞ 桌面", 0x33FFFFFF, Color.WHITE);
+        TextView btnHome = makeDockBtn(ctx, "桌面", 0x2AFFFFFF, Color.WHITE);
+        HyperUi.setStartIcon(btnHome, HyperUi.ICON_APPS, Color.WHITE, 12.5f, 4f);
+        attachTactilePress(btnHome, 0.90f);
         btnHome.setOnClickListener(v -> {
             setPanelOpen(false);
             setSplitMenuOpen(false);
-            BridgeClient.relaunchLauncher();
+            setTaskBubbleOpen(false);
+            performHomeButtonAnimated(btnHome);
         });
         mDockRoot.addView(btnHome);
 
-        TextView btnBack = makeDockBtn(ctx, "←", 0x26FFFFFF, Color.WHITE);
-        btnBack.setOnClickListener(v -> BridgeClient.sendBack());
+        TextView btnBack = makeDockBtn(ctx, "返回", 0x22FFFFFF, Color.WHITE);
+        HyperUi.setStartIcon(btnBack, HyperUi.ICON_CHEVRON_LEFT, Color.WHITE, 12.5f, 3f);
+        attachTactilePress(btnBack, 0.90f);
+        btnBack.setOnClickListener(v -> safeInputExecute(BridgeClient::sendBack));
         mDockRoot.addView(btnBack);
 
-        mBtnDockSplit = makeDockBtn(ctx, "◫ 分屏", 0x26FFFFFF, Color.WHITE);
+        mBtnDockSplit = makeDockBtn(ctx, "分屏", 0x22FFFFFF, Color.WHITE);
+        HyperUi.setStartIcon(mBtnDockSplit, HyperUi.ICON_SPLIT, Color.WHITE, 12.5f, 4f);
+        attachTactilePress(mBtnDockSplit, 0.90f);
         mBtnDockSplit.setOnClickListener(v -> triggerQuickSplitOrMenu());
         mBtnDockSplit.setOnLongClickListener(v -> {
             setSplitMenuOpen(!mSplitMenuOpen);
@@ -1195,11 +1521,13 @@ public class BridgeService extends Service {
         });
         mDockRoot.addView(mBtnDockSplit);
 
-        mBtnToggle = makeDockBtn(ctx, st.inputToExt == 1 ? "⇄ 外接" : "⇄ 平板",
-                st.inputToExt == 1 ? 0xCC2563EB : 0xCCEA580C, Color.WHITE);
-        mBtnToggle.setOnClickListener(v -> mBg.execute(() -> {
+        mBtnToggle = makeDockBtn(ctx, st.inputToExt == 1 ? "外接" : "本机",
+                st.inputToExt == 1 ? HyperUi.HYPER_BLUE : 0xCC3B4252, Color.WHITE);
+        HyperUi.setStartIcon(mBtnToggle, HyperUi.ICON_SWAP, Color.WHITE, 12.5f, 4f);
+        attachTactilePress(mBtnToggle, 0.90f);
+        mBtnToggle.setOnClickListener(v -> safeInputExecute(() -> {
             int m = BridgeClient.toggleInput();
-            mHandler.post(() -> {
+            safePost(() -> {
                 updateInputToggleUi(m);
                 Toast.makeText(BridgeService.this, m == 1 ? "键鼠 -> 扩展屏" : "键鼠 -> 平板", Toast.LENGTH_SHORT).show();
             });
@@ -1318,11 +1646,11 @@ public class BridgeService extends Service {
 
         mPanelCard = new LinearLayout(ctx);
         mPanelCard.setOrientation(LinearLayout.VERTICAL);
-        mPanelCard.setElevation(dp(ctx, 16));
+        mPanelCard.setElevation(dp(ctx, 18));
         GradientDrawable panelBg = new GradientDrawable();
-        panelBg.setColor(0xEE18202E);
-        panelBg.setCornerRadius(dp(ctx, 16));
-        panelBg.setStroke(1, 0x3FFFFFFF);
+        panelBg.setColor(HyperUi.FLYOUT_BG);
+        panelBg.setCornerRadius(dp(ctx, 22));
+        panelBg.setStroke(1, HyperUi.FLYOUT_STROKE);
         mPanelCard.setBackground(panelBg);
 
         LinearLayout body = new LinearLayout(ctx);
@@ -1392,12 +1720,12 @@ public class BridgeService extends Service {
         volRow.addView(mVolSpeakerIcon, new LinearLayout.LayoutParams(dp(ctx, 28), dp(ctx, 28)));
 
         mVolSeekBar = new SeekBar(ctx);
-        int accent = 0xFFA6D8E8;
+        int accent = HyperUi.HYPER_BLUE;
         if (mVolSeekBar.getProgressDrawable() != null) {
             mVolSeekBar.getProgressDrawable().setColorFilter(new PorterDuffColorFilter(accent, PorterDuff.Mode.SRC_IN));
         }
         if (mVolSeekBar.getThumb() != null) {
-            mVolSeekBar.getThumb().setColorFilter(new PorterDuffColorFilter(accent, PorterDuff.Mode.SRC_IN));
+            mVolSeekBar.getThumb().setColorFilter(new PorterDuffColorFilter(Color.WHITE, PorterDuff.Mode.SRC_IN));
         }
         if (mAm != null) {
             mVolSeekBar.setMax(Math.max(1, mAm.getStreamMaxVolume(AudioManager.STREAM_MUSIC)));
@@ -1421,10 +1749,12 @@ public class BridgeService extends Service {
         volRow.addView(mVolSeekBar, skLp);
 
         TextView btnAudioMore = new TextView(ctx);
-        btnAudioMore.setText("🎚 ›");
+        btnAudioMore.setText("音效");
         btnAudioMore.setTextColor(0xFFCBD5E1);
-        btnAudioMore.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f);
+        btnAudioMore.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        btnAudioMore.setGravity(Gravity.CENTER_VERTICAL);
         btnAudioMore.setPadding(dp(ctx, 8), dp(ctx, 4), dp(ctx, 6), dp(ctx, 4));
+        HyperUi.setStartIcon(btnAudioMore, HyperUi.ICON_SLIDERS, 0xFFCBD5E1, 13f, 4f);
         btnAudioMore.setOnClickListener(v -> openExtSettings(Settings.ACTION_SOUND_SETTINGS));
         volRow.addView(btnAudioMore);
 
@@ -1439,7 +1769,7 @@ public class BridgeService extends Service {
         mrLp.topMargin = dp(ctx, 10);
         modeRow.setLayoutParams(mrLp);
 
-        mBtnPanelDex = makeFooterChip(ctx, "🖥 DeX桌面");
+        mBtnPanelDex = makeFooterChip(ctx, "DeX 桌面");
         mBtnPanelDex.setSingleLine(true);
         mBtnPanelDex.setGravity(Gravity.CENTER);
         mBtnPanelDex.setOnClickListener(v -> switchPanelMode(BridgeClient.MIRROR_MODE_DEX));
@@ -1447,7 +1777,7 @@ public class BridgeService extends Service {
         mp1.rightMargin = dp(ctx, 6);
         modeRow.addView(mBtnPanelDex, mp1);
 
-        mBtnPanelMirror = makeFooterChip(ctx, "📺 原生镜像");
+        mBtnPanelMirror = makeFooterChip(ctx, "原生镜像");
         mBtnPanelMirror.setSingleLine(true);
         mBtnPanelMirror.setGravity(Gravity.CENTER);
         mBtnPanelMirror.setOnClickListener(v -> switchPanelMode(BridgeClient.MIRROR_MODE_MIRROR));
@@ -1466,15 +1796,18 @@ public class BridgeService extends Service {
         drLp.topMargin = dp(ctx, 6);
         dexRow.setLayoutParams(drLp);
 
-        mBtnPanelFullscreen = makeFooterChip(ctx, st.fullscreenPolicy == 1 ? "⛶ 桌面横屏:开" : "⛶ 桌面横屏:关");
+        boolean initFs = st.fullscreenPolicy == 1;
+        mBtnPanelFullscreen = makeFooterChip(ctx, initFs ? "桌面横屏: 开" : "桌面横屏: 关");
         mBtnPanelFullscreen.setSingleLine(true);
         mBtnPanelFullscreen.setGravity(Gravity.CENTER);
-        mBtnPanelFullscreen.setTextColor(st.fullscreenPolicy == 1 ? 0xFF7DD3FC : 0xFFCBD5E1);
+        HyperUi.styleHyperChip(mBtnPanelFullscreen, initFs);
+        HyperUi.setStartIcon(mBtnPanelFullscreen, HyperUi.ICON_FULLSCREEN,
+                initFs ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         mBtnPanelFullscreen.setOnClickListener(v -> mBg.execute(() -> {
             int next = BridgeClient.toggleFullscreenPolicy();
             mHandler.post(() -> {
                 Toast.makeText(BridgeService.this,
-                        next == 1 ? "已开启：DeX 默认横屏大屏桌面（单应用可在桌面长按改模式）" : "已关闭：DeX 桌面默认横屏锁定",
+                        next == 1 ? "已开启：DeX 默认横屏大屏桌面" : "已关闭：DeX 默认横屏锁定",
                         Toast.LENGTH_SHORT).show();
                 pollRemoteStateAsync();
             });
@@ -1483,15 +1816,18 @@ public class BridgeService extends Service {
         dp1.rightMargin = dp(ctx, 6);
         dexRow.addView(mBtnPanelFullscreen, dp1);
 
-        mBtnPanelRotate = makeFooterChip(ctx, "↻ 旋转: " + BridgeClient.rotationLabel(st.virtRot));
+        boolean initRot = st.virtRot != 0;
+        mBtnPanelRotate = makeFooterChip(ctx, "旋转: " + BridgeClient.rotationLabel(st.virtRot));
         mBtnPanelRotate.setSingleLine(true);
         mBtnPanelRotate.setGravity(Gravity.CENTER);
-        mBtnPanelRotate.setTextColor(st.virtRot != 0 ? 0xFF7DD3FC : 0xFFCBD5E1);
+        HyperUi.styleHyperChip(mBtnPanelRotate, initRot);
+        HyperUi.setStartIcon(mBtnPanelRotate, HyperUi.ICON_ROTATE,
+                initRot ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         mBtnPanelRotate.setOnClickListener(v -> mBg.execute(() -> {
             int next = BridgeClient.cycleRotation();
             mHandler.post(() -> {
                 Toast.makeText(BridgeService.this,
-                        "输出旋转已切换为：" + BridgeClient.rotationLabel(next),
+                        "输出旋转：" + BridgeClient.rotationLabel(next),
                         Toast.LENGTH_SHORT).show();
                 pollRemoteStateAsync();
             });
@@ -1509,20 +1845,17 @@ public class BridgeService extends Service {
         dr2Lp.topMargin = dp(ctx, 6);
         dexRow2.setLayoutParams(dr2Lp);
 
-        mBtnPanelSplit = makeFooterChip(ctx, st.splitActive == 1 ? "◫ 退出分屏" : "◫ 一键分屏");
+        boolean initSplit = st.splitActive == 1;
+        mBtnPanelSplit = makeFooterChip(ctx, initSplit ? "退出分屏" : "一键分屏");
         mBtnPanelSplit.setSingleLine(true);
         mBtnPanelSplit.setGravity(Gravity.CENTER);
-        mBtnPanelSplit.setTextColor(st.splitActive == 1 ? 0xFF7DD3FC : 0xFFCBD5E1);
+        HyperUi.styleHyperChip(mBtnPanelSplit, initSplit);
+        HyperUi.setStartIcon(mBtnPanelSplit, HyperUi.ICON_SPLIT,
+                initSplit ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         mBtnPanelSplit.setOnClickListener(v -> {
             setPanelOpen(false);
             if (mLastStatus.splitActive == 1) {
-                mBg.execute(() -> {
-                    BridgeClient.exitSplitMode();
-                    mHandler.post(() -> {
-                        Toast.makeText(BridgeService.this, "已退出分屏模式", Toast.LENGTH_SHORT).show();
-                        pollRemoteStateAsync();
-                    });
-                });
+                performExitSplitAnimated();
             } else {
                 triggerQuickSplitOrMenu();
             }
@@ -1531,16 +1864,18 @@ public class BridgeService extends Service {
         dp3s.rightMargin = dp(ctx, 6);
         dexRow2.addView(mBtnPanelSplit, dp3s);
 
-        mBtnPanelHideDock = makeFooterChip(ctx, mDockAutoHide ? "📌 Dock自动隐藏" : "📌 Dock固定显示");
+        mBtnPanelHideDock = makeFooterChip(ctx, mDockAutoHide ? "Dock 自动隐藏" : "Dock 固定显示");
         mBtnPanelHideDock.setSingleLine(true);
         mBtnPanelHideDock.setGravity(Gravity.CENTER);
-        mBtnPanelHideDock.setTextColor(mDockAutoHide ? 0xFF7DD3FC : 0xFFCBD5E1);
+        HyperUi.styleHyperChip(mBtnPanelHideDock, mDockAutoHide);
+        HyperUi.setStartIcon(mBtnPanelHideDock, HyperUi.ICON_PIN,
+                mDockAutoHide ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         mBtnPanelHideDock.setOnClickListener(v -> {
             boolean next = !mDockAutoHide;
             setDockAutoHideEnabled(BridgeService.this, next);
             Toast.makeText(BridgeService.this,
-                    next ? "已开启 Dock 自动隐藏（应用内闲置自动收起，鼠标移至底边唤醒）"
-                         : "已关闭自动隐藏：Dock 栏将始终固定显示",
+                    next ? "已开启 Dock 自动隐藏（鼠标移至底边唤醒）"
+                         : "已关闭自动隐藏：Dock 固定显示",
                     Toast.LENGTH_SHORT).show();
         });
         mBtnPanelHideDock.setOnLongClickListener(v -> {
@@ -1561,7 +1896,7 @@ public class BridgeService extends Service {
         dr3Lp.topMargin = dp(ctx, 6);
         dexRow3.setLayoutParams(dr3Lp);
 
-        mBtnPanelBlackout = makeFooterChip(ctx, mBlackoutActive ? "🌙 已黑屏 · 点此恢复平板亮屏" : "🌙 一键黑屏 (平板最低亮度)");
+        mBtnPanelBlackout = makeFooterChip(ctx, mBlackoutActive ? "主屏已黑屏 · 点此恢复亮屏" : "一键黑屏 (主屏最低亮度)");
         mBtnPanelBlackout.setSingleLine(true);
         mBtnPanelBlackout.setGravity(Gravity.CENTER);
         mBtnPanelBlackout.setOnClickListener(v -> toggleDexBlackout());
@@ -1576,10 +1911,10 @@ public class BridgeService extends Service {
         LinearLayout footer = new LinearLayout(ctx);
         footer.setOrientation(LinearLayout.HORIZONTAL);
         footer.setGravity(Gravity.CENTER_VERTICAL);
-        footer.setPadding(dp(ctx, 16), dp(ctx, 10), dp(ctx, 14), dp(ctx, 10));
+        footer.setPadding(dp(ctx, 16), dp(ctx, 10), dp(ctx, 14), dp(ctx, 11));
         GradientDrawable footBg = new GradientDrawable();
-        footBg.setColor(0x440B111C);
-        float r = dp(ctx, 16);
+        footBg.setColor(0x38000000);
+        float r = dp(ctx, 22);
         footBg.setCornerRadii(new float[]{0, 0, 0, 0, r, r, r, r});
         footer.setBackground(footBg);
 
@@ -1593,14 +1928,16 @@ public class BridgeService extends Service {
         mPanelBattText.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
         footer.addView(mPanelBattText, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        TextView btnCtrl = makeFooterChip(ctx, "🎛 控制台");
+        TextView btnCtrl = makeFooterChip(ctx, "控制台");
+        HyperUi.setStartIcon(btnCtrl, HyperUi.ICON_SLIDERS, 0xFFD8DEE9, 13f, 4f);
         btnCtrl.setOnClickListener(v -> openTabletMain());
         LinearLayout.LayoutParams cLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         cLp.rightMargin = dp(ctx, 8);
         footer.addView(btnCtrl, cLp);
 
-        TextView btnSysSet = makeFooterChip(ctx, "⚙ 设置");
+        TextView btnSysSet = makeFooterChip(ctx, "设置");
+        HyperUi.setStartIcon(btnSysSet, HyperUi.ICON_SETTINGS, 0xFFD8DEE9, 13f, 4f);
         btnSysSet.setOnClickListener(v -> openExtSettings(Settings.ACTION_SETTINGS));
         footer.addView(btnSysSet);
 
@@ -1737,16 +2074,7 @@ public class BridgeService extends Service {
                     setSplitMenuOpen(!mSplitMenuOpen);
                 } else {
                     int pct = Math.max(25, Math.min(75, Math.round(dragState[3] * 100f)));
-                    mLastStatus.splitRatioPct = pct;
-                    positionSplitDividerAt(pct / 100f, false);
-                    mBg.execute(() -> {
-                        BridgeClient.setSplitRatio(pct);
-                        mHandler.post(() -> {
-                            Toast.makeText(BridgeService.this,
-                                    "分屏比例：" + pct + "% : " + (100 - pct) + "%", Toast.LENGTH_SHORT).show();
-                            pollRemoteStateAsync();
-                        });
-                    });
+                    performSplitRatioAnimated(pct, true);
                 }
                 return true;
             }
@@ -1772,16 +2100,18 @@ public class BridgeService extends Service {
         mSplitMenuRoot.setElevation(dp(ctx, 16));
         mSplitMenuRoot.setVisibility(View.GONE);
         GradientDrawable menuBg = new GradientDrawable();
-        menuBg.setColor(0xEB0F172A);
-        menuBg.setCornerRadius(dp(ctx, 16));
-        menuBg.setStroke(1, 0x5538BDF8);
+        menuBg.setColor(HyperUi.FLYOUT_BG);
+        menuBg.setCornerRadius(dp(ctx, 20));
+        menuBg.setStroke(1, HyperUi.FLYOUT_STROKE);
         mSplitMenuRoot.setBackground(menuBg);
 
         TextView title = new TextView(ctx);
-        title.setText("◫ 分屏比例与控制");
-        title.setTextColor(0xFFE2E8F0);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        title.setText("分屏比例与控制");
+        title.setTextColor(0xFFF1F5F9);
+        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
         title.getPaint().setFakeBoldText(true);
+        title.setGravity(Gravity.CENTER_VERTICAL);
+        HyperUi.setStartIcon(title, HyperUi.ICON_SPLIT, HyperUi.HYPER_BLUE, 13.5f, 5f);
         LinearLayout.LayoutParams tLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         tLp.bottomMargin = dp(ctx, 8);
@@ -1794,26 +2124,21 @@ public class BridgeService extends Service {
             String lbl = (pct / 10) + ":" + ((100 - pct) / 10);
             TextView btn = makeFooterChip(ctx, lbl);
             btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+            btn.setSingleLine(true);
+            btn.setGravity(Gravity.CENTER);
+            btn.setPadding(dp(ctx, 6), dp(ctx, 6), dp(ctx, 6), dp(ctx, 6));
             btn.setOnClickListener(v -> {
                 setSplitMenuOpen(false);
-                mLastStatus.splitRatioPct = pct;
-                positionSplitDividerAt(pct / 100f, false);
-                mBg.execute(() -> {
-                    BridgeClient.setSplitRatio(pct);
-                    mHandler.post(() -> {
-                        Toast.makeText(BridgeService.this,
-                                "分屏比例：" + pct + "% : " + (100 - pct) + "%", Toast.LENGTH_SHORT).show();
-                        pollRemoteStateAsync();
-                    });
-                });
+                performSplitRatioAnimated(pct, false);
             });
             LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
             if (i < SPLIT_PRESET_PCTS.length - 1) bLp.rightMargin = dp(ctx, 5);
             ratiosRow.addView(btn, bLp);
             mSplitRatioBtns[i] = btn;
         }
-        mSplitMenuRoot.addView(ratiosRow);
+        mSplitMenuRoot.addView(ratiosRow, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
         LinearLayout actRow = new LinearLayout(ctx);
         actRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -1821,37 +2146,30 @@ public class BridgeService extends Service {
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         aLp.topMargin = dp(ctx, 8);
 
-        mSplitSwapBtn = makeFooterChip(ctx, mSplitDividerPortrait ? "⇅ 上下互换" : "⇄ 左右互换");
+        mSplitSwapBtn = makeFooterChip(ctx, mSplitDividerPortrait ? "上下互换" : "左右互换");
         mSplitSwapBtn.setGravity(Gravity.CENTER);
+        HyperUi.setStartIcon(mSplitSwapBtn, HyperUi.ICON_SWAP, 0xFFE2E8F0, 12.5f, 4f);
         mSplitSwapBtn.setOnClickListener(v -> {
             setSplitMenuOpen(false);
-            mBg.execute(() -> {
-                BridgeClient.swapSplitSlots();
-                mHandler.post(this::pollRemoteStateAsync);
-            });
+            performSplitSwapAnimated();
         });
         LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         swLp.rightMargin = dp(ctx, 6);
         actRow.addView(mSplitSwapBtn, swLp);
 
-        TextView exitBtn = makeFooterChip(ctx, "✕ 退出分屏");
+        TextView exitBtn = makeFooterChip(ctx, "退出分屏");
         exitBtn.setGravity(Gravity.CENTER);
         exitBtn.setTextColor(0xFFFCA5A5);
+        HyperUi.setStartIcon(exitBtn, HyperUi.ICON_CLOSE, 0xFFFCA5A5, 12.5f, 4f);
         exitBtn.setOnClickListener(v -> {
             setSplitMenuOpen(false);
-            mBg.execute(() -> {
-                BridgeClient.exitSplitMode();
-                mHandler.post(() -> {
-                    Toast.makeText(BridgeService.this, "已退出分屏", Toast.LENGTH_SHORT).show();
-                    pollRemoteStateAsync();
-                });
-            });
+            performExitSplitAnimated();
         });
         actRow.addView(exitBtn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         mSplitMenuRoot.addView(actRow, aLp);
 
         mSplitMenuLp = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                dp(ctx, 296),
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 mWinType,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
@@ -1978,25 +2296,31 @@ public class BridgeService extends Service {
         Toast.makeText(BridgeService.this,
                 "正在切换为【" + BridgeClient.mirrorModeLabel(mode) + "】...",
                 Toast.LENGTH_SHORT).show();
-        mBg.execute(() -> {
+        safeBgExecute(() -> {
             BridgeClient.setMirrorMode(mode);
-            mHandler.post(this::pollRemoteStateAsync);
+            safePost(this::pollRemoteStateAsync);
         });
     }
 
     private void updatePanelModeChips(int mirrorMode) {
+        boolean isDex = mirrorMode == BridgeClient.MIRROR_MODE_DEX;
+        boolean isMir = mirrorMode == BridgeClient.MIRROR_MODE_MIRROR;
         if (mBtnPanelDex != null) {
-            mBtnPanelDex.setTextColor(mirrorMode == BridgeClient.MIRROR_MODE_DEX ? 0xFF7DD3FC : 0xFFCBD5E1);
+            HyperUi.styleHyperChip(mBtnPanelDex, isDex);
+            HyperUi.setStartIcon(mBtnPanelDex, HyperUi.ICON_DEX, isDex ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         }
         if (mBtnPanelMirror != null) {
-            mBtnPanelMirror.setTextColor(mirrorMode == BridgeClient.MIRROR_MODE_MIRROR ? 0xFF7DD3FC : 0xFFCBD5E1);
+            HyperUi.styleHyperChip(mBtnPanelMirror, isMir);
+            HyperUi.setStartIcon(mBtnPanelMirror, HyperUi.ICON_MIRROR, isMir ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         }
     }
 
     private void updateDockAutoHideUi() {
         if (mBtnPanelHideDock != null) {
-            mBtnPanelHideDock.setText(mDockAutoHide ? "📌 Dock自动隐藏" : "📌 Dock固定显示");
-            mBtnPanelHideDock.setTextColor(mDockAutoHide ? 0xFF7DD3FC : 0xFFCBD5E1);
+            mBtnPanelHideDock.setText(mDockAutoHide ? "Dock 自动隐藏" : "Dock 固定显示");
+            HyperUi.styleHyperChip(mBtnPanelHideDock, mDockAutoHide);
+            HyperUi.setStartIcon(mBtnPanelHideDock, HyperUi.ICON_PIN,
+                    mDockAutoHide ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         }
     }
 
@@ -2006,34 +2330,58 @@ public class BridgeService extends Service {
             setSplitMenuOpen(!mSplitMenuOpen);
             return;
         }
-        mBg.execute(() -> {
-            boolean ok = BridgeClient.toggleQuickSplit();
-            mHandler.post(() -> {
-                if (ok) {
-                    Toast.makeText(BridgeService.this,
-                            (mOverlayH > mOverlayW ? "已开启上下分屏（拖动分割条可调比例）" : "已开启左右分屏（拖动分割条可调比例）"),
-                            Toast.LENGTH_SHORT).show();
-                } else {
-                    Toast.makeText(BridgeService.this,
-                            "请先打开应用，或在桌面长按/右键图标选择「分屏：放到左/右屏」",
-                            Toast.LENGTH_LONG).show();
-                }
-                pollRemoteStateAsync();
-            });
-        });
+        performEnterOrAssignSplitAnimated(BridgeClient.SPLIT_TOGGLE_QUICK, -1, 0, null, null);
     }
 
     private void setSplitMenuOpen(boolean open) {
         if (open && (mLastStatus == null || mLastStatus.splitActive == 0)) open = false;
+        if (mSplitMenuOpen == open && (mSplitMenuRoot == null || (open && mSplitMenuRoot.getVisibility() == View.VISIBLE))) {
+            return;
+        }
         mSplitMenuOpen = open;
         if (open) setTaskBubbleOpen(false);
-        if (mSplitMenuRoot != null) {
-            mSplitMenuRoot.setVisibility(open ? View.VISIBLE : View.GONE);
+        if (mSplitMenuRoot != null && mExtCtx != null) {
+            mSplitMenuRoot.animate().cancel();
             if (open) {
+                mSplitMenuRoot.setVisibility(View.VISIBLE);
                 repositionSplitMenu();
                 mHandler.removeCallbacks(mAutoHideDockTask);
+                mSplitMenuRoot.setAlpha(0f);
+                mSplitMenuRoot.setTranslationY(dp(mExtCtx, 10));
+                mSplitMenuRoot.setScaleX(0.92f);
+                mSplitMenuRoot.setScaleY(0.92f);
+                mSplitMenuRoot.animate()
+                        .alpha(1f)
+                        .translationY(0f)
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .setDuration(180L)
+                        .setInterpolator(new DecelerateInterpolator(1.6f))
+                        .withEndAction(this::bringCursorToFront)
+                        .start();
             } else {
                 evaluateDockAutoHide(false);
+                if (mSplitMenuRoot.getVisibility() == View.VISIBLE) {
+                    mSplitMenuRoot.animate()
+                            .alpha(0f)
+                            .translationY(dp(mExtCtx, 8))
+                            .scaleX(0.94f)
+                            .scaleY(0.94f)
+                            .setDuration(135L)
+                            .setInterpolator(new AccelerateInterpolator(1.3f))
+                            .withEndAction(() -> {
+                                if (!mSplitMenuOpen && mSplitMenuRoot != null) {
+                                    mSplitMenuRoot.setVisibility(View.GONE);
+                                    mSplitMenuRoot.setAlpha(1f);
+                                    mSplitMenuRoot.setTranslationY(0f);
+                                    mSplitMenuRoot.setScaleX(1f);
+                                    mSplitMenuRoot.setScaleY(1f);
+                                }
+                            })
+                            .start();
+                } else {
+                    mSplitMenuRoot.setVisibility(View.GONE);
+                }
             }
         }
         bringCursorToFront();
@@ -2043,23 +2391,27 @@ public class BridgeService extends Service {
         boolean active = st != null && st.connected && st.vdId > 0 && st.mirrorMode != 1 && st.splitActive == 1;
         syncOverlayHostSurface(false);
         if (mBtnDockSplit != null) {
-            mBtnDockSplit.setText(active ? "◫ 分屏*" : "◫ 分屏");
+            mBtnDockSplit.setText("分屏");
+            HyperUi.setStartIcon(mBtnDockSplit, HyperUi.ICON_SPLIT, Color.WHITE, 12.5f, 4f);
             GradientDrawable bg = (GradientDrawable) mBtnDockSplit.getBackground();
-            bg.setColor(active ? 0xCC0284C7 : 0x26FFFFFF);
+            bg.setColor(active ? HyperUi.HYPER_BLUE : 0x22FFFFFF);
         }
         if (mBtnPanelSplit != null) {
-            mBtnPanelSplit.setText(active ? "◫ 退出分屏" : "◫ 一键分屏");
-            mBtnPanelSplit.setTextColor(active ? 0xFF7DD3FC : 0xFFCBD5E1);
+            mBtnPanelSplit.setText(active ? "退出分屏" : "一键分屏");
+            HyperUi.styleHyperChip(mBtnPanelSplit, active);
+            HyperUi.setStartIcon(mBtnPanelSplit, HyperUi.ICON_SPLIT,
+                    active ? Color.WHITE : 0xFFD8DEE9, 13f, 5f);
         }
         if (mSplitSwapBtn != null) {
-            mSplitSwapBtn.setText(mOverlayH > mOverlayW ? "⇅ 上下互换" : "⇄ 左右互换");
+            mSplitSwapBtn.setText(mOverlayH > mOverlayW ? "上下互换" : "左右互换");
+            HyperUi.setStartIcon(mSplitSwapBtn, HyperUi.ICON_SWAP, 0xFFE2E8F0, 12.5f, 4f);
         }
         int curPct = (st != null && st.splitRatioPct > 0) ? st.splitRatioPct : 50;
         for (int i = 0; i < SPLIT_PRESET_PCTS.length; i++) {
             TextView tv = mSplitRatioBtns[i];
             if (tv == null) continue;
             boolean sel = Math.abs(curPct - SPLIT_PRESET_PCTS[i]) <= 3;
-            tv.setTextColor(sel ? 0xFF7DD3FC : 0xFFE2E8F0);
+            HyperUi.styleHyperChip(tv, sel);
         }
 
         boolean singleEmpty = st != null
@@ -2068,14 +2420,33 @@ public class BridgeService extends Service {
         boolean hasTwoOrSlot = active && (!mIsOnLauncherHome || singleEmpty);
         if (mSplitDividerRoot != null) {
             if (hasTwoOrSlot) {
-                if (mSplitDividerRoot.getVisibility() != View.VISIBLE) {
+                float targetRatio = Math.max(25, Math.min(75, curPct)) / 100f;
+                boolean wasHidden = mSplitDividerRoot.getVisibility() != View.VISIBLE;
+                if (wasHidden) {
+                    mSplitDividerRoot.animate().cancel();
                     mSplitDividerRoot.setVisibility(View.VISIBLE);
-                }
-                if (!mSplitDragging) {
-                    positionSplitDividerAt(Math.max(25, Math.min(75, curPct)) / 100f, false);
+                    positionSplitDividerAt(targetRatio, false);
+                    mSplitDividerRoot.setAlpha(0f);
+                    mSplitDividerRoot.setScaleX(0.55f);
+                    mSplitDividerRoot.setScaleY(0.55f);
+                    mSplitDividerRoot.animate()
+                            .alpha(1f)
+                            .scaleX(1f)
+                            .scaleY(1f)
+                            .setDuration(230L)
+                            .setInterpolator(new OvershootInterpolator(1.5f))
+                            .start();
+                } else if (!mSplitDragging && (mSplitDividerAnimator == null || !mSplitDividerAnimator.isRunning())) {
+                    positionSplitDividerAt(targetRatio, false);
                 }
             } else {
-                mSplitDividerRoot.setVisibility(View.GONE);
+                if (mSplitDividerRoot.getVisibility() == View.VISIBLE) {
+                    mSplitDividerRoot.animate().cancel();
+                    mSplitDividerRoot.setVisibility(View.GONE);
+                    mSplitDividerRoot.setAlpha(1f);
+                    mSplitDividerRoot.setScaleX(1f);
+                    mSplitDividerRoot.setScaleY(1f);
+                }
                 if (mSplitMenuOpen) setSplitMenuOpen(false);
             }
         }
@@ -2099,6 +2470,7 @@ public class BridgeService extends Service {
         int w = port ? dp(mExtCtx, 80) : dp(mExtCtx, 26);
         int h = port ? dp(mExtCtx, 26) : dp(mExtCtx, 80);
         float r = Math.max(0.25f, Math.min(0.75f, ratio));
+        mDisplayedSplitRatio = r;
         int pct = Math.round(r * 100f);
 
         int x = port ? (surfW - w) / 2 : Math.max(0, Math.min(surfW - w, Math.round(surfW * r) - w / 2));
@@ -2143,10 +2515,11 @@ public class BridgeService extends Service {
             surfW = sLauncherHost.getWidth();
             surfH = sLauncherHost.getHeight();
         }
+        int fixedMenuW = dp(mExtCtx, 296);
         mSplitMenuRoot.measure(
-                View.MeasureSpec.makeMeasureSpec(surfW, View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.makeMeasureSpec(fixedMenuW, View.MeasureSpec.EXACTLY),
                 View.MeasureSpec.makeMeasureSpec(surfH, View.MeasureSpec.AT_MOST));
-        int mw = Math.max(dp(mExtCtx, 220), mSplitMenuRoot.getMeasuredWidth());
+        int mw = fixedMenuW;
         int mh = Math.max(dp(mExtCtx, 96), mSplitMenuRoot.getMeasuredHeight());
         int pct = (mLastStatus != null && mLastStatus.splitRatioPct > 0) ? mLastStatus.splitRatioPct : 50;
         float r = Math.max(0.25f, Math.min(0.75f, pct / 100f));
@@ -2208,13 +2581,11 @@ public class BridgeService extends Service {
     private TextView makeFooterChip(Context ctx, String txt) {
         TextView tv = new TextView(ctx);
         tv.setText(txt);
-        tv.setTextColor(0xFFE2E8F0);
+        tv.setTextColor(0xFFD8DEE9);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
-        tv.setPadding(dp(ctx, 10), dp(ctx, 5), dp(ctx, 10), dp(ctx, 5));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0x28FFFFFF);
-        bg.setCornerRadius(dp(ctx, 10));
-        tv.setBackground(bg);
+        tv.setGravity(Gravity.CENTER_VERTICAL);
+        tv.setPadding(dp(ctx, 11), dp(ctx, 6), dp(ctx, 11), dp(ctx, 6));
+        HyperUi.styleHyperChip(tv, false);
         return tv;
     }
 
@@ -2346,16 +2717,17 @@ public class BridgeService extends Service {
         mTaskBubbleCard.addView(sep, sepLp);
 
         // Action 1: Exit accidental Freeform small window back to fullscreen (enabling Freeform is disabled in DeX)
-        mBubbleFreeformBtn = makeBubbleRowBtn(ctx, "⬜ 退出小窗（恢复全屏）", 0xFFE2E8F0, 0x3838BDF8);
+        mBubbleFreeformBtn = makeBubbleRowBtn(ctx, "退出小窗（恢复全屏）", 0xFFE2E8F0, HyperUi.CHIP_ACTIVE_BG);
+        HyperUi.setStartIcon(mBubbleFreeformBtn, HyperUi.ICON_WINDOW, 0xFFE2E8F0, 13f, 5f);
         mBubbleFreeformBtn.setVisibility(View.GONE);
         mBubbleFreeformBtn.setOnClickListener(v -> {
             BridgeClient.TaskEntry target = mBubbleTask;
             String targetLbl = mBubbleLabel;
             setTaskBubbleOpen(false);
             if (target == null || !target.isFreeform()) return;
-            mBg.execute(() -> {
+            safeBgExecute(() -> {
                 int res = BridgeClient.toggleTaskFreeform(target.taskId, target.pkg, 0);
-                mHandler.post(() -> {
+                safePost(() -> {
                     Toast.makeText(BridgeService.this,
                             res == 0 ? ("已恢复全屏：" + targetLbl) : ("恢复全屏失败：" + targetLbl),
                             Toast.LENGTH_SHORT).show();
@@ -2372,39 +2744,36 @@ public class BridgeService extends Service {
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         srLp.topMargin = dp(ctx, 4);
 
-        mBubbleSplit0Btn = makeBubbleRowBtn(ctx, "◫ 放左屏", 0xFFBAE6FD, 0x380284C7);
+        mBubbleSplit0Btn = makeBubbleRowBtn(ctx, "放入左屏", 0xFFBAE6FD, HyperUi.CHIP_ACTIVE_BG);
         mBubbleSplit0Btn.setGravity(Gravity.CENTER);
         mBubbleSplit0Btn.setPadding(dp(ctx, 8), dp(ctx, 6), dp(ctx, 8), dp(ctx, 6));
+        HyperUi.setStartIcon(mBubbleSplit0Btn, HyperUi.ICON_SPLIT, 0xFFBAE6FD, 12.5f, 4f);
         mBubbleSplit0Btn.setOnClickListener(v -> {
             BridgeClient.TaskEntry target = mBubbleTask;
             setTaskBubbleOpen(false);
             if (target == null) return;
-            mBg.execute(() -> {
-                BridgeClient.splitAction(BridgeClient.SPLIT_ASSIGN_LEFT_TOP, target.taskId, target.pkg, null);
-                mHandler.post(this::pollRemoteStateAsync);
-            });
+            performEnterOrAssignSplitAnimated(BridgeClient.SPLIT_ASSIGN_LEFT_TOP, 0, target.taskId, target.pkg, null);
         });
         LinearLayout.LayoutParams s0Lp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         s0Lp.rightMargin = dp(ctx, 5);
         splitRow.addView(mBubbleSplit0Btn, s0Lp);
 
-        mBubbleSplit1Btn = makeBubbleRowBtn(ctx, "◫ 放右屏", 0xFFBAE6FD, 0x380284C7);
+        mBubbleSplit1Btn = makeBubbleRowBtn(ctx, "放入右屏", 0xFFBAE6FD, HyperUi.CHIP_ACTIVE_BG);
         mBubbleSplit1Btn.setGravity(Gravity.CENTER);
         mBubbleSplit1Btn.setPadding(dp(ctx, 8), dp(ctx, 6), dp(ctx, 8), dp(ctx, 6));
+        HyperUi.setStartIcon(mBubbleSplit1Btn, HyperUi.ICON_SPLIT, 0xFFBAE6FD, 12.5f, 4f);
         mBubbleSplit1Btn.setOnClickListener(v -> {
             BridgeClient.TaskEntry target = mBubbleTask;
             setTaskBubbleOpen(false);
             if (target == null) return;
-            mBg.execute(() -> {
-                BridgeClient.splitAction(BridgeClient.SPLIT_ASSIGN_RIGHT_BOTTOM, target.taskId, target.pkg, null);
-                mHandler.post(this::pollRemoteStateAsync);
-            });
+            performEnterOrAssignSplitAnimated(BridgeClient.SPLIT_ASSIGN_RIGHT_BOTTOM, 1, target.taskId, target.pkg, null);
         });
         splitRow.addView(mBubbleSplit1Btn, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         mTaskBubbleCard.addView(splitRow, srLp);
 
         // Action 3: Close app
-        mBubbleCloseBtn = makeBubbleRowBtn(ctx, "✕ 关闭应用", 0xFFFCA5A5, 0x36EF4444);
+        mBubbleCloseBtn = makeBubbleRowBtn(ctx, "关闭应用", 0xFFFCA5A5, 0x36EF4444);
+        HyperUi.setStartIcon(mBubbleCloseBtn, HyperUi.ICON_CLOSE, 0xFFFCA5A5, 12.5f, 5f);
         LinearLayout.LayoutParams clLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         clLp.topMargin = dp(ctx, 4);
@@ -2413,9 +2782,9 @@ public class BridgeService extends Service {
             String targetLbl = mBubbleLabel;
             setTaskBubbleOpen(false);
             if (target == null) return;
-            mBg.execute(() -> {
+            safeBgExecute(() -> {
                 boolean ok = target.taskId > 0 && BridgeClient.removeTask(target.taskId);
-                mHandler.post(() -> {
+                safePost(() -> {
                     Toast.makeText(BridgeService.this,
                             ok ? ("已关闭：" + targetLbl) : ("暂无运行任务：" + targetLbl),
                             Toast.LENGTH_SHORT).show();
@@ -2511,11 +2880,11 @@ public class BridgeService extends Service {
         }
         if (mBubbleFreeformBtn != null) {
             mBubbleFreeformBtn.setVisibility(t.isFreeform() ? View.VISIBLE : View.GONE);
-            mBubbleFreeformBtn.setText("⬜ 退出小窗（恢复全屏）");
+            mBubbleFreeformBtn.setText("退出小窗（恢复全屏）");
         }
         boolean port = mOverlayH > mOverlayW;
-        if (mBubbleSplit0Btn != null) mBubbleSplit0Btn.setText(port ? "◫ 放上屏" : "◫ 放左屏");
-        if (mBubbleSplit1Btn != null) mBubbleSplit1Btn.setText(port ? "◫ 放下屏" : "◫ 放右屏");
+        if (mBubbleSplit0Btn != null) mBubbleSplit0Btn.setText(port ? "放入上屏" : "放入左屏");
+        if (mBubbleSplit1Btn != null) mBubbleSplit1Btn.setText(port ? "放入下屏" : "放入右屏");
         if (mBubbleCloseBtn != null) {
             mBubbleCloseBtn.setEnabled(t.taskId > 0);
             mBubbleCloseBtn.setAlpha(t.taskId > 0 ? 1f : 0.45f);
@@ -2542,10 +2911,13 @@ public class BridgeService extends Service {
 
     private void setTaskBubbleOpen(boolean open) {
         if (open && mBubbleTask == null) open = false;
+        if (mTaskBubbleOpen == open && (mTaskBubbleRoot == null || (open && mTaskBubbleRoot.getVisibility() == View.VISIBLE))) {
+            return;
+        }
         mTaskBubbleOpen = open;
         if (mTaskBubbleRoot != null) {
-            mTaskBubbleRoot.setVisibility(open ? View.VISIBLE : View.GONE);
             if (open) {
+                mTaskBubbleRoot.setVisibility(View.VISIBLE);
                 repositionTaskBubble();
                 mHandler.removeCallbacks(mAutoHideDockTask);
                 if (mTaskBubbleCard != null) {
@@ -2559,13 +2931,37 @@ public class BridgeService extends Service {
                             .translationY(0f)
                             .scaleX(1f)
                             .scaleY(1f)
-                            .setDuration(150L)
+                            .setDuration(155L)
                             .setInterpolator(new DecelerateInterpolator(1.5f))
                             .withEndAction(this::bringCursorToFront)
                             .start();
                 }
             } else {
                 evaluateDockAutoHide(false);
+                if (mTaskBubbleCard != null && mTaskBubbleRoot.getVisibility() == View.VISIBLE && mExtCtx != null) {
+                    mTaskBubbleCard.animate().cancel();
+                    mTaskBubbleCard.animate()
+                            .alpha(0f)
+                            .translationY(dp(mExtCtx, 8))
+                            .scaleX(0.93f)
+                            .scaleY(0.93f)
+                            .setDuration(125L)
+                            .setInterpolator(new AccelerateInterpolator(1.3f))
+                            .withEndAction(() -> {
+                                if (!mTaskBubbleOpen && mTaskBubbleRoot != null) {
+                                    mTaskBubbleRoot.setVisibility(View.GONE);
+                                    if (mTaskBubbleCard != null) {
+                                        mTaskBubbleCard.setAlpha(1f);
+                                        mTaskBubbleCard.setTranslationY(0f);
+                                        mTaskBubbleCard.setScaleX(1f);
+                                        mTaskBubbleCard.setScaleY(1f);
+                                    }
+                                }
+                            })
+                            .start();
+                } else {
+                    mTaskBubbleRoot.setVisibility(View.GONE);
+                }
             }
         }
         bringCursorToFront();
@@ -2708,12 +3104,13 @@ public class BridgeService extends Service {
 
     private void updateInputToggleUi(int inputToExt) {
         if (mBtnToggle != null) {
-            mBtnToggle.setText(inputToExt == 1 ? "⇄ 外接" : "⇄ 平板");
+            mBtnToggle.setText(inputToExt == 1 ? "外接" : "本机");
+            HyperUi.setStartIcon(mBtnToggle, HyperUi.ICON_SWAP, Color.WHITE, 12.5f, 4f);
             GradientDrawable gd = (GradientDrawable) mBtnToggle.getBackground();
-            gd.setColor(inputToExt == 1 ? 0xCC2563EB : 0xCCEA580C);
+            gd.setColor(inputToExt == 1 ? HyperUi.HYPER_BLUE : 0xCC3B4252);
         }
         if (mTileInput != null) {
-            mTileInput.setActive(inputToExt == 1, inputToExt == 1 ? "外接扩展屏" : "平板本机");
+            mTileInput.setActive(inputToExt == 1, inputToExt == 1 ? "外接扩展屏" : "本机内屏");
         }
     }
 
@@ -2750,6 +3147,7 @@ public class BridgeService extends Service {
             String label = getCachedLabel(pm, t.pkg);
 
             LinearLayout slot = new LinearLayout(mExtCtx);
+            slot.setTag(t.pkg);
             slot.setOrientation(LinearLayout.VERTICAL);
             slot.setGravity(Gravity.CENTER);
             slot.setPadding(dp(mExtCtx, 6), dp(mExtCtx, 3), dp(mExtCtx, 6), dp(mExtCtx, 3));
@@ -2799,14 +3197,11 @@ public class BridgeService extends Service {
                 setTaskBubbleOpen(false);
                 boolean shouldMinimize = t.isTopExt() && !t.isInSplit()
                         && mLastStatus != null && mLastStatus.mirrorMode == BridgeClient.MIRROR_MODE_DEX;
-                mBg.execute(() -> {
-                    if (shouldMinimize) {
-                        BridgeClient.minimizeToExtHome(t.taskId, t.pkg);
-                    } else {
-                        BridgeClient.switchToTask(t.taskId, t.pkg);
-                    }
-                    mHandler.postDelayed(this::pollRemoteStateAsync, 250);
-                });
+                if (shouldMinimize) {
+                    performMinimizeTaskAnimated(slot, t, label, icon);
+                } else {
+                    performRestoreTaskAnimated(slot, t, label, icon);
+                }
             });
             slot.setOnTouchListener((v, ev) -> {
                 if (ev == null) return false;
@@ -2822,6 +3217,14 @@ public class BridgeService extends Service {
                         secDown[0] = false;
                     }
                     return true;
+                }
+                if (act == MotionEvent.ACTION_DOWN) {
+                    v.animate().cancel();
+                    v.animate().scaleX(0.86f).scaleY(0.86f).setDuration(80L).start();
+                } else if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) {
+                    v.animate().cancel();
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(170L)
+                            .setInterpolator(new OvershootInterpolator(1.9f)).start();
                 }
                 return false;
             });
@@ -2850,6 +3253,789 @@ public class BridgeService extends Service {
             sLp.rightMargin = dp(mExtCtx, 2);
             mTaskStrip.addView(slot, sLp);
         }
+    }
+
+    // --- HyperOS 2.0 Window Minimize / Restore & Split-Screen Choreography ---
+
+    private static void attachTactilePress(View v, float pressedScale) {
+        if (v == null) return;
+        v.setOnTouchListener((view, ev) -> {
+            if (ev == null) return false;
+            int act = ev.getActionMasked();
+            if (act == MotionEvent.ACTION_DOWN) {
+                view.animate().cancel();
+                view.animate().scaleX(pressedScale).scaleY(pressedScale).setDuration(80L).start();
+            } else if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) {
+                view.animate().cancel();
+                view.animate().scaleX(1f).scaleY(1f).setDuration(165L)
+                        .setInterpolator(new OvershootInterpolator(1.8f)).start();
+            }
+            return false;
+        });
+    }
+
+    private Rect getFullStageRect() {
+        int sw = Math.max(600, mOverlayW);
+        int sh = Math.max(600, mOverlayH);
+        return new Rect(0, 0, sw, sh);
+    }
+
+    private Rect computeLocalSplitRect(int slot, float ratio) {
+        int sw = Math.max(600, mOverlayW);
+        int sh = Math.max(600, mOverlayH);
+        boolean portrait = sh > sw;
+        float r = Math.max(0.25f, Math.min(0.75f, ratio));
+        int halfGap = 4;
+        if (!portrait) {
+            int div = Math.max(Math.round(sw * 0.25f), Math.min(Math.round(sw * 0.75f), Math.round(sw * r)));
+            return slot == 0
+                    ? new Rect(0, 0, Math.max(240, div - halfGap), sh)
+                    : new Rect(Math.min(sw - 240, div + halfGap), 0, sw, sh);
+        } else {
+            int div = Math.max(Math.round(sh * 0.25f), Math.min(Math.round(sh * 0.75f), Math.round(sh * r)));
+            return slot == 0
+                    ? new Rect(0, 0, sw, Math.max(240, div - halfGap))
+                    : new Rect(0, Math.min(sh - 240, div + halfGap), sw, sh);
+        }
+    }
+
+    private View findDockSlotByPkg(String pkg) {
+        if (mTaskStrip == null || pkg == null || pkg.isEmpty()) return null;
+        int n = mTaskStrip.getChildCount();
+        for (int i = 0; i < n; i++) {
+            View child = mTaskStrip.getChildAt(i);
+            if (child != null && pkg.equals(child.getTag())) {
+                return child;
+            }
+        }
+        return null;
+    }
+
+    private RectF resolveDockIconRectOnScreen(View preferredSlot, String pkg) {
+        int sw = Math.max(600, mOverlayW);
+        int sh = Math.max(600, mOverlayH);
+        View slot = preferredSlot != null ? preferredSlot : findDockSlotByPkg(pkg);
+        View target = slot;
+        if (slot instanceof ViewGroup && ((ViewGroup) slot).getChildCount() > 0) {
+            target = ((ViewGroup) slot).getChildAt(0);
+        }
+        if (target != null && target.isShown() && target.getWidth() > 0 && target.getHeight() > 0) {
+            int[] loc = new int[2];
+            target.getLocationOnScreen(loc);
+            if (loc[0] >= 0 && loc[1] >= 0 && loc[0] < sw && loc[1] < sh) {
+                return new RectF(loc[0], loc[1], loc[0] + target.getWidth(), loc[1] + target.getHeight());
+            }
+        }
+        int sz = mExtCtx != null ? dp(mExtCtx, 28) : 36;
+        int bottomPad = mExtCtx != null ? dp(mExtCtx, 18) : 24;
+        float cx = sw * 0.5f;
+        float cy = sh - bottomPad - sz * 0.5f;
+        return new RectF(cx - sz * 0.5f, cy - sz * 0.5f, cx + sz * 0.5f, cy + sz * 0.5f);
+    }
+
+    private void bounceDockSlot(String pkg, View fallbackView, boolean downwardCushion) {
+        View v = findDockSlotByPkg(pkg);
+        if (v == null) v = fallbackView;
+        if (v == null || mExtCtx == null) return;
+        final View target = v;
+        float dy = downwardCushion ? dp(mExtCtx, 4.5f) : -dp(mExtCtx, 4f);
+        float sc = downwardCushion ? 0.85f : 1.12f;
+        target.animate().cancel();
+        target.animate()
+                .translationY(dy)
+                .scaleX(sc)
+                .scaleY(sc)
+                .setDuration(85L)
+                .setInterpolator(new DecelerateInterpolator())
+                .withEndAction(() -> target.animate()
+                        .translationY(0f)
+                        .scaleX(1f)
+                        .scaleY(1f)
+                        .setDuration(190L)
+                        .setInterpolator(new OvershootInterpolator(2.1f))
+                        .start())
+                .start();
+    }
+
+    private void beginWindowOverlayStage() {
+        mForceWindowOverlaysDuringAnim = true;
+        syncOverlayHostSurface(false);
+        bringCursorToFront();
+    }
+
+    private void endWindowOverlayStage() {
+        mForceWindowOverlaysDuringAnim = false;
+        syncOverlayHostSurface(false);
+        bringCursorToFront();
+    }
+
+    private StageTransitionView.CardSpec buildCardSpec(
+            String pkg,
+            BridgeClient.TaskSnapshotData snap,
+            Rect startR,
+            Rect endR) {
+        StageTransitionView.CardSpec spec = new StageTransitionView.CardSpec();
+        if (snap != null && snap.bitmap != null) {
+            spec.snapshot = snap.bitmap;
+            spec.ownSnapshot = snap.ownBitmap;
+        }
+        if (pkg != null && !pkg.isEmpty() && !"com.extbridge.helper".equals(pkg)) {
+            PackageManager pm = getPackageManager();
+            spec.icon = getCachedIcon(pm, pkg);
+            spec.label = getCachedLabel(pm, pkg);
+        } else {
+            spec.label = "扩展桌面";
+        }
+        spec.setRects(startR, endR);
+        return spec;
+    }
+
+    private static void recycleUnusedCard(StageTransitionView.CardSpec c) {
+        if (c != null && c.ownSnapshot && c.snapshot != null && !c.snapshot.isRecycled()) {
+            try { c.snapshot.recycle(); } catch (Throwable ignored) {}
+        }
+        if (c != null) c.snapshot = null;
+    }
+
+    private void performMinimizeTaskAnimated(View slotView, BridgeClient.TaskEntry t, String label, Drawable icon) {
+        if (mStageAnimView == null || mExtCtx == null || t == null) {
+            safeBgExecute(() -> {
+                BridgeClient.minimizeToExtHome(t != null ? t.taskId : -1, t != null ? t.pkg : null);
+                safePost(this::pollRemoteStateAsync);
+            });
+            return;
+        }
+        final RectF dockIconRect = resolveDockIconRectOnScreen(slotView, t.pkg);
+        final Rect fullRect = getFullStageRect();
+        final Drawable animIcon = icon != null ? cloneDrawable(icon) : getCachedIcon(getPackageManager(), t.pkg);
+        final String animLabel = (label != null && !label.isEmpty()) ? label : getCachedLabel(getPackageManager(), t.pkg);
+
+        safeBgExecute(() -> {
+            BridgeClient.TaskSnapshotData snap = BridgeClient.captureTaskSnapshot(t.taskId, t.pkg, true);
+            Rect startBounds = (snap != null && snap.bounds != null && snap.bounds.width() > 60)
+                    ? snap.bounds : fullRect;
+
+            StageTransitionView.CardSpec card = new StageTransitionView.CardSpec();
+            if (snap != null && snap.bitmap != null) {
+                card.snapshot = snap.bitmap;
+                card.ownSnapshot = snap.ownBitmap;
+            }
+            card.icon = animIcon;
+            card.label = animLabel;
+            card.startRect.set(startBounds);
+            card.endRect.set(dockIconRect);
+
+            CountDownLatch frame0Latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(card);
+                    frame0Latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playMinimizeToDock(
+                        card,
+                        () -> bounceDockSlot(t.pkg, slotView, true),
+                        () -> {
+                            endWindowOverlayStage();
+                            pollRemoteStateAsync();
+                        });
+                frame0Latch.countDown();
+            });
+            try { frame0Latch.await(45L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+
+            BridgeClient.minimizeToExtHome(t.taskId, t.pkg);
+            mHandler.postDelayed(this::pollRemoteStateAsync, 260L);
+        });
+    }
+
+    private void performHomeButtonAnimated(View homeBtn) {
+        BridgeClient.Status st = mLastStatus;
+        boolean canAnimMinimize = mStageAnimView != null && mExtCtx != null
+                && !mIsOnLauncherHome
+                && st != null && st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX;
+        if (!canAnimMinimize) {
+            safeBgExecute(() -> {
+                BridgeClient.relaunchLauncher();
+                safePost(this::pollRemoteStateAsync);
+            });
+            return;
+        }
+        if (st.splitActive == 1) {
+            boolean singleEmpty = ((st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty())
+                    != (st.splitSlot1Pkg == null || st.splitSlot1Pkg.isEmpty()));
+            if (!singleEmpty) {
+                performExitSplitToHomeAnimated(homeBtn);
+                return;
+            }
+            safeBgExecute(() -> {
+                BridgeClient.relaunchLauncher();
+                safePost(this::pollRemoteStateAsync);
+            });
+            return;
+        }
+
+        safeBgExecute(() -> {
+            List<BridgeClient.TaskEntry> tasks = BridgeClient.getTasks();
+            BridgeClient.TaskEntry topExt = null;
+            if (tasks != null) {
+                for (BridgeClient.TaskEntry te : tasks) {
+                    if (te != null && te.isTopExt() && !"com.extbridge.helper".equals(te.pkg)) {
+                        topExt = te;
+                        break;
+                    }
+                }
+            }
+            if (topExt == null) {
+                BridgeClient.relaunchLauncher();
+                safePost(this::pollRemoteStateAsync);
+                return;
+            }
+            final BridgeClient.TaskEntry target = topExt;
+            PackageManager pm = getPackageManager();
+            final Drawable icon = getCachedIcon(pm, target.pkg);
+            final String label = getCachedLabel(pm, target.pkg);
+            safePost(() -> performMinimizeTaskAnimated(findDockSlotByPkg(target.pkg) != null
+                    ? findDockSlotByPkg(target.pkg) : homeBtn, target, label, icon));
+        });
+    }
+
+    private void performExitSplitToHomeAnimated(View anchorBtn) {
+        Context extCtx = mExtCtx;
+        if (mStageAnimView == null || extCtx == null) {
+            safeBgExecute(() -> {
+                BridgeClient.relaunchLauncher();
+                safePost(this::pollRemoteStateAsync);
+            });
+            return;
+        }
+        final int cornerStart = dp(extCtx, 10);
+        final int cornerEnd = dp(extCtx, 9);
+        final RectF anchorRect = resolveDockIconRectOnScreen(anchorBtn, null);
+        final Rect fullRect = getFullStageRect();
+        final String p0 = mLastStatus != null ? mLastStatus.splitSlot0Pkg : "";
+        final String p1 = mLastStatus != null ? mLastStatus.splitSlot1Pkg : "";
+        final float ratio = mDisplayedSplitRatio;
+
+        safeBgExecute(() -> {
+            BridgeClient.TaskSnapshotData s0 = !TextUtils.isEmpty(p0)
+                    ? BridgeClient.captureTaskSnapshot(-1, p0, true) : null;
+            BridgeClient.TaskSnapshotData s1 = !TextUtils.isEmpty(p1)
+                    ? BridgeClient.captureTaskSnapshot(-1, p1, true) : null;
+            Rect r0 = (s0 != null && s0.bounds != null) ? s0.bounds : computeLocalSplitRect(0, ratio);
+            Rect r1 = (s1 != null && s1.bounds != null) ? s1.bounds : computeLocalSplitRect(1, ratio);
+
+            StageTransitionView.CardSpec c0 = !TextUtils.isEmpty(p0)
+                    ? buildCardSpec(p0, s0, r0, new Rect(Math.round(anchorRect.left), Math.round(anchorRect.top),
+                            Math.round(anchorRect.right), Math.round(anchorRect.bottom)))
+                    : null;
+            StageTransitionView.CardSpec c1 = !TextUtils.isEmpty(p1)
+                    ? buildCardSpec(p1, s1, r1, new Rect(Math.round(anchorRect.left), Math.round(anchorRect.top),
+                            Math.round(anchorRect.right), Math.round(anchorRect.bottom)))
+                    : null;
+            if (c0 != null) {
+                c0.mode = StageTransitionView.MODE_MINIMIZE_TO_ICON;
+                c0.startCornerPx = cornerStart;
+                c0.endCornerPx = cornerEnd;
+            }
+            if (c1 != null) {
+                c1.mode = StageTransitionView.MODE_MINIMIZE_TO_ICON;
+                c1.startCornerPx = cornerStart;
+                c1.endCornerPx = cornerEnd;
+            }
+            final StageTransitionView.CardSpec fc0 = c0 != null ? c0 : buildCardSpec(null, null, fullRect, fullRect);
+            final StageTransitionView.CardSpec fc1 = c1;
+            CountDownLatch latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(fc0);
+                    recycleUnusedCard(fc1);
+                    latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playSplitTransition(fc0, fc1, mOverlayH > mOverlayW, 250L, false, () -> {
+                    endWindowOverlayStage();
+                    pollRemoteStateAsync();
+                });
+                anim.notifyBackendReady(anim.getActiveToken());
+                latch.countDown();
+            });
+            try { latch.await(45L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+            BridgeClient.relaunchLauncher();
+            mHandler.postDelayed(this::pollRemoteStateAsync, 260L);
+        });
+    }
+
+    private void performRestoreTaskAnimated(View slotView, BridgeClient.TaskEntry t, String label, Drawable icon) {
+        if (mStageAnimView == null || mExtCtx == null || t == null) {
+            safeBgExecute(() -> {
+                BridgeClient.switchToTask(t != null ? t.taskId : -1, t != null ? t.pkg : null);
+                safePost(this::pollRemoteStateAsync);
+            });
+            return;
+        }
+        bounceDockSlot(t.pkg, slotView, false);
+        final RectF dockIconRect = resolveDockIconRectOnScreen(slotView, t.pkg);
+        BridgeClient.Status st = mLastStatus;
+        int splitTargetSlot = -1;
+        if (st != null && st.splitActive == 1 && t.pkg != null && !"com.extbridge.helper".equals(t.pkg)) {
+            if (t.pkg.equals(st.splitSlot0Pkg)) splitTargetSlot = 0;
+            else if (t.pkg.equals(st.splitSlot1Pkg)) splitTargetSlot = 1;
+            else if (TextUtils.isEmpty(st.splitSlot0Pkg)) splitTargetSlot = 0;
+            else if (TextUtils.isEmpty(st.splitSlot1Pkg)) splitTargetSlot = 1;
+        }
+        final boolean targetIsSplit = (splitTargetSlot >= 0);
+        final Rect targetRect = targetIsSplit
+                ? computeLocalSplitRect(splitTargetSlot, mDisplayedSplitRatio)
+                : getFullStageRect();
+        final Drawable animIcon = icon != null ? cloneDrawable(icon) : getCachedIcon(getPackageManager(), t.pkg);
+        final String animLabel = (label != null && !label.isEmpty()) ? label : getCachedLabel(getPackageManager(), t.pkg);
+
+        safeBgExecute(() -> {
+            BridgeClient.TaskSnapshotData snap = BridgeClient.captureTaskSnapshot(t.taskId, t.pkg, false);
+            StageTransitionView.CardSpec card = new StageTransitionView.CardSpec();
+            if (snap != null && snap.bitmap != null) {
+                card.snapshot = snap.bitmap;
+                card.ownSnapshot = snap.ownBitmap;
+            }
+            card.icon = animIcon;
+            card.label = animLabel;
+            card.startRect.set(dockIconRect);
+            card.endRect.set(targetRect);
+
+            final int[] tokenBox = {-1};
+            CountDownLatch latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(card);
+                    latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playRestoreFromDock(card, targetIsSplit, () -> {
+                    endWindowOverlayStage();
+                    pollRemoteStateAsync();
+                });
+                tokenBox[0] = anim.getActiveToken();
+                latch.countDown();
+            });
+            try { latch.await(45L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+
+            BridgeClient.switchToTask(t.taskId, t.pkg);
+            StageTransitionView animNow = mStageAnimView;
+            if (animNow != null && tokenBox[0] > 0) animNow.notifyBackendReady(tokenBox[0]);
+            mHandler.postDelayed(this::pollRemoteStateAsync, 180L);
+        });
+    }
+
+    private void animateSplitDividerTo(float targetRatio, long durationMs) {
+        if (mSplitDividerAnimator != null) {
+            mSplitDividerAnimator.cancel();
+            mSplitDividerAnimator = null;
+        }
+        float startRatio = mDisplayedSplitRatio;
+        float clamped = Math.max(0.25f, Math.min(0.75f, targetRatio));
+        if (Math.abs(clamped - startRatio) < 0.005f || mSplitDividerRoot == null) {
+            positionSplitDividerAt(clamped, false);
+            return;
+        }
+        ValueAnimator va = ValueAnimator.ofFloat(startRatio, clamped);
+        va.setDuration(durationMs);
+        va.setInterpolator(new PathInterpolator(0.20f, 0.96f, 0.28f, 1.0f));
+        va.addUpdateListener(anim -> positionSplitDividerAt((float) anim.getAnimatedValue(), false));
+        mSplitDividerAnimator = va;
+        va.start();
+    }
+
+    private void performEnterOrAssignSplitAnimated(int action, int slotHint, int taskId, String pkg, String cls) {
+        Context extCtx = mExtCtx;
+        if (mStageAnimView == null || extCtx == null) {
+            safeBgExecute(() -> {
+                BridgeClient.SplitResult sr = BridgeClient.splitActionDetailed(action, taskId, pkg, cls);
+                safePost(() -> {
+                    if (action == BridgeClient.SPLIT_TOGGLE_QUICK && !sr.ok) {
+                        Toast.makeText(BridgeService.this,
+                                "请先打开应用，或在桌面长按/右键图标选择「分屏：放入左/右屏」",
+                                Toast.LENGTH_LONG).show();
+                    }
+                    pollRemoteStateAsync();
+                });
+            });
+            return;
+        }
+
+        final int dp16 = dp(extCtx, 16);
+        final int dp8 = dp(extCtx, 8);
+        final boolean portrait = mOverlayH > mOverlayW;
+        final Rect fullRect = getFullStageRect();
+        final BridgeClient.Status preSt = mLastStatus;
+        final boolean wasSplit = (preSt != null && preSt.splitActive == 1);
+        final float curRatio = (preSt != null && preSt.splitRatioPct > 0) ? (preSt.splitRatioPct / 100f) : 0.50f;
+        final String preSlot0 = (preSt != null && preSt.splitSlot0Pkg != null) ? preSt.splitSlot0Pkg : "";
+        final String preSlot1 = (preSt != null && preSt.splitSlot1Pkg != null) ? preSt.splitSlot1Pkg : "";
+
+        safeBgExecute(() -> {
+            // 1. Capture pre-transition snapshot(s) BEFORE split changes WM bounds so there is zero black resize flash
+            String topVisiblePkg = "";
+            int topVisibleTid = -1;
+            String secondCandPkg = "";
+            int secondCandTid = -1;
+            List<BridgeClient.TaskEntry> preTasks = BridgeClient.getTasks();
+            if (preTasks != null) {
+                for (BridgeClient.TaskEntry te : preTasks) {
+                    if (te == null || "com.extbridge.helper".equals(te.pkg) || "android".equals(te.pkg)) continue;
+                    if (TextUtils.isEmpty(topVisiblePkg) && te.isTopExt()) {
+                        topVisiblePkg = te.pkg;
+                        topVisibleTid = te.taskId;
+                    } else if (TextUtils.isEmpty(secondCandPkg)) {
+                        secondCandPkg = te.pkg;
+                        secondCandTid = te.taskId;
+                    }
+                }
+                if (TextUtils.isEmpty(topVisiblePkg)) {
+                    for (BridgeClient.TaskEntry te : preTasks) {
+                        if (te == null || "com.extbridge.helper".equals(te.pkg) || "android".equals(te.pkg)) continue;
+                        topVisiblePkg = te.pkg;
+                        topVisibleTid = te.taskId;
+                        break;
+                    }
+                }
+            }
+
+            if (action == BridgeClient.SPLIT_TOGGLE_QUICK && TextUtils.isEmpty(topVisiblePkg) && TextUtils.isEmpty(secondCandPkg)) {
+                safePost(() -> Toast.makeText(BridgeService.this,
+                        "请先打开应用，或在桌面长按/右键图标选择「分屏：放入左/右屏」",
+                        Toast.LENGTH_LONG).show());
+                return;
+            }
+
+            // Predict resulting slot0 and slot1 before calling splitActionDetailed so Frame 0 covers screen immediately
+            String pred0, pred1;
+            if (action == BridgeClient.SPLIT_TOGGLE_QUICK) {
+                pred0 = topVisiblePkg;
+                pred1 = secondCandPkg;
+            } else if (action == BridgeClient.SPLIT_ASSIGN_LEFT_TOP) {
+                pred0 = pkg != null ? pkg : "";
+                pred1 = (wasSplit && !pred0.equals(preSlot1)) ? preSlot1 : "";
+            } else {
+                pred1 = pkg != null ? pkg : "";
+                pred0 = (wasSplit && !pred1.equals(preSlot0)) ? preSlot0 : "";
+            }
+
+            BridgeClient.TaskSnapshotData snap0 = null;
+            if (!TextUtils.isEmpty(pred0)) {
+                boolean isLive0 = pred0.equals(topVisiblePkg) || (wasSplit && pred0.equals(preSlot0));
+                snap0 = BridgeClient.captureTaskSnapshot(pred0.equals(topVisiblePkg) ? topVisibleTid : -1, pred0, isLive0);
+            }
+            BridgeClient.TaskSnapshotData snap1 = null;
+            if (!TextUtils.isEmpty(pred1)) {
+                boolean isLive1 = pred1.equals(topVisiblePkg) || (wasSplit && pred1.equals(preSlot1));
+                snap1 = BridgeClient.captureTaskSnapshot(pred1.equals(topVisiblePkg) ? topVisibleTid : secondCandTid, pred1, isLive1);
+            }
+
+            float targetRatio = Math.max(0.25f, Math.min(0.75f, curRatio));
+            Rect end0 = computeLocalSplitRect(0, targetRatio);
+            Rect end1 = computeLocalSplitRect(1, targetRatio);
+
+            Rect start0 = (wasSplit && pred0.equals(preSlot0)) ? computeLocalSplitRect(0, curRatio)
+                    : ((!TextUtils.isEmpty(pred0) && pred0.equals(topVisiblePkg)) ? fullRect : offsetSlideInRect(end0, portrait, true));
+            Rect start1 = (wasSplit && pred1.equals(preSlot1)) ? computeLocalSplitRect(1, curRatio)
+                    : ((!TextUtils.isEmpty(pred1) && pred1.equals(topVisiblePkg)) ? fullRect : offsetSlideInRect(end1, portrait, false));
+
+            StageTransitionView.CardSpec c0 = buildCardSpec(pred0, snap0, start0, end0);
+            c0.startCornerPx = start0.equals(fullRect) ? 0f : dp16;
+            c0.endCornerPx = dp8;
+            c0.startAlpha = start0.equals(fullRect) || (wasSplit && pred0.equals(preSlot0)) ? 1f : 0.30f;
+
+            StageTransitionView.CardSpec c1 = buildCardSpec(pred1, snap1, start1, end1);
+            c1.startCornerPx = start1.equals(fullRect) ? 0f : dp16;
+            c1.endCornerPx = dp8;
+            c1.startAlpha = start1.equals(fullRect) || (wasSplit && pred1.equals(preSlot1)) ? 1f : 0.30f;
+
+            final int[] tokenBox = {-1};
+            CountDownLatch frame0Latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(c0);
+                    recycleUnusedCard(c1);
+                    frame0Latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playSplitTransition(c0, c1, portrait, 285L, false, () -> {
+                    endWindowOverlayStage();
+                    pollRemoteStateAsync();
+                });
+                tokenBox[0] = anim.getActiveToken();
+                frame0Latch.countDown();
+            });
+            try { frame0Latch.await(45L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+
+            // 2. Now resize tasks underneath our active StageTransitionView (zero black resize flash!)
+            BridgeClient.SplitResult sr = BridgeClient.splitActionDetailed(action, taskId, pkg, cls);
+            final int expectedToken = tokenBox[0];
+            safePost(() -> {
+                if (sr.ok && action == BridgeClient.SPLIT_TOGGLE_QUICK) {
+                    Toast.makeText(BridgeService.this,
+                            portrait ? "已开启上下分屏（拖动分割条可调比例）" : "已开启左右分屏（拖动分割条可调比例）",
+                            Toast.LENGTH_SHORT).show();
+                } else if (!sr.ok && action == BridgeClient.SPLIT_TOGGLE_QUICK) {
+                    Toast.makeText(BridgeService.this,
+                            "请先打开应用，或在桌面长按/右键图标选择「分屏：放入左/右屏」",
+                            Toast.LENGTH_LONG).show();
+                }
+                pollRemoteStateAsync();
+                // Allow multi-window Activities ~130ms to finish redrawing their new half-bounds before dissolving
+                mHandler.postDelayed(() -> {
+                    StageTransitionView animNow = mStageAnimView;
+                    if (animNow != null && expectedToken > 0) animNow.notifyBackendReady(expectedToken);
+                }, 130L);
+            });
+        });
+    }
+
+    private Rect offsetSlideInRect(Rect target, boolean portrait, boolean firstSlot) {
+        Context extCtx = mExtCtx;
+        int shift = extCtx != null ? dp(extCtx, 56) : 72;
+        int insetW = Math.round(target.width() * 0.04f);
+        int insetH = Math.round(target.height() * 0.04f);
+        Rect r = new Rect(target.left + insetW, target.top + insetH,
+                target.right - insetW, target.bottom - insetH);
+        if (!portrait) {
+            r.offset(firstSlot ? -shift : shift, 0);
+        } else {
+            r.offset(0, firstSlot ? -shift : shift);
+        }
+        return r;
+    }
+
+    private void performSplitRatioAnimated(int pct, boolean fromDragRelease) {
+        int clampedPct = Math.max(25, Math.min(75, pct));
+        float oldRatio = mDisplayedSplitRatio;
+        float newRatio = clampedPct / 100f;
+        if (mLastStatus != null) mLastStatus.splitRatioPct = clampedPct;
+
+        long dur = fromDragRelease ? 180L : 240L;
+        animateSplitDividerTo(newRatio, dur);
+
+        Context extCtx = mExtCtx;
+        if (mStageAnimView == null || extCtx == null || Math.abs(newRatio - oldRatio) < 0.015f || fromDragRelease) {
+            safeBgExecute(() -> {
+                BridgeClient.setSplitRatio(clampedPct);
+                safePost(() -> {
+                    Toast.makeText(BridgeService.this,
+                            "分屏比例：" + clampedPct + "% : " + (100 - clampedPct) + "%", Toast.LENGTH_SHORT).show();
+                    pollRemoteStateAsync();
+                });
+            });
+            return;
+        }
+
+        final int dp8 = dp(extCtx, 8);
+        final int dp6 = dp(extCtx, 6);
+        final String p0 = (mLastStatus != null && mLastStatus.splitSlot0Pkg != null) ? mLastStatus.splitSlot0Pkg : "";
+        final String p1 = (mLastStatus != null && mLastStatus.splitSlot1Pkg != null) ? mLastStatus.splitSlot1Pkg : "";
+        final boolean portrait = mOverlayH > mOverlayW;
+        final Rect old0 = computeLocalSplitRect(0, oldRatio);
+        final Rect old1 = computeLocalSplitRect(1, oldRatio);
+        final Rect new0 = computeLocalSplitRect(0, newRatio);
+        final Rect new1 = computeLocalSplitRect(1, newRatio);
+
+        safeBgExecute(() -> {
+            BridgeClient.TaskSnapshotData s0 = !TextUtils.isEmpty(p0)
+                    ? BridgeClient.captureTaskSnapshot(-1, p0, true) : null;
+            BridgeClient.TaskSnapshotData s1 = !TextUtils.isEmpty(p1)
+                    ? BridgeClient.captureTaskSnapshot(-1, p1, true) : null;
+
+            StageTransitionView.CardSpec c0 = buildCardSpec(p0, s0, old0, new0);
+            c0.startCornerPx = dp8;
+            c0.endCornerPx = dp6;
+
+            StageTransitionView.CardSpec c1 = buildCardSpec(p1, s1, old1, new1);
+            c1.startCornerPx = dp8;
+            c1.endCornerPx = dp6;
+
+            final int[] tokenBox = {-1};
+            CountDownLatch latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(c0);
+                    recycleUnusedCard(c1);
+                    latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playSplitTransition(c0, c1, portrait, dur, false, () -> {
+                    endWindowOverlayStage();
+                    pollRemoteStateAsync();
+                });
+                tokenBox[0] = anim.getActiveToken();
+                latch.countDown();
+            });
+            try { latch.await(40L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+
+            BridgeClient.setSplitRatio(clampedPct);
+            StageTransitionView animNow = mStageAnimView;
+            if (animNow != null && tokenBox[0] > 0) animNow.notifyBackendReady(tokenBox[0]);
+            safePost(() -> Toast.makeText(BridgeService.this,
+                    "分屏比例：" + clampedPct + "% : " + (100 - clampedPct) + "%", Toast.LENGTH_SHORT).show());
+        });
+    }
+
+    private void performSplitSwapAnimated() {
+        Context extCtx = mExtCtx;
+        if (mStageAnimView == null || extCtx == null || mLastStatus == null) {
+            safeBgExecute(() -> {
+                BridgeClient.swapSplitSlots();
+                safePost(this::pollRemoteStateAsync);
+            });
+            return;
+        }
+        final int dp8 = dp(extCtx, 8);
+        final String p0 = mLastStatus.splitSlot0Pkg != null ? mLastStatus.splitSlot0Pkg : "";
+        final String p1 = mLastStatus.splitSlot1Pkg != null ? mLastStatus.splitSlot1Pkg : "";
+        final boolean portrait = mOverlayH > mOverlayW;
+        final float ratio = mDisplayedSplitRatio;
+        final Rect r0 = computeLocalSplitRect(0, ratio);
+        final Rect r1 = computeLocalSplitRect(1, ratio);
+
+        if (mSplitDividerPill != null) {
+            mSplitDividerPill.animate().cancel();
+            mSplitDividerPill.animate()
+                    .scaleX(1.16f).scaleY(1.16f).setDuration(130L)
+                    .withEndAction(() -> {
+                        if (mSplitDividerPill != null) {
+                            mSplitDividerPill.animate().scaleX(1f).scaleY(1f).setDuration(170L)
+                                    .setInterpolator(new OvershootInterpolator(1.6f)).start();
+                        }
+                    }).start();
+        }
+
+        safeBgExecute(() -> {
+            BridgeClient.TaskSnapshotData s0 = !TextUtils.isEmpty(p0)
+                    ? BridgeClient.captureTaskSnapshot(-1, p0, true) : null;
+            BridgeClient.TaskSnapshotData s1 = !TextUtils.isEmpty(p1)
+                    ? BridgeClient.captureTaskSnapshot(-1, p1, true) : null;
+
+            StageTransitionView.CardSpec cOver = buildCardSpec(p0, s0, r0, r1);
+            cOver.mode = StageTransitionView.MODE_SWAP_OVER;
+            cOver.startCornerPx = dp8;
+            cOver.endCornerPx = dp8;
+
+            StageTransitionView.CardSpec cUnder = buildCardSpec(p1, s1, r1, r0);
+            cUnder.mode = StageTransitionView.MODE_SWAP_UNDER;
+            cUnder.startCornerPx = dp8;
+            cUnder.endCornerPx = dp8;
+
+            final int[] tokenBox = {-1};
+            CountDownLatch latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(cOver);
+                    recycleUnusedCard(cUnder);
+                    latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playSplitTransition(cOver, cUnder, portrait, 300L, true, () -> {
+                    endWindowOverlayStage();
+                    pollRemoteStateAsync();
+                });
+                tokenBox[0] = anim.getActiveToken();
+                latch.countDown();
+            });
+            try { latch.await(45L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+
+            BridgeClient.swapSplitSlots();
+            StageTransitionView animNow = mStageAnimView;
+            if (animNow != null && tokenBox[0] > 0) animNow.notifyBackendReady(tokenBox[0]);
+        });
+    }
+
+    private void performExitSplitAnimated() {
+        if (mStageAnimView == null || mExtCtx == null || mLastStatus == null) {
+            safeBgExecute(() -> {
+                BridgeClient.exitSplitMode();
+                safePost(() -> {
+                    Toast.makeText(BridgeService.this, "已退出分屏", Toast.LENGTH_SHORT).show();
+                    pollRemoteStateAsync();
+                });
+            });
+            return;
+        }
+        final String p0 = mLastStatus.splitSlot0Pkg != null ? mLastStatus.splitSlot0Pkg : "";
+        final String p1 = mLastStatus.splitSlot1Pkg != null ? mLastStatus.splitSlot1Pkg : "";
+        final boolean portrait = mOverlayH > mOverlayW;
+        final float ratio = mDisplayedSplitRatio;
+        final Rect r0 = computeLocalSplitRect(0, ratio);
+        final Rect r1 = computeLocalSplitRect(1, ratio);
+        final Rect fullRect = getFullStageRect();
+        final boolean expandSlot0 = !TextUtils.isEmpty(p0) || TextUtils.isEmpty(p1);
+
+        if (mSplitDividerRoot != null && mSplitDividerRoot.getVisibility() == View.VISIBLE) {
+            mSplitDividerRoot.animate().cancel();
+            mSplitDividerRoot.animate()
+                    .alpha(0f).scaleX(0.55f).scaleY(0.55f).setDuration(150L)
+                    .withEndAction(() -> {
+                        if (mSplitDividerRoot != null) {
+                            mSplitDividerRoot.setVisibility(View.GONE);
+                            mSplitDividerRoot.setAlpha(1f);
+                            mSplitDividerRoot.setScaleX(1f);
+                            mSplitDividerRoot.setScaleY(1f);
+                        }
+                    }).start();
+        }
+
+        safeBgExecute(() -> {
+            BridgeClient.TaskSnapshotData s0 = !TextUtils.isEmpty(p0)
+                    ? BridgeClient.captureTaskSnapshot(-1, p0, true) : null;
+            BridgeClient.TaskSnapshotData s1 = !TextUtils.isEmpty(p1)
+                    ? BridgeClient.captureTaskSnapshot(-1, p1, true) : null;
+
+            StageTransitionView.CardSpec expCard;
+            StageTransitionView.CardSpec recCard;
+            if (expandSlot0) {
+                expCard = buildCardSpec(p0, s0, r0, fullRect);
+                Rect recEnd = offsetSlideInRect(r1, portrait, false);
+                recCard = !TextUtils.isEmpty(p1) ? buildCardSpec(p1, s1, r1, recEnd) : null;
+            } else {
+                expCard = buildCardSpec(p1, s1, r1, fullRect);
+                Rect recEnd = offsetSlideInRect(r0, portrait, true);
+                recCard = !TextUtils.isEmpty(p0) ? buildCardSpec(p0, s0, r0, recEnd) : null;
+            }
+
+            final int[] tokenBox = {-1};
+            CountDownLatch latch = new CountDownLatch(1);
+            safePost(() -> {
+                StageTransitionView anim = mStageAnimView;
+                if (anim == null || !anim.isAttachedToWindow() || mExtCtx == null) {
+                    recycleUnusedCard(expCard);
+                    recycleUnusedCard(recCard);
+                    latch.countDown();
+                    return;
+                }
+                beginWindowOverlayStage();
+                anim.playSplitExit(expCard, recCard, () -> {
+                    endWindowOverlayStage();
+                    pollRemoteStateAsync();
+                });
+                tokenBox[0] = anim.getActiveToken();
+                latch.countDown();
+            });
+            try { latch.await(45L, TimeUnit.MILLISECONDS); } catch (InterruptedException ignored) {}
+
+            BridgeClient.exitSplitMode();
+            StageTransitionView animNow = mStageAnimView;
+            if (animNow != null && tokenBox[0] > 0) animNow.notifyBackendReady(tokenBox[0]);
+            safePost(() -> Toast.makeText(BridgeService.this, "已退出分屏", Toast.LENGTH_SHORT).show());
+        });
     }
 
     private void refreshLocalHardwareViews() {
@@ -2907,14 +4093,16 @@ public class BridgeService extends Service {
     }
 
     private void execSysAndRefresh(int act, int arg, String str) {
-        mBg.execute(() -> {
+        safeBgExecute(() -> {
             BridgeClient.execSysAction(act, arg, str);
-            try { Thread.sleep(220); } catch (InterruptedException ignored) {}
-            BridgeClient.SysStatus sys = BridgeClient.getSysStatus();
-            mHandler.post(() -> {
-                if (sys != null && sys.valid) mLastSys = sys;
-                refreshSysViews();
-            });
+            safePost(() -> mHandler.postDelayed(() -> safeBgExecute(() -> {
+                BridgeClient.SysStatus sys = BridgeClient.getSysStatus();
+                safePost(() -> {
+                    if (sys != null && sys.valid) mLastSys = sys;
+                    refreshSysViews();
+                    refreshMirrorSideViews(mLastStatus);
+                });
+            }), 220L));
         });
     }
 
@@ -2922,11 +4110,11 @@ public class BridgeService extends Service {
         setPanelOpen(false);
         if (mUsingA11yOverlay) {
             // Scheme B: accessibility overlay remains visible inside Settings on external display
-            mBg.execute(() -> BridgeClient.execSysAction(BridgeClient.SYS_OPEN_SETTINGS, -1, action));
+            safeBgExecute(() -> BridgeClient.execSysAction(BridgeClient.SYS_OPEN_SETTINGS, -1, action));
         } else {
             // Scheme A fallback: open Settings on tablet Display 0 so external screen isn't trapped
             Toast.makeText(this, "未开启无障碍：已在平板打开系统设置", Toast.LENGTH_SHORT).show();
-            mBg.execute(() -> BridgeClient.execSysAction(BridgeClient.SYS_OPEN_SETTINGS, 0, action));
+            safeBgExecute(() -> BridgeClient.execSysAction(BridgeClient.SYS_OPEN_SETTINGS, 0, action));
         }
     }
 
@@ -3045,6 +4233,12 @@ public class BridgeService extends Service {
             return;
         }
         if (on) {
+            BridgeClient.Status st = mLastStatus;
+            if (st == null || !st.connected || st.mirrorMode != BridgeClient.MIRROR_MODE_DEX || st.vdId <= 0) {
+                Toast.makeText(this, "仅在 DeX 扩展桌面已连接外接屏时可用", Toast.LENGTH_SHORT).show();
+                updateBlackoutUi();
+                return;
+            }
             if (!attachBlackoutOverlay()) {
                 mBlackoutActive = false;
                 updateBlackoutUi();
@@ -3096,7 +4290,7 @@ public class BridgeService extends Service {
                     | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
 
             final TextView hint = new TextView(ctx0);
-            hint.setText("🌙 平板已进入一键省电黑屏（最低亮度）\n双击平板屏幕 · 或在 Dock 控制中心关闭");
+            hint.setText("主屏已进入省电黑屏（最低亮度）\n双击屏幕任意位置 · 或锁屏再解锁立即恢复");
             hint.setTextColor(0x99FFFFFF);
             hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
             hint.setGravity(Gravity.CENTER);
@@ -3113,21 +4307,25 @@ public class BridgeService extends Service {
                 if (hint.getParent() != null) hint.setVisibility(View.GONE);
             };
             mLastBlackoutTapMs = 0L;
-            root.setOnClickListener(v -> {
-                long now = SystemClock.uptimeMillis();
-                if (now - mLastBlackoutTapMs <= 450L) {
+            root.setOnTouchListener((v, ev) -> {
+                if (ev != null && ev.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                    long now = SystemClock.uptimeMillis();
+                    if (now - mLastBlackoutTapMs <= 450L) {
+                        if (mHandler != null && mBlackoutHideHintTask != null) {
+                            mHandler.removeCallbacks(mBlackoutHideHintTask);
+                        }
+                        setDexBlackout(false);
+                        return true;
+                    }
+                    mLastBlackoutTapMs = now;
+                    hint.setVisibility(View.VISIBLE);
                     if (mHandler != null && mBlackoutHideHintTask != null) {
                         mHandler.removeCallbacks(mBlackoutHideHintTask);
+                        mHandler.postDelayed(mBlackoutHideHintTask, 2600L);
                     }
-                    setDexBlackout(false);
-                    return;
+                    return true;
                 }
-                mLastBlackoutTapMs = now;
-                hint.setVisibility(View.VISIBLE);
-                if (mHandler != null && mBlackoutHideHintTask != null) {
-                    mHandler.removeCallbacks(mBlackoutHideHintTask);
-                    mHandler.postDelayed(mBlackoutHideHintTask, 2600L);
-                }
+                return true;
             });
             if (mHandler != null) mHandler.postDelayed(mBlackoutHideHintTask, 3200L);
 
@@ -3172,8 +4370,11 @@ public class BridgeService extends Service {
 
     private void updateBlackoutUi() {
         if (mBtnPanelBlackout != null) {
-            mBtnPanelBlackout.setText(mBlackoutActive ? "☀ 已黑屏 · 点此恢复平板亮屏" : "🌙 一键黑屏 (平板最低亮度)");
-            mBtnPanelBlackout.setTextColor(mBlackoutActive ? 0xFFFDE047 : 0xFFCBD5E1);
+            mBtnPanelBlackout.setText(mBlackoutActive ? "主屏已黑屏 · 点此恢复亮屏" : "一键黑屏 (主屏最低亮度)");
+            HyperUi.styleHyperChip(mBtnPanelBlackout, mBlackoutActive);
+            HyperUi.setStartIcon(mBtnPanelBlackout,
+                    mBlackoutActive ? HyperUi.ICON_SUN : HyperUi.ICON_MOON,
+                    mBlackoutActive ? Color.WHITE : 0xFFD8DEE9, 13.5f, 5f);
         }
     }
 
@@ -3186,6 +4387,15 @@ public class BridgeService extends Service {
                 removeBlackoutOverlay();
             }
         }
+        if (mSplitDividerAnimator != null) {
+            mSplitDividerAnimator.cancel();
+            mSplitDividerAnimator = null;
+        }
+        if (mStageAnimView != null) {
+            mStageAnimView.cancelActiveAnimation();
+        }
+        mForceWindowOverlaysDuringAnim = false;
+        removeOverlayView(mStageAnimView);
         removeOverlayView(mSplitDividerRoot);
         removeOverlayView(mSplitMenuRoot);
         removeOverlayView(mTaskBubbleRoot);
@@ -3198,6 +4408,8 @@ public class BridgeService extends Service {
         mExtCtx = null;
         mUsingA11yOverlay = false;
         mWinType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
+        mStageAnimView = null;
+        mStageAnimLp = null;
         mDockRoot = null;
         mDockEdgeTrigger = null;
         mDockEdgePill = null;
@@ -3385,15 +4597,15 @@ public class BridgeService extends Service {
             active = on;
             bgInit = true;
 
-            bg.setColor(on ? 0xFFA6D8E8 : 0xFF2B3444);
-            bg.setCornerRadius(dp(ctx, 8));
-            bg.setStroke(1, on ? 0x44FFFFFF : 0x1AFFFFFF);
+            bg.setColor(on ? HyperUi.HYPER_BLUE : HyperUi.TILE_INACTIVE);
+            bg.setCornerRadius(dp(ctx, 14));
+            bg.setStroke(1, on ? 0x48FFFFFF : 0x1AFFFFFF);
             box.setBackground(bg);
 
-            int fg = on ? 0xFF0F172A : Color.WHITE;
+            int fg = Color.WHITE;
             icon.setTint(fg);
             if (arrow != null) arrow.setTextColor(fg);
-            if (splitSep != null) splitSep.setBackgroundColor(on ? 0x330F172A : 0x22FFFFFF);
+            if (splitSep != null) splitSep.setBackgroundColor(on ? 0x38FFFFFF : 0x22FFFFFF);
         }
     }
 
@@ -3809,7 +5021,14 @@ public class BridgeService extends Service {
     }
 
     private void attachMirrorSidebars(BridgeClient.Status st, int leftWidgetId, int rightWidgetId) {
-        detachMirrorSidebars();
+        if (!attachMirrorSidebarsInternal(st, leftWidgetId, rightWidgetId, true)
+                && Settings.canDrawOverlays(this)) {
+            attachMirrorSidebarsInternal(st, leftWidgetId, rightWidgetId, false);
+        }
+    }
+
+    private boolean attachMirrorSidebarsInternal(
+            BridgeClient.Status st, int leftWidgetId, int rightWidgetId, boolean preferA11y) {
         Display target = null;
         for (Display d : mDm.getDisplays()) {
             if (d != null && d.getDisplayId() == st.sideVdId) {
@@ -3817,7 +5036,12 @@ public class BridgeService extends Service {
                 break;
             }
         }
-        if (target == null) return;
+        if (target == null) {
+            if (mSideAttachedVdId != -1 && mSideAttachedVdId != st.sideVdId) {
+                detachMirrorSidebars();
+            }
+            return true;
+        }
 
         int leftW = Math.max(0, st.mirX);
         int rightW = Math.max(0, st.physW - (st.mirX + st.mirW));
@@ -3827,24 +5051,30 @@ public class BridgeService extends Service {
         final int minWing = 48;
         boolean hasHoriz = (leftW >= minWing || rightW >= minWing);
         boolean hasVert = !hasHoriz && (topH >= minWing || bottomH >= minWing);
-        if (!hasHoriz && !hasVert) return;
+        if (!hasHoriz && !hasVert) {
+            detachMirrorSidebars();
+            return true;
+        }
 
         boolean singleWing = hasHoriz
                 ? ((leftW < minWing && rightW >= minWing) || (rightW < minWing && leftW >= minWing))
                 : ((topH < minWing && bottomH >= minWing) || (bottomH < minWing && topH >= minWing));
 
         NavAssistService a11y = NavAssistService.getInstance();
-        mLastObservedA11y = (a11y != null);
+        boolean displayTrusted = (target.getFlags() & 0x80 /* Display.FLAG_TRUSTED */) != 0;
         int winType;
         Context dispCtx;
-        if (a11y != null) {
+        if (preferA11y) {
+            if (!displayTrusted || a11y == null) {
+                return false;
+            }
             winType = WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY;
             dispCtx = a11y.createDisplayContext(target);
         } else if (Settings.canDrawOverlays(this)) {
             winType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
             dispCtx = createDisplayContext(target);
         } else {
-            return;
+            return true;
         }
 
         // Resolution-agnostic DPI scaling across 720p/1080p/2K/4K, 16:9/16:10/3:2/21:9 & portrait monitors
@@ -3885,23 +5115,13 @@ public class BridgeService extends Service {
         String themeSig = themeId + ":" + Integer.toHexString(customBg);
         String ratioSig = getMirrorWidgetRatio(this, 0) + ":" + getMirrorWidgetRatio(this, 1);
 
-        mSideCtx = uiCtx;
-        mSideWm = (WindowManager) dispCtx.getSystemService(WINDOW_SERVICE);
-        mSideAttachedVdId = st.sideVdId;
-        mSidePhysW = st.physW;
-        mSidePhysH = st.physH;
-        mSideMirX = st.mirX;
-        mSideMirY = st.mirY;
-        mSideMirW = st.mirW;
-        mSideMirH = st.mirH;
-        mSideModeAttached = st.mirrorSideMode;
-        mSideAttachedLeftWidgetId = leftWidgetId;
-        mSideAttachedRightWidgetId = rightWidgetId;
-        mSidePresetSigAttached = presetSig;
-        mSideMemoAttached = memoTxt;
-        mSideThemeSigAttached = themeSig;
-        mSideWidgetRatioSigAttached = ratioSig;
+        final LinearLayout oldLeftRoot = mMirLeftRoot;
+        final LinearLayout oldRightRoot = mMirRightRoot;
+        final WindowManager oldWm = mSideWm;
+        if (mHandler != null) mHandler.removeCallbacks(mPomoTickTask);
+        resetMirrorSideChildRefs();
 
+        WindowManager newWm = (WindowManager) dispCtx.getSystemService(WINDOW_SERVICE);
         ensureWidgetHost();
         if ((leftWidgetId > 0 || rightWidgetId > 0) && mAppWidgetHost != null && !mWidgetHostListening) {
             try {
@@ -3916,79 +5136,121 @@ public class BridgeService extends Service {
                 | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                 | WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED;
 
+        LinearLayout newLeftRoot = null;
+        LinearLayout newRightRoot = null;
+        int nLx = 0, nLy = 0, nLw = 0, nLh = 0;
+        int nRx = 0, nRy = 0, nRw = 0, nRh = 0;
+
         try {
             if (singleWing) {
                 int sx = hasHoriz ? ((leftW < minWing) ? (st.mirX + st.mirW) : 0) : 0;
                 int sy = hasVert ? ((topH < minWing) ? (st.mirY + st.mirH) : 0) : 0;
                 int sw = hasHoriz ? ((leftW < minWing) ? rightW : leftW) : st.physW;
                 int sh = hasVert ? ((topH < minWing) ? bottomH : topH) : st.physH;
-                mMirLeftRoot = buildMirrorUnifiedSidebar(mSideCtx, sw, sh, leftWidgetId, rightWidgetId, presetKeys);
-                mSideLeftX = sx; mSideLeftY = sy; mSideLeftW = sw; mSideLeftH = sh;
-                mSideRightX = 0; mSideRightY = 0; mSideRightW = 0; mSideRightH = 0;
+                newLeftRoot = buildMirrorUnifiedSidebar(uiCtx, sw, sh, leftWidgetId, rightWidgetId, presetKeys);
+                nLx = sx; nLy = sy; nLw = sw; nLh = sh;
                 WindowManager.LayoutParams lpU = new WindowManager.LayoutParams(
-                        sw, sh, winType, baseFlags, PixelFormat.TRANSLUCENT);
+                        sw, sh, winType, baseFlags, PixelFormat.OPAQUE);
                 lpU.gravity = Gravity.TOP | Gravity.LEFT;
                 lpU.x = sx;
                 lpU.y = sy;
                 lpU.setTitle("ExtMirrorUnified");
-                mSideWm.addView(mMirLeftRoot, lpU);
+                newWm.addView(newLeftRoot, lpU);
             } else {
                 int mid = (presetKeys.size() + 1) / 2;
                 List<String> firstHalf = new ArrayList<>(presetKeys.subList(0, Math.min(mid, presetKeys.size())));
                 List<String> secondHalf = new ArrayList<>(presetKeys.subList(Math.min(mid, presetKeys.size()), presetKeys.size()));
-                mSideLeftX = 0; mSideLeftY = 0; mSideLeftW = 0; mSideLeftH = 0;
-                mSideRightX = 0; mSideRightY = 0; mSideRightW = 0; mSideRightH = 0;
                 if (hasHoriz) {
                     if (leftW >= minWing) {
-                        mMirLeftRoot = buildMirrorDualWing(mSideCtx, leftW, st.physH, leftWidgetId, true, firstHalf);
-                        mSideLeftX = 0; mSideLeftY = 0; mSideLeftW = leftW; mSideLeftH = st.physH;
+                        newLeftRoot = buildMirrorDualWing(uiCtx, leftW, st.physH, leftWidgetId, true, firstHalf);
+                        nLx = 0; nLy = 0; nLw = leftW; nLh = st.physH;
                         WindowManager.LayoutParams lpL = new WindowManager.LayoutParams(
-                                leftW, st.physH, winType, baseFlags, PixelFormat.TRANSLUCENT);
+                                leftW, st.physH, winType, baseFlags, PixelFormat.OPAQUE);
                         lpL.gravity = Gravity.TOP | Gravity.LEFT;
                         lpL.x = 0;
                         lpL.y = 0;
                         lpL.setTitle("ExtMirrorLeft");
-                        mSideWm.addView(mMirLeftRoot, lpL);
+                        newWm.addView(newLeftRoot, lpL);
                     }
                     if (rightW >= minWing) {
-                        mMirRightRoot = buildMirrorDualWing(mSideCtx, rightW, st.physH, rightWidgetId, false, secondHalf);
-                        mSideRightX = st.mirX + st.mirW; mSideRightY = 0; mSideRightW = rightW; mSideRightH = st.physH;
+                        newRightRoot = buildMirrorDualWing(uiCtx, rightW, st.physH, rightWidgetId, false, secondHalf);
+                        nRx = st.mirX + st.mirW; nRy = 0; nRw = rightW; nRh = st.physH;
                         WindowManager.LayoutParams lpR = new WindowManager.LayoutParams(
-                                rightW, st.physH, winType, baseFlags, PixelFormat.TRANSLUCENT);
+                                rightW, st.physH, winType, baseFlags, PixelFormat.OPAQUE);
                         lpR.gravity = Gravity.TOP | Gravity.LEFT;
                         lpR.x = st.mirX + st.mirW;
                         lpR.y = 0;
                         lpR.setTitle("ExtMirrorRight");
-                        mSideWm.addView(mMirRightRoot, lpR);
+                        newWm.addView(newRightRoot, lpR);
                     }
                 } else {
                     if (topH >= minWing) {
-                        mMirLeftRoot = buildMirrorDualWing(mSideCtx, st.physW, topH, leftWidgetId, true, firstHalf);
-                        mSideLeftX = 0; mSideLeftY = 0; mSideLeftW = st.physW; mSideLeftH = topH;
+                        newLeftRoot = buildMirrorDualWing(uiCtx, st.physW, topH, leftWidgetId, true, firstHalf);
+                        nLx = 0; nLy = 0; nLw = st.physW; nLh = topH;
                         WindowManager.LayoutParams lpT = new WindowManager.LayoutParams(
-                                st.physW, topH, winType, baseFlags, PixelFormat.TRANSLUCENT);
+                                st.physW, topH, winType, baseFlags, PixelFormat.OPAQUE);
                         lpT.gravity = Gravity.TOP | Gravity.LEFT;
                         lpT.x = 0;
                         lpT.y = 0;
                         lpT.setTitle("ExtMirrorTop");
-                        mSideWm.addView(mMirLeftRoot, lpT);
+                        newWm.addView(newLeftRoot, lpT);
                     }
                     if (bottomH >= minWing) {
-                        mMirRightRoot = buildMirrorDualWing(mSideCtx, st.physW, bottomH, rightWidgetId, false, secondHalf);
-                        mSideRightX = 0; mSideRightY = st.mirY + st.mirH; mSideRightW = st.physW; mSideRightH = bottomH;
+                        newRightRoot = buildMirrorDualWing(uiCtx, st.physW, bottomH, rightWidgetId, false, secondHalf);
+                        nRx = 0; nRy = st.mirY + st.mirH; nRw = st.physW; nRh = bottomH;
                         WindowManager.LayoutParams lpB = new WindowManager.LayoutParams(
-                                st.physW, bottomH, winType, baseFlags, PixelFormat.TRANSLUCENT);
+                                st.physW, bottomH, winType, baseFlags, PixelFormat.OPAQUE);
                         lpB.gravity = Gravity.TOP | Gravity.LEFT;
                         lpB.x = 0;
                         lpB.y = st.mirY + st.mirH;
                         lpB.setTitle("ExtMirrorBottom");
-                        mSideWm.addView(mMirRightRoot, lpB);
+                        newWm.addView(newRightRoot, lpB);
                     }
                 }
             }
+
+            if (oldLeftRoot != null && oldWm != null) {
+                try { oldWm.removeViewImmediate(oldLeftRoot); } catch (Throwable ignored) {}
+            }
+            if (oldRightRoot != null && oldWm != null) {
+                try { oldWm.removeViewImmediate(oldRightRoot); } catch (Throwable ignored) {}
+            }
+
+            mLastObservedA11y = (a11y != null);
+            mSideCtx = uiCtx;
+            mSideWm = newWm;
+            mMirLeftRoot = newLeftRoot;
+            mMirRightRoot = newRightRoot;
+            mSideLeftX = nLx; mSideLeftY = nLy; mSideLeftW = nLw; mSideLeftH = nLh;
+            mSideRightX = nRx; mSideRightY = nRy; mSideRightW = nRw; mSideRightH = nRh;
+            mSideAttachedVdId = st.sideVdId;
+            mSidePhysW = st.physW;
+            mSidePhysH = st.physH;
+            mSideMirX = st.mirX;
+            mSideMirY = st.mirY;
+            mSideMirW = st.mirW;
+            mSideMirH = st.mirH;
+            mSideModeAttached = st.mirrorSideMode;
+            mSideAttachedLeftWidgetId = leftWidgetId;
+            mSideAttachedRightWidgetId = rightWidgetId;
+            mSidePresetSigAttached = presetSig;
+            mSideMemoAttached = memoTxt;
+            mSideThemeSigAttached = themeSig;
+            mSideWidgetRatioSigAttached = ratioSig;
+            return true;
         } catch (Throwable t) {
             t.printStackTrace();
-            detachMirrorSidebars();
+            if (newLeftRoot != null && newWm != null) {
+                try { newWm.removeViewImmediate(newLeftRoot); } catch (Throwable ignored) {}
+            }
+            if (newRightRoot != null && newWm != null) {
+                try { newWm.removeViewImmediate(newRightRoot); } catch (Throwable ignored) {}
+            }
+            if (!preferA11y) {
+                detachMirrorSidebars();
+                mLastObservedA11y = (a11y != null);
+            }
+            return false;
         }
     }
 
@@ -4178,11 +5440,11 @@ public class BridgeService extends Service {
         LinearLayout ctrlRow = new LinearLayout(ctx);
         ctrlRow.setOrientation(LinearLayout.HORIZONTAL);
         ctrlRow.setPadding(0, dp(ctx, 6), 0, 0);
-        TextView btnVolDown = makeMirPillBtn(ctx, "➖", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
+        TextView btnVolDown = makeMirPillBtn(ctx, "音量 -", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
         btnVolDown.setOnClickListener(v -> adjustMirVolume(AudioManager.ADJUST_LOWER));
-        TextView btnMute = makeMirPillBtn(ctx, "🔇", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
+        TextView btnMute = makeMirPillBtn(ctx, "静音", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
         btnMute.setOnClickListener(v -> adjustMirVolume(AudioManager.ADJUST_TOGGLE_MUTE));
-        TextView btnVolUp = makeMirPillBtn(ctx, "➕", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
+        TextView btnVolUp = makeMirPillBtn(ctx, "音量 +", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
         btnVolUp.setOnClickListener(v -> adjustMirVolume(AudioManager.ADJUST_RAISE));
         LinearLayout.LayoutParams bLp1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         bLp1.rightMargin = dp(ctx, 4);
@@ -4206,8 +5468,10 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirMediaCard(Context ctx, boolean compact) {
         LinearLayout mediaCard = makeMirrorCard(ctx, compact);
-        mMirMediaBadge = makeMirLabel(ctx, "🎵 媒体播放", compact ? 12f : 13.5f,
+        mMirMediaBadge = makeMirLabel(ctx, "媒体播放", compact ? 12f : 13.5f,
                 mSideTheme.lightMode ? 0xFF7C3AED : 0xFFA78BFA, true);
+        HyperUi.setStartIcon(mMirMediaBadge, HyperUi.ICON_MEDIA,
+                mSideTheme.lightMode ? 0xFF7C3AED : 0xFFA78BFA, 13f, 5f);
         mediaCard.addView(mMirMediaBadge);
 
         mMirMediaTitle = makeMirLabel(ctx, "当前暂无播放媒体", compact ? 13.5f : 15f, mSideTheme.titleColor, true);
@@ -4225,15 +5489,15 @@ public class BridgeService extends Service {
         LinearLayout mediaBtns = new LinearLayout(ctx);
         mediaBtns.setOrientation(LinearLayout.HORIZONTAL);
         mediaBtns.setPadding(0, dp(ctx, 6), 0, 0);
-        TextView btnPrev = makeMirPillBtn(ctx, "⏮", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
+        TextView btnPrev = makeMirPillBtn(ctx, "上一曲", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
         btnPrev.setOnClickListener(v -> sendMirMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS));
-        TextView btnPlay = makeMirPillBtn(ctx, "⏯", mSideTheme.accentBtnColor, 0xFFF8FAFC, compact);
+        TextView btnPlay = makeMirPillBtn(ctx, "播放/暂停", HyperUi.HYPER_BLUE, 0xFFF8FAFC, compact);
         btnPlay.setOnClickListener(v -> sendMirMediaKey(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE));
-        TextView btnNext = makeMirPillBtn(ctx, "⏭", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
+        TextView btnNext = makeMirPillBtn(ctx, "下一曲", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
         btnNext.setOnClickListener(v -> sendMirMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT));
         LinearLayout.LayoutParams p1 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         p1.rightMargin = dp(ctx, 4);
-        LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.2f);
+        LinearLayout.LayoutParams p2 = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.25f);
         p2.rightMargin = dp(ctx, 4);
         mediaBtns.addView(btnPrev, p1);
         mediaBtns.addView(btnPlay, p2);
@@ -4254,8 +5518,9 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirCalCard(Context ctx, boolean compact) {
         LinearLayout calCard = makeMirrorCard(ctx, compact);
-        TextView calHdr = makeMirLabel(ctx, "📅 日程日历", compact ? 12.5f : 14f,
-                mSideTheme.lightMode ? 0xFF059669 : 0xFF34D399, true);
+        int calCol = mSideTheme.lightMode ? 0xFF059669 : 0xFF34D399;
+        TextView calHdr = makeMirLabel(ctx, "日程日历", compact ? 12.5f : 14f, calCol, true);
+        HyperUi.setStartIcon(calHdr, HyperUi.ICON_CALENDAR, calCol, 13f, 5f);
         calCard.addView(calHdr);
         mMirCalBody = makeMirLabel(ctx, "近两日暂无日程", compact ? 12f : 13f, mSideTheme.subColor, false);
         mMirCalBody.setMaxLines(compact ? 3 : 4);
@@ -4267,7 +5532,9 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirPerfCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
-        card.addView(makeMirLabel(ctx, "⚡ 内存与系统负载", compact ? 12f : 13.5f, mSideTheme.accentColor, true));
+        TextView hdr = makeMirLabel(ctx, "内存与系统负载", compact ? 12f : 13.5f, mSideTheme.accentColor, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_CPU, mSideTheme.accentColor, 13f, 5f);
+        card.addView(hdr);
         mMirPerfMain = makeMirLabel(ctx, "RAM 检测中…", compact ? 14f : 15.5f, mSideTheme.titleColor, true);
         mMirPerfMain.setPadding(0, dp(ctx, 3), 0, 0);
         card.addView(mMirPerfMain);
@@ -4284,7 +5551,9 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirNetCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
-        card.addView(makeMirLabel(ctx, "🌐 实时网速监控", compact ? 12f : 13.5f, mSideTheme.accentColor, true));
+        TextView hdr = makeMirLabel(ctx, "实时网速监控", compact ? 12f : 13.5f, mSideTheme.accentColor, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_NET, mSideTheme.accentColor, 13f, 5f);
+        card.addView(hdr);
         mMirNetMain = makeMirLabel(ctx, "↓ 0 KB/s · ↑ 0 KB/s", compact ? 13.5f : 15f, mSideTheme.titleColor, true);
         mMirNetMain.setPadding(0, dp(ctx, 3), 0, 0);
         card.addView(mMirNetMain);
@@ -4296,8 +5565,10 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirStorageCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
-        card.addView(makeMirLabel(ctx, "💾 存储与屏幕亮度", compact ? 12f : 13.5f,
-                mSideTheme.lightMode ? 0xFFD97706 : 0xFFFBBF24, true));
+        int stCol = mSideTheme.lightMode ? 0xFFD97706 : 0xFFFBBF24;
+        TextView hdr = makeMirLabel(ctx, "存储与屏幕亮度", compact ? 12f : 13.5f, stCol, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_STORAGE, stCol, 13f, 5f);
+        card.addView(hdr);
         mMirStorageMain = makeMirLabel(ctx, "存储计算中…", compact ? 14f : 15.5f, mSideTheme.titleColor, true);
         mMirStorageMain.setPadding(0, dp(ctx, 3), 0, 0);
         card.addView(mMirStorageMain);
@@ -4307,22 +5578,24 @@ public class BridgeService extends Service {
         mMirStorageProg = new ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal);
         mMirStorageProg.setMax(100);
         mMirStorageProg.setProgress(40);
-        try { mMirStorageProg.getProgressDrawable().setColorFilter(mSideTheme.lightMode ? 0xFFD97706 : 0xFFFBBF24, PorterDuff.Mode.SRC_IN); } catch (Throwable ignored) {}
+        try { mMirStorageProg.getProgressDrawable().setColorFilter(stCol, PorterDuff.Mode.SRC_IN); } catch (Throwable ignored) {}
         card.addView(mMirStorageProg, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(ctx, 6)));
         return card;
     }
 
     private LinearLayout buildMirPomodoroCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
-        card.addView(makeMirLabel(ctx, "⏱ 专注番茄钟", compact ? 12f : 13.5f,
-                mSideTheme.lightMode ? 0xFFDB2777 : 0xFFF472B6, true));
+        int pmCol = mSideTheme.lightMode ? 0xFFDB2777 : 0xFFF472B6;
+        TextView hdr = makeMirLabel(ctx, "专注番茄钟", compact ? 12f : 13.5f, pmCol, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_TIMER, pmCol, 13f, 5f);
+        card.addView(hdr);
         mMirPomoTime = makeMirLabel(ctx, formatCountdown(mPomoRemainSec), compact ? 24f : 28f, mSideTheme.titleColor, true);
         mMirPomoTime.setPadding(0, dp(ctx, 2), 0, dp(ctx, 4));
         card.addView(mMirPomoTime);
 
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
-        mMirPomoToggleBtn = makeMirPillBtn(ctx, mPomoRunning ? "⏸ 暂停" : "▶ 开始", 0xFF9D174D, 0xFFFDF2F8, compact);
+        mMirPomoToggleBtn = makeMirPillBtn(ctx, mPomoRunning ? "暂停" : "开始专注", HyperUi.HYPER_BLUE, Color.WHITE, compact);
         mMirPomoToggleBtn.setOnClickListener(v -> {
             mPomoRunning = !mPomoRunning;
             mPomoLastTickMs = SystemClock.elapsedRealtime();
@@ -4332,7 +5605,7 @@ public class BridgeService extends Service {
             }
             refreshMirrorSideViews(mLastStatus);
         });
-        TextView btnReset = makeMirPillBtn(ctx, "↺ 25分", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
+        TextView btnReset = makeMirPillBtn(ctx, "重置 25m", mSideTheme.pillBgColor, mSideTheme.titleColor, compact);
         btnReset.setOnClickListener(v -> {
             mPomoRunning = false;
             mPomoRemainSec = 25 * 60;
@@ -4354,8 +5627,10 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirMemoCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
-        card.addView(makeMirLabel(ctx, "📝 快捷桌面便签", compact ? 12f : 13.5f,
-                mSideTheme.lightMode ? 0xFF0D9488 : 0xFF2DD4BF, true));
+        int mmCol = mSideTheme.lightMode ? 0xFF0D9488 : 0xFF2DD4BF;
+        TextView hdr = makeMirLabel(ctx, "快捷桌面便签", compact ? 12f : 13.5f, mmCol, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_MEMO, mmCol, 13f, 5f);
+        card.addView(hdr);
         mMirMemoBody = makeMirLabel(ctx, getMirrorMemoText(this), compact ? 12f : 13f, mSideTheme.subColor, false);
         mMirMemoBody.setMaxLines(4);
         mMirMemoBody.setEllipsize(TextUtils.TruncateAt.END);
@@ -4379,8 +5654,10 @@ public class BridgeService extends Service {
     private LinearLayout buildMirScreenDimCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
         boolean dimmed = mLastSys.valid && mLastSys.screenDimmed;
-        card.addView(makeMirLabel(ctx, "🌙 主屏最低亮度", compact ? 12f : 13.5f,
-                mSideTheme.lightMode ? 0xFFB45309 : 0xFFFBBF24, true));
+        int dmCol = mSideTheme.lightMode ? 0xFFB45309 : 0xFFFBBF24;
+        TextView hdr = makeMirLabel(ctx, "主屏最低亮度", compact ? 12f : 13.5f, dmCol, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_MOON, dmCol, 13f, 5f);
+        card.addView(hdr);
 
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
@@ -4388,13 +5665,13 @@ public class BridgeService extends Service {
         row.setPadding(0, dp(ctx, 4), 0, 0);
 
         mMirDimMain = makeMirLabel(ctx,
-                dimmed ? "平板/手机主屏：最低亮度" : "平板/手机主屏：当前亮度",
+                dimmed ? "主屏状态：最低亮度" : "主屏状态：正常亮度",
                 compact ? 11.5f : 12.5f,
                 dimmed ? 0xFFFDE047 : mSideTheme.subColor, false);
         row.addView(mMirDimMain, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        mMirDimBtn = makeMirPillBtn(ctx, dimmed ? "☀ 恢复亮度" : "🌙 最低亮度",
-                dimmed ? 0xFFD97706 : 0xFF334155, Color.WHITE, compact);
+        mMirDimBtn = makeMirPillBtn(ctx, dimmed ? "恢复亮度" : "最低亮度",
+                dimmed ? HyperUi.HYPER_BLUE : 0xFF334155, Color.WHITE, compact);
         mMirDimBtn.setOnClickListener(v -> toggleMirrorMainScreenDim());
         LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -4407,21 +5684,23 @@ public class BridgeService extends Service {
 
     private LinearLayout buildMirQuickCtrlCard(Context ctx, boolean compact) {
         LinearLayout card = makeMirrorCard(ctx, compact);
-        card.addView(makeMirLabel(ctx, "🎛 镜像快捷控制", compact ? 12f : 13.5f, mSideTheme.accentColor, true));
+        TextView hdr = makeMirLabel(ctx, "镜像快捷控制", compact ? 12f : 13.5f, mSideTheme.accentColor, true);
+        HyperUi.setStartIcon(hdr, HyperUi.ICON_SLIDERS, mSideTheme.accentColor, 13f, 5f);
+        card.addView(hdr);
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(0, dp(ctx, 6), 0, 0);
-        TextView bDex = makeMirPillBtn(ctx, "🖥 回DeX", 0xFF1D4ED8, Color.WHITE, compact);
+        TextView bDex = makeMirPillBtn(ctx, "回 DeX", HyperUi.HYPER_BLUE, Color.WHITE, compact);
         bDex.setOnClickListener(v -> mBg.execute(() -> {
             BridgeClient.setMirrorMode(BridgeClient.MIRROR_MODE_DEX);
             if (mHandler != null) mHandler.post(this::pollRemoteStateAsync);
         }));
-        TextView bAlign = makeMirPillBtn(ctx, "🔀 换边", mSideTheme.accentBtnColor, Color.WHITE, compact);
+        TextView bAlign = makeMirPillBtn(ctx, "换边", mSideTheme.accentBtnColor, Color.WHITE, compact);
         bAlign.setOnClickListener(v -> mBg.execute(() -> {
             BridgeClient.setMirrorSideMode(-1);
             if (mHandler != null) mHandler.post(this::pollRemoteStateAsync);
         }));
-        TextView bInp = makeMirPillBtn(ctx, "⇄ 键鼠", 0xFF0F766E, Color.WHITE, compact);
+        TextView bInp = makeMirPillBtn(ctx, "切键鼠", 0xFF0F766E, Color.WHITE, compact);
         bInp.setOnClickListener(v -> mBg.execute(() -> {
             BridgeClient.toggleInput();
             if (mHandler != null) mHandler.post(this::pollRemoteStateAsync);
@@ -4437,8 +5716,8 @@ public class BridgeService extends Service {
 
         boolean dimmed = mLastSys.valid && mLastSys.screenDimmed;
         mMirQuickDimBtn = makeMirPillBtn(ctx,
-                dimmed ? "☀ 主屏已最低亮度 · 点此恢复" : "🌙 主屏最低亮度（省电/防刺眼）",
-                dimmed ? 0xFFD97706 : 0xFF334155, Color.WHITE, compact);
+                dimmed ? "主屏已最低亮度 · 点此恢复" : "主屏最低亮度（省电防刺眼）",
+                dimmed ? HyperUi.HYPER_BLUE : 0xFF334155, Color.WHITE, compact);
         mMirQuickDimBtn.setOnClickListener(v -> toggleMirrorMainScreenDim());
         LinearLayout.LayoutParams dimLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -4488,7 +5767,9 @@ public class BridgeService extends Service {
     private LinearLayout buildMirrorUnifiedSidebar(
             Context ctx, int wingW, int wingH, int leftWidgetId, int rightWidgetId, List<String> presets) {
         LinearLayout outer = new LinearLayout(ctx);
-        outer.setBackgroundColor(mSideTheme.bgColor);
+        outer.setBackgroundColor(0xFF000000 | mSideTheme.bgColor);
+        outer.setClipChildren(true);
+        outer.setClipToPadding(true);
         float density = Math.max(0.5f, ctx.getResources().getDisplayMetrics().density);
         float dpW = wingW / density;
         float dpH = wingH / density;
@@ -4662,7 +5943,9 @@ public class BridgeService extends Service {
 
         LinearLayout outer = new LinearLayout(ctx);
         outer.setOrientation(horizWing ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-        outer.setBackgroundColor(mSideTheme.bgColor);
+        outer.setBackgroundColor(0xFF000000 | mSideTheme.bgColor);
+        outer.setClipChildren(true);
+        outer.setClipToPadding(true);
         int padH = dp(ctx, compact ? 6 : 12);
         int padV = dp(ctx, compact ? 8 : 14);
         outer.setPadding(padH, padV, padH, padV);
@@ -4706,6 +5989,8 @@ public class BridgeService extends Service {
             Context ctx, FrameLayout box, int widgetId, int slot, int availWpx, int availHpx, boolean compact) {
         if (box == null) return;
         box.removeAllViews();
+        box.setClipChildren(true);
+        box.setClipToPadding(true);
         if (widgetId > 0 && (availWpx < dp(ctx, 90) || availHpx < dp(ctx, 72))) {
             LinearLayout smallCard = makeMirrorCard(ctx, true);
             smallCard.setGravity(Gravity.CENTER);
@@ -4776,6 +6061,9 @@ public class BridgeService extends Service {
                     wBg.setCornerRadius(dp(ctx, 12));
                     wBg.setStroke(1, mSideTheme.cardStrokeColor);
                     hv.setBackground(wBg);
+                    hv.setClipChildren(true);
+                    hv.setClipToPadding(true);
+                    hv.setClipToOutline(true);
                     hv.setPadding(dp(ctx, 4), dp(ctx, 4), dp(ctx, 4), dp(ctx, 4));
                     FrameLayout.LayoutParams hvLp = new FrameLayout.LayoutParams(
                             fitW, fitH, Gravity.CENTER);
@@ -4815,7 +6103,7 @@ public class BridgeService extends Service {
     private void refreshMirrorSideViews(BridgeClient.Status st) {
         if (mMirBattIcon != null) mMirBattIcon.setBattery(mBattPct, mBattCharging);
         if (mMirBattMain != null) {
-            mMirBattMain.setText(mBattPct + "%" + (mBattCharging ? " ⚡" : ""));
+            mMirBattMain.setText(mBattPct + "%" + (mBattCharging ? " · 充电中" : ""));
             int chgCol = mSideTheme.lightMode ? 0xFF16A34A : 0xFF4ADE80;
             int lowCol = mSideTheme.lightMode ? 0xFFDC2626 : 0xFFF87171;
             mMirBattMain.setTextColor(mBattCharging ? chgCol : (mBattPct <= 20 ? lowCol : mSideTheme.titleColor));
@@ -4864,15 +6152,15 @@ public class BridgeService extends Service {
 
         if (mMirMediaBadge != null && mMirMediaTitle != null && mMirMediaSub != null) {
             if (mLastMirTel != null && !mLastMirTel.mediaTitle.isEmpty()) {
-                String stTag = (mLastMirTel.mediaState == 3) ? "▶ 正在播放"
-                        : (mLastMirTel.mediaState == 2 ? "⏸ 已暂停" : "⏹ 最近播放");
+                String stTag = (mLastMirTel.mediaState == 3) ? "正在播放"
+                        : (mLastMirTel.mediaState == 2 ? "已暂停" : "最近播放");
                 String appName = resolvePkgLabel(mLastMirTel.mediaPkg);
                 mMirMediaBadge.setText(appName.isEmpty() ? stTag : (stTag + " · " + appName));
                 mMirMediaTitle.setText(mLastMirTel.mediaTitle);
                 mMirMediaSub.setText(mLastMirTel.mediaSubtitle);
                 mMirMediaSub.setVisibility(mLastMirTel.mediaSubtitle.isEmpty() ? View.GONE : View.VISIBLE);
             } else {
-                mMirMediaBadge.setText("🎵 媒体播放");
+                mMirMediaBadge.setText("媒体播放");
                 mMirMediaTitle.setText("当前暂无媒体会话");
                 mMirMediaSub.setVisibility(View.GONE);
             }
@@ -4923,7 +6211,7 @@ public class BridgeService extends Service {
             }
             mMirPomoTime.setText(formatCountdown(mPomoRemainSec));
             if (mMirPomoToggleBtn != null) {
-                mMirPomoToggleBtn.setText(mPomoRunning ? "⏸ 暂停" : "▶ 开始");
+                mMirPomoToggleBtn.setText(mPomoRunning ? "暂停" : "开始专注");
             }
         }
 
@@ -4933,18 +6221,18 @@ public class BridgeService extends Service {
 
         boolean dimmed = mLastSys.valid && mLastSys.screenDimmed;
         if (mMirDimMain != null) {
-            mMirDimMain.setText(dimmed ? "平板/手机主屏：最低亮度" : "平板/手机主屏：当前亮度");
+            mMirDimMain.setText(dimmed ? "主屏状态：最低亮度" : "主屏状态：正常亮度");
             mMirDimMain.setTextColor(dimmed
                     ? (mSideTheme.lightMode ? 0xFFB45309 : 0xFFFDE047)
                     : mSideTheme.subColor);
         }
         if (mMirDimBtn != null) {
-            mMirDimBtn.setText(dimmed ? "☀ 恢复亮度" : "🌙 最低亮度");
-            setMirPillBg(mMirDimBtn, dimmed ? 0xFFD97706 : 0xFF334155);
+            mMirDimBtn.setText(dimmed ? "恢复亮度" : "最低亮度");
+            setMirPillBg(mMirDimBtn, dimmed ? HyperUi.HYPER_BLUE : 0xFF334155);
         }
         if (mMirQuickDimBtn != null) {
-            mMirQuickDimBtn.setText(dimmed ? "☀ 主屏已最低亮度 · 点此恢复" : "🌙 主屏最低亮度（省电/防刺眼）");
-            setMirPillBg(mMirQuickDimBtn, dimmed ? 0xFFD97706 : 0xFF334155);
+            mMirQuickDimBtn.setText(dimmed ? "主屏已最低亮度 · 点此恢复" : "主屏最低亮度（省电防刺眼）");
+            setMirPillBg(mMirQuickDimBtn, dimmed ? HyperUi.HYPER_BLUE : 0xFF334155);
         }
     }
 
@@ -4962,6 +6250,42 @@ public class BridgeService extends Service {
         } catch (Throwable ignored) {
             return pkg;
         }
+    }
+
+    private void resetMirrorSideChildRefs() {
+        mMirBattIcon = null;
+        mMirBattMain = null;
+        mMirBattSub = null;
+        mMirWifiIcon = null;
+        mMirWifiMain = null;
+        mMirWifiSub = null;
+        mMirBtIcon = null;
+        mMirBtMain = null;
+        mMirBtSub = null;
+        mMirAudioIcon = null;
+        mMirAudioRoute = null;
+        mMirAudioSub = null;
+        mMirVolProg = null;
+        mMirMediaBadge = null;
+        mMirMediaTitle = null;
+        mMirMediaSub = null;
+        mMirCalBody = null;
+        mMirPerfMain = null;
+        mMirPerfSub = null;
+        mMirPerfProg = null;
+        mMirNetMain = null;
+        mMirNetSub = null;
+        mMirStorageMain = null;
+        mMirStorageSub = null;
+        mMirStorageProg = null;
+        mMirPomoTime = null;
+        mMirPomoToggleBtn = null;
+        mMirMemoBody = null;
+        mMirDimMain = null;
+        mMirDimBtn = null;
+        mMirQuickDimBtn = null;
+        mMirLeftWidgetBox = null;
+        mMirRightWidgetBox = null;
     }
 
     private void detachMirrorSidebars() {
@@ -4997,39 +6321,7 @@ public class BridgeService extends Service {
         mSideMemoAttached = "";
         mSideThemeSigAttached = "";
         mSideWidgetRatioSigAttached = "";
-        mMirBattIcon = null;
-        mMirBattMain = null;
-        mMirBattSub = null;
-        mMirWifiIcon = null;
-        mMirWifiMain = null;
-        mMirWifiSub = null;
-        mMirBtIcon = null;
-        mMirBtMain = null;
-        mMirBtSub = null;
-        mMirAudioIcon = null;
-        mMirAudioRoute = null;
-        mMirAudioSub = null;
-        mMirVolProg = null;
-        mMirMediaBadge = null;
-        mMirMediaTitle = null;
-        mMirMediaSub = null;
-        mMirCalBody = null;
-        mMirPerfMain = null;
-        mMirPerfSub = null;
-        mMirPerfProg = null;
-        mMirNetMain = null;
-        mMirNetSub = null;
-        mMirStorageMain = null;
-        mMirStorageSub = null;
-        mMirStorageProg = null;
-        mMirPomoTime = null;
-        mMirPomoToggleBtn = null;
-        mMirMemoBody = null;
-        mMirDimMain = null;
-        mMirDimBtn = null;
-        mMirQuickDimBtn = null;
-        mMirLeftWidgetBox = null;
-        mMirRightWidgetBox = null;
+        resetMirrorSideChildRefs();
     }
 
     // ---- Live Mirror Sidebar Reflection & Touch Control API (used by SideControlActivity) ----
@@ -5103,7 +6395,7 @@ public class BridgeService extends Service {
                     && mEdgeHoverInFlight.compareAndSet(false, true)) {
                 final float px = lp.x + ev.getX();
                 final float py = lp.y + ev.getY();
-                safeBgExecute(() -> {
+                safeInputExecute(() -> {
                     try {
                         int[] res = BridgeClient.notifyMirrorEdgeHover(px, py);
                         if (res[0] == 1) {
@@ -5184,11 +6476,23 @@ public class BridgeService extends Service {
                 public void onWindowFocusChanged(boolean hasFocus) {
                     super.onWindowFocusChanged(hasFocus);
                     if (hasFocus && mEdgeCapturing && Build.VERSION.SDK_INT >= 26) {
+                        if (mHandler != null) mHandler.removeCallbacks(mEdgeReacquireTask);
                         post(() -> {
                             if (mEdgeCapturing) {
-                                try { requestPointerCapture(); } catch (Throwable ignored) {}
+                                try {
+                                    requestPointerCapture();
+                                    if (hasPointerCapture()) {
+                                        mEdgePointerCaptured = true;
+                                        mOverlayPointerCaptureSupported = true;
+                                        mEdgeReacquireAttempts = 0;
+                                    }
+                                } catch (Throwable ignored) {}
                             }
                         });
+                    } else if (!hasFocus && mEdgeCapturing) {
+                        // Transient focus blip (e.g. AppWidget trampoline Activity): seamlessly reacquire!
+                        mEdgePointerCaptured = false;
+                        scheduleEdgePointerReacquire();
                     }
                 }
 
@@ -5197,17 +6501,49 @@ public class BridgeService extends Service {
                     super.onPointerCaptureChange(hasCapture);
                     if (hasCapture) {
                         mEdgePointerCaptured = true;
-                    } else if (mEdgeCapturing && mEdgePointerCaptured) {
-                        notifyDaemonCaptureExitIfNeeded();
-                        safePost(BridgeService.this::exitSidePointerCapture);
+                        mOverlayPointerCaptureSupported = true;
+                        mEdgeReacquireAttempts = 0;
+                        if (mHandler != null) {
+                            mHandler.removeCallbacks(mEdgeCaptureFallbackTask);
+                            mHandler.removeCallbacks(mEdgeReacquireTask);
+                        }
+                    } else if (mEdgeCapturing) {
+                        // Do not drop sidebar capture or jump cursor when an AppWidget steals focus momentarily
+                        mEdgePointerCaptured = false;
+                        scheduleEdgePointerReacquire();
                     }
+                }
+
+                @Override
+                public boolean dispatchKeyEvent(KeyEvent event) {
+                    if (mEdgeCapturing && event != null && event.getAction() == KeyEvent.ACTION_DOWN) {
+                        int kc = event.getKeyCode();
+                        if (kc == KeyEvent.KEYCODE_ESCAPE || kc == KeyEvent.KEYCODE_BACK) {
+                            safePost(BridgeService.this::exitSidePointerCapture);
+                            return true;
+                        }
+                    }
+                    return super.dispatchKeyEvent(event);
                 }
             };
             mEdgeSensorView.setBackgroundColor(Color.TRANSPARENT);
+            mEdgeSensorView.setOnTouchListener((v, ev) -> {
+                if (mEdgeCapturing && ev != null) {
+                    int act = ev.getActionMasked();
+                    boolean outside = (act == MotionEvent.ACTION_OUTSIDE);
+                    boolean finger = (ev.getSource() & InputDevice.SOURCE_TOUCHSCREEN) == InputDevice.SOURCE_TOUCHSCREEN
+                            || (ev.getPointerCount() > 0 && ev.getToolType(0) != MotionEvent.TOOL_TYPE_MOUSE);
+                    if (outside || finger) {
+                        exitSidePointerCapture();
+                        return false;
+                    }
+                }
+                return false;
+            });
             attachEdgeHoverListener(mEdgeSensorView, mEdgeLp);
             if (Build.VERSION.SDK_INT >= 26) {
                 mEdgeSensorView.setOnCapturedPointerListener((v, ev) ->
-                        handleCapturedPointerEventStatic(ev, mBg, () -> safePost(this::exitSidePointerCapture)));
+                        handleCapturedPointerEventStatic(ev, mInputBg, () -> safePost(this::revertEdgeOverlayToSensor)));
             }
             mEdgeD0Wm.addView(mEdgeSensorView, mEdgeLp);
 
@@ -5224,9 +6560,16 @@ public class BridgeService extends Service {
         }
     }
 
+    private void scheduleEdgePointerReacquire() {
+        if (mDestroyed || !mEdgeCapturing || mHandler == null) return;
+        mEdgeReacquireAttempts = 0;
+        mHandler.removeCallbacks(mEdgeReacquireTask);
+        mHandler.postDelayed(mEdgeReacquireTask, 18L);
+    }
+
     private void notifyDaemonCaptureExitIfNeeded() {
         if (mEdgeCapturing || mEdgePointerCaptured) {
-            safeBgExecute(() -> BridgeClient.sendCapturedMirrorMouse(5, 0f, 0f, 0f));
+            safeInputExecute(() -> BridgeClient.sendCapturedMirrorMouse(5, 0f, 0f, 0f));
         }
     }
 
@@ -5238,12 +6581,15 @@ public class BridgeService extends Service {
         }
         mEdgeCapturing = true;
         mEdgePointerCaptured = false;
+        mEdgeReacquireAttempts = 0;
+        if (mHandler != null) mHandler.removeCallbacks(mEdgeReacquireTask);
         try {
             mEdgeLp.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                    | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
                     | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                     | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
-            mEdgeLp.width = 8;
-            mEdgeLp.height = 8;
+            mEdgeLp.width = 1;
+            mEdgeLp.height = 1;
             mEdgeLp.x = 0;
             mEdgeLp.y = 0;
             mEdgeD0Wm.updateViewLayout(mEdgeSensorView, mEdgeLp);
@@ -5256,11 +6602,16 @@ public class BridgeService extends Service {
                     mEdgeSensorView.requestPointerCapture();
                     if (mEdgeSensorView.hasPointerCapture()) {
                         mEdgePointerCaptured = true;
+                        mOverlayPointerCaptureSupported = true;
                     }
                 } catch (Throwable ignored) {}
             });
             mHandler.removeCallbacks(mEdgeCaptureFallbackTask);
-            mHandler.postDelayed(mEdgeCaptureFallbackTask, 280L);
+            if (!mOverlayPointerCaptureSupported) {
+                mHandler.postDelayed(mEdgeCaptureFallbackTask, 280L);
+            } else {
+                mHandler.postDelayed(mEdgeReacquireTask, 65L);
+            }
         } catch (Throwable ignored) {
             notifyDaemonCaptureExitIfNeeded();
             revertEdgeOverlayToSensor();
@@ -5271,7 +6622,12 @@ public class BridgeService extends Service {
     private void revertEdgeOverlayToSensor() {
         mEdgeCapturing = false;
         mEdgePointerCaptured = false;
-        if (mHandler != null) mHandler.removeCallbacks(mEdgeCaptureFallbackTask);
+        mEdgeReacquireAttempts = 0;
+        resetCapturedMouseMoveState();
+        if (mHandler != null) {
+            mHandler.removeCallbacks(mEdgeCaptureFallbackTask);
+            mHandler.removeCallbacks(mEdgeReacquireTask);
+        }
         if (mEdgeSensorView != null && mEdgeD0Wm != null && mEdgeLp != null) {
             try {
                 if (Build.VERSION.SDK_INT >= 26) mEdgeSensorView.releasePointerCapture();
@@ -5279,6 +6635,10 @@ public class BridgeService extends Service {
             try {
                 mEdgeSensorView.setFocusable(false);
                 mEdgeSensorView.setFocusableInTouchMode(false);
+                mEdgeLp.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                mEdgeD0Wm.updateViewLayout(mEdgeSensorView, mEdgeLp);
+            } catch (Throwable ignored) {}
+            try {
                 mEdgeSensorKey = "";
                 if (mLastStatus != null) syncMirrorEdgeSensor(mLastStatus);
             } catch (Throwable ignored) {}
@@ -5287,16 +6647,23 @@ public class BridgeService extends Service {
 
     private void exitSidePointerCapture() {
         notifyDaemonCaptureExitIfNeeded();
+        SideMouseCaptureActivity.finishActiveIfAny();
         revertEdgeOverlayToSensor();
     }
 
     private void detachMirrorEdgeSensor() {
         notifyDaemonCaptureExitIfNeeded();
+        SideMouseCaptureActivity.finishActiveIfAny();
+        resetCapturedMouseMoveState();
         mEdgeCapturing = false;
         mEdgePointerCaptured = false;
+        mEdgeReacquireAttempts = 0;
         mEdgeSensorKey = "";
         mEdgeHoverInFlight.set(false);
-        if (mHandler != null) mHandler.removeCallbacks(mEdgeCaptureFallbackTask);
+        if (mHandler != null) {
+            mHandler.removeCallbacks(mEdgeCaptureFallbackTask);
+            mHandler.removeCallbacks(mEdgeReacquireTask);
+        }
         if (mEdgeSensorView2 != null && mEdgeD0Wm != null) {
             try { mEdgeD0Wm.removeViewImmediate(mEdgeSensorView2); } catch (Throwable ignored) {}
         }
@@ -5311,6 +6678,14 @@ public class BridgeService extends Service {
         mEdgeSensorView = null;
         mEdgeLp = null;
         mEdgeD0Wm = null;
+    }
+
+    public static void resetCapturedMouseMoveState() {
+        synchronized (sCapMoveLock) {
+            sCapPendingDx = 0f;
+            sCapPendingDy = 0f;
+            sCapMoveInFlight = false;
+        }
     }
 
     public static boolean handleCapturedPointerEventStatic(
@@ -5379,6 +6754,7 @@ public class BridgeService extends Service {
                                     }
                                 }
                             } catch (Throwable ignored) {
+                            } finally {
                                 synchronized (sCapMoveLock) {
                                     sCapMoveInFlight = false;
                                 }

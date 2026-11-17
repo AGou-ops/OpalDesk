@@ -2,6 +2,9 @@ package com.extbridge.helper;
 
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.ColorSpace;
+import android.graphics.Rect;
+import android.hardware.HardwareBuffer;
 import android.os.IBinder;
 import android.os.Parcel;
 
@@ -11,6 +14,7 @@ import java.util.List;
 import java.util.Map;
 
 public class BridgeClient {
+    public static final String BINDER_DESC = "com.extbridge.daemon.IBridgeControl";
     public static final int SYS_WIFI = 1;
     public static final int SYS_BT = 2;
     public static final int SYS_AIRPLANE = 3;
@@ -113,8 +117,21 @@ public class BridgeClient {
         } catch (Throwable ignored) {}
     }
 
+    private static Parcel obtainInterfaceParcel() {
+        Parcel p = Parcel.obtain();
+        p.writeInterfaceToken(BINDER_DESC);
+        return p;
+    }
+
     public static void setBinder(IBinder b) {
         if (b != null && b.pingBinder()) {
+            try {
+                if (!BINDER_DESC.equals(b.getInterfaceDescriptor())) {
+                    return;
+                }
+            } catch (Throwable t) {
+                return;
+            }
             sBinder = b;
             linkBinderDeath(b);
             for (Runnable r : sBinderListeners) {
@@ -123,15 +140,49 @@ public class BridgeClient {
         }
     }
 
+    private static void sendCtlSocketCmdAsync(final String cmd) {
+        new Thread(() -> {
+            android.net.LocalSocket sock = null;
+            try {
+                sock = new android.net.LocalSocket();
+                sock.connect(new android.net.LocalSocketAddress(
+                        "com.extbridge.daemon.ctl", android.net.LocalSocketAddress.Namespace.ABSTRACT));
+                android.net.Credentials peer = sock.getPeerCredentials();
+                if (peer == null || (peer.getUid() != 0 && peer.getUid() != 1000 && peer.getUid() != 2000)) {
+                    return;
+                }
+                sock.setSoTimeout(2500);
+                sock.getOutputStream().write((cmd + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                sock.getOutputStream().flush();
+                sock.getInputStream().read();
+            } catch (Throwable ignored) {
+            } finally {
+                if (sock != null) {
+                    try { sock.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }, "ExtCtlPing").start();
+    }
+
     public static void requestBinder(android.content.Context ctx) {
+        sendCtlSocketCmdAsync("NEED_BINDER");
         if (ctx == null) return;
         try {
+            android.os.Bundle opts = null;
+            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                opts = android.app.BroadcastOptions.makeBasic()
+                        .setShareIdentityEnabled(true)
+                        .toBundle();
+            }
             android.content.Intent i1 = new android.content.Intent("com.extbridge.daemon.NEED_BINDER");
             i1.setPackage("android");
-            ctx.sendBroadcast(i1);
+            if (opts != null) ctx.sendBroadcast(i1, null, opts);
+            else ctx.sendBroadcast(i1);
+
             android.content.Intent i2 = new android.content.Intent("com.extbridge.daemon.NEED_BINDER");
             i2.setPackage("com.android.shell");
-            ctx.sendBroadcast(i2);
+            if (opts != null) ctx.sendBroadcast(i2, null, opts);
+            else ctx.sendBroadcast(i2);
         } catch (Throwable ignored) {}
     }
 
@@ -141,15 +192,6 @@ public class BridgeClient {
             if (b.pingBinder()) return b;
             sBinder = null;
         }
-        try {
-            Class<?> sm = Class.forName("android.os.ServiceManager");
-            b = (IBinder) sm.getMethod("getService", String.class).invoke(null, "extbridge");
-            if (b != null && b.pingBinder()) {
-                sBinder = b;
-                linkBinderDeath(b);
-                return b;
-            }
-        } catch (Throwable ignored) {}
         return null;
     }
 
@@ -157,7 +199,7 @@ public class BridgeClient {
         Status st = new Status();
         IBinder b = getService();
         if (b == null) return st;
-        Parcel data = Parcel.obtain();
+        Parcel data = obtainInterfaceParcel();
         Parcel reply = Parcel.obtain();
         try {
             if (b.transact(15, data, reply, 0)) {
@@ -223,7 +265,7 @@ public class BridgeClient {
     public static int setInputMode(int mode) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(mode);
@@ -262,7 +304,7 @@ public class BridgeClient {
         ApplyResult res = new ApplyResult();
         IBinder b = getService();
         if (b == null) return res;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(w);
@@ -289,9 +331,10 @@ public class BridgeClient {
     }
 
     public static void shutdownDaemon(android.content.Context ctx) {
+        sendCtlSocketCmdAsync("SHUTDOWN");
         IBinder b = getService();
         if (b != null) {
-            Parcel d = Parcel.obtain();
+            Parcel d = obtainInterfaceParcel();
             Parcel r = Parcel.obtain();
             try {
                 b.transact(99, d, r, 0);
@@ -302,22 +345,12 @@ public class BridgeClient {
             }
         }
         sBinder = null;
-        if (ctx != null) {
-            try {
-                android.content.Intent i1 = new android.content.Intent("com.extbridge.daemon.SHUTDOWN");
-                i1.setPackage("android");
-                ctx.sendBroadcast(i1);
-                android.content.Intent i2 = new android.content.Intent("com.extbridge.daemon.SHUTDOWN");
-                i2.setPackage("com.android.shell");
-                ctx.sendBroadcast(i2);
-            } catch (Throwable ignored) {}
-        }
     }
 
     public static int[] sendMouse(int actionType, float a1, float a2) {
         IBinder b = getService();
         if (b == null) return null;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(actionType);
@@ -339,7 +372,7 @@ public class BridgeClient {
     public static void sendKey(int keyCode, int metaState) {
         IBinder b = getService();
         if (b == null) return;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(0);
@@ -357,7 +390,7 @@ public class BridgeClient {
     public static void sendAscii(String txt) {
         IBinder b = getService();
         if (b == null) return;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(1);
@@ -375,7 +408,7 @@ public class BridgeClient {
     public static void sendPaste(boolean useCtrlV) {
         IBinder b = getService();
         if (b == null) return;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(2);
@@ -393,7 +426,7 @@ public class BridgeClient {
     public static boolean launchComponent(String pkg, String cls) {
         IBinder b = getService();
         if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeString(pkg);
@@ -413,7 +446,7 @@ public class BridgeClient {
         }
         IBinder b = getService();
         if (b == null) return sCachedWpBitmap;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(force ? 1 : 0);
@@ -439,7 +472,7 @@ public class BridgeClient {
         List<TaskEntry> out = new ArrayList<>();
         IBinder b = getService();
         if (b == null) return out;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             if (b.transact(23, d, r, 0)) {
@@ -463,7 +496,7 @@ public class BridgeClient {
     public static boolean switchToTask(int taskId, String pkg) {
         IBinder b = getService();
         if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(taskId);
@@ -481,7 +514,7 @@ public class BridgeClient {
     public static boolean minimizeToExtHome(int taskId, String pkg) {
         IBinder b = getService();
         if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(taskId);
@@ -499,7 +532,7 @@ public class BridgeClient {
     public static boolean removeTask(int taskId) {
         IBinder b = getService();
         if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(taskId);
@@ -517,7 +550,7 @@ public class BridgeClient {
         SysStatus st = new SysStatus();
         IBinder b = getService();
         if (b == null) return st;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             if (b.transact(26, d, r, 0)) {
@@ -543,7 +576,7 @@ public class BridgeClient {
     public static boolean execSysAction(int act, int arg, String str) {
         IBinder b = getService();
         if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(act);
@@ -569,7 +602,7 @@ public class BridgeClient {
     public static int setMirrorMode(int mode) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(mode);
@@ -590,7 +623,7 @@ public class BridgeClient {
     public static int setFullscreenPolicy(int enable) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(enable);
@@ -611,7 +644,7 @@ public class BridgeClient {
     public static int setRotation(int rot) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(rot);
@@ -664,7 +697,7 @@ public class BridgeClient {
         if (pkg == null || pkg.isEmpty()) return 0;
         IBinder b = getService();
         if (b == null) return 0;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeString(pkg);
@@ -682,7 +715,7 @@ public class BridgeClient {
         Map<String, Integer> map = new HashMap<>();
         IBinder b = getService();
         if (b == null) return map;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             b.transact(31, d, r, 0);
@@ -711,7 +744,7 @@ public class BridgeClient {
         if (pkg == null || pkg.isEmpty()) return false;
         IBinder b = getService();
         if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeString(pkg);
@@ -738,21 +771,129 @@ public class BridgeClient {
     public static final int SPLIT_SWAP = 5;
     public static final int SPLIT_EXIT = 6;
 
-    public static boolean splitAction(int action, int arg, String pkg, String cls) {
+    public static final class SplitResult {
+        public boolean ok;
+        public boolean splitActive;
+        public int ratioPct = 50;
+        public String slot0Pkg = "";
+        public String slot1Pkg = "";
+    }
+
+    public static SplitResult splitActionDetailed(int action, int arg, String pkg, String cls) {
+        SplitResult res = new SplitResult();
         IBinder b = getService();
-        if (b == null) return false;
-        Parcel d = Parcel.obtain();
+        if (b == null) return res;
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(action);
             d.writeInt(arg);
             d.writeString(pkg != null ? pkg : "");
             d.writeString(cls != null ? cls : "");
-            b.transact(35, d, r, 0);
-            return r.readInt() == 1;
+            if (b.transact(35, d, r, 0)) {
+                res.ok = r.readInt() == 1;
+                if (r.dataAvail() >= 8) {
+                    res.splitActive = r.readInt() == 1;
+                    res.ratioPct = r.readInt();
+                    String s0 = r.readString();
+                    String s1 = r.readString();
+                    res.slot0Pkg = s0 != null ? s0 : "";
+                    res.slot1Pkg = s1 != null ? s1 : "";
+                }
+            }
+            return res;
         } catch (Throwable ignored) {
-            return false;
+            return res;
         } finally {
+            d.recycle();
+            r.recycle();
+        }
+    }
+
+    public static boolean splitAction(int action, int arg, String pkg, String cls) {
+        return splitActionDetailed(action, arg, pkg, cls).ok;
+    }
+
+    public static final class TaskSnapshotData {
+        public Bitmap bitmap;
+        public Rect bounds;
+        public boolean ownBitmap;
+    }
+
+    private static volatile boolean sHwBufSnapshotBlocked = false;
+
+    public static TaskSnapshotData captureTaskSnapshot(int taskId, String pkg, boolean live) {
+        if (!sHwBufSnapshotBlocked) {
+            TaskSnapshotData hw = captureTaskSnapshotInternal(taskId, pkg, live, false);
+            if (hw != null) return hw;
+        }
+        return captureTaskSnapshotInternal(taskId, pkg, live, true);
+    }
+
+    private static TaskSnapshotData captureTaskSnapshotInternal(int taskId, String pkg, boolean live, boolean forceJpeg) {
+        IBinder b = getService();
+        if (b == null) return new TaskSnapshotData();
+        Parcel d = obtainInterfaceParcel();
+        Parcel r = Parcel.obtain();
+        HardwareBuffer hb = null;
+        try {
+            int flags = (live ? 1 : 0) | (forceJpeg ? 2 : 0);
+            d.writeInt(taskId);
+            d.writeString(pkg != null ? pkg : "");
+            d.writeInt(flags);
+            if (!b.transact(44, d, r, 0) || r.dataAvail() < 4) {
+                if (!forceJpeg) {
+                    sHwBufSnapshotBlocked = true;
+                    return null;
+                }
+                return new TaskSnapshotData();
+            }
+            TaskSnapshotData out = new TaskSnapshotData();
+            int hasBounds = r.readInt();
+            if (hasBounds == 1 && r.dataAvail() >= 16) {
+                out.bounds = new Rect(r.readInt(), r.readInt(), r.readInt(), r.readInt());
+            }
+            if (r.dataAvail() < 4) return out;
+            int snapType = r.readInt();
+            if (snapType == 1) {
+                int csOrd = r.readInt();
+                hb = HardwareBuffer.CREATOR.createFromParcel(r);
+                if (hb != null && !hb.isClosed() && hb.getWidth() > 0 && hb.getHeight() > 0) {
+                    ColorSpace.Named[] names = ColorSpace.Named.values();
+                    ColorSpace cs = ColorSpace.get(
+                            (csOrd >= 0 && csOrd < names.length) ? names[csOrd] : ColorSpace.Named.SRGB);
+                    Bitmap bmp = Bitmap.wrapHardwareBuffer(hb, cs);
+                    if (bmp != null) {
+                        out.bitmap = bmp;
+                        out.ownBitmap = true;
+                        return out;
+                    }
+                }
+                if (!forceJpeg) {
+                    sHwBufSnapshotBlocked = true;
+                    return null;
+                }
+            } else if (snapType == 2) {
+                byte[] bytes = r.createByteArray();
+                if (bytes != null && bytes.length > 0) {
+                    Bitmap bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                    if (bmp != null) {
+                        out.bitmap = bmp;
+                        out.ownBitmap = true;
+                    }
+                }
+            }
+            return out;
+        } catch (Throwable t) {
+            if (!forceJpeg) {
+                sHwBufSnapshotBlocked = true;
+                return null;
+            }
+            return new TaskSnapshotData();
+        } finally {
+            if (hb != null && !hb.isClosed()) {
+                try { hb.close(); } catch (Throwable ignored) {}
+            }
             d.recycle();
             r.recycle();
         }
@@ -782,7 +923,7 @@ public class BridgeClient {
     public static int toggleTaskFreeform(int taskId, String pkg, int enableFreeform) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(taskId);
@@ -924,20 +1065,20 @@ public class BridgeClient {
     };
 
     public static final String[] MIRROR_PRESET_TITLES = {
-            "🕒 大数字时钟",
-            "🔋 电池温压详情",
-            "📶 Wi-Fi 与信号",
-            "🎧 蓝牙与外设",
-            "🔊 音频通道与音量",
-            "🎵 媒体播放与切歌",
-            "📅 日历与近期日程",
-            "⚡ 内存与系统负载",
-            "🌐 实时网速监控",
-            "💾 存储与亮度信息",
-            "⏱ 专注番茄钟",
-            "📝 快捷桌面便签",
-            "🎛 镜像快捷控制台",
-            "🌙 主屏最低亮度"
+            "大数字时钟",
+            "电池温压详情",
+            "Wi-Fi 与信号",
+            "蓝牙与外设",
+            "音频通道与音量",
+            "媒体播放与切歌",
+            "日历与近期日程",
+            "内存与系统负载",
+            "实时网速监控",
+            "存储与亮度信息",
+            "专注番茄钟",
+            "快捷桌面便签",
+            "镜像快捷控制台",
+            "主屏最低亮度"
     };
 
     public static final String[] MIRROR_PRESET_DESCS = {
@@ -945,17 +1086,31 @@ public class BridgeClient {
             "电量百分比、快充功耗、电池温度与电压",
             "当前 Wi-Fi 名称、连接速率与信号强度",
             "蓝牙开关状态与已连接耳机/键鼠名称",
-            "实时输出通道 + 可触控点按 ➖/🔇/➕",
-            "当前媒体曲目/App + 可点按 ⏮/⏯/⏭ 切歌",
+            "实时输出通道 + 触控音量加减与静音",
+            "当前媒体曲目/App + 上一曲/播放暂停/下一曲",
             "读取系统日历近两日日程提醒",
             "实时可用 RAM 内存占比条 + 系统运行负载",
             "每秒实时下行 ↓ / 上行 ↑ 网络吞吐速率",
             "机身存储可用空间 GB + 系统当前亮度状态",
             "25 分钟倒计时专注钟，支持边栏直接启停/重置",
             "自定义文字待办/会议备忘，随时在控制台修改",
-            "边栏直达快捷按钮：切回DeX / 切换对齐方位 / 切换键鼠 / 极暗",
+            "边栏直达快捷按钮：切回 DeX / 切换对齐方位 / 切换键鼠 / 最低亮度",
             "一键把平板/手机主屏亮度压至硬件最低（省电护眼），再点恢复"
     };
+
+    public static String getOemInjectHint() {
+        String brand = (android.os.Build.MANUFACTURER + " " + android.os.Build.BRAND).toLowerCase(java.util.Locale.ROOT);
+        if (brand.contains("xiaomi") || brand.contains("redmi") || brand.contains("poco")) {
+            return "Xiaomi HyperOS 请前往「开发者选项」开启「USB 调试（安全设置）」以允许外接屏模拟点击与键鼠注入。";
+        }
+        if (brand.contains("oppo") || brand.contains("oneplus") || brand.contains("realme")) {
+            return "ColorOS 请前往「开发者选项」底部开启「禁止权限监控」以允许外接屏输入注入。";
+        }
+        if (brand.contains("vivo") || brand.contains("iqoo")) {
+            return "OriginOS 请前往「开发者选项」开启「USB 调试（安全设置）/ 模拟点击」权限。";
+        }
+        return "请前往系统「开发者选项」开启允许模拟点击 / USB 安全调试设置。";
+    }
 
     public static int mirrorPresetIndex(String key) {
         if (key == null) return -1;
@@ -980,7 +1135,7 @@ public class BridgeClient {
     public static int setMirrorSideMode(int mode) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(mode);
@@ -998,7 +1153,7 @@ public class BridgeClient {
         MirrorTelemetry mt = new MirrorTelemetry();
         IBinder b = getService();
         if (b == null) return mt;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             if (b.transact(39, d, r, 0)) {
@@ -1037,7 +1192,7 @@ public class BridgeClient {
     public static void sendSideTouch(int actionMasked, float sx, float sy) {
         IBinder b = getService();
         if (b == null) return;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(actionMasked);
@@ -1054,7 +1209,7 @@ public class BridgeClient {
     public static int[] sendCapturedMirrorMouse(int actionType, float a1, float a2, float a3) {
         IBinder b = getService();
         if (b == null) return new int[]{0, 0, 0};
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeInt(actionType);
@@ -1075,7 +1230,7 @@ public class BridgeClient {
     public static int[] notifyMirrorEdgeHover(float px, float py) {
         IBinder b = getService();
         if (b == null) return new int[]{0, 0, 0};
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             d.writeFloat(px);
@@ -1094,7 +1249,7 @@ public class BridgeClient {
     private static int simpleCall(int code) {
         IBinder b = getService();
         if (b == null) return -1;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         Parcel r = Parcel.obtain();
         try {
             b.transact(code, d, r, 0);
@@ -1110,7 +1265,7 @@ public class BridgeClient {
     private static void simpleOneWay(int code) {
         IBinder b = getService();
         if (b == null) return;
-        Parcel d = Parcel.obtain();
+        Parcel d = obtainInterfaceParcel();
         try {
             b.transact(code, d, null, IBinder.FLAG_ONEWAY);
         } catch (Throwable ignored) {

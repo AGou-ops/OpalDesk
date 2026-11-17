@@ -1,6 +1,28 @@
 # Changelog / 更新日志
 
-本项目版本号与安装包后缀同步（见 `helper/AndroidManifest.xml` 及 GitHub Releases）。
+本项目版本号与安装包后缀同步（见 `helper/build.gradle.kts` 及 GitHub Releases）。
+
+---
+
+## v3.5.3 (`versionCode: 25`) — 2026-11-18
+
+### ✨ 全新界面重构：Xiaomi HyperOS 原生风格（`Jetpack Compose + Miuix 0.9.4`）、舞台过渡动画与周边联动
+- **主控台全面重构 (`MainActivity.kt` + `Miuix 0.9.4`)**
+  - 引入 **手机竖屏（可折叠大标题 `TopAppBar` + 底部四栏 `NavigationBar`）** 与 **平板横屏（左侧 `NavigationRail` + 双栏工作台）** 自适应响应式骨架，支持 **跟随系统 / 澎湃浅色 / 澎湃深色** 三态外观实时切换。
+  - 重组信息层级为 `控制台`、`显示与边栏`、`应用规则`、`设置` 四大清晰板块：首页精简为连接状态卡 + 输出模式分段胶囊 + `2×2` 澎湃快捷控制磁贴（新增首页直达 **一键黑屏** 开关）；权限提示仅在缺失时按需展示；连接诊断、三模激活引导、EDID 物理信号档位、系统 `AppWidget` 绑定及 14 款镜像卡片管理全部收纳进丝滑的 Miuix `OverlayBottomSheet` / `OverlayDialog`。
+  - **分应用显示规则独立成页**：提供实时搜索、应用图标展示、已自定义应用置顶及一键下拉切换兼容策略；原生镜像布局切换升级为 **2×2 可视化微缩显示器示意图卡片**；DeX DPI 调节升级为关键刻度吸附滑块并实时换算 `swDp`。
+- **HyperOS 2.0 级窗口舞台过渡动画引擎 (`StageTransitionView.java` + `ExtBridge.java`)**
+  - 新增守护进程跨进程零拷贝 GPU `TaskSnapshot (HardwareBuffer)` 快照通道（兼容 Android 17 `ITaskSnapshotManager` 并带 `FLAG_SECURE` / 冷启动毛玻璃应用卡兜底）；实现 Dock 图标点击退回后台（窗口微弧收缩形变为图标 + 弹性回弹）、后台应用唤起展开、自由分屏进入/退出、`3:7 ~ 7:3` 比例切换双窗同步形变及左右/上下互换立体交叉动画。
+- **全周边界面 HyperOS 视觉联动（零 Emoji · 线性矢量图标统一）**
+  - **大触摸板 (`TouchpadActivity.kt`)**：同步重构为 `Compose + Miuix` 架构，并修复虚拟触摸板「右键 / 返回」与双指轻触在外接屏无法触发 `KEYCODE_BACK` 的焦点与按键分发缺陷（智能区分桌面/Dock 上下文菜单、浮窗收起与应用内跨屏返回）。
+  - **DeX Dock、澎湃控制中心浮窗、扩展桌面启动器、副屏直控与镜像融合边栏 (`HyperUi.java` + `BridgeService.java` + `LauncherActivity.java` + `SideControlActivity.java`)**：新增抗锯齿线性矢量图标绘制引擎 `HyperUi`，全面清除浮窗、Dock、分屏气泡、启动器顶栏及 14 款镜像边栏信息卡中的 Emoji 符号，统一采用澎湃标志蓝 (`#0D84FF`) 激活磁贴与 `22dp` 毛玻璃圆角卡片风格。
+
+### 🐛 全链路恶性隐患治理、镜像副屏防串屏与 IPC 安全加固（`v3.5.1` ~ `v3.5.3` 合并修复）
+- **分屏退出半屏黑屏卡死根治**：修复 Android 15~17 / HyperOS 2.0 下 `MULTI_WINDOW (6)` 直接切回 `FULLSCREEN (1)` 残留分屏裁剪/偏移坐标（如 `7:3` 退出后左侧黑屏遮挡点击）的缺陷，全路径先 `resizeTask(fullBounds)` 再切回 `FULLSCREEN (1)`。
+- **镜像模式副屏偶发渲染串屏（变成应用界面一部分）根治**：新增主屏镜像物理像素硬裁剪容器 `ExtMir0Clip`（配 `ExtMir0Bg` 纯黑底衬），单侧副屏模式下将 `ExtMirrorSide` 提升至 `layer 2` 配合精确边栏 `setCrop` 硬件裁剪（HWC `DEVICE` 直通）；副屏窗口升级为 `PixelFormat.OPAQUE` 实心背景与无空窗期原子换窗（保持 `AppWidgetHost` 持续监听），配合 `IDisplayManager` 无缓存主屏横竖屏追踪与 `35ms / 110ms / 280ms` 副屏误入任务自动迁回主屏，彻底杜绝串屏。
+- **镜像副屏点击第三方小组件（如网易云音乐）指针跳出副屏与原点偏移修复**：通过 `0x1040B`（`STEAL_TOP_FOCUS_DISABLED`）、`mTopFocusedDisplayId=0` 焦点回正、WMS 焦点脉冲无感重获 `PointerCapture` 及非越界释放零强制位移彻底消除跳针。
+- **全链路 IPC 鉴权、特权隔离、崩溃自愈与构建供应链深度加固（Codex + Claude 联合安全审计修复）**：导出 `ControlReceiver` 升级为纯签名级权限 `android.permission.INJECT_EVENTS` 并拆分非导出 `ControlReceiver$Internal`；移除 `BridgeService` 与 `LauncherActivity` 未鉴权 Binder Extra 注入，收敛至唯一 `BridgeProvider` 入口并实施 `IBridgeControl` `InterfaceToken` 校验与 `com.extbridge.helper` 官方 X.509 证书 SHA-256 动态绑定（信任模型限定为 `uid 0/1000/2000` 及通过官方证书校验的客户端，补充高危 Binder 动作包名与外接屏任务归属白名单）；守护进程强制清空附加组并校验降权 `uid/gid=2000`（失败即退），Root 与手动激活脚本先校验哈希/证书并降权至 `u:r:shell:s0` 后以 `mktemp` (`O_EXCL`) 拒绝符号链接原子替换，三端电脑 ADB 激活命令统一为零 `$` 跨平台管道；内置无线调试 ADB 改用应用私有 `0700` Unix Socket、校验本机 IP、全路径 `finally` 清理并支持自动关闭无线调试；`@com.extbridge.daemon.ctl` 双向校验 `SO_PEERCRED` 且取锁失败即退；启动前自动恢复残留键鼠绑定与孤儿亮度备份，退出重排为「原子备份读回校验恢复亮度 → 解绑输入 → 释放图层 → 还原分屏兼容」；CI 最小化 `contents: read` 权限、全量 Action 按 Commit SHA 固定、隔离签名口令与 `release` 作业，移除 V1 与 Debug 签名回退，新增 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) 完整声明 `libadb.so` 来源、SHA-256 与开源许可证。
+- **现代化构建工具链与 R8 瘦身**：升级至 Gradle `9.7.1` + AGP `9.4.1` + Kotlin `2.4.20` + JDK `21` + Compile SDK `37.0`，启用 R8 代码与资源压缩（整包约 `5.29 MB`），保持原有签名无缝覆盖升级。
 
 ---
 

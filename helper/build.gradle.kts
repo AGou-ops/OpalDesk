@@ -1,0 +1,180 @@
+import java.security.KeyStore
+import java.security.MessageDigest
+
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.plugin.compose")
+}
+
+kotlin {
+    jvmToolchain(21)
+}
+
+@Suppress("UnstableApiUsage")
+android {
+    namespace = "com.extbridge.helper"
+    buildToolsVersion = "37.0.0"
+    compileSdk {
+        version = release(37) {
+            minorApiLevel = 0
+        }
+    }
+
+    defaultConfig {
+        applicationId = "com.extbridge.helper"
+        minSdk = 30
+        targetSdk = 35
+        versionCode = 25
+        versionName = "3.5.3"
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+    }
+
+    sourceSets {
+        named("main") {
+            manifest.srcFile("AndroidManifest.xml")
+            java.directories.clear()
+            java.directories.add("src")
+            kotlin.directories.clear()
+            kotlin.directories.add("src")
+            res.directories.clear()
+            res.directories.add("res")
+            jniLibs.directories.clear()
+            jniLibs.directories.add("jniLibs")
+            assets.directories.clear()
+            assets.directories.add("assets")
+        }
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    val expectedReleaseCertSha256 = "e4f67b3012a16633006c64bfc9d5a95c7bdda10826bd729777c2a3066f49117c"
+    val p12File = rootProject.file("exthelper.p12")
+    val envKs = System.getenv("EXTBRIDGE_KEYSTORE")?.takeIf { it.isNotBlank() }?.let { file(it) }
+    if (envKs != null && !envKs.exists()) {
+        throw GradleException("EXTBRIDGE_KEYSTORE points to non-existent file: ${envKs.absolutePath}")
+    }
+    val activeKs = when {
+        envKs != null -> envKs
+        p12File.exists() -> p12File
+        else -> null
+    }
+    val envPass = System.getenv("EXTBRIDGE_KEYSTORE_PASS")?.takeIf { it.isNotBlank() }
+    if (envKs != null && envPass == null) {
+        throw GradleException("EXTBRIDGE_KEYSTORE_PASS must be explicitly set when EXTBRIDGE_KEYSTORE is provided.")
+    }
+    val activePass = envPass ?: "extbridge"
+    val requireReleaseKey = (System.getenv("EXTBRIDGE_REQUIRE_RELEASE_KEY") == "1")
+        || (project.findProperty("requireReleaseKey")?.toString()?.equals("true", ignoreCase = true) == true)
+        || (System.getenv("GITHUB_REF")?.startsWith("refs/tags/v") == true)
+    val allowUnsignedRelease = !requireReleaseKey && (
+        (System.getenv("EXTBRIDGE_ALLOW_UNSIGNED_RELEASE") == "1")
+            || (project.findProperty("allowUnsignedRelease")?.toString()?.equals("true", ignoreCase = true) == true)
+        )
+    val allowCustomCert = project.findProperty("allowCustomReleaseCert")?.toString()?.equals("true", ignoreCase = true) == true
+    val isReleaseTaskRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
+
+    if ((requireReleaseKey || (isReleaseTaskRequested && !allowUnsignedRelease)) && activeKs == null) {
+        throw GradleException(
+            "Release build requires EXTBRIDGE_KEYSTORE (or local exthelper.p12) matching SHA-256 $expectedReleaseCertSha256. " +
+                "Never falls back to debug signing. For keyless reproducible-build verification only, pass -PallowUnsignedRelease=true (or EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1)."
+        )
+    }
+
+    if (activeKs != null) {
+        val ks = KeyStore.getInstance("PKCS12")
+        activeKs.inputStream().use { stream -> ks.load(stream, activePass.toCharArray()) }
+        val cert = ks.getCertificate("extbridge")
+            ?: throw GradleException("Alias 'extbridge' not found in release keystore: ${activeKs.absolutePath}")
+        val actualSha256 = MessageDigest.getInstance("SHA-256")
+            .digest(cert.encoded)
+            .joinToString("") { b -> "%02x".format(b) }
+        if (!allowCustomCert && !actualSha256.equals(expectedReleaseCertSha256, ignoreCase = true)) {
+            throw GradleException(
+                "Release keystore certificate SHA-256 mismatch! Expected $expectedReleaseCertSha256, got $actualSha256"
+            )
+        }
+    }
+
+    signingConfigs {
+        if (activeKs != null) {
+            create("extrelease") {
+                storeFile = activeKs
+                storeType = "PKCS12"
+                storePassword = activePass
+                keyAlias = "extbridge"
+                keyPassword = activePass
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = true
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            // Never fall back to debug keystore for release builds: if no release keystore is configured
+            // (e.g. third-party reproducible-build verification), emit an unsigned APK instead of a debug-signed APK.
+            signingConfig = if (activeKs != null) {
+                signingConfigs.getByName("extrelease")
+            } else {
+                null
+            }
+        }
+        debug {
+            if (activeKs != null) {
+                signingConfig = signingConfigs.getByName("extrelease")
+            }
+        }
+    }
+
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+}
+
+dependencies {
+    implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("org.jetbrains.compose.foundation:foundation:1.12.0")
+    implementation("org.jetbrains.compose.ui:ui:1.12.0")
+    implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.4")
+    implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.4")
+    implementation("top.yukonga.miuix.kmp:miuix-icons:0.9.4")
+    implementation("top.yukonga.miuix.kmp:miuix-squircle:0.9.4")
+}
+
+tasks.named("preBuild") {
+    doFirst {
+        val jar = file("assets/extbridge.jar")
+        if (!jar.exists() || jar.length() < 4096L) {
+            throw GradleException(
+                "Missing or empty helper/assets/extbridge.jar! Run build_v3.ps1 (or compile the bridge daemon first) " +
+                    "so the APK never ships without assets/extbridge.jar."
+            )
+        }
+    }
+}

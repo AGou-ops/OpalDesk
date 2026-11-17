@@ -19,11 +19,37 @@ public class ControlReceiver extends BroadcastReceiver {
         sMain.post(() -> Toast.makeText(appCtx, msg, Toast.LENGTH_SHORT).show());
     }
 
+    /**
+     * Non-exported receiver used exclusively by in-app Notification PendingIntents so internal
+     * actions never need exported broadcast permissions.
+     */
+    public static class Internal extends ControlReceiver {}
+
+    private boolean isTrustedBroadcastSender(Context context) {
+        if (this instanceof Internal) {
+            return true;
+        }
+        // Exported ControlReceiver is enforced by android:permission="android.permission.INJECT_EVENTS"
+        // (pure signature permission held by com.android.shell, impossible to grant to 3rd-party apps).
+        // On Android 14+, when sender identity is explicitly shared (uid != INVALID_UID), also
+        // enforce the strict UID allowlist.
+        if (android.os.Build.VERSION.SDK_INT >= 34) {
+            int uid = getSentFromUid();
+            if (uid != android.os.Process.INVALID_UID) {
+                return uid == 0 || uid == 1000 || uid == 2000 || uid == android.os.Process.myUid();
+            }
+        }
+        return true;
+    }
+
     @Override
     public void onReceive(Context context, Intent intent) {
         if (context == null || intent == null) return;
         final String act = intent.getAction();
         if (act == null) return;
+        if (!isTrustedBroadcastSender(context)) {
+            return;
+        }
 
         if ("com.extbridge.helper.STATE_SYNC".equals(act)) {
             BridgeService.refreshFromReceiver(context);
@@ -35,13 +61,11 @@ public class ControlReceiver extends BroadcastReceiver {
             return;
         }
         if ("com.extbridge.helper.SET_DOCK_AUTO_HIDE".equals(act)) {
-            boolean en = intent.getBooleanExtra("enable", !BridgeService.isDockAutoHideEnabled(context));
+            boolean defVal = !BridgeService.isDockAutoHideEnabled(context);
+            boolean en = intent.hasExtra("auto_hide")
+                    ? intent.getBooleanExtra("auto_hide", defVal)
+                    : intent.getBooleanExtra("enable", defVal);
             BridgeService.setDockAutoHideEnabled(context, en);
-            return;
-        }
-        if ("com.extbridge.helper.MIR_EDGE_CAPTURE".equals(act)) {
-            boolean enter = intent.getBooleanExtra("enter", true);
-            BridgeService.onEdgeCaptureFromDaemon(enter);
             return;
         }
 
@@ -72,7 +96,9 @@ public class ControlReceiver extends BroadcastReceiver {
                     BridgeService.refreshFromReceiver(appCtx);
                     toastAsync(appCtx, next == 1 ? "已切换为【原生镜像模式】" : "已切换为【ExtBridge DeX 扩展模式】");
                 } else if ("com.extbridge.helper.SET_MIRROR_SIDE_MODE".equals(act)) {
-                    int sideMode = copy.getIntExtra("side_mode", -1);
+                    int sideMode = copy.hasExtra("side_mode")
+                            ? copy.getIntExtra("side_mode", -1)
+                            : copy.getIntExtra("mode", -1);
                     int next = BridgeClient.setMirrorSideMode(sideMode);
                     BridgeService.refreshFromReceiver(appCtx);
                     toastAsync(appCtx, "镜像边栏：" + BridgeClient.mirrorSideModeLabel(next));
@@ -84,7 +110,12 @@ public class ControlReceiver extends BroadcastReceiver {
                     BridgeClient.splitAction(splitAct, arg, pkg, cls);
                     BridgeService.refreshFromReceiver(appCtx);
                 } else if ("com.extbridge.helper.SET_ROTATION".equals(act)) {
-                    int rot = copy.getIntExtra("rot", -1);
+                    int rot = copy.hasExtra("rot")
+                            ? copy.getIntExtra("rot", -1)
+                            : copy.getIntExtra("rotation", -1);
+                    if (rot == 90) rot = 1;
+                    else if (rot == 180) rot = 2;
+                    else if (rot == 270) rot = 3;
                     if (rot >= 0) BridgeClient.setRotation(rot);
                     else BridgeClient.cycleRotation();
                     BridgeService.refreshFromReceiver(appCtx);

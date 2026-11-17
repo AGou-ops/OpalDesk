@@ -17,6 +17,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
+import android.graphics.ColorSpace;
 import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Path;
@@ -28,11 +29,15 @@ import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.graphics.drawable.Drawable;
+import android.hardware.HardwareBuffer;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.hardware.input.InputManager;
 import android.media.AudioDeviceInfo;
 import android.media.AudioManager;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
+import android.net.LocalSocketAddress;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.BatteryManager;
@@ -52,6 +57,10 @@ import android.view.Display;
 import android.view.InputDevice;
 import android.view.InputEvent;
 import android.view.KeyCharacterMap;
+import android.content.pm.ActivityInfo;
+import android.content.pm.ProviderInfo;
+import android.content.pm.Signature;
+import android.content.pm.SigningInfo;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
@@ -59,6 +68,7 @@ import android.view.Surface;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.InputStreamReader;
@@ -66,6 +76,7 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -74,12 +85,33 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 
 public class ExtBridge implements Runnable {
+    private static final String BINDER_DESC = "com.extbridge.daemon.IBridgeControl";
+    private static final String EXPECTED_HELPER_CERT_SHA256 =
+            "e4f67b3012a16633006c64bfc9d5a95c7bdda10826bd729777c2a3066f49117c";
+    private static final Pattern PKG_NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+)+$");
+    private static final Pattern CLS_NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_$]+(\\.[a-zA-Z0-9_$]+)+$");
     private static final String CONF_PATH = "/data/local/tmp/extbridge.conf";
     private static final String APP_CONF_PATH = "/data/local/tmp/extbridge_apps.conf";
     private static final int VD_FLAGS_COMPAT = 0x44CB; // includes ROTATES_WITH_CONTENT (0x0080)
     private static final int VD_FLAGS_DEX_FIXED = 0x444B; // strips ROTATES_WITH_CONTENT -> lock landscape desktop!
+    private static final Object sDisplayLock = new Object();
+    private static final ExecutorService sBgIoExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ExtBgIo");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final ScheduledExecutorService sBgSchedExec = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "ExtBgSched");
+        t.setDaemon(true);
+        return t;
+    });
 
     private static Context sCtx;
     private static DisplayManager sDm;
@@ -98,7 +130,9 @@ public class ExtBridge implements Runnable {
     private static Method sMRemAssoc;
     private static Method sMReplaceContent;
     private static Method sMMirrorDisplay;
+    private static Method sMMoveDisplayToTop;
     private static Method sMStartActivity;
+    private static Method sMFocusTopTask;
     private static Method sMSetUserPreferredMode;
     private static Object sSetUserPreferredTarget;
     private static int sSetUserPreferredArgCount = 0;
@@ -122,6 +156,8 @@ public class ExtBridge implements Runnable {
     private static volatile float sPhysFps = 60.0f;
     private static volatile int sVirtW = 2560;
     private static volatile int sVirtH = 1440;
+    private static volatile int sCreatedVdW = 0;
+    private static volatile int sCreatedVdH = 0;
     private static volatile int sVirtDpi = 240;
     private static volatile float sVirtFps = 60.0f;
     private static volatile int sVirtRot = 0; // 0=0°, 1=90° CW, 2=180°, 3=270° CW
@@ -155,6 +191,7 @@ public class ExtBridge implements Runnable {
     private static volatile String sSplitSlot1Pkg = "";
     private static volatile int sSplitSlot0TaskId = -1;
     private static volatile int sSplitSlot1TaskId = -1;
+    private static volatile long sLastSplitActionMs = 0L;
     private static final int SPLIT_GAP_PX = 8;
     private static volatile int sMirrorMode = 0;       // 0=DeX独立桌面, 1=原生镜像
     private static volatile int sMirrorSideMode = 1;   // 0=纯黑原生镜像, 1=贴边信息条, 2=宽边栏+系统小组件
@@ -163,6 +200,8 @@ public class ExtBridge implements Runnable {
     private static volatile Object sSideBbq;
     private static volatile Surface sSideSurf;
     private static volatile Object sSideMirSc;
+    private static volatile Object sMir0WrapSc;
+    private static volatile Object sMir0BgSc;
     private static volatile Object sMir0Sc;
     private static volatile Object sMirCursorWrapSc;
     private static volatile Object sMirCursorSc;
@@ -199,7 +238,24 @@ public class ExtBridge implements Runnable {
     private static volatile boolean sHasLastPollD0 = false;
     private static volatile boolean sCachedExtMousePresent = false;
     private static volatile long sLastExtMouseCheckMs = 0L;
-    private static volatile int sHelperUid = -1;
+    private static volatile int sVerifiedHelperUid = -1;
+    private static volatile long sLastHelperUidVerifyMs = 0L;
+    private static volatile long sLastNeedBinderRxMs = 0L;
+    private static volatile long sLastBinderPushAttemptMs = 0L;
+    private static volatile long sHomeSanitizeIntervalMs = 15000L;
+
+    private static final class MirrorGeom {
+        final int d0W, d0H, mirX, mirY, mirW, mirH;
+        MirrorGeom(int d0W, int d0H, int mirX, int mirY, int mirW, int mirH) {
+            this.d0W = d0W;
+            this.d0H = d0H;
+            this.mirX = mirX;
+            this.mirY = mirY;
+            this.mirW = mirW;
+            this.mirH = mirH;
+        }
+    }
+    private static volatile MirrorGeom sMirGeom = new MirrorGeom(0, 0, 0, 0, 0, 0);
 
     private static Class<?> sScCls;
     private static Class<?> sScBuilderCls;
@@ -209,6 +265,7 @@ public class ExtBridge implements Runnable {
     private static Method sTxSetColor;
     private static Method sTxSetAlpha;
     private static Method sTxSetWindowCrop;
+    private static Method sTxSetCrop;
     private static Method sTxSetPosition;
     private static Method sTxSetScale;
     private static Method sTxSetMatrix;
@@ -220,12 +277,16 @@ public class ExtBridge implements Runnable {
     private static Method sTxApplySync;
     private static Method sTxClose;
     private static Method sScRelease;
+    private static Object sIDm;
+    private static Method sMGetDisplayInfo;
     private static volatile int sD0W = 0;
     private static volatile int sD0H = 0;
     private static volatile int sMirX = 0;
     private static volatile int sMirY = 0;
     private static volatile int sMirW = 0;
     private static volatile int sMirH = 0;
+    private static volatile int sLastAppliedMirSideMode = -1;
+    private static volatile long sLastMirD0SizeCheckMs = 0L;
     private static volatile DisplayManager.DisplayListener sMirrorDisplayListener;
     private static volatile long sLastMirTelemetryMs = 0L;
     private static volatile String sCachedAudioRoute = "平板外放";
@@ -242,7 +303,7 @@ public class ExtBridge implements Runnable {
     private static volatile boolean sSavedSysPrefs = false;
     private static int sOrigForceResizable = 0;
     private static int sOrigNonResizableMw = 0;
-    private static final HashSet<String> sCompatOverriddenPkgs = new HashSet<>();
+    private static final HashMap<String, Integer> sCompatOverriddenModes = new HashMap<>();
     private static final HashMap<String, Integer> sAppModes = new HashMap<>(); // 0=default, 1=land_full, 2=port_compat (freeform disabled on DeX)
 
     private static volatile int sCachedWpId = Integer.MIN_VALUE;
@@ -252,21 +313,173 @@ public class ExtBridge implements Runnable {
     private static volatile long sLastHomeSanitizeMs = 0L;
     private static volatile String sCachedWifiSsid = "";
     private static volatile String sCachedBtName = "";
+    private static final String DIM_BACKUP_PATH = "/data/local/tmp/extbridge_dim.bak";
+    private static final String CTL_SOCKET_NAME = "com.extbridge.daemon.ctl";
+    private static LocalServerSocket sCtlServerSocket;
     private static volatile boolean sScreenDimmed = false;
     private static int sSavedBrightMode = 0;
     private static int sSavedBrightInt = 100;
     private static float sSavedBrightFloat = -1f;
 
+    private static boolean isTrustedDaemonServerUid(int uid) {
+        return uid == 0 || uid == 1000 || uid == 2000;
+    }
+
+    private static void dropRootFailClosed() {
+        int initUid = android.os.Process.myUid();
+        int osUid = -1;
+        try { osUid = android.system.Os.getuid(); } catch (Throwable ignored) {}
+        if (initUid != 0 && osUid != 0) return;
+        try {
+            try {
+                Class<?> lcCls = Class.forName("libcore.io.Libcore");
+                Object osObj = lcCls.getField("os").get(null);
+                if (osObj != null) {
+                    for (Method m : osObj.getClass().getMethods()) {
+                        if ("setgroups".equals(m.getName()) && m.getParameterCount() == 1
+                                && m.getParameterTypes()[0] == int[].class) {
+                            m.invoke(osObj, (Object) new int[]{2000});
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {}
+            android.system.Os.setgid(2000);
+            android.system.Os.setuid(2000);
+            int curUid = android.system.Os.getuid();
+            int curEuid = android.system.Os.geteuid();
+            int curGid = android.system.Os.getgid();
+            int curEgid = android.system.Os.getegid();
+            if (android.os.Process.myUid() != 2000 || curUid != 2000 || curEuid != 2000
+                    || curGid != 2000 || curEgid != 2000) {
+                System.err.println("EXTBRIDGE_FATAL_DROP_ROOT_INCOMPLETE uid=" + curUid + " gid=" + curGid);
+                System.exit(1);
+                return;
+            }
+            System.out.println("EXTBRIDGE_ROOT_DROPPED_TO_SHELL uid=2000 gid=2000");
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_FATAL_DROP_ROOT_FAILED: " + t);
+            System.exit(1);
+        }
+    }
+
+    private static boolean ensureSingleInstanceAndStartCtlServer() {
+        for (int attempt = 0; attempt < 20; attempt++) {
+            try {
+                sCtlServerSocket = new LocalServerSocket(CTL_SOCKET_NAME);
+                break;
+            } catch (Throwable bindBusy) {
+                LocalSocket client = null;
+                boolean untrustedSquatter = false;
+                try {
+                    client = new LocalSocket();
+                    client.connect(new LocalSocketAddress(CTL_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+                    android.net.Credentials peer = client.getPeerCredentials();
+                    if (peer == null || !isTrustedDaemonServerUid(peer.getUid())) {
+                        System.err.println("EXTBRIDGE_CTL_SQUATTER_REJECTED peerUid=" + (peer == null ? -1 : peer.getUid()));
+                        untrustedSquatter = true;
+                    } else {
+                        client.setSoTimeout(4500);
+                        client.getOutputStream().write("SHUTDOWN\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        client.getOutputStream().flush();
+                        BufferedReader r = new BufferedReader(new InputStreamReader(client.getInputStream()));
+                        r.readLine();
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (client != null) {
+                        try { client.close(); } catch (Throwable ignored) {}
+                    }
+                }
+                if (untrustedSquatter) {
+                    return false;
+                }
+                SystemClock.sleep(200);
+            }
+        }
+        if (sCtlServerSocket == null) return false;
+        Thread ctlThread = new Thread(() -> {
+            while (!sShuttingDown && sCtlServerSocket != null) {
+                LocalSocket sock = null;
+                try {
+                    sock = sCtlServerSocket.accept();
+                    sock.setSoTimeout(1500);
+                    android.net.Credentials cred = sock.getPeerCredentials();
+                    if (cred == null || !isTrustedCaller(cred.getUid())) {
+                        continue;
+                    }
+                    BufferedReader br = new BufferedReader(new InputStreamReader(sock.getInputStream()));
+                    String cmd = br.readLine();
+                    if ("SHUTDOWN".equals(cmd)) {
+                        sShuttingDown = true;
+                        try { cleanupDisplay(true); } catch (Throwable ignored) {}
+                        try {
+                            sock.getOutputStream().write("DONE\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            sock.getOutputStream().flush();
+                        } catch (Throwable ignored) {}
+                        try { sCtlServerSocket.close(); } catch (Throwable ignored) {}
+                        try { sock.close(); } catch (Throwable ignored) {}
+                        SystemClock.sleep(40);
+                        System.exit(0);
+                        return;
+                    } else if ("NEED_BINDER".equals(cmd)) {
+                        enqueuePushBinderToHelper(false);
+                        try {
+                            sock.getOutputStream().write("OK\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                            sock.getOutputStream().flush();
+                        } catch (Throwable ignored) {}
+                    }
+                } catch (Throwable ignored) {
+                    if (sShuttingDown) break;
+                } finally {
+                    if (sock != null) {
+                        try { sock.close(); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        }, "ExtCtlSocket");
+        ctlThread.setDaemon(true);
+        ctlThread.start();
+        return true;
+    }
+
     public static void main(String[] args) {
         try {
-            if (android.os.Process.myUid() == 0) {
+            dropRootFailClosed();
+            if (args != null && args.length > 0 && "--verify-helper".equals(args[0])) {
+                Looper.prepareMainLooper();
+                Class<?> atCls = Class.forName("android.app.ActivityThread");
+                Object at = atCls.getMethod("systemMain").invoke(null);
+                sCtx = (Context) atCls.getMethod("getSystemContext").invoke(at);
+                int vUid = getVerifiedHelperUid();
+                System.exit(vUid > 0 ? 0 : 3);
+                return;
+            }
+            if (args != null && args.length > 0 && "--stop".equals(args[0])) {
+                LocalSocket client = null;
                 try {
-                    android.system.Os.setgid(2000);
-                    android.system.Os.setuid(2000);
-                    System.out.println("EXTBRIDGE_ROOT_DROPPED_TO_SHELL uid=2000");
-                } catch (Throwable t) {
-                    System.err.println("drop root to shell warning: " + t);
+                    client = new LocalSocket();
+                    client.connect(new LocalSocketAddress(CTL_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+                    android.net.Credentials peer = client.getPeerCredentials();
+                    if (peer != null && isTrustedDaemonServerUid(peer.getUid())) {
+                        client.setSoTimeout(6500);
+                        client.getOutputStream().write("SHUTDOWN\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        client.getOutputStream().flush();
+                        new BufferedReader(new InputStreamReader(client.getInputStream())).readLine();
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    if (client != null) {
+                        try { client.close(); } catch (Throwable ignored) {}
+                    }
                 }
+                System.exit(0);
+                return;
+            }
+            if (!ensureSingleInstanceAndStartCtlServer()) {
+                System.err.println("EXTBRIDGE_LOCK_BUSY another daemon instance still holds @" + CTL_SOCKET_NAME);
+                System.exit(2);
+                return;
             }
             Looper.prepareMainLooper();
             Class<?> atCls = Class.forName("android.app.ActivityThread");
@@ -279,8 +492,11 @@ public class ExtBridge implements Runnable {
                 sCtx = sysCtx;
             }
             sCtx = fixShellContext(sCtx);
-            try { runCmdOut("appops", "set", "com.extbridge.helper", "10021", "allow"); } catch (Throwable ignored) {}
-            try { runCmdOut("appops", "set", "com.extbridge.helper", "ACCESS_RESTRICTED_SETTINGS", "allow"); } catch (Throwable ignored) {}
+            if (getVerifiedHelperUid() > 0) {
+                try { runCmdOut("appops", "set", "com.extbridge.helper", "10021", "allow"); } catch (Throwable ignored) {}
+                try { runCmdOut("appops", "set", "com.extbridge.helper", "ACCESS_RESTRICTED_SETTINGS", "allow"); } catch (Throwable ignored) {}
+                try { runCmdOut("appops", "set", "com.extbridge.helper", "SYSTEM_ALERT_WINDOW", "allow"); } catch (Throwable ignored) {}
+            }
             sDm = (DisplayManager) sCtx.getSystemService(Context.DISPLAY_SERVICE);
             sIm = (InputManager) sCtx.getSystemService(Context.INPUT_SERVICE);
 
@@ -297,28 +513,35 @@ public class ExtBridge implements Runnable {
             sAtm = Class.forName("android.app.IActivityTaskManager$Stub").getMethod("asInterface", IBinder.class).invoke(null, atmB);
 
             initReflection();
+            // Always recover stale external input associations and orphan brightness backup on startup
+            unbindInput();
+            restoreOrphanScreenDimBackup();
             loadConf();
-            sanitizeSystemHomeTasks(true);
+            sBgIoExec.execute(() -> sanitizeSystemHomeTasks(true));
 
             sCtlBinder = new BridgeBinder();
             try {
                 IntentFilter flt = new IntentFilter();
                 flt.addAction("com.extbridge.daemon.NEED_BINDER");
-                flt.addAction("com.extbridge.daemon.SHUTDOWN");
-                sCtx.registerReceiver(new BroadcastReceiver() {
+                BroadcastReceiver needBinderRx = new BroadcastReceiver() {
                     @Override
                     public void onReceive(Context c, Intent i) {
-                        if (i == null) return;
-                        String act = i.getAction();
-                        if ("com.extbridge.daemon.NEED_BINDER".equals(act)) {
-                            pushBinderToHelper();
-                        } else if ("com.extbridge.daemon.SHUTDOWN".equals(act)) {
-                            sShuttingDown = true;
-                            cleanupDisplay(true);
-                            new Thread(() -> { SystemClock.sleep(80); System.exit(0); }).start();
+                        if (i == null || !"com.extbridge.daemon.NEED_BINDER".equals(i.getAction())) return;
+                        if (Build.VERSION.SDK_INT >= 34) {
+                            int senderUid = getSentFromUid();
+                            if (!isTrustedCaller(senderUid)) return;
                         }
+                        long now = SystemClock.uptimeMillis();
+                        if (now - sLastNeedBinderRxMs < 800L) return;
+                        sLastNeedBinderRxMs = now;
+                        enqueuePushBinderToHelper(false);
                     }
-                }, flt, Context.RECEIVER_EXPORTED);
+                };
+                if (Build.VERSION.SDK_INT >= 33) {
+                    sCtx.registerReceiver(needBinderRx, flt, Context.RECEIVER_EXPORTED);
+                } else {
+                    sCtx.registerReceiver(needBinderRx, flt);
+                }
             } catch (Throwable ignored) {}
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
@@ -330,8 +553,9 @@ public class ExtBridge implements Runnable {
             System.out.flush();
 
             sHandler = new Handler(Looper.getMainLooper());
+            sBgIoExec.execute(() -> healStrayCompatOverrides(false));
             grantAppWidgetBind();
-            pushBinderToHelper();
+            enqueuePushBinderToHelper(true);
             sHandler.post(new ExtBridge());
             Looper.loop();
         } catch (Throwable t) {
@@ -362,13 +586,30 @@ public class ExtBridge implements Runnable {
             for (Method m : sWm.getClass().getMethods()) {
                 if (m.getName().equals("replaceContentOnDisplay")) sMReplaceContent = m;
                 else if (m.getName().equals("mirrorDisplay")) sMMirrorDisplay = m;
+                else if (m.getName().equals("moveDisplayToTop") && m.getParameterCount() == 2) sMMoveDisplayToTop = m;
             }
         } catch (Throwable ignored) {}
         try {
             for (Method m : sAtm.getClass().getMethods()) {
                 if (m.getName().equals("startActivity") && m.getParameterCount() == 11) {
                     sMStartActivity = m;
-                    break;
+                } else if (m.getName().equals("focusTopTask") && m.getParameterCount() == 1) {
+                    sMFocusTopTask = m;
+                }
+            }
+        } catch (Throwable ignored) {}
+        try {
+            Class<?> dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal");
+            try { dmgCls.getMethod("disableLocalDisplayInfoCaches").invoke(null); } catch (Throwable ignored) {}
+        } catch (Throwable ignored) {}
+        try {
+            Class<?> smCls = Class.forName("android.os.ServiceManager");
+            IBinder dmB = (IBinder) smCls.getMethod("getService", String.class).invoke(null, "display");
+            if (dmB != null) {
+                sIDm = Class.forName("android.hardware.display.IDisplayManager$Stub")
+                        .getMethod("asInterface", IBinder.class).invoke(null, dmB);
+                if (sIDm != null) {
+                    sMGetDisplayInfo = sIDm.getClass().getMethod("getDisplayInfo", int.class);
                 }
             }
         } catch (Throwable ignored) {}
@@ -386,6 +627,7 @@ public class ExtBridge implements Runnable {
             sTxSetColor = sTxCls.getMethod("setColor", sScCls, float[].class);
             sTxSetAlpha = sTxCls.getMethod("setAlpha", sScCls, float.class);
             sTxSetWindowCrop = sTxCls.getMethod("setWindowCrop", sScCls, int.class, int.class);
+            try { sTxSetCrop = sTxCls.getMethod("setCrop", sScCls, Rect.class); } catch (Throwable ignored) {}
             sTxSetPosition = sTxCls.getMethod("setPosition", sScCls, float.class, float.class);
             sTxSetScale = sTxCls.getMethod("setScale", sScCls, float.class, float.class);
             sTxSetMatrix = sTxCls.getMethod("setMatrix", sScCls, float.class, float.class, float.class, float.class);
@@ -484,6 +726,26 @@ public class ExtBridge implements Runnable {
         System.err.println("EXTBRIDGE_PHYS_API=NONE (will fallback to cmd display)");
     }
 
+    private static float clampFps(float fps, float def) {
+        if (!Float.isFinite(fps) || fps < 15f) return def;
+        return Math.min(360f, fps);
+    }
+
+    private static boolean isValidPackageName(String pkg) {
+        return pkg != null && pkg.length() >= 3 && pkg.length() <= 160 && PKG_NAME_PATTERN.matcher(pkg).matches();
+    }
+
+    private static boolean isValidClassName(String cls) {
+        return cls != null && cls.length() >= 3 && cls.length() <= 220 && CLS_NAME_PATTERN.matcher(cls).matches();
+    }
+
+    private static void resetCompatForPkg(String pkg) {
+        if (!isValidPackageName(pkg)) return;
+        String qp = pkg.replace("'", "");
+        runCmdOut("sh", "-c", "am compat reset-all --no-kill '" + qp
+                + "' >/dev/null 2>&1 || am compat reset-all '" + qp + "' >/dev/null 2>&1");
+    }
+
     private static void loadConf() {
         try {
             File f = new File(CONF_PATH);
@@ -493,15 +755,15 @@ public class ExtBridge implements Runnable {
                 if (line == null) return;
                 String[] parts = line.trim().split(",");
                 if (parts.length >= 4) {
-                    int w = Integer.parseInt(parts[0]);
-                    int h = Integer.parseInt(parts[1]);
-                    int d = Integer.parseInt(parts[2]);
-                    float fps = Float.parseFloat(parts[3]);
+                    int w = Integer.parseInt(parts[0].trim());
+                    int h = Integer.parseInt(parts[1].trim());
+                    int d = Integer.parseInt(parts[2].trim());
+                    float fps = Float.parseFloat(parts[3].trim());
                     if (isValidDims(w, h) && d >= 80 && d <= 640) {
                         sVirtW = w;
                         sVirtH = h;
                         sVirtDpi = d;
-                        sVirtFps = fps > 10f ? fps : 60f;
+                        sVirtFps = clampFps(fps, 60f);
                         sCursorX = sVirtW * 0.5f;
                         sCursorY = sVirtH * 0.5f;
                         sHasUserConf = true;
@@ -540,16 +802,21 @@ public class ExtBridge implements Runnable {
                 try (BufferedReader br = new BufferedReader(new FileReader(f))) {
                     String line;
                     while ((line = br.readLine()) != null) {
-                        String t = line.trim();
-                        int eq = t.indexOf('=');
-                        if (eq <= 0) continue;
-                        String pkg = t.substring(0, eq).trim();
-                        int m = Integer.parseInt(t.substring(eq + 1).trim());
-                        if (!pkg.isEmpty() && (m == 1 || m == 2)) {
-                            sAppModes.put(pkg, m);
-                        } else if (!pkg.isEmpty() && m == 3) {
-                            prunedLegacyFreeform = true;
-                        }
+                        try {
+                            String t = line.trim();
+                            int eq = t.indexOf('=');
+                            if (eq <= 0) continue;
+                            String pkg = t.substring(0, eq).trim();
+                            if (!isValidPackageName(pkg)) continue;
+                            int m = Integer.parseInt(t.substring(eq + 1).trim());
+                            if (m == 1 || m == 2) {
+                                if (sAppModes.size() < 512 || sAppModes.containsKey(pkg)) {
+                                    sAppModes.put(pkg, m);
+                                }
+                            } else if (m == 3) {
+                                prunedLegacyFreeform = true;
+                            }
+                        } catch (Throwable ignoredLine) {}
                     }
                 } catch (Throwable ignored) {}
                 if (prunedLegacyFreeform) {
@@ -558,8 +825,7 @@ public class ExtBridge implements Runnable {
             }
         }
         if (firstConf || !new File(HEAL_MARKER_PATH).exists()) {
-            setGlobalIntSafe("force_resizable_activities", 0);
-            setGlobalIntSafe("enable_non_resizable_multi_window", 0);
+            // Never overwrite user Developer Options (force_resizable_activities / enable_non_resizable_multi_window)
             healStrayCompatOverrides(false);
             try (FileWriter fw = new FileWriter(HEAL_MARKER_PATH, false)) {
                 fw.write("1\n");
@@ -589,7 +855,7 @@ public class ExtBridge implements Runnable {
                         int eq = kv.indexOf('=');
                         if (eq <= 0) continue;
                         String pkg = kv.substring(0, eq).trim();
-                        if (!pkg.isEmpty()) toReset.add(pkg);
+                        if (isValidPackageName(pkg)) toReset.add(pkg);
                     }
                 }
             }
@@ -601,14 +867,8 @@ public class ExtBridge implements Runnable {
                     }
                 }
             }
-            if (!toReset.isEmpty()) {
-                StringBuilder cmd = new StringBuilder();
-                for (String pkg : toReset) {
-                    String qp = pkg.replace("'", "");
-                    cmd.append("am compat reset-all --no-kill '").append(qp)
-                       .append("' >/dev/null 2>&1 || am compat reset-all '").append(qp).append("' >/dev/null 2>&1; ");
-                }
-                runCmdOut("sh", "-c", cmd.toString());
+            for (String pkg : toReset) {
+                resetCompatForPkg(pkg);
             }
         } catch (Throwable ignored) {}
     }
@@ -616,16 +876,17 @@ public class ExtBridge implements Runnable {
     private static void saveAppModesLocked() {
         try (FileWriter fw = new FileWriter(APP_CONF_PATH, false)) {
             for (Map.Entry<String, Integer> e : sAppModes.entrySet()) {
+                String k = e.getKey();
                 int m = e.getValue() == null ? 0 : e.getValue();
-                if (m >= 1 && m <= 3) {
-                    fw.write(e.getKey() + "=" + m + "\n");
+                if (isValidPackageName(k) && (m == 1 || m == 2)) {
+                    fw.write(k + "=" + m + "\n");
                 }
             }
         } catch (Throwable ignored) {}
     }
 
     private static int getAppMode(String pkg) {
-        if (pkg == null || pkg.isEmpty()) return 0;
+        if (!isValidPackageName(pkg)) return 0;
         synchronized (sAppModes) {
             Integer v = sAppModes.get(pkg);
             return v != null ? v : 0;
@@ -672,6 +933,8 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean isHelperProcessRunning() {
+        int helperUid = getVerifiedHelperUid();
+        if (helperUid <= 0) return false;
         try {
             Class<?> smCls = Class.forName("android.os.ServiceManager");
             IBinder amB = (IBinder) smCls.getMethod("getService", String.class).invoke(null, "activity");
@@ -683,7 +946,7 @@ public class ExtBridge implements Runnable {
                     (List<ActivityManager.RunningAppProcessInfo>) am.getClass().getMethod("getRunningAppProcesses").invoke(am);
             if (procs == null) return false;
             for (ActivityManager.RunningAppProcessInfo info : procs) {
-                if (info != null && "com.extbridge.helper".equals(info.processName)) {
+                if (info != null && info.uid == helperUid && "com.extbridge.helper".equals(info.processName)) {
                     return true;
                 }
             }
@@ -691,106 +954,115 @@ public class ExtBridge implements Runnable {
         return false;
     }
 
-    private static synchronized void tick() {
-        if ((sHelperProcToken == null || !sHelperProcToken.pingBinder()) && isHelperProcessRunning()) {
-            pushBinderToHelper();
-        }
+    private static void tick() {
         long nowMs = SystemClock.uptimeMillis();
+        if ((sHelperProcToken == null || !sHelperProcToken.pingBinder())
+                && (nowMs - sLastBinderPushAttemptMs >= 2500L)
+                && isHelperProcessRunning()) {
+            enqueuePushBinderToHelper(false);
+        }
         if (nowMs - sLastHomeCheckMs >= 3000L) {
             sLastHomeCheckMs = nowMs;
-            sanitizeSystemHomeTasks(false);
+            sBgIoExec.execute(() -> sanitizeSystemHomeTasks(false));
         }
-        Display ext = findExternalDisplay();
-        if (ext == null) {
-            sLastPushedExtId = -1;
-            if (sExtId >= 0 || sVd != null) {
-                System.out.println("EXTBRIDGE_DETACHED");
-                cleanupDisplay(false);
+        synchronized (sDisplayLock) {
+            if (sShuttingDown) return;
+            Display ext = findExternalDisplay();
+            if (ext == null) {
+                sLastPushedExtId = -1;
+                if (sExtId >= 0 || sVd != null || sMir0Sc != null || sSideVd != null) {
+                    System.out.println("EXTBRIDGE_DETACHED");
+                    cleanupDisplay(false);
+                }
+                return;
             }
-            return;
-        }
-        int extId = ext.getDisplayId();
-        int prevPhysW = sPhysW;
-        int prevPhysH = sPhysH;
-        float prevPhysFps = sPhysFps;
-        Display.Mode curMode = ext.getMode();
-        if (curMode != null) {
-            sPhysW = curMode.getPhysicalWidth();
-            sPhysH = curMode.getPhysicalHeight();
-            sPhysFps = curMode.getRefreshRate();
-        }
-        boolean physSizeChanged = (prevPhysW != sPhysW || prevPhysH != sPhysH);
-        boolean physFpsChanged = Math.abs(prevPhysFps - sPhysFps) > 0.2f;
+            int extId = ext.getDisplayId();
+            int prevPhysW = sPhysW;
+            int prevPhysH = sPhysH;
+            float prevPhysFps = sPhysFps;
+            Display.Mode curMode = ext.getMode();
+            if (curMode != null) {
+                sPhysW = curMode.getPhysicalWidth();
+                sPhysH = curMode.getPhysicalHeight();
+                sPhysFps = curMode.getRefreshRate();
+            }
+            boolean physSizeChanged = (prevPhysW != sPhysW || prevPhysH != sPhysH);
+            boolean physFpsChanged = Math.abs(prevPhysFps - sPhysFps) > 0.2f;
 
-        if (sMirrorMode == 1) {
-            if (sVd != null) {
+            if (sMirrorMode == 1) {
+                if (sVd != null) {
+                    cleanupDisplay(false);
+                }
+                if (sForceRebuild) {
+                    sForceRebuild = false;
+                    sSideVdAttempted = false;
+                    cleanupDisplay(false);
+                }
+                if (physSizeChanged && (sMir0Sc != null || sSideVd != null)) {
+                    sSideVdAttempted = false;
+                    cleanupDisplay(false);
+                }
+                boolean needSide = (sMirrorSideMode > 0);
+                boolean stockFallback = "NATIVE_MIRROR_STOCK".equals(sRenderMode);
+                boolean sideRetryNeeded = needSide && sSideVd == null && (!sSideVdAttempted || sLastSideVdAttemptMode != sMirrorSideMode);
+                boolean needAttachMirror = (extId != sExtId)
+                        || (!stockFallback && (sRootSc == null || sMir0Sc == null || sideRetryNeeded || (!needSide && sSideVd != null)));
+                if (needAttachMirror) {
+                    cleanupDisplay(false);
+                    attachMirrorDisplay(extId);
+                    sLastPushedExtId = extId;
+                } else {
+                    boolean geomUpdated = false;
+                    if (!stockFallback) {
+                        geomUpdated = updateMirrorGeometry(true);
+                        reassert();
+                        if (sSideVdId > 0) {
+                            final int svd = sSideVdId;
+                            sBgIoExec.execute(() -> rescueStrayTasksOnSideVd(svd));
+                        }
+                    }
+                    if ((physSizeChanged || physFpsChanged) && !geomUpdated) {
+                        notifyHelperSync();
+                    }
+                    if (extId != sLastPushedExtId) {
+                        sLastPushedExtId = extId;
+                        if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
+                            enqueuePushBinderToHelper(true);
+                        }
+                    }
+                }
+                return;
+            }
+
+            if (sMir0Sc != null || sSideVd != null || "NATIVE_MIRROR_STOCK".equals(sRenderMode)) {
+                sSideVdAttempted = false;
                 cleanupDisplay(false);
             }
-            if (sForceRebuild) {
+
+            if (sForceRebuild && sVd != null) {
                 sForceRebuild = false;
-                sSideVdAttempted = false;
                 cleanupDisplay(false);
             }
-            if (physSizeChanged && (sMir0Sc != null || sSideVd != null)) {
-                sSideVdAttempted = false;
+
+            if (extId != sExtId || sVd == null) {
                 cleanupDisplay(false);
-            }
-            boolean needSide = (sMirrorSideMode > 0);
-            boolean stockFallback = "NATIVE_MIRROR_STOCK".equals(sRenderMode);
-            boolean sideRetryNeeded = needSide && sSideVd == null && (!sSideVdAttempted || sLastSideVdAttemptMode != sMirrorSideMode);
-            boolean needAttachMirror = (extId != sExtId)
-                    || (!stockFallback && (sRootSc == null || sMir0Sc == null || sideRetryNeeded || (!needSide && sSideVd != null)));
-            if (needAttachMirror) {
-                cleanupDisplay(false);
-                attachMirrorDisplay(extId);
+                attachDisplay(extId);
                 sLastPushedExtId = extId;
             } else {
-                boolean geomUpdated = false;
-                if (!stockFallback) {
-                    geomUpdated = updateMirrorGeometry(true);
-                    reassert();
+                if (physSizeChanged) {
+                    applySurfaceTransform();
                 }
-                if ((physSizeChanged || physFpsChanged) && !geomUpdated) {
+                if (physSizeChanged || physFpsChanged) {
                     notifyHelperSync();
                 }
+                reassert();
+                checkInput();
+                enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1);
                 if (extId != sLastPushedExtId) {
                     sLastPushedExtId = extId;
                     if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
-                        pushBinderToHelper();
+                        enqueuePushBinderToHelper(true);
                     }
-                }
-            }
-            return;
-        }
-
-        if (sMir0Sc != null || sSideVd != null || "NATIVE_MIRROR_STOCK".equals(sRenderMode)) {
-            sSideVdAttempted = false;
-            cleanupDisplay(false);
-        }
-
-        if (sForceRebuild && sVd != null) {
-            sForceRebuild = false;
-            cleanupDisplay(false);
-        }
-
-        if (extId != sExtId || sVd == null) {
-            cleanupDisplay(false);
-            attachDisplay(extId);
-            sLastPushedExtId = extId;
-        } else {
-            if (physSizeChanged) {
-                applySurfaceTransform();
-            }
-            if (physSizeChanged || physFpsChanged) {
-                notifyHelperSync();
-            }
-            reassert();
-            checkInput();
-            enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1);
-            if (extId != sLastPushedExtId) {
-                sLastPushedExtId = extId;
-                if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
-                    pushBinderToHelper();
                 }
             }
         }
@@ -852,6 +1124,7 @@ public class ExtBridge implements Runnable {
     }
 
     private static void attachDisplay(int extId) {
+        sForceRebuild = false;
         try {
             if (!sHasUserConf) {
                 Display extDisp = findExternalDisplay();
@@ -883,7 +1156,6 @@ public class ExtBridge implements Runnable {
             System.out.println("EXTBRIDGE_ATTACHING extId=" + extId + " phys=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " virt=" + sVirtW + "x" + sVirtH + "@" + sVirtDpi + " rot=" + (sVirtRot * 90));
             Class<?> scCls = Class.forName("android.view.SurfaceControl");
             Class<?> bCls = Class.forName("android.view.SurfaceControl$Builder");
-            Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
 
             Object bRoot = bCls.getConstructor().newInstance();
             bCls.getMethod("setName", String.class).invoke(bRoot, "ExtRoot");
@@ -968,6 +1240,8 @@ public class ExtBridge implements Runnable {
             }
             Display vdDisp = sVd.getDisplay();
             sVdId = vdDisp.getDisplayId();
+            sCreatedVdW = sVirtW;
+            sCreatedVdH = sVirtH;
             try {
                 sVdUniqueId = (String) Display.class.getMethod("getUniqueId").invoke(vdDisp);
             } catch (Throwable t) {
@@ -979,9 +1253,13 @@ public class ExtBridge implements Runnable {
             if (!bbqOk && sMMirrorDisplay != null) {
                 sMirrorSc = mirrorDisplaySafe(sVdId);
                 if (sMirrorSc != null) {
-                    Object tx0 = txCls.getConstructor().newInstance();
-                    txCls.getMethod("reparent", scCls, scCls).invoke(tx0, sMirrorSc, sScaleSc);
-                    txCls.getMethod("apply").invoke(tx0);
+                    Object tx0 = newSurfaceTx();
+                    try {
+                        sTxReparent.invoke(tx0, sMirrorSc, sScaleSc);
+                        sTxApply.invoke(tx0);
+                    } finally {
+                        closeSurfaceTx(tx0);
+                    }
                 }
             }
 
@@ -992,10 +1270,12 @@ public class ExtBridge implements Runnable {
             sCursorY = sVirtH * 0.5f;
             syncInput();
             launchLauncher();
-            sanitizeSystemHomeTasks(false);
-            pushBinderToHelper();
+            sBgIoExec.execute(() -> sanitizeSystemHomeTasks(false));
+            enqueuePushBinderToHelper(true);
             if (sSplitActive && sHandler != null) {
                 sHandler.postDelayed(() -> relayoutSplitTasks(false), 220L);
+            } else if (sHandler != null) {
+                sHandler.postDelayed(ExtBridge::ensureLauncherTaskFullscreenInBg, 220L);
             }
             notifyHelperSync();
 
@@ -1030,11 +1310,13 @@ public class ExtBridge implements Runnable {
             @Override public void onDisplayRemoved(int displayId) {}
             @Override public void onDisplayChanged(int displayId) {
                 if (displayId == 0 && sMirrorMode == 1 && !sShuttingDown && sHandler != null) {
-                    sHandler.post(() -> {
-                        if (sMirrorMode == 1 && sMir0Sc != null) {
+                    Runnable syncGeom = () -> {
+                        if (!sShuttingDown && sMirrorMode == 1 && sMir0Sc != null) {
                             updateMirrorGeometry(true);
                         }
-                    });
+                    };
+                    sHandler.post(syncGeom);
+                    sHandler.postDelayed(syncGeom, 120L);
                 }
             }
         };
@@ -1053,10 +1335,10 @@ public class ExtBridge implements Runnable {
     }
 
     private static void attachMirrorDisplay(int extId) {
+        sForceRebuild = false;
         try {
             Class<?> scCls = Class.forName("android.view.SurfaceControl");
             Class<?> bCls = Class.forName("android.view.SurfaceControl$Builder");
-            Class<?> txCls = Class.forName("android.view.SurfaceControl$Transaction");
 
             Object mir0 = mirrorDisplaySafe(0);
             if (mir0 == null) {
@@ -1069,8 +1351,10 @@ public class ExtBridge implements Runnable {
                     if (sWm != null && sMReplaceContent != null) {
                         sMReplaceContent.invoke(sWm, extId, null);
                     }
-                } catch (Throwable ignored) {}
-                pushBinderToHelper();
+                } catch (Throwable t) {
+                    System.err.println("EXTBRIDGE_REPLACE_CONTENT_NULL_ERR: " + t);
+                }
+                enqueuePushBinderToHelper(true);
                 notifyHelperSync();
                 System.out.println("EXTBRIDGE_MIRROR_FALLBACK_STOCK extId=" + extId);
                 return;
@@ -1089,10 +1373,24 @@ public class ExtBridge implements Runnable {
             bCls.getMethod("setHidden", boolean.class).invoke(bBg, false);
             sBgSc = bCls.getMethod("build").invoke(bBg);
 
+            Object bMirWrap = bCls.getConstructor().newInstance();
+            bCls.getMethod("setName", String.class).invoke(bMirWrap, "ExtMir0Clip");
+            bCls.getMethod("setContainerLayer").invoke(bMirWrap);
+            bCls.getMethod("setParent", scCls).invoke(bMirWrap, sRootSc);
+            bCls.getMethod("setHidden", boolean.class).invoke(bMirWrap, false);
+            sMir0WrapSc = bCls.getMethod("build").invoke(bMirWrap);
+
+            Object bMirBg = bCls.getConstructor().newInstance();
+            bCls.getMethod("setName", String.class).invoke(bMirBg, "ExtMir0Bg");
+            bCls.getMethod("setColorLayer").invoke(bMirBg);
+            bCls.getMethod("setParent", scCls).invoke(bMirBg, sMir0WrapSc);
+            bCls.getMethod("setHidden", boolean.class).invoke(bMirBg, false);
+            sMir0BgSc = bCls.getMethod("build").invoke(bMirBg);
+
             sMir0Sc = mir0;
             Object txInit = newSurfaceTx();
             try {
-                sTxReparent.invoke(txInit, sMir0Sc, sRootSc);
+                sTxReparent.invoke(txInit, sMir0Sc, sMir0WrapSc);
                 sTxApply.invoke(txInit);
             } finally {
                 closeSurfaceTx(txInit);
@@ -1119,22 +1417,36 @@ public class ExtBridge implements Runnable {
                     if (sSideSurf != null) {
                         int sideDpi = Math.max(120, Math.min(360, Math.round(Math.min(sPhysW, sPhysH) * 200f / 1440f)));
                         Class<?> vdcBCls = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
-                        Object vdcB = vdcBCls.getConstructor(String.class, int.class, int.class, int.class)
-                                .newInstance("RedmiKPad-MirrorSide", sPhysW, sPhysH, sideDpi);
-                        // PUBLIC | PRESENTATION | OWN_CONTENT_ONLY | TRUSTED = 0x40B
-                        vdcBCls.getMethod("setFlags", int.class).invoke(vdcB, 0x40B);
-                        try { vdcBCls.getMethod("setHomeSupported", boolean.class).invoke(vdcB, false); } catch (Throwable ignored) {}
-                        try { vdcBCls.getMethod("setRequestedRefreshRate", float.class).invoke(vdcB, sPhysFps > 10f ? sPhysFps : 60f); } catch (Throwable ignored) {}
-                        vdcBCls.getMethod("setSurface", Surface.class).invoke(vdcB, sSideSurf);
-                        Object vdc = vdcBCls.getMethod("build").invoke(vdcB);
-
-                        sSideVd = (VirtualDisplay) DisplayManager.class
-                                .getMethod("createVirtualDisplay", Class.forName("android.hardware.display.VirtualDisplayConfig"))
-                                .invoke(sDm, vdc);
+                        Method createVdM = DisplayManager.class.getMethod(
+                                "createVirtualDisplay", Class.forName("android.hardware.display.VirtualDisplayConfig"));
+                        // Prefer 0x1040B (with STEAL_TOP_FOCUS_DISABLED) then 0x40B (PUBLIC | PRESENTATION | OWN_CONTENT_ONLY | TRUSTED):
+                        // TRUSTED (0x400) is required so AppWidget PendingIntents do not hit ATM SecurityException
+                        // and so NavAssistService attaches ExtMirrorUnified at TYPE_ACCESSIBILITY_OVERLAY (layer 311000).
+                        int[] candidateFlags = new int[]{0x1040B, 0x40B};
+                        int chosenFlags = 0;
+                        for (int vdFlags : candidateFlags) {
+                            try {
+                                Object vdcB = vdcBCls.getConstructor(String.class, int.class, int.class, int.class)
+                                        .newInstance("RedmiKPad-MirrorSide", sPhysW, sPhysH, sideDpi);
+                                vdcBCls.getMethod("setFlags", int.class).invoke(vdcB, vdFlags);
+                                try { vdcBCls.getMethod("setHomeSupported", boolean.class).invoke(vdcB, false); } catch (Throwable ignored) {}
+                                try { vdcBCls.getMethod("setRequestedRefreshRate", float.class).invoke(vdcB, clampFps(sPhysFps, 60f)); } catch (Throwable ignored) {}
+                                vdcBCls.getMethod("setSurface", Surface.class).invoke(vdcB, sSideSurf);
+                                Object vdc = vdcBCls.getMethod("build").invoke(vdcB);
+                                sSideVd = (VirtualDisplay) createVdM.invoke(sDm, vdc);
+                                if (sSideVd != null && sSideVd.getDisplay() != null) {
+                                    chosenFlags = vdFlags;
+                                    break;
+                                }
+                            } catch (Throwable ignored) {
+                                sSideVd = null;
+                            }
+                        }
                         if (sSideVd != null && sSideVd.getDisplay() != null) {
                             sSideVdId = sSideVd.getDisplay().getDisplayId();
                             applyDisplayFullscreenPolicy(sSideVdId, false);
                             sideReady = true;
+                            System.out.println("EXTBRIDGE_SIDE_VD_OK id=" + sSideVdId + " flags=0x" + Integer.toHexString(chosenFlags));
                         }
                     }
                 } catch (Throwable t) {
@@ -1167,13 +1479,14 @@ public class ExtBridge implements Runnable {
             sCursorX = sPhysW * 0.5f;
             sCursorY = sPhysH * 0.5f;
             sRenderMode = sideReady ? "MIRROR_SIDEBAR" : "MIRROR_COMP";
+            sLastAppliedMirSideMode = -1;
             initMirrorCursorOverlay(scCls, bCls);
             registerMirrorDisplayListener();
             updateMirrorGeometry(false);
             reassert();
             grantAppWidgetBind();
             startMirrorCursorPoller();
-            pushBinderToHelper();
+            enqueuePushBinderToHelper(true);
             notifyHelperSync();
             System.out.println("EXTBRIDGE_MIRROR_ATTACHED extId=" + extId + " sideVdId=" + sSideVdId
                     + " d0=" + sD0W + "x" + sD0H + " mir=" + sMirW + "x" + sMirH + "@" + sMirX + "," + sMirY);
@@ -1336,31 +1649,32 @@ public class ExtBridge implements Runnable {
     }
 
     private static float[] computeEdgeEntryPoint(float ptX, float ptY, float prevX, float prevY, boolean fromHoverSensor) {
-        if (sMirrorMode != 1 || sMirrorSideMode <= 0 || sSideVdId <= 0 || sD0W <= 0 || sD0H <= 0 || sMirW <= 0 || sMirH <= 0) {
+        MirrorGeom g = sMirGeom;
+        if (sMirrorMode != 1 || sMirrorSideMode <= 0 || sSideVdId <= 0 || g.d0W <= 0 || g.d0H <= 0 || g.mirW <= 0 || g.mirH <= 0) {
             return null;
         }
-        float mappedX = Math.max(0f, Math.min(sPhysW - 1f, sMirX + ptX * (sMirW / (float) sD0W)));
-        float mappedY = Math.max(0f, Math.min(sPhysH - 1f, sMirY + ptY * (sMirH / (float) sD0H)));
+        float mappedX = Math.max(0f, Math.min(sPhysW - 1f, g.mirX + ptX * (g.mirW / (float) g.d0W)));
+        float mappedY = Math.max(0f, Math.min(sPhysH - 1f, g.mirY + ptY * (g.mirH / (float) g.d0H)));
         // Horizontal wings
-        if (sMirX >= EDGE_MARGIN_MIN_PX) {
+        if (g.mirX >= EDGE_MARGIN_MIN_PX) {
             boolean hit = fromHoverSensor ? (ptX <= 4.5f) : (prevX > 2.5f && ptX <= 2.5f);
-            if (hit) return new float[]{Math.max(0f, sMirX - 10f), mappedY};
+            if (hit) return new float[]{Math.max(0f, g.mirX - 10f), mappedY};
         }
-        int rightMargin = sPhysW - (sMirX + sMirW);
+        int rightMargin = sPhysW - (g.mirX + g.mirW);
         if (rightMargin >= EDGE_MARGIN_MIN_PX) {
-            boolean hit = fromHoverSensor ? (ptX >= sD0W - 5.5f) : (prevX < sD0W - 3.5f && ptX >= sD0W - 3.5f);
-            if (hit) return new float[]{Math.min(sPhysW - 1f, sMirX + sMirW + 10f), mappedY};
+            boolean hit = fromHoverSensor ? (ptX >= g.d0W - 5.5f) : (prevX < g.d0W - 3.5f && ptX >= g.d0W - 3.5f);
+            if (hit) return new float[]{Math.min(sPhysW - 1f, g.mirX + g.mirW + 10f), mappedY};
         }
         // Vertical wings (when horizontal margin doesn't exist)
-        if (sPhysW - sMirW < EDGE_MARGIN_MIN_PX) {
-            if (sMirY >= EDGE_MARGIN_MIN_PX) {
+        if (sPhysW - g.mirW < EDGE_MARGIN_MIN_PX) {
+            if (g.mirY >= EDGE_MARGIN_MIN_PX) {
                 boolean hit = fromHoverSensor ? (ptY <= 4.5f) : (prevY > 2.5f && ptY <= 2.5f);
-                if (hit) return new float[]{mappedX, Math.max(0f, sMirY - 10f)};
+                if (hit) return new float[]{mappedX, Math.max(0f, g.mirY - 10f)};
             }
-            int bottomMargin = sPhysH - (sMirY + sMirH);
+            int bottomMargin = sPhysH - (g.mirY + g.mirH);
             if (bottomMargin >= EDGE_MARGIN_MIN_PX) {
-                boolean hit = fromHoverSensor ? (ptY >= sD0H - 5.5f) : (prevY < sD0H - 3.5f && ptY >= sD0H - 3.5f);
-                if (hit) return new float[]{mappedX, Math.min(sPhysH - 1f, sMirY + sMirH + 10f)};
+                boolean hit = fromHoverSensor ? (ptY >= g.d0H - 5.5f) : (prevY < g.d0H - 3.5f && ptY >= g.d0H - 3.5f);
+                if (hit) return new float[]{mappedX, Math.min(sPhysH - 1f, g.mirY + g.mirH + 10f)};
             }
         }
         return null;
@@ -1369,12 +1683,11 @@ public class ExtBridge implements Runnable {
     private static void notifyMirrorEdgeCapture(boolean enter, float cx, float cy) {
         try {
             if (sCtx == null || sShuttingDown) return;
-            Intent i = new Intent("com.extbridge.helper.MIR_EDGE_CAPTURE");
-            i.setClassName("com.extbridge.helper", "com.extbridge.helper.ControlReceiver");
-            i.putExtra("enter", enter);
-            i.putExtra("cx", cx);
-            i.putExtra("cy", cy);
-            sCtx.sendBroadcast(i);
+            Bundle b = new Bundle();
+            b.putBoolean("enter", enter);
+            b.putFloat("cx", cx);
+            b.putFloat("cy", cy);
+            callHelperProvider("mirEdgeCapture", b);
         } catch (Throwable ignored) {}
     }
 
@@ -1389,23 +1702,23 @@ public class ExtBridge implements Runnable {
                 if (sShuttingDown || sMirrorMode != 1 || sMirCursorSc == null || sMirCursorPollTask != this) return;
                 int delayMs = 250;
                 long now = SystemClock.uptimeMillis();
-                if (sJustExitedSideEdge && now >= sMirEdgeCooldownUntilMs) {
-                    sJustExitedSideEdge = false;
-                }
-                if (sMirMouseCaptured && sMouseButtons == 0 && sLastMirCapActionMs > 0 && now - sLastMirCapActionMs > 15000L) {
-                    synchronized (sCursorLock) {
-                        sMirMouseCaptured = false;
+                if (now - sLastMirD0SizeCheckMs >= 240L) {
+                    sLastMirD0SizeCheckMs = now;
+                    Point d0Pt = readDisplay0RealSize();
+                    if (d0Pt.x > 0 && d0Pt.y > 0 && (d0Pt.x != sD0W || d0Pt.y != sD0H)) {
+                        updateMirrorGeometry(true);
                     }
                 }
-                if (!sMirMouseCaptured && hasExternalCursorDevice() && sMirW > 0 && sMirH > 0 && sD0W > 0 && sD0H > 0) {
+                MirrorGeom g = sMirGeom;
+                if (!sMirMouseCaptured && hasExternalCursorDevice() && g.mirW > 0 && g.mirH > 0 && g.d0W > 0 && g.d0H > 0) {
                     long idleMs = now - lastActiveMoveMs;
                     delayMs = (idleMs < 500L) ? 16 : (idleMs < 2000L ? 50 : 150);
                     try {
                         Object res = sMGetCursorPos.invoke(sIIm, 0);
                         if (res instanceof PointF) {
                             PointF pt = (PointF) res;
-                            if (!Float.isNaN(pt.x) && !Float.isNaN(pt.y)
-                                    && pt.x >= -1f && pt.y >= -1f && pt.x <= sD0W + 1f && pt.y <= sD0H + 1f) {
+                            if (Float.isFinite(pt.x) && Float.isFinite(pt.y)
+                                    && pt.x >= -1f && pt.y >= -1f && pt.x <= g.d0W + 1f && pt.y <= g.d0H + 1f) {
                                 boolean moved = !sHasLastPollD0
                                         || Math.abs(pt.x - sLastPollD0X) > 0.25f
                                         || Math.abs(pt.y - sLastPollD0Y) > 0.25f;
@@ -1419,7 +1732,7 @@ public class ExtBridge implements Runnable {
                                     sLastPollD0Y = pt.y;
                                     sHasLastPollD0 = true;
                                     if (!firstSample && now - sLastTouchpadMs > 350L) {
-                                        boolean awayFromEdge = (pt.x > 10f && pt.x < sD0W - 10f && pt.y > 10f && pt.y < sD0H - 10f);
+                                        boolean awayFromEdge = (pt.x > 10f && pt.x < g.d0W - 10f && pt.y > 10f && pt.y < g.d0H - 10f);
                                         if (sJustExitedSideEdge && awayFromEdge) {
                                             sJustExitedSideEdge = false;
                                         }
@@ -1436,8 +1749,8 @@ public class ExtBridge implements Runnable {
                                             updateMirrorCursorSurface(sCursorX, sCursorY, false, true);
                                             notifyMirrorEdgeCapture(true, entry[0], entry[1]);
                                         } else {
-                                            float mx = sMirX + Math.max(0f, Math.min(sD0W, pt.x)) * (sMirW / (float) Math.max(1, sD0W));
-                                            float my = sMirY + Math.max(0f, Math.min(sD0H, pt.y)) * (sMirH / (float) Math.max(1, sD0H));
+                                            float mx = g.mirX + Math.max(0f, Math.min(g.d0W, pt.x)) * (g.mirW / (float) Math.max(1, g.d0W));
+                                            float my = g.mirY + Math.max(0f, Math.min(g.d0H, pt.y)) * (g.mirH / (float) Math.max(1, g.d0H));
                                             synchronized (sCursorLock) {
                                                 sCursorX = Math.max(0f, Math.min(sPhysW - 1f, mx));
                                                 sCursorY = Math.max(0f, Math.min(sPhysH - 1f, my));
@@ -1467,39 +1780,68 @@ public class ExtBridge implements Runnable {
         if (sHandler != null) {
             try { sHandler.removeCallbacks(sMirCursorAutoHideRunnable); } catch (Throwable ignored) {}
         }
+        boolean wasCaptured;
+        synchronized (sCursorLock) {
+            wasCaptured = sMirMouseCaptured;
+            sMirMouseCaptured = false;
+            sMouseButtons = 0;
+            sMouseDownTime = 0L;
+            sSideTouchDownTime = 0L;
+            sMirDragDisplayId = -1;
+        }
+        if (wasCaptured) {
+            notifyMirrorEdgeCapture(false, sCursorX, sCursorY);
+        }
         sHasLastPollD0 = false;
-        sMirMouseCaptured = false;
         sJustExitedSideEdge = false;
         sMirCursorVisible = false;
     }
 
-    private static boolean updateMirrorGeometry(boolean notifyOnChange) {
+    private static Point readDisplay0RealSize() {
+        Point p = new Point(0, 0);
         try {
-            if (sRootSc == null || sBgSc == null || sMir0Sc == null || sDm == null) return false;
-            Display d0 = sDm.getDisplay(0);
-            int curD0W = 1920;
-            int curD0H = 1200;
-            if (d0 != null) {
-                Point p = new Point();
-                d0.getRealSize(p);
-                if (p.x > 0 && p.y > 0) {
-                    curD0W = p.x;
-                    curD0H = p.y;
+            if (sIDm != null && sMGetDisplayInfo != null) {
+                Object di = sMGetDisplayInfo.invoke(sIDm, 0);
+                if (di != null) {
+                    int lw = readIntField(di, "logicalWidth", 0);
+                    int lh = readIntField(di, "logicalHeight", 0);
+                    if (lw > 0 && lh > 0) {
+                        p.set(lw, lh);
+                        return p;
+                    }
                 }
             }
+        } catch (Throwable ignored) {}
+        try {
+            if (sDm != null) {
+                Display d0 = sDm.getDisplay(0);
+                if (d0 != null) {
+                    d0.getRealSize(p);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return p;
+    }
+
+    private static boolean updateMirrorGeometry(boolean notifyOnChange) {
+        try {
+            if (sRootSc == null || sBgSc == null || sMir0Sc == null || sMir0WrapSc == null || sDm == null) return false;
+            Point d0Pt = readDisplay0RealSize();
+            int curD0W = (d0Pt.x > 0 && d0Pt.y > 0) ? d0Pt.x : 1920;
+            int curD0H = (d0Pt.x > 0 && d0Pt.y > 0) ? d0Pt.y : 1200;
 
             float fit = Math.min(sPhysW / (float) curD0W, sPhysH / (float) curD0H);
             int mirW = Math.max(1, Math.round(curD0W * fit));
             int mirH = Math.max(1, Math.round(curD0H * fit));
             int mirX = Math.max(0, (sPhysW - mirW) / 2);
             int mirY = Math.max(0, (sPhysH - mirH) / 2);
-            if (sPhysW - mirW >= 48) {
+            if (sPhysW - mirW >= EDGE_MARGIN_MIN_PX) {
                 if (sMirrorSideMode == 1) {
                     mirX = 0;
                 } else if (sMirrorSideMode == 2) {
                     mirX = Math.max(0, sPhysW - mirW);
                 }
-            } else if (sPhysH - mirH >= 48) {
+            } else if (sPhysH - mirH >= EDGE_MARGIN_MIN_PX) {
                 if (sMirrorSideMode == 1) {
                     mirY = 0;
                 } else if (sMirrorSideMode == 2) {
@@ -1508,7 +1850,8 @@ public class ExtBridge implements Runnable {
             }
 
             boolean changed = (curD0W != sD0W || curD0H != sD0H
-                    || mirW != sMirW || mirH != sMirH || mirX != sMirX || mirY != sMirY);
+                    || mirW != sMirW || mirH != sMirH || mirX != sMirX || mirY != sMirY
+                    || sMirrorSideMode != sLastAppliedMirSideMode);
             if (!changed && notifyOnChange) return false;
 
             sD0W = curD0W;
@@ -1517,6 +1860,20 @@ public class ExtBridge implements Runnable {
             sMirH = mirH;
             sMirX = mirX;
             sMirY = mirY;
+            sMirGeom = new MirrorGeom(curD0W, curD0H, mirX, mirY, mirW, mirH);
+            sLastAppliedMirSideMode = sMirrorSideMode;
+
+            int leftW = Math.max(0, mirX);
+            int rightW = Math.max(0, sPhysW - (mirX + mirW));
+            int topH = Math.max(0, mirY);
+            int bottomH = Math.max(0, sPhysH - (mirY + mirH));
+            boolean hasHoriz = (leftW >= EDGE_MARGIN_MIN_PX || rightW >= EDGE_MARGIN_MIN_PX);
+            boolean hasVert = !hasHoriz && (topH >= EDGE_MARGIN_MIN_PX || bottomH >= EDGE_MARGIN_MIN_PX);
+            boolean singleWing = hasHoriz
+                    ? ((leftW < EDGE_MARGIN_MIN_PX && rightW >= EDGE_MARGIN_MIN_PX)
+                            || (rightW < EDGE_MARGIN_MIN_PX && leftW >= EDGE_MARGIN_MIN_PX))
+                    : ((topH < EDGE_MARGIN_MIN_PX && bottomH >= EDGE_MARGIN_MIN_PX)
+                            || (bottomH < EDGE_MARGIN_MIN_PX && topH >= EDGE_MARGIN_MIN_PX));
 
             Object tx = newSurfaceTx();
             try {
@@ -1527,20 +1884,58 @@ public class ExtBridge implements Runnable {
                 sTxSetWindowCrop.invoke(tx, sBgSc, sPhysW, sPhysH);
                 sTxShow.invoke(tx, sBgSc);
 
-                if (sSideMirSc != null) {
-                    sTxSetLayer.invoke(tx, sSideMirSc, 0);
-                    sTxSetAlpha.invoke(tx, sSideMirSc, 1.0f);
-                    sTxSetWindowCrop.invoke(tx, sSideMirSc, sPhysW, sPhysH);
-                    sTxSetPosition.invoke(tx, sSideMirSc, 0f, 0f);
-                    sTxShow.invoke(tx, sSideMirSc);
+                // Hard physical-pixel clip container for Display 0 mirror so rotation/transition overflow can NEVER bleed into sidebars
+                sTxSetLayer.invoke(tx, sMir0WrapSc, 1);
+                sTxSetAlpha.invoke(tx, sMir0WrapSc, 1.0f);
+                sTxSetPosition.invoke(tx, sMir0WrapSc, (float) mirX, (float) mirY);
+                sTxSetWindowCrop.invoke(tx, sMir0WrapSc, mirW, mirH);
+                sTxShow.invoke(tx, sMir0WrapSc);
+
+                if (sMir0BgSc != null) {
+                    sTxSetLayer.invoke(tx, sMir0BgSc, -1);
+                    sTxSetColor.invoke(tx, sMir0BgSc, new float[]{0f, 0f, 0f});
+                    sTxSetAlpha.invoke(tx, sMir0BgSc, 1.0f);
+                    sTxSetWindowCrop.invoke(tx, sMir0BgSc, mirW, mirH);
+                    sTxShow.invoke(tx, sMir0BgSc);
                 }
 
-                sTxSetLayer.invoke(tx, sMir0Sc, 1);
+                sTxSetLayer.invoke(tx, sMir0Sc, 0);
                 sTxSetAlpha.invoke(tx, sMir0Sc, 1.0f);
                 sTxSetScale.invoke(tx, sMir0Sc, fit, fit);
                 sTxSetWindowCrop.invoke(tx, sMir0Sc, curD0W, curD0H);
-                sTxSetPosition.invoke(tx, sMir0Sc, (float) mirX, (float) mirY);
+                sTxSetPosition.invoke(tx, sMir0Sc, 0f, 0f);
                 sTxShow.invoke(tx, sMir0Sc);
+
+                if (sSideMirSc != null) {
+                    if (sMirrorSideMode <= 0 || (!hasHoriz && !hasVert)) {
+                        try { sTxHide.invoke(tx, sSideMirSc); } catch (Throwable ignored) {}
+                    } else {
+                        sTxSetAlpha.invoke(tx, sSideMirSc, 1.0f);
+                        sTxSetPosition.invoke(tx, sSideMirSc, 0f, 0f);
+                        if (singleWing && sTxSetCrop != null) {
+                            Rect wingCrop;
+                            if (hasHoriz) {
+                                wingCrop = (leftW < EDGE_MARGIN_MIN_PX)
+                                        ? new Rect(mirX + mirW, 0, sPhysW, sPhysH)
+                                        : new Rect(0, 0, leftW, sPhysH);
+                            } else {
+                                wingCrop = (topH < EDGE_MARGIN_MIN_PX)
+                                        ? new Rect(0, mirY + mirH, sPhysW, sPhysH)
+                                        : new Rect(0, 0, sPhysW, topH);
+                            }
+                            sTxSetLayer.invoke(tx, sSideMirSc, 2);
+                            sTxSetCrop.invoke(tx, sSideMirSc, wingCrop);
+                        } else {
+                            sTxSetLayer.invoke(tx, sSideMirSc, 0);
+                            if (sTxSetCrop != null) {
+                                sTxSetCrop.invoke(tx, sSideMirSc, new Rect(0, 0, sPhysW, sPhysH));
+                            } else {
+                                sTxSetWindowCrop.invoke(tx, sSideMirSc, sPhysW, sPhysH);
+                            }
+                        }
+                        sTxShow.invoke(tx, sSideMirSc);
+                    }
+                }
 
                 sTxSetWindowCrop.invoke(tx, sRootSc, sPhysW, sPhysH);
                 sTxApply.invoke(tx);
@@ -1624,113 +2019,140 @@ public class ExtBridge implements Runnable {
         }
     }
 
-    private static synchronized void cleanupDisplay(boolean unbindWm) {
-        if (unbindWm && sShuttingDown && sCleanupDoneOnShutdown) {
-            return;
-        }
-        if (unbindWm && sShuttingDown) {
-            sCleanupDoneOnShutdown = true;
-        }
-        stopMirrorCursorPoller();
-        unregisterMirrorDisplayListener();
-        unbindInput();
-        boolean extUnplugged = (findExternalDisplay() == null);
-        if (unbindWm || sShuttingDown || sMirrorMode == 1 || extUnplugged) {
-            synchronized (sSplitLock) {
-                clearSplitState();
+    private static void cleanupDisplay(boolean unbindWm) {
+        synchronized (sDisplayLock) {
+            if (unbindWm && sShuttingDown && sCleanupDoneOnShutdown) {
+                return;
             }
-        }
-        if (unbindWm || sShuttingDown || extUnplugged) {
-            restoreGlobalFullscreenPrefs();
-            resetAppFullscreenCompatAll();
-            if (sScreenDimmed) {
-                setMainScreenDim(0);
+            if (unbindWm && sShuttingDown) {
+                sCleanupDoneOnShutdown = true;
             }
-        }
-        if (extUnplugged) {
-            sSideVdAttempted = false;
-        }
-        int prevExtId = sExtId;
-        try {
-            if (unbindWm && prevExtId > 0 && sWm != null && sMReplaceContent != null) {
-                try { sMReplaceContent.invoke(sWm, prevExtId, null); } catch (Throwable ignored) {}
+            stopMirrorCursorPoller();
+            unregisterMirrorDisplayListener();
+            boolean extUnplugged = (findExternalDisplay() == null);
+            if (extUnplugged) {
+                sSideVdAttempted = false;
             }
-        } catch (Throwable ignored) {}
-        try {
-            if (sVd != null) { sVd.release(); sVd = null; }
-        } catch (Throwable ignored) {}
-        try {
-            if (sSideVd != null) { sSideVd.release(); sSideVd = null; }
-        } catch (Throwable ignored) {}
-        try {
-            if (sBbq != null) {
-                sBbq.getClass().getMethod("destroy").invoke(sBbq);
-                sBbq = null;
-            }
-        } catch (Throwable ignored) {}
-        try {
-            if (sSideBbq != null) {
-                sSideBbq.getClass().getMethod("destroy").invoke(sSideBbq);
-                sSideBbq = null;
-            }
-        } catch (Throwable ignored) {}
-        try {
-            if (sMirCursorBbq != null) {
-                sMirCursorBbq.getClass().getMethod("destroy").invoke(sMirCursorBbq);
-                sMirCursorBbq = null;
-            }
-        } catch (Throwable ignored) {}
-        try {
-            if (sSurf != null) { sSurf.release(); sSurf = null; }
-        } catch (Throwable ignored) {}
-        try {
-            if (sSideSurf != null) { sSideSurf.release(); sSideSurf = null; }
-        } catch (Throwable ignored) {}
-        try {
-            if (sMirCursorSurf != null) { sMirCursorSurf.release(); sMirCursorSurf = null; }
-        } catch (Throwable ignored) {}
-        try {
-            if (sSt != null) { sSt.release(); sSt = null; }
-        } catch (Throwable ignored) {}
-        Object tx = null;
-        try {
-            tx = newSurfaceTx();
-            Object[] scs = new Object[]{sMirCursorSc, sMirCursorWrapSc, sMir0Sc, sSideMirSc, sMirrorSc, sScaleSc, sBgSc, sRootSc};
-            for (Object sc : scs) {
-                if (sc != null) {
-                    try { sTxReparent.invoke(tx, sc, null); } catch (Throwable ignored) {}
-                    try { sTxRemove.invoke(tx, sc); } catch (Throwable ignored) {}
+
+            // 1. Restore main screen brightness FIRST so persistent low brightness can never survive a kill!
+            if (unbindWm || sShuttingDown || extUnplugged) {
+                if (sScreenDimmed || new File(DIM_BACKUP_PATH).exists()) {
+                    setMainScreenDim(0);
                 }
             }
-            sMirCursorSc = null;
-            sMirCursorWrapSc = null;
-            sMir0Sc = null;
-            sSideMirSc = null;
-            sMirrorSc = null;
-            sScaleSc = null;
-            sBgSc = null;
-            sRootSc = null;
-            if (sTxApplySync != null) {
-                try { sTxApplySync.invoke(tx, true); } catch (Throwable ignored) { sTxApply.invoke(tx); }
-            } else {
-                sTxApply.invoke(tx);
+
+            // 2. Unbind external input device associations SECOND (before VirtualDisplay release!)
+            unbindInput();
+
+            // 3. Detach & remove all SurfaceControl layers + VirtualDisplays (<10ms)
+            int prevExtId = sExtId;
+            int prevVdId = sVdId;
+            try {
+                if (unbindWm && prevExtId > 0 && sWm != null && sMReplaceContent != null) {
+                    try {
+                        sMReplaceContent.invoke(sWm, prevExtId, null);
+                    } catch (Throwable t) {
+                        System.err.println("EXTBRIDGE_UNBIND_WM_ERR extId=" + prevExtId + ": " + t);
+                    }
+                }
+            } catch (Throwable ignored) {}
+            try {
+                if (sVd != null) { sVd.release(); sVd = null; }
+            } catch (Throwable ignored) {}
+            sCreatedVdW = 0;
+            sCreatedVdH = 0;
+            try {
+                if (sSideVd != null) { sSideVd.release(); sSideVd = null; }
+            } catch (Throwable ignored) {}
+            try {
+                if (sBbq != null) {
+                    sBbq.getClass().getMethod("destroy").invoke(sBbq);
+                    sBbq = null;
+                }
+            } catch (Throwable ignored) {}
+            try {
+                if (sSideBbq != null) {
+                    sSideBbq.getClass().getMethod("destroy").invoke(sSideBbq);
+                    sSideBbq = null;
+                }
+            } catch (Throwable ignored) {}
+            try {
+                if (sMirCursorBbq != null) {
+                    sMirCursorBbq.getClass().getMethod("destroy").invoke(sMirCursorBbq);
+                    sMirCursorBbq = null;
+                }
+            } catch (Throwable ignored) {}
+            try {
+                if (sSurf != null) { sSurf.release(); sSurf = null; }
+            } catch (Throwable ignored) {}
+            try {
+                if (sSideSurf != null) { sSideSurf.release(); sSideSurf = null; }
+            } catch (Throwable ignored) {}
+            try {
+                if (sMirCursorSurf != null) { sMirCursorSurf.release(); sMirCursorSurf = null; }
+            } catch (Throwable ignored) {}
+            try {
+                if (sSt != null) { sSt.release(); sSt = null; }
+            } catch (Throwable ignored) {}
+            Object tx = null;
+            try {
+                tx = newSurfaceTx();
+                Object[] scs = new Object[]{sMirCursorSc, sMirCursorWrapSc, sMir0Sc, sMir0BgSc, sMir0WrapSc, sSideMirSc, sMirrorSc, sScaleSc, sBgSc, sRootSc};
+                for (Object sc : scs) {
+                    if (sc != null) {
+                        try { sTxReparent.invoke(tx, sc, null); } catch (Throwable ignored) {}
+                        try { sTxRemove.invoke(tx, sc); } catch (Throwable ignored) {}
+                    }
+                }
+                sMirCursorSc = null;
+                sMirCursorWrapSc = null;
+                sMir0Sc = null;
+                sMir0BgSc = null;
+                sMir0WrapSc = null;
+                sSideMirSc = null;
+                sMirrorSc = null;
+                sScaleSc = null;
+                sBgSc = null;
+                sRootSc = null;
+                if (sTxApplySync != null) {
+                    try { sTxApplySync.invoke(tx, true); } catch (Throwable ignored) { sTxApply.invoke(tx); }
+                } else {
+                    sTxApply.invoke(tx);
+                }
+                for (Object sc : scs) {
+                    if (sc != null && sScRelease != null) {
+                        try { sScRelease.invoke(sc); } catch (Throwable ignored) {}
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                closeSurfaceTx(tx);
             }
-            for (Object sc : scs) {
-                if (sc != null && sScRelease != null) {
-                    try { sScRelease.invoke(sc); } catch (Throwable ignored) {}
+            sExtId = -1;
+            sVdId = -1;
+            sSideVdId = -1;
+            sMirW = 0;
+            sMirH = 0;
+            sMirGeom = new MirrorGeom(0, 0, 0, 0, 0, 0);
+            sLastAppliedMirSideMode = -1;
+            sVdUniqueId = null;
+            sRenderMode = "NONE";
+
+            // 4. Exit split & reset per-app compat overrides last
+            if (unbindWm || sShuttingDown || sMirrorMode == 1 || extUnplugged) {
+                if (sSplitActive && prevVdId > 0) {
+                    try { exitSplitAndRestore(false); } catch (Throwable ignored) {}
+                } else {
+                    synchronized (sSplitLock) {
+                        clearSplitState();
+                    }
                 }
             }
-        } catch (Throwable ignored) {
-        } finally {
-            closeSurfaceTx(tx);
+            if (unbindWm || sShuttingDown || extUnplugged) {
+                restoreGlobalFullscreenPrefs();
+                resetAppFullscreenCompatAll();
+            }
         }
-        sExtId = -1;
-        sVdId = -1;
-        sSideVdId = -1;
-        sMirW = 0;
-        sMirH = 0;
-        sVdUniqueId = null;
-        sRenderMode = "NONE";
     }
 
     private static volatile int sLastPhysResult = 0; // 0=ok/unchanged, 1=switched, -1=edid unsupported, -2=invoke failed, -3=system locked physical mode
@@ -1767,149 +2189,209 @@ public class ExtBridge implements Runnable {
         return false;
     }
 
-    private static synchronized void syncPhysicalModeIfChanged() {
-        Display ext = findExternalDisplay();
-        if (ext == null || ext.getDisplayId() != sExtId) return;
-        Display.Mode curMode = ext.getMode();
-        if (curMode == null) return;
-        int cw = curMode.getPhysicalWidth();
-        int ch = curMode.getPhysicalHeight();
-        float cf = curMode.getRefreshRate();
-        boolean sizeChanged = (cw != sPhysW || ch != sPhysH);
-        boolean fpsChanged = Math.abs(cf - sPhysFps) > 0.2f;
-        if (sizeChanged || fpsChanged) {
-            sPhysW = cw;
-            sPhysH = ch;
-            sPhysFps = cf;
-            if (sizeChanged) {
-                applySurfaceTransform();
+    private static void syncPhysicalModeIfChanged() {
+        synchronized (sDisplayLock) {
+            Display ext = findExternalDisplay();
+            if (ext == null || ext.getDisplayId() != sExtId) return;
+            Display.Mode curMode = ext.getMode();
+            if (curMode == null) return;
+            int cw = curMode.getPhysicalWidth();
+            int ch = curMode.getPhysicalHeight();
+            float cf = curMode.getRefreshRate();
+            boolean sizeChanged = (cw != sPhysW || ch != sPhysH);
+            boolean fpsChanged = Math.abs(cf - sPhysFps) > 0.2f;
+            if (sizeChanged || fpsChanged) {
+                sPhysW = cw;
+                sPhysH = ch;
+                sPhysFps = cf;
+                if (sMirrorMode == 1 && sizeChanged) {
+                    sForceRebuild = true;
+                    sSideVdAttempted = false;
+                    tick();
+                    return;
+                }
+                if (sizeChanged) {
+                    applySurfaceTransform();
+                }
+                reassert();
+                notifyHelperSync();
             }
-            reassert();
-            notifyHelperSync();
         }
     }
 
-    private static synchronized boolean applyConfig(int reqW, int reqH, int reqDpi, int reqFpsX100, int physModeId, int reqRot) {
-        try {
-            sLastPhysResult = 0;
-            if (!isValidDims(reqW, reqH) || reqDpi < 80 || reqDpi > 640) {
-                return false;
-            }
-            float fps = reqFpsX100 > 0 ? (reqFpsX100 / 100.0f) : sVirtFps;
-            sVirtW = reqW;
-            sVirtH = reqH;
-            sVirtDpi = reqDpi;
-            sVirtFps = fps;
-            if (reqRot >= 0) {
-                sVirtRot = normalizeRot(reqRot);
-            }
-            sHasUserConf = true;
-            saveConf();
+    private static boolean applyConfig(int reqW, int reqH, int reqDpi, int reqFpsX100, int physModeId, int reqRot) {
+        synchronized (sDisplayLock) {
+            try {
+                sLastPhysResult = 0;
+                if (!isValidDims(reqW, reqH) || reqDpi < 80 || reqDpi > 640) {
+                    return false;
+                }
+                float fps = reqFpsX100 > 0 ? clampFps(reqFpsX100 / 100.0f, sVirtFps) : sVirtFps;
+                sVirtW = reqW;
+                sVirtH = reqH;
+                sVirtDpi = reqDpi;
+                sVirtFps = fps;
+                if (reqRot >= 0) {
+                    sVirtRot = normalizeRot(reqRot);
+                }
+                sHasUserConf = true;
+                saveConf();
 
-            // 1. Apply physical external display mode if supported & requested
-            Display ext = findExternalDisplay();
-            if (ext != null) {
-                Display.Mode chosenMode = null;
-                Display.Mode[] modes = ext.getSupportedModes();
-                if (modes != null && modes.length > 0) {
-                    if (physModeId > 0) {
-                        for (Display.Mode m : modes) {
-                            if (m.getModeId() == physModeId) { chosenMode = m; break; }
-                        }
-                    } else if (reqFpsX100 > 0) {
-                        int matchW = ((sVirtRot & 1) == 1) ? reqH : reqW;
-                        int matchH = ((sVirtRot & 1) == 1) ? reqW : reqH;
-                        float bestScore = Float.MAX_VALUE;
-                        for (Display.Mode m : modes) {
-                            float diff = Math.abs(m.getRefreshRate() - fps);
-                            if (diff > 2.5f) continue;
-                            int mw = m.getPhysicalWidth();
-                            int mh = m.getPhysicalHeight();
-                            boolean resMatch = (mw == matchW && mh == matchH) || (mw == matchH && mh == matchW);
-                            long area = (long) mw * (long) mh;
-                            float areaBias = Math.max(0f, 4.0f - (area / 2073600f));
-                            float score = diff + (resMatch ? 0f : (5.0f + areaBias));
-                            if (score < bestScore) {
-                                bestScore = score;
-                                chosenMode = m;
+                // 1. Apply physical external display mode if supported & requested
+                Display ext = findExternalDisplay();
+                if (ext != null) {
+                    Display.Mode chosenMode = null;
+                    Display.Mode[] modes = ext.getSupportedModes();
+                    if (modes != null && modes.length > 0) {
+                        if (physModeId > 0) {
+                            for (Display.Mode m : modes) {
+                                if (m.getModeId() == physModeId) { chosenMode = m; break; }
+                            }
+                        } else if (reqFpsX100 > 0) {
+                            int matchW = ((sVirtRot & 1) == 1) ? reqH : reqW;
+                            int matchH = ((sVirtRot & 1) == 1) ? reqW : reqH;
+                            float bestScore = Float.MAX_VALUE;
+                            for (Display.Mode m : modes) {
+                                float diff = Math.abs(m.getRefreshRate() - fps);
+                                if (diff > 2.5f) continue;
+                                int mw = m.getPhysicalWidth();
+                                int mh = m.getPhysicalHeight();
+                                boolean resMatch = (mw == matchW && mh == matchH) || (mw == matchH && mh == matchW);
+                                long area = (long) mw * (long) mh;
+                                float areaBias = Math.max(0f, 4.0f - (area / 2073600f));
+                                float score = diff + (resMatch ? 0f : (5.0f + areaBias));
+                                if (score < bestScore) {
+                                    bestScore = score;
+                                    chosenMode = m;
+                                }
+                            }
+                            if (chosenMode == null) {
+                                sLastPhysResult = -1;
+                                System.out.println("EXTBRIDGE_PHYS_SKIP no EDID mode near " + fps + "Hz for " + matchW + "x" + matchH);
                             }
                         }
-                        if (chosenMode == null) {
-                            sLastPhysResult = -1;
-                            System.out.println("EXTBRIDGE_PHYS_SKIP no EDID mode near " + fps + "Hz for " + matchW + "x" + matchH);
-                        }
-                    }
-                    if (chosenMode != null) {
-                        boolean invoked = invokeSetUserPreferredMode(ext.getDisplayId(), chosenMode);
-                        if (invoked) {
-                            SystemClock.sleep(120);
-                            Display extNow = findExternalDisplay();
-                            Display.Mode cur = (extNow != null) ? extNow.getMode() : null;
-                            if (cur != null) {
-                                sPhysW = cur.getPhysicalWidth();
-                                sPhysH = cur.getPhysicalHeight();
-                                sPhysFps = cur.getRefreshRate();
+                        if (chosenMode != null) {
+                            boolean invoked = invokeSetUserPreferredMode(ext.getDisplayId(), chosenMode);
+                            if (invoked) {
+                                SystemClock.sleep(120);
+                                Display extNow = findExternalDisplay();
+                                Display.Mode cur = (extNow != null) ? extNow.getMode() : null;
+                                if (cur != null) {
+                                    sPhysW = cur.getPhysicalWidth();
+                                    sPhysH = cur.getPhysicalHeight();
+                                    sPhysFps = cur.getRefreshRate();
+                                }
+                                boolean curMatched = cur == null
+                                        || (((cur.getPhysicalWidth() == chosenMode.getPhysicalWidth()
+                                                && cur.getPhysicalHeight() == chosenMode.getPhysicalHeight())
+                                            || (cur.getPhysicalWidth() == chosenMode.getPhysicalHeight()
+                                                && cur.getPhysicalHeight() == chosenMode.getPhysicalWidth()))
+                                            && Math.abs(cur.getRefreshRate() - chosenMode.getRefreshRate()) <= 2.5f);
+                                sLastPhysResult = curMatched ? 1 : -3;
+                                if (sHandler != null) {
+                                    sHandler.postDelayed(ExtBridge::syncPhysicalModeIfChanged, 250);
+                                    sHandler.postDelayed(ExtBridge::syncPhysicalModeIfChanged, 700);
+                                }
+                                System.out.println("EXTBRIDGE_PHYS_REQ mode=" + chosenMode.getModeId()
+                                        + " target=" + chosenMode.getPhysicalWidth() + "x" + chosenMode.getPhysicalHeight() + "@" + chosenMode.getRefreshRate()
+                                        + " actual=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " res=" + sLastPhysResult);
+                            } else {
+                                sLastPhysResult = -2;
                             }
-                            boolean curMatched = cur == null
-                                    || (((cur.getPhysicalWidth() == chosenMode.getPhysicalWidth()
-                                            && cur.getPhysicalHeight() == chosenMode.getPhysicalHeight())
-                                        || (cur.getPhysicalWidth() == chosenMode.getPhysicalHeight()
-                                            && cur.getPhysicalHeight() == chosenMode.getPhysicalWidth()))
-                                        && Math.abs(cur.getRefreshRate() - chosenMode.getRefreshRate()) <= 2.5f);
-                            sLastPhysResult = curMatched ? 1 : -3;
-                            if (sHandler != null) {
-                                sHandler.postDelayed(ExtBridge::syncPhysicalModeIfChanged, 250);
-                                sHandler.postDelayed(ExtBridge::syncPhysicalModeIfChanged, 700);
-                            }
-                            System.out.println("EXTBRIDGE_PHYS_REQ mode=" + chosenMode.getModeId()
-                                    + " target=" + chosenMode.getPhysicalWidth() + "x" + chosenMode.getPhysicalHeight() + "@" + chosenMode.getRefreshRate()
-                                    + " actual=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " res=" + sLastPhysResult);
-                        } else {
-                            sLastPhysResult = -2;
                         }
                     }
                 }
-            }
 
-            // 2. Live resize VirtualDisplay + BBQ + hardware scale without tearing down running apps!
-            liveResizeOrRebuild();
-            return true;
-        } catch (Throwable t) {
-            t.printStackTrace();
-            return false;
+                // 2. Live resize VirtualDisplay + BBQ + hardware scale without tearing down running apps!
+                liveResizeOrRebuild();
+                return true;
+            } catch (Throwable t) {
+                t.printStackTrace();
+                return false;
+            }
         }
     }
 
-    private static synchronized int setRotation(int reqRot) {
-        int next = (reqRot < 0) ? ((sVirtRot + 1) % 4) : normalizeRot(reqRot);
-        boolean wantPortrait = (next & 1) == 1;
-        if (wantPortrait && sVirtW > sVirtH) {
-            int tmp = sVirtW;
-            sVirtW = sVirtH;
-            sVirtH = tmp;
-        } else if (!wantPortrait && sVirtH > sVirtW) {
-            int tmp = sVirtW;
-            sVirtW = sVirtH;
-            sVirtH = tmp;
+    private static int setRotation(int reqRot) {
+        synchronized (sDisplayLock) {
+            int next = (reqRot < 0) ? ((sVirtRot + 1) % 4) : normalizeRot(reqRot);
+            boolean wantPortrait = (next & 1) == 1;
+            if (wantPortrait && sVirtW > sVirtH) {
+                int tmp = sVirtW;
+                sVirtW = sVirtH;
+                sVirtH = tmp;
+            } else if (!wantPortrait && sVirtH > sVirtW) {
+                int tmp = sVirtW;
+                sVirtW = sVirtH;
+                sVirtH = tmp;
+            }
+            sVirtRot = next;
+            sHasUserConf = true;
+            saveConf();
+            liveResizeOrRebuild();
+            return sVirtRot;
         }
-        sVirtRot = next;
-        sHasUserConf = true;
-        saveConf();
-        liveResizeOrRebuild();
-        return sVirtRot;
+    }
+
+    private static ArrayList<Integer> collectExtUserTaskIds(int vdId) {
+        ArrayList<Integer> tids = new ArrayList<>();
+        if (vdId <= 0) return tids;
+        try {
+            List<?> running = invokeTaskQuery("getTasks");
+            if (running != null) {
+                // Iterate bottom-to-top so moving them to the new VD preserves z-order
+                for (int i = running.size() - 1; i >= 0; i--) {
+                    Object t = running.get(i);
+                    if (t == null) continue;
+                    int did = readIntField(t, "displayId", -1);
+                    if (did != vdId) continue;
+                    String pkg = extractTaskPkg(t);
+                    if ("com.extbridge.helper".equals(pkg) || isProtectedSystemTaskPkg(pkg)) continue;
+                    int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                    if (tid > 0 && !tids.contains(tid)) tids.add(tid);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return tids;
     }
 
     private static void liveResizeOrRebuild() {
+        boolean orientationAspectFlipped = (sVd != null && sCreatedVdW > 0 && sCreatedVdH > 0)
+                && ((sCreatedVdW > sCreatedVdH) != (sVirtW > sVirtH));
+        if (orientationAspectFlipped) {
+            // Android VirtualDisplayDevice letterboxes if landscape<->portrait flips via resize() while
+            // display rotation is frozen at 0; rebuild VD natively at the new aspect and migrate tasks!
+            ArrayList<Integer> prevTasks = collectExtUserTaskIds(sVdId);
+            sForceRebuild = true;
+            tick();
+            if (sVdId > 0 && !prevTasks.isEmpty() && sAtm != null) {
+                for (int tid : prevTasks) {
+                    try {
+                        for (Method m : sAtm.getClass().getMethods()) {
+                            if (m.getName().equals("moveRootTaskToDisplay") && m.getParameterCount() == 2) {
+                                m.invoke(sAtm, tid, sVdId);
+                                break;
+                            }
+                        }
+                    } catch (Throwable ignored) {}
+                }
+            }
+            notifyHelperSync();
+            return;
+        }
         if (sVd != null && "BBQ".equals(sRenderMode) && sMirrorSc != null) {
+            Object newBbq = null;
+            Surface newSurf = null;
+            boolean swapped = false;
             try {
                 Class<?> scCls = Class.forName("android.view.SurfaceControl");
                 Class<?> bbqCls = Class.forName("android.graphics.BLASTBufferQueue");
                 Object oldBbq = sBbq;
                 Surface oldSurf = sSurf;
 
-                Object newBbq = bbqCls.getConstructor(String.class, boolean.class).newInstance("ExtBBQ", true);
+                newBbq = bbqCls.getConstructor(String.class, boolean.class).newInstance("ExtBBQ", true);
                 bbqCls.getMethod("update", scCls, int.class, int.class, int.class).invoke(newBbq, sMirrorSc, sVirtW, sVirtH, 1);
-                Surface newSurf = (Surface) bbqCls.getMethod("createSurface").invoke(newBbq);
+                newSurf = (Surface) bbqCls.getMethod("createSurface").invoke(newBbq);
                 if (newSurf != null && Build.VERSION.SDK_INT >= 30) {
                     try { newSurf.setFrameRate(sVirtFps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE); } catch (Throwable ignored) {}
                 }
@@ -1918,6 +2400,7 @@ public class ExtBridge implements Runnable {
 
                 sBbq = newBbq;
                 sSurf = newSurf;
+                swapped = true;
                 if (oldSurf != null) try { oldSurf.release(); } catch (Throwable ignored) {}
                 if (oldBbq != null) try { bbqCls.getMethod("destroy").invoke(oldBbq); } catch (Throwable ignored) {}
 
@@ -1940,6 +2423,10 @@ public class ExtBridge implements Runnable {
                 return;
             } catch (Throwable t) {
                 t.printStackTrace();
+                if (!swapped) {
+                    if (newSurf != null) try { newSurf.release(); } catch (Throwable ignored) {}
+                    if (newBbq != null) try { newBbq.getClass().getMethod("destroy").invoke(newBbq); } catch (Throwable ignored) {}
+                }
             }
         }
         sForceRebuild = true;
@@ -1954,6 +2441,17 @@ public class ExtBridge implements Runnable {
                     try { sMRemAssoc.invoke(sIm, desc); } catch (Throwable ignored) {}
                 }
                 sBoundDescs.clear();
+                int[] ids = sIm.getInputDeviceIds();
+                if (ids != null) {
+                    for (int id : ids) {
+                        InputDevice dev = sIm.getInputDevice(id);
+                        if (dev == null || !dev.isExternal() || dev.isVirtual()) continue;
+                        String desc = dev.getDescriptor();
+                        if (desc != null) {
+                            try { sMRemAssoc.invoke(sIm, desc); } catch (Throwable ignored) {}
+                        }
+                    }
+                }
             } catch (Throwable ignored) {}
         }
     }
@@ -1974,9 +2472,14 @@ public class ExtBridge implements Runnable {
                     if (desc != null) descs.add(desc);
                     if (sInputToExt != 0 && sMAddAssoc != null && desc != null) {
                         try {
+                            if (sMRemAssoc != null) {
+                                try { sMRemAssoc.invoke(sIm, desc); } catch (Throwable ignored) {}
+                            }
                             sMAddAssoc.invoke(sIm, desc, sVdUniqueId);
                             sBoundDescs.add(desc);
-                        } catch (Throwable ignored) {}
+                        } catch (Throwable t) {
+                            System.err.println("EXTBRIDGE_ASSOC_ERR desc=" + desc + " err=" + t);
+                        }
                     }
                 }
                 java.util.Collections.sort(descs);
@@ -2013,14 +2516,21 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean invokeInjectInput(InputEvent ev, int targetDisplayId) {
+        return invokeInjectInputMode(ev, targetDisplayId, 0);
+    }
+
+    private static boolean invokeInjectInputMode(InputEvent ev, int targetDisplayId, int mode) {
         if (ev == null || targetDisplayId < 0 || sIIm == null || sMInjectInput == null) return false;
         try {
             if (sMSetDisplayId != null) sMSetDisplayId.invoke(ev, targetDisplayId);
-            Object res = sMInjectInput.invoke(sIIm, ev, 0);
+            Object res = sMInjectInput.invoke(sIIm, ev, mode);
             boolean ok = !(res instanceof Boolean) || (Boolean) res;
             if (ok) sLastInjectStatus = 1;
             return ok;
         } catch (Throwable t) {
+            if (mode != 0) {
+                return invokeInjectInputMode(ev, targetDisplayId, 0);
+            }
             Throwable root = (t instanceof InvocationTargetException && t.getCause() != null) ? t.getCause() : t;
             if (root instanceof SecurityException) {
                 sLastInjectStatus = -1;
@@ -2037,15 +2547,57 @@ public class ExtBridge implements Runnable {
         }
     }
 
+    private static void focusDisplayForKey(int dispId) {
+        if (dispId <= 0) return;
+        try {
+            if (sMFocusTopTask != null) {
+                sMFocusTopTask.invoke(sAtm, dispId);
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (sMMoveDisplayToTop != null) {
+                sMMoveDisplayToTop.invoke(sWm, dispId, "ExtBridge");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean isHelperTopOnDisplay0() {
+        try {
+            List<?> tasks = invokeTaskQuery("getTasks");
+            if (tasks != null) {
+                for (Object t : tasks) {
+                    if (t == null) continue;
+                    int did = readIntField(t, "displayId", 0);
+                    if (did != 0) continue;
+                    if (!readBoolField(t, "isVisible", true)) continue;
+                    return "com.extbridge.helper".equals(extractTaskPkg(t));
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
     private static void injectKey(int keyCode, int metaState) {
         try {
             int dispId = (sMirrorMode == 1) ? 0 : sVdId;
             if (dispId < 0 || sIIm == null || sMInjectInput == null) return;
-            long now = SystemClock.uptimeMillis();
-            KeyEvent kd = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, metaState, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
-            KeyEvent ku = new KeyEvent(now, now + 15, KeyEvent.ACTION_UP, keyCode, 0, metaState, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
-            invokeInjectInput(kd, dispId);
-            invokeInjectInput(ku, dispId);
+            if (dispId == 0 && keyCode == KeyEvent.KEYCODE_BACK && metaState == 0 && isHelperTopOnDisplay0()) {
+                return;
+            }
+            if (dispId > 0) {
+                focusDisplayForKey(dispId);
+            }
+            long tDown = SystemClock.uptimeMillis();
+            KeyEvent kd = new KeyEvent(tDown, tDown, KeyEvent.ACTION_DOWN, keyCode, 0, metaState,
+                    KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+            boolean okDown = invokeInjectInputMode(kd, dispId, 2);
+            long tUp = Math.max(tDown, SystemClock.uptimeMillis());
+            KeyEvent ku = new KeyEvent(tDown, tUp, KeyEvent.ACTION_UP, keyCode, 0, metaState,
+                    KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+            invokeInjectInputMode(ku, dispId, 2);
+            if (!okDown && keyCode == KeyEvent.KEYCODE_BACK && metaState == 0) {
+                runCmdOut("cmd", "input", "-d", String.valueOf(dispId), "keyevent", "4");
+            }
         } catch (Throwable t) {
             t.printStackTrace();
         }
@@ -2067,9 +2619,10 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean isPointInMirrorMain(float cx, float cy) {
-        return sMirW > 0 && sMirH > 0
-                && cx >= sMirX && cx < (sMirX + sMirW)
-                && cy >= sMirY && cy < (sMirY + sMirH);
+        MirrorGeom g = sMirGeom;
+        return g.mirW > 0 && g.mirH > 0
+                && cx >= g.mirX && cx < (g.mirX + g.mirW)
+                && cy >= g.mirY && cy < (g.mirY + g.mirH);
     }
 
     private static int resolveMirrorTargetDisplay(float cx, float cy) {
@@ -2078,20 +2631,63 @@ public class ExtBridge implements Runnable {
     }
 
     private static float mapMirrorX(int targetDisp, float cx) {
-        if (targetDisp == 0 && sMirW > 0 && sD0W > 0) {
-            return Math.max(0f, Math.min(sD0W - 1f, (cx - sMirX) * sD0W / (float) sMirW));
+        MirrorGeom g = sMirGeom;
+        if (targetDisp == 0 && g.mirW > 0 && g.d0W > 0) {
+            return Math.max(0f, Math.min(g.d0W - 1f, (cx - g.mirX) * g.d0W / (float) g.mirW));
         }
         return Math.max(0f, Math.min(sPhysW - 1f, cx));
     }
 
     private static float mapMirrorY(int targetDisp, float cy) {
-        if (targetDisp == 0 && sMirH > 0 && sD0H > 0) {
-            return Math.max(0f, Math.min(sD0H - 1f, (cy - sMirY) * sD0H / (float) sMirH));
+        MirrorGeom g = sMirGeom;
+        if (targetDisp == 0 && g.mirH > 0 && g.d0H > 0) {
+            return Math.max(0f, Math.min(g.d0H - 1f, (cy - g.mirY) * g.d0H / (float) g.mirH));
         }
         return Math.max(0f, Math.min(sPhysH - 1f, cy));
     }
 
+    private static void releaseStaleMouseDragOnHelperDeath() {
+        synchronized (sCursorLock) {
+            try {
+                long now = SystemClock.uptimeMillis();
+                if (sMouseButtons != 0) {
+                    boolean mirror = (sMirrorMode == 1);
+                    int disp = mirror
+                            ? (sMirDragDisplayId >= 0 ? sMirDragDisplayId : resolveMirrorTargetDisplay(sCursorX, sCursorY))
+                            : sVdId;
+                    int prevBtns = sMouseButtons;
+                    sMouseButtons = 0;
+                    sMirDragDisplayId = -1;
+                    sMouseDownTime = 0L;
+                    if (disp >= 0 && sIIm != null && sMInjectInput != null) {
+                        float tx = mirror ? mapMirrorX(disp, sCursorX) : sCursorX;
+                        float ty = mirror ? mapMirrorY(disp, sCursorY) : sCursorY;
+                        if (mirror && disp == sSideVdId && sSideVdId > 0 && (prevBtns & MotionEvent.BUTTON_PRIMARY) != 0) {
+                            dispatchTouchMotion(MotionEvent.ACTION_UP, now, tx, ty, disp);
+                        } else {
+                            dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, tx, ty, 0, prevBtns, 0f, 0f, disp);
+                            dispatchMouseMotion(MotionEvent.ACTION_UP, now, tx, ty, 0, 0, 0f, 0f, disp);
+                        }
+                    }
+                }
+                if (sSideTouchDownTime > 0L) {
+                    long downTime = sSideTouchDownTime;
+                    sSideTouchDownTime = 0L;
+                    if (sMirrorMode == 1 && sSideVdId > 0) {
+                        dispatchTouchMotionWithDownTime(MotionEvent.ACTION_CANCEL, now, downTime, sCursorX, sCursorY, sSideVdId);
+                    }
+                }
+                if (sMirMouseCaptured) {
+                    sMirMouseCaptured = false;
+                    updateMirrorCursorSurface(sCursorX, sCursorY, false, false);
+                }
+            } catch (Throwable ignored) {}
+        }
+    }
+
     private static void injectMouseAction(int type, float a1, float a2) {
+        if (!Float.isFinite(a1) || !Float.isFinite(a2)) return;
+        boolean triggerBackAfterLock = false;
         synchronized (sCursorLock) {
             try {
                 boolean mirror = (sMirrorMode == 1);
@@ -2100,6 +2696,8 @@ public class ExtBridge implements Runnable {
                 sLastTouchpadMs = SystemClock.uptimeMillis();
                 float maxX = mirror ? (sPhysW - 1f) : (sVirtW - 1f);
                 float maxY = mirror ? (sPhysH - 1f) : (sVirtH - 1f);
+                if (!Float.isFinite(sCursorX)) sCursorX = maxX * 0.5f;
+                if (!Float.isFinite(sCursorY)) sCursorY = maxY * 0.5f;
                 long now = SystemClock.uptimeMillis();
                 switch (type) {
                     case 0: { // MOVE_REL
@@ -2126,6 +2724,7 @@ public class ExtBridge implements Runnable {
                             sMouseDownTime = now - 20;
                             dispatchTouchMotion(MotionEvent.ACTION_DOWN, now - 20, tx, ty, disp);
                             dispatchTouchMotion(MotionEvent.ACTION_UP, now, tx, ty, disp);
+                            scheduleMirrorSideClickPostChecks();
                         } else {
                             dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now - 25, tx, ty, 0, 0, 0f, 0f, disp);
                             sMouseDownTime = now - 20;
@@ -2137,17 +2736,24 @@ public class ExtBridge implements Runnable {
                         }
                         break;
                     }
-                    case 2: { // RIGHT_CLICK
+                    case 2: { // RIGHT_CLICK / BACK (a1 > 0.5f => explicit context secondary click)
                         int disp = mirror ? resolveMirrorTargetDisplay(sCursorX, sCursorY) : sVdId;
-                        float tx = mirror ? mapMirrorX(disp, sCursorX) : sCursorX;
-                        float ty = mirror ? mapMirrorY(disp, sCursorY) : sCursorY;
-                        dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now - 25, tx, ty, 0, 0, 0f, 0f, disp);
-                        sMouseDownTime = now - 20;
-                        dispatchMouseMotion(MotionEvent.ACTION_DOWN, now - 20, tx, ty, MotionEvent.BUTTON_SECONDARY, 0, 0f, 0f, disp);
-                        dispatchMouseMotion(MotionEvent.ACTION_BUTTON_PRESS, now - 20, tx, ty, MotionEvent.BUTTON_SECONDARY, MotionEvent.BUTTON_SECONDARY, 0f, 0f, disp);
-                        dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, tx, ty, 0, MotionEvent.BUTTON_SECONDARY, 0f, 0f, disp);
-                        dispatchMouseMotion(MotionEvent.ACTION_UP, now, tx, ty, 0, 0, 0f, 0f, disp);
-                        dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now, tx, ty, 0, 0, 0f, 0f, disp);
+                        boolean forceContextButton = (a1 > 0.5f)
+                                || (mirror && disp == sSideVdId && sSideVdId > 0)
+                                || (mirror && disp == 0 && isHelperTopOnDisplay0());
+                        if (forceContextButton) {
+                            float tx = mirror ? mapMirrorX(disp, sCursorX) : sCursorX;
+                            float ty = mirror ? mapMirrorY(disp, sCursorY) : sCursorY;
+                            dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now - 25, tx, ty, 0, 0, 0f, 0f, disp);
+                            sMouseDownTime = now - 20;
+                            dispatchMouseMotion(MotionEvent.ACTION_DOWN, now - 20, tx, ty, MotionEvent.BUTTON_SECONDARY, 0, 0f, 0f, disp);
+                            dispatchMouseMotion(MotionEvent.ACTION_BUTTON_PRESS, now - 20, tx, ty, MotionEvent.BUTTON_SECONDARY, MotionEvent.BUTTON_SECONDARY, 0f, 0f, disp);
+                            dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, tx, ty, 0, MotionEvent.BUTTON_SECONDARY, 0f, 0f, disp);
+                            dispatchMouseMotion(MotionEvent.ACTION_UP, now, tx, ty, 0, 0, 0f, 0f, disp);
+                            dispatchMouseMotion(MotionEvent.ACTION_HOVER_MOVE, now, tx, ty, 0, 0, 0f, 0f, disp);
+                        } else {
+                            triggerBackAfterLock = true;
+                        }
                         break;
                     }
                     case 3: { // LEFT_DOWN (drag)
@@ -2173,6 +2779,7 @@ public class ExtBridge implements Runnable {
                         float ty = mirror ? mapMirrorY(disp, sCursorY) : sCursorY;
                         if (mirror && disp == sSideVdId && sSideVdId > 0) {
                             dispatchTouchMotion(MotionEvent.ACTION_UP, now, tx, ty, disp);
+                            scheduleMirrorSideClickPostChecks();
                         } else {
                             dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, tx, ty, 0, MotionEvent.BUTTON_PRIMARY, 0f, 0f, disp);
                             dispatchMouseMotion(MotionEvent.ACTION_UP, now, tx, ty, 0, 0, 0f, 0f, disp);
@@ -2211,9 +2818,59 @@ public class ExtBridge implements Runnable {
                 t.printStackTrace();
             }
         }
+        if (triggerBackAfterLock) {
+            injectKey(KeyEvent.KEYCODE_BACK, 0);
+        }
+    }
+
+    private static void reassertDisplay0FocusForMirrorCapture() {
+        try {
+            if (sMirrorMode == 1 && sMirMouseCaptured && sWm != null && sMMoveDisplayToTop != null) {
+                sMMoveDisplayToTop.invoke(sWm, 0, "extMirSideCap");
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static void scheduleMirrorSideClickPostChecks() {
+        if (sHandler == null || sShuttingDown) return;
+        sHandler.postDelayed(ExtBridge::reassertDisplay0FocusForMirrorCapture, 22L);
+        sHandler.postDelayed(ExtBridge::reassertDisplay0FocusForMirrorCapture, 85L);
+        final int checkSideVdId = sSideVdId;
+        if (checkSideVdId > 0) {
+            sBgSchedExec.schedule(() -> rescueStrayTasksOnSideVd(checkSideVdId), 35L, TimeUnit.MILLISECONDS);
+            sBgSchedExec.schedule(() -> rescueStrayTasksOnSideVd(checkSideVdId), 110L, TimeUnit.MILLISECONDS);
+            sBgSchedExec.schedule(() -> rescueStrayTasksOnSideVd(checkSideVdId), 280L, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    private static void rescueStrayTasksOnSideVd(int sideVdId) {
+        if (sideVdId <= 0 || sMirrorMode != 1 || sAtm == null) return;
+        try {
+            List<?> infos = (List<?>) sAtm.getClass()
+                    .getMethod("getAllRootTaskInfosOnDisplay", int.class)
+                    .invoke(sAtm, sideVdId);
+            if (infos == null || infos.isEmpty()) return;
+            Method moveM = null;
+            for (Method m : sAtm.getClass().getMethods()) {
+                if (m.getName().equals("moveRootTaskToDisplay") && m.getParameterCount() == 2) {
+                    moveM = m;
+                    break;
+                }
+            }
+            if (moveM == null) return;
+            for (Object ti : infos) {
+                if (ti == null) continue;
+                int tid = readIntField(ti, "taskId", readIntField(ti, "id", -1));
+                if (tid > 0) {
+                    try { moveM.invoke(sAtm, tid, 0); } catch (Throwable ignored) {}
+                }
+            }
+            reassertDisplay0FocusForMirrorCapture();
+        } catch (Throwable ignored) {}
     }
 
     private static void handleSideDirectTouch(int action, float sx, float sy) {
+        if (!Float.isFinite(sx) || !Float.isFinite(sy)) return;
         synchronized (sCursorLock) {
             try {
                 if (sMirrorMode != 1 || sSideVdId <= 0 || sIIm == null || sMInjectInput == null) return;
@@ -2226,6 +2883,9 @@ public class ExtBridge implements Runnable {
                 dispatchTouchMotionWithDownTime(action, now, sSideTouchDownTime > 0 ? sSideTouchDownTime : now, cx, cy, sSideVdId);
                 if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
                     sSideTouchDownTime = 0L;
+                    if (action == MotionEvent.ACTION_UP) {
+                        scheduleMirrorSideClickPostChecks();
+                    }
                 }
                 if (sMirCursorVisible) {
                     updateMirrorCursorSurface(cx, cy, false, false);
@@ -2237,31 +2897,59 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean handleCapturedMirrorMouse(int actionType, float a1, float a2, float a3) {
+        if (!Float.isFinite(a1) || !Float.isFinite(a2) || !Float.isFinite(a3)) return false;
         synchronized (sCursorLock) {
             try {
                 if (sMirrorMode != 1 || sSideVdId <= 0 || sPhysW <= 0 || sPhysH <= 0) {
                     sMirMouseCaptured = false;
                     return false;
                 }
+                if (actionType == 9) { // REASSERT_D0_FOCUS while keeping sidebar capture alive
+                    if (!sMirMouseCaptured) return false;
+                    reassertDisplay0FocusForMirrorCapture();
+                    return true;
+                }
                 if (!sMirMouseCaptured && actionType != 5) {
                     return false;
                 }
                 long now = SystemClock.uptimeMillis();
                 sLastMirCapActionMs = now;
+                if (actionType == 5) {
+                    // Explicit local interrupt (finger touch on Display 0 / ESC / mode exit):
+                    // NEVER clamp sCursorX out of the sidebar to cause a phantom jump; release cleanly!
+                    if (sMouseButtons != 0) {
+                        if ((sMouseButtons & MotionEvent.BUTTON_PRIMARY) != 0) {
+                            dispatchTouchMotion(MotionEvent.ACTION_UP, now, sCursorX, sCursorY, sSideVdId);
+                        } else {
+                            dispatchMouseMotion(MotionEvent.ACTION_BUTTON_RELEASE, now, sCursorX, sCursorY, 0, sMouseButtons, 0f, 0f, sSideVdId);
+                            dispatchMouseMotion(MotionEvent.ACTION_UP, now, sCursorX, sCursorY, 0, 0, 0f, 0f, sSideVdId);
+                        }
+                        sMouseButtons = 0;
+                        sMouseDownTime = 0L;
+                    }
+                    sMirMouseCaptured = false;
+                    sHasLastPollD0 = false;
+                    sJustExitedSideEdge = false;
+                    sMirEdgeCooldownUntilMs = now + 320L;
+                    updateMirrorCursorSurface(sCursorX, sCursorY, false, false);
+                    return false;
+                }
+
+                MirrorGeom g = sMirGeom;
+                if (!Float.isFinite(sCursorX)) sCursorX = sPhysW * 0.5f;
+                if (!Float.isFinite(sCursorY)) sCursorY = sPhysH * 0.5f;
                 float nx = (actionType == 0) ? Math.max(0f, Math.min(sPhysW - 1f, sCursorX + a1)) : sCursorX;
                 float ny = (actionType == 0) ? Math.max(0f, Math.min(sPhysH - 1f, sCursorY + a2)) : sCursorY;
 
-                boolean hasHorizMargin = (sPhysW - sMirW >= EDGE_MARGIN_MIN_PX);
-                boolean hasVertMargin = !hasHorizMargin && (sPhysH - sMirH >= EDGE_MARGIN_MIN_PX);
-                boolean inHorizMain = hasHorizMargin
-                        ? (nx >= sMirX + (sMirX >= EDGE_MARGIN_MIN_PX ? 4f : 0f)
-                                && nx <= (sMirX + sMirW) - ((sPhysW - sMirX - sMirW >= EDGE_MARGIN_MIN_PX) ? 5f : 0f))
-                        : (nx >= sMirX && nx < sMirX + sMirW);
-                boolean inVertMain = hasVertMargin
-                        ? (ny >= sMirY + (sMirY >= EDGE_MARGIN_MIN_PX ? 4f : 0f)
-                                && ny <= (sMirY + sMirH) - ((sPhysH - sMirY - sMirH >= EDGE_MARGIN_MIN_PX) ? 5f : 0f))
-                        : (ny >= sMirY && ny < sMirY + sMirH);
-                boolean crossedBack = (actionType == 5) || (inHorizMain && inVertMain);
+                boolean hasHorizMargin = (sPhysW - g.mirW >= EDGE_MARGIN_MIN_PX);
+                boolean hasVertMargin = !hasHorizMargin && (sPhysH - g.mirH >= EDGE_MARGIN_MIN_PX);
+                boolean inHorizMain = !hasHorizMargin
+                        || (nx >= g.mirX + (g.mirX >= EDGE_MARGIN_MIN_PX ? 4f : 0f)
+                                && nx <= (g.mirX + g.mirW) - ((sPhysW - g.mirX - g.mirW >= EDGE_MARGIN_MIN_PX) ? 5f : 0f));
+                boolean inVertMain = !hasVertMargin
+                        || (ny >= g.mirY + (g.mirY >= EDGE_MARGIN_MIN_PX ? 4f : 0f)
+                                && ny <= (g.mirY + g.mirH) - ((sPhysH - g.mirY - g.mirH >= EDGE_MARGIN_MIN_PX) ? 5f : 0f));
+                boolean crossedBack = (actionType == 0) && (inHorizMain && inVertMain);
                 if (crossedBack) {
                     if (sMouseButtons != 0) {
                         if ((sMouseButtons & MotionEvent.BUTTON_PRIMARY) != 0) {
@@ -2273,8 +2961,8 @@ public class ExtBridge implements Runnable {
                         sMouseButtons = 0;
                         sMouseDownTime = 0L;
                     }
-                    sCursorX = Math.max(sMirX, Math.min(sMirX + sMirW - 1f, nx));
-                    sCursorY = Math.max(sMirY, Math.min(sMirY + sMirH - 1f, ny));
+                    sCursorX = Math.max(g.mirX, Math.min(g.mirX + g.mirW - 1f, nx));
+                    sCursorY = Math.max(g.mirY, Math.min(g.mirY + g.mirH - 1f, ny));
                     sMirMouseCaptured = false;
                     sHasLastPollD0 = false;
                     sJustExitedSideEdge = true;
@@ -2302,6 +2990,7 @@ public class ExtBridge implements Runnable {
                             sMouseDownTime = now;
                             sMouseButtons = MotionEvent.BUTTON_PRIMARY;
                             dispatchTouchMotion(MotionEvent.ACTION_DOWN, now, sCursorX, sCursorY, sSideVdId);
+                            reassertDisplay0FocusForMirrorCapture();
                         }
                         break;
                     }
@@ -2310,6 +2999,7 @@ public class ExtBridge implements Runnable {
                             sMouseButtons &= ~MotionEvent.BUTTON_PRIMARY;
                             dispatchTouchMotion(MotionEvent.ACTION_UP, now, sCursorX, sCursorY, sSideVdId);
                             sMouseDownTime = 0L;
+                            scheduleMirrorSideClickPostChecks();
                         }
                         break;
                     }
@@ -2350,12 +3040,10 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean triggerEdgeHoverEntry(float ptX, float ptY) {
+        if (!Float.isFinite(ptX) || !Float.isFinite(ptY)) return false;
         synchronized (sCursorLock) {
             if (sMirMouseCaptured) return true;
             long now = SystemClock.uptimeMillis();
-            if (sJustExitedSideEdge && now >= sMirEdgeCooldownUntilMs) {
-                sJustExitedSideEdge = false;
-            }
             if (now < sMirEdgeCooldownUntilMs || now - sLastTouchpadMs < 350L || sJustExitedSideEdge) return false;
             float[] entry = computeEdgeEntryPoint(ptX, ptY, ptX, ptY, true);
             if (entry == null) return false;
@@ -2424,10 +3112,35 @@ public class ExtBridge implements Runnable {
         }
     }
 
+    private static boolean isAllowedLaunchTarget(String pkg, String cls) {
+        if (!isValidPackageName(pkg) || !isValidClassName(cls)) return false;
+        if ("com.extbridge.helper".equals(pkg)) {
+            return "com.extbridge.helper.LauncherActivity".equals(cls) && getVerifiedHelperUid() > 0;
+        }
+        if ("android".equals(pkg) || "com.android.systemui".equals(pkg)
+                || "com.miui.home".equals(pkg) || "com.miui.securitycenter".equals(pkg)) {
+            return false;
+        }
+        if (sCtx == null) return false;
+        try {
+            PackageManager pm = sCtx.getPackageManager();
+            Intent q = new Intent(Intent.ACTION_MAIN, null)
+                    .addCategory(Intent.CATEGORY_LAUNCHER)
+                    .setComponent(new ComponentName(pkg, cls));
+            List<ResolveInfo> ris = pm.queryIntentActivities(q, 0);
+            if (ris != null && !ris.isEmpty()) return true;
+            ActivityInfo ai = pm.getActivityInfo(new ComponentName(pkg, cls), 0);
+            return ai != null && ai.enabled && ai.exported && (ai.permission == null || ai.permission.isEmpty());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     private static boolean launchComponentOnVd(String pkg, String cls) {
         try {
             if (sVdId <= 0 || sAtm == null || sMStartActivity == null) return false;
-            boolean isExtLauncher = "com.extbridge.helper".equals(pkg) && cls != null && cls.contains("LauncherActivity");
+            if (!isAllowedLaunchTarget(pkg, cls)) return false;
+            boolean isExtLauncher = "com.extbridge.helper".equals(pkg) && "com.extbridge.helper.LauncherActivity".equals(cls);
             synchronized (sSplitLock) {
                 if (sSplitActive) {
                     if (isExtLauncher) {
@@ -2449,7 +3162,7 @@ public class ExtBridge implements Runnable {
             int preTid = isExtLauncher ? findExtLauncherTaskId() : findTaskIdForPkg(pkg);
             if (preTid > 0) {
                 int preWm = getTaskWindowingMode(preTid);
-                if (preWm == 5 || (isExtLauncher && preWm != 1 && preWm != 0)) {
+                if (preWm != 1 && preWm != 0) {
                     detachFreeformAndEnsureFullscreen(preTid, true);
                 }
             }
@@ -2458,10 +3171,7 @@ public class ExtBridge implements Runnable {
             Intent intent = new Intent();
             intent.setComponent(new ComponentName(pkg, cls));
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            if ("com.extbridge.helper".equals(pkg) && sCtlBinder != null) {
-                Bundle b = new Bundle();
-                b.putBinder("cb", sCtlBinder);
-                intent.putExtras(b);
+            if ("com.extbridge.helper".equals(pkg)) {
                 intent.putExtra("extId", sVdId);
             }
             ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
@@ -2507,7 +3217,7 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean shouldCompatOverridePkg(String pkg) {
-        if (pkg == null || pkg.isEmpty()) return false;
+        if (!isValidPackageName(pkg)) return false;
         return !"android".equals(pkg)
                 && !"com.extbridge.helper".equals(pkg)
                 && !"com.android.settings".equals(pkg)
@@ -2605,53 +3315,54 @@ public class ExtBridge implements Runnable {
 
     private static void applyAppModeCompat(String pkg, int mode, boolean forceApply) {
         if (!shouldCompatOverridePkg(pkg)) return;
-        String qPkg = pkg.replace("'", "");
         if (mode == 0 || mode == 3) {
             boolean wasOverridden;
-            synchronized (sCompatOverriddenPkgs) {
-                wasOverridden = sCompatOverriddenPkgs.remove(pkg);
+            synchronized (sCompatOverriddenModes) {
+                wasOverridden = sCompatOverriddenModes.remove(pkg) != null;
             }
             if (wasOverridden || forceApply) {
-                runCmdOut("sh", "-c", "am compat reset-all --no-kill '" + qPkg
-                        + "' >/dev/null 2>&1 || am compat reset-all '" + qPkg + "' >/dev/null 2>&1");
+                resetCompatForPkg(pkg);
             }
             return;
         }
-        synchronized (sCompatOverriddenPkgs) {
-            if (!forceApply && sCompatOverriddenPkgs.contains(pkg)) return;
-            sCompatOverriddenPkgs.add(pkg);
+        synchronized (sCompatOverriddenModes) {
+            Integer prev = sCompatOverriddenModes.get(pkg);
+            if (!forceApply && prev != null && prev == mode) return;
+            sCompatOverriddenModes.put(pkg, mode);
         }
-        String cmd;
+        // Execute one `am compat` command per process (argv, no multi-command `sh -c` loop)
+        // so a single slow command never kills the shell mid-loop.
         if (mode == 1) {
-            cmd = "for ch in 254631730 310816437 265464455 263259275 208648326 174042936; do "
-                    + "am compat enable --no-kill $ch '" + qPkg + "' >/dev/null 2>&1; done; "
-                    + "for ch in 265452344 236283604; do "
-                    + "am compat disable --no-kill $ch '" + qPkg + "' >/dev/null 2>&1; done";
+            String[] enableIds = {"254631730", "310816437", "265464455", "263259275", "208648326", "174042936"};
+            String[] disableIds = {"265452344", "236283604"};
+            for (String ch : enableIds) {
+                runCmdOut("am", "compat", "enable", "--no-kill", ch, pkg);
+            }
+            for (String ch : disableIds) {
+                runCmdOut("am", "compat", "disable", "--no-kill", ch, pkg);
+            }
         } else {
             // mode == 2: portrait/phone ratio compat
-            cmd = "for ch in 254631730 310816437 265464455; do "
-                    + "am compat disable --no-kill $ch '" + qPkg + "' >/dev/null 2>&1; done; "
-                    + "for ch in 265452344 236283604; do "
-                    + "am compat enable --no-kill $ch '" + qPkg + "' >/dev/null 2>&1; done";
+            String[] disableIds = {"254631730", "310816437", "265464455"};
+            String[] enableIds = {"265452344", "236283604"};
+            for (String ch : disableIds) {
+                runCmdOut("am", "compat", "disable", "--no-kill", ch, pkg);
+            }
+            for (String ch : enableIds) {
+                runCmdOut("am", "compat", "enable", "--no-kill", ch, pkg);
+            }
         }
-        runCmdOut("sh", "-c", cmd);
     }
 
     private static void resetAppFullscreenCompatAll() {
         ArrayList<String> pkgs;
-        synchronized (sCompatOverriddenPkgs) {
-            if (sCompatOverriddenPkgs.isEmpty()) return;
-            pkgs = new ArrayList<>(sCompatOverriddenPkgs);
-            sCompatOverriddenPkgs.clear();
+        synchronized (sCompatOverriddenModes) {
+            if (sCompatOverriddenModes.isEmpty()) return;
+            pkgs = new ArrayList<>(sCompatOverriddenModes.keySet());
+            sCompatOverriddenModes.clear();
         }
-        StringBuilder cmd = new StringBuilder();
         for (String pkg : pkgs) {
-            String qPkg = pkg.replace("'", "");
-            cmd.append("am compat reset-all --no-kill '").append(qPkg)
-               .append("' >/dev/null 2>&1 || am compat reset-all '").append(qPkg).append("' >/dev/null 2>&1; ");
-        }
-        if (cmd.length() > 0) {
-            runCmdOut("sh", "-c", cmd.toString());
+            resetCompatForPkg(pkg);
         }
     }
 
@@ -2707,14 +3418,20 @@ public class ExtBridge implements Runnable {
 
     private static void detachFreeformAndEnsureFullscreen(int taskId, boolean syncFullBounds) {
         if (taskId <= 0 || sAtm == null) return;
+        if (syncFullBounds) {
+            Rect fullBounds = new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH));
+            // Must resize while in MULTI_WINDOW (6) so ATM.resizeTask resets SurfaceFlinger Task leash position & crop to (0,0,sVirtW,sVirtH) before entering FULLSCREEN (1)!
+            if (getTaskWindowingMode(taskId) != 6) {
+                if (!applyWctForTask(taskId, Boolean.FALSE, 6, null)) {
+                    clearTaskAlwaysOnTop(taskId);
+                    forceTaskWindowingMode(taskId, 6);
+                }
+            }
+            resizeTaskBoundsOnly(taskId, fullBounds, true);
+        }
         if (!applyWctForTask(taskId, Boolean.FALSE, 1, new Rect())) {
             clearTaskAlwaysOnTop(taskId);
             forceTaskWindowingMode(taskId, 1);
-        }
-        if (syncFullBounds) {
-            Rect fullBounds = new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH));
-            resizeTaskBoundsOnly(taskId, fullBounds, true);
-            applyWctForTask(taskId, Boolean.FALSE, 1, new Rect());
         }
     }
 
@@ -2735,6 +3452,29 @@ public class ExtBridge implements Runnable {
             }
             List<?> running = invokeTaskQuery("getTasks");
             if (running == null) return;
+            if (splitOn && (SystemClock.uptimeMillis() - sLastSplitActionMs) > 2600L) {
+                boolean s0Vis = s0Pkg.isEmpty();
+                boolean s1Vis = s1Pkg.isEmpty();
+                for (Object t : running) {
+                    if (t == null) continue;
+                    if (readIntField(t, "displayId", -1) != sVdId) continue;
+                    if (!readBoolField(t, "isVisible", false)) continue;
+                    String p = extractTaskPkg(t);
+                    int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                    if (!s0Pkg.isEmpty() && (s0Pkg.equals(p) || (s0Tid > 0 && tid == s0Tid))) s0Vis = true;
+                    if (!s1Pkg.isEmpty() && (s1Pkg.equals(p) || (s1Tid > 0 && tid == s1Tid))) s1Vis = true;
+                }
+                if (!s0Vis && !s1Vis) {
+                    exitSplitAndRestore(false);
+                    return;
+                } else if (!s0Vis && !s0Pkg.isEmpty()) {
+                    detachPkgFromSplit(s0Pkg, s0Tid);
+                    return;
+                } else if (!s1Vis && !s1Pkg.isEmpty()) {
+                    detachPkgFromSplit(s1Pkg, s1Tid);
+                    return;
+                }
+            }
             for (Object t : running) {
                 if (t == null) continue;
                 int did = readIntField(t, "displayId", -1);
@@ -2758,17 +3498,14 @@ public class ExtBridge implements Runnable {
                     }
                     continue;
                 }
-                // Rescue any DeX task hijacked into MIUI Freeform (5) so mouse never gets stuck unable to drag
-                if (tid > 0 && wmode == 5) {
+                // Rescue any non-split DeX task left in Freeform (5) or Multi-Window (6) back to Fullscreen (1)
+                if (tid > 0 && wmode != 1 && wmode != 0) {
                     detachFreeformAndEnsureFullscreen(tid, true);
                     wmode = 1;
                 }
                 if (!enforceCompat || !shouldCompatOverridePkg(pkg)) continue;
                 int mode = getAppMode(pkg);
                 applyAppModeCompat(pkg, mode, false);
-                if (mode == 1 && tid > 0 && wmode != 1 && wmode != 0) {
-                    detachFreeformAndEnsureFullscreen(tid, wmode == 6);
-                }
             }
         } catch (Throwable ignored) {}
     }
@@ -2791,12 +3528,15 @@ public class ExtBridge implements Runnable {
                 Bundle b = opts.toBundle();
                 for (Method m : sAtm.getClass().getMethods()) {
                     if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
-                        m.invoke(sAtm, lTid, b);
-                        if (sHandler != null) {
-                            sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+                        Object rc = m.invoke(sAtm, lTid, b);
+                        if (!(rc instanceof Integer) || (Integer) rc >= 0) {
+                            if (sHandler != null) {
+                                sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+                            }
+                            notifyHelperSync();
+                            return true;
                         }
-                        notifyHelperSync();
-                        return true;
+                        break;
                     }
                 }
             } catch (Throwable ignored) {}
@@ -2806,35 +3546,113 @@ public class ExtBridge implements Runnable {
         return ok;
     }
 
-    private static void pushBinderToHelper() {
-        if (sCtx == null || sCtlBinder == null) return;
+    private static int getVerifiedHelperUid() {
+        if (sCtx == null) return -1;
+        try {
+            PackageManager pm = sCtx.getPackageManager();
+            int curUid = pm.getPackageUid("com.extbridge.helper", 0);
+            if (curUid <= 0) {
+                sVerifiedHelperUid = -1;
+                return -1;
+            }
+            long now = SystemClock.uptimeMillis();
+            if (curUid == sVerifiedHelperUid && (now - sLastHelperUidVerifyMs) < 5000L) {
+                return curUid;
+            }
+            android.content.pm.PackageInfo pi = pm.getPackageInfo(
+                    "com.extbridge.helper", PackageManager.GET_SIGNING_CERTIFICATES);
+            SigningInfo si = (pi != null) ? pi.signingInfo : null;
+            if (si == null || si.hasMultipleSigners()) {
+                sVerifiedHelperUid = -1;
+                return -1;
+            }
+            Signature[] sigs = si.getApkContentsSigners();
+            if (sigs == null || sigs.length != 1 || sigs[0] == null) {
+                sVerifiedHelperUid = -1;
+                return -1;
+            }
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(sigs[0].toByteArray());
+            StringBuilder hex = new StringBuilder(64);
+            for (byte b : digest) {
+                hex.append(String.format(Locale.US, "%02x", b & 0xff));
+            }
+            if (!EXPECTED_HELPER_CERT_SHA256.equalsIgnoreCase(hex.toString())) {
+                System.err.println("EXTBRIDGE_SECURITY_REJECT untrusted com.extbridge.helper cert=" + hex);
+                sVerifiedHelperUid = -1;
+                return -1;
+            }
+            sVerifiedHelperUid = curUid;
+            sLastHelperUidVerifyMs = now;
+            return curUid;
+        } catch (Throwable ignored) {
+            sVerifiedHelperUid = -1;
+            return -1;
+        }
+    }
+
+    private static boolean isVerifiedHelperProviderOwner() {
+        int helperUid = getVerifiedHelperUid();
+        if (helperUid <= 0 || sCtx == null) return false;
+        try {
+            ProviderInfo pi = sCtx.getPackageManager().resolveContentProvider("com.extbridge.helper.provider", 0);
+            return pi != null && pi.applicationInfo != null
+                    && pi.applicationInfo.uid == helperUid
+                    && "com.extbridge.helper".equals(pi.packageName);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static Bundle callHelperProvider(String method, Bundle extras) {
+        if (sCtx == null || method == null || !isVerifiedHelperProviderOwner()) return null;
         Bundle res = null;
+        try {
+            ContentProviderClient cpc = sCtx.getContentResolver()
+                    .acquireUnstableContentProviderClient("com.extbridge.helper.provider");
+            if (cpc != null) {
+                try {
+                    res = cpc.call(method, null, extras);
+                } finally {
+                    try { cpc.close(); } catch (Throwable ignored) {}
+                }
+            }
+            if (res == null) {
+                res = sCtx.getContentResolver().call(
+                        Uri.parse("content://com.extbridge.helper.provider"), method, null, extras);
+            }
+        } catch (Throwable ignored) {}
+        if (res == null || !res.getBoolean("ok", false)) {
+            if (isVerifiedHelperProviderOwner()) {
+                res = callProviderViaAm("com.extbridge.helper.provider", method, null, extras);
+            }
+        }
+        return res;
+    }
+
+    private static void enqueuePushBinderToHelper(boolean forceImmediate) {
+        long now = SystemClock.uptimeMillis();
+        if (!forceImmediate && (now - sLastBinderPushAttemptMs) < 900L) return;
+        sLastBinderPushAttemptMs = now;
+        sBgIoExec.execute(ExtBridge::pushBinderToHelper);
+    }
+
+    private static void pushBinderToHelper() {
+        if (sCtx == null || sCtlBinder == null || sShuttingDown) return;
+        if (!isVerifiedHelperProviderOwner()) return;
         try {
             Bundle b = new Bundle();
             b.putBinder("cb", sCtlBinder);
-            try {
-                ContentProviderClient cpc = sCtx.getContentResolver().acquireUnstableContentProviderClient("com.extbridge.helper.provider");
-                if (cpc != null) {
-                    try {
-                        res = cpc.call("setBinder", null, b);
-                    } finally {
-                        try { cpc.close(); } catch (Throwable ignored) {}
-                    }
-                }
-                if (res == null) {
-                    res = sCtx.getContentResolver().call(Uri.parse("content://com.extbridge.helper.provider"), "setBinder", null, b);
-                }
-            } catch (Throwable ignored) {}
-            if (res == null || !res.getBoolean("ok", false)) {
-                res = callProviderViaAm("com.extbridge.helper.provider", "setBinder", null, b);
-            }
+            Bundle res = callHelperProvider("setBinder", b);
             if (res != null) {
-                IBinder tok = res.getBinder("proc");
+                final IBinder tok = res.getBinder("proc");
                 if (tok != null && tok != sHelperProcToken) {
                     sHelperProcToken = tok;
                     try {
                         tok.linkToDeath(() -> {
-                            sHelperProcToken = null;
+                            if (sHelperProcToken == tok) {
+                                sHelperProcToken = null;
+                                releaseStaleMouseDragOnHelperDeath();
+                            }
                         }, 0);
                     } catch (Throwable ignored) {}
                 }
@@ -2927,14 +3745,10 @@ public class ExtBridge implements Runnable {
     }
 
     private static void startHelperService() {
+        if (getVerifiedHelperUid() <= 0) return;
         try {
             Intent svc = new Intent();
             svc.setComponent(new ComponentName("com.extbridge.helper", "com.extbridge.helper.BridgeService"));
-            if (sCtlBinder != null) {
-                Bundle b = new Bundle();
-                b.putBinder("cb", sCtlBinder);
-                svc.putExtras(b);
-            }
             if (Build.VERSION.SDK_INT >= 26) {
                 sCtx.startForegroundService(svc);
             } else {
@@ -2947,24 +3761,11 @@ public class ExtBridge implements Runnable {
         try {
             if (sShuttingDown) return;
             if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) return;
-            Intent b = new Intent("com.extbridge.helper.STATE_SYNC");
-            b.setPackage("com.extbridge.helper");
-            b.putExtra("extId", sExtId);
-            b.putExtra("vdId", sVdId);
-            b.putExtra("physW", sPhysW);
-            b.putExtra("physH", sPhysH);
-            b.putExtra("physFps", sPhysFps);
-            b.putExtra("virtW", sVirtW);
-            b.putExtra("virtH", sVirtH);
-            b.putExtra("virtDpi", sVirtDpi);
-            b.putExtra("virtFps", sVirtFps);
-            b.putExtra("virtRot", sVirtRot);
-            b.putExtra("inputToExt", sInputToExt);
-            b.putExtra("splitActive", sSplitActive ? 1 : 0);
-            b.putExtra("splitRatioPct", Math.round(sSplitRatio * 100f));
-            b.putExtra("splitSlot0Pkg", sSplitSlot0Pkg != null ? sSplitSlot0Pkg : "");
-            b.putExtra("splitSlot1Pkg", sSplitSlot1Pkg != null ? sSplitSlot1Pkg : "");
-            sCtx.sendBroadcast(b);
+            sBgIoExec.execute(() -> {
+                if (!sShuttingDown && sHelperProcToken != null && sHelperProcToken.pingBinder()) {
+                    callHelperProvider("syncState", null);
+                }
+            });
         } catch (Throwable ignored) {}
     }
 
@@ -2988,29 +3789,34 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean isTrustedCaller(int callingUid) {
+        if (callingUid < 0) return false;
         if (callingUid == android.os.Process.myUid()
                 || callingUid == 0
                 || callingUid == 1000
                 || callingUid == 2000) {
             return true;
         }
-        int cached = sHelperUid;
-        if (cached > 0 && callingUid == cached) return true;
-        if (sCtx != null) {
-            try {
-                int uid = sCtx.getPackageManager().getPackageUid("com.extbridge.helper", 0);
-                sHelperUid = uid;
-                if (callingUid == uid) return true;
-            } catch (Throwable ignored) {}
-        }
-        return false;
+        int verifiedUid = getVerifiedHelperUid();
+        return verifiedUid > 0 && callingUid == verifiedUid;
     }
 
     private static class BridgeBinder extends Binder {
+        BridgeBinder() {
+            attachInterface(null, BINDER_DESC);
+        }
+
         @Override
         protected boolean onTransact(int code, Parcel data, Parcel reply, int flags) throws RemoteException {
+            if (code == IBinder.INTERFACE_TRANSACTION) {
+                if (reply != null) reply.writeString(BINDER_DESC);
+                return true;
+            }
             if (!isTrustedCaller(Binder.getCallingUid())) {
                 throw new SecurityException("Untrusted ExtBridge caller uid=" + Binder.getCallingUid());
+            }
+            if (code >= 10 && code <= 99) {
+                if (data == null) return false;
+                data.enforceInterface(BINDER_DESC);
             }
             if (code == 10) {
                 sInputToExt = (sInputToExt == 0) ? 1 : 0;
@@ -3052,6 +3858,7 @@ public class ExtBridge implements Runnable {
                         s0 = sSplitSlot0Pkg != null ? sSplitSlot0Pkg : "";
                         s1 = sSplitSlot1Pkg != null ? sSplitSlot1Pkg : "";
                     }
+                    MirrorGeom g = sMirGeom;
                     reply.writeInt(sExtId);
                     reply.writeInt(sVdId);
                     reply.writeInt(sPhysW);
@@ -3077,12 +3884,12 @@ public class ExtBridge implements Runnable {
                     reply.writeString(s1);
                     reply.writeInt(sMirrorSideMode);
                     reply.writeInt(sSideVdId);
-                    reply.writeInt(sD0W);
-                    reply.writeInt(sD0H);
-                    reply.writeInt(sMirX);
-                    reply.writeInt(sMirY);
-                    reply.writeInt(sMirW);
-                    reply.writeInt(sMirH);
+                    reply.writeInt(g.d0W);
+                    reply.writeInt(g.d0H);
+                    reply.writeInt(g.mirX);
+                    reply.writeInt(g.mirY);
+                    reply.writeInt(g.mirW);
+                    reply.writeInt(g.mirH);
                 }
                 return true;
             } else if (code == 16) {
@@ -3237,49 +4044,52 @@ public class ExtBridge implements Runnable {
                 String pkg = data.readString();
                 int mode = Math.max(0, Math.min(2, data.readInt()));
                 int restart = data.readInt();
-                if (pkg != null && !pkg.isEmpty()) {
+                boolean applied = false;
+                if (shouldCompatOverridePkg(pkg)) {
+                    Intent launchIntent = null;
+                    try {
+                        if (sCtx != null) launchIntent = sCtx.getPackageManager().getLaunchIntentForPackage(pkg);
+                    } catch (Throwable ignored) {}
                     synchronized (sAppModes) {
-                        if (mode == 0) sAppModes.remove(pkg);
-                        else sAppModes.put(pkg, mode);
-                        saveAppModesLocked();
+                        if (mode == 0) {
+                            sAppModes.remove(pkg);
+                            applied = true;
+                        } else if (sAppModes.size() < 512 || sAppModes.containsKey(pkg)) {
+                            sAppModes.put(pkg, mode);
+                            applied = true;
+                        }
+                        if (applied) saveAppModesLocked();
                     }
-                    if (restart == 1) {
-                        runCmdOut("am", "force-stop", pkg);
-                    }
-                    applyAppModeCompat(pkg, mode, true);
-                    if (restart == 1 && sVdId > 0 && sMirrorMode != 1 && sCtx != null) {
-                        try {
-                            Intent li = sCtx.getPackageManager().getLaunchIntentForPackage(pkg);
-                            if (li != null) {
-                                li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                    if (applied) {
+                        if (restart == 1 && launchIntent != null) {
+                            runCmdOut("am", "force-stop", pkg);
+                        }
+                        applyAppModeCompat(pkg, mode, true);
+                        if (restart == 1 && launchIntent != null && sVdId > 0 && sMirrorMode != 1) {
+                            try {
+                                launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
                                 ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
-                                sMStartActivity.invoke(sAtm, null, "com.android.shell", null, li, null, null, null, 0, 0, null, opts.toBundle());
-                            }
-                        } catch (Throwable ignored) {}
+                                sMStartActivity.invoke(sAtm, null, "com.android.shell", null, launchIntent, null, null, null, 0, 0, null, opts.toBundle());
+                            } catch (Throwable ignored) {}
+                        }
+                        notifyHelperSync();
                     }
-                    notifyHelperSync();
                 }
-                if (reply != null) reply.writeInt(1);
+                if (reply != null) reply.writeInt(applied ? 1 : 0);
                 return true;
             } else if (code == 33) {
-                ArrayList<String> allPkgs = new ArrayList<>();
+                HashSet<String> allPkgs = new HashSet<>();
                 synchronized (sAppModes) {
                     allPkgs.addAll(sAppModes.keySet());
                     sAppModes.clear();
                     saveAppModesLocked();
                 }
-                synchronized (sCompatOverriddenPkgs) {
-                    allPkgs.addAll(sCompatOverriddenPkgs);
-                    sCompatOverriddenPkgs.clear();
+                synchronized (sCompatOverriddenModes) {
+                    allPkgs.addAll(sCompatOverriddenModes.keySet());
+                    sCompatOverriddenModes.clear();
                 }
-                if (!allPkgs.isEmpty()) {
-                    StringBuilder cmd = new StringBuilder();
-                    for (String p : allPkgs) {
-                        String qp = p.replace("'", "");
-                        cmd.append("am compat reset-all --no-kill '").append(qp)
-                           .append("' >/dev/null 2>&1 || am compat reset-all '").append(qp).append("' >/dev/null 2>&1; ");
-                    }
-                    runCmdOut("sh", "-c", cmd.toString());
+                for (String p : allPkgs) {
+                    resetCompatForPkg(p);
                 }
                 healStrayCompatOverrides(true);
                 notifyHelperSync();
@@ -3297,6 +4107,7 @@ public class ExtBridge implements Runnable {
                 String cls = data.readString();
                 boolean ok = handleSplitAction(action, arg, pkg, cls);
                 if (reply != null) {
+                    MirrorGeom g = sMirGeom;
                     reply.writeInt(ok ? 1 : 0);
                     reply.writeInt(sSplitActive ? 1 : 0);
                     reply.writeInt(Math.round(sSplitRatio * 100f));
@@ -3304,12 +4115,12 @@ public class ExtBridge implements Runnable {
                     reply.writeString(sSplitSlot1Pkg != null ? sSplitSlot1Pkg : "");
                     reply.writeInt(sMirrorSideMode);
                     reply.writeInt(sSideVdId);
-                    reply.writeInt(sD0W);
-                    reply.writeInt(sD0H);
-                    reply.writeInt(sMirX);
-                    reply.writeInt(sMirY);
-                    reply.writeInt(sMirW);
-                    reply.writeInt(sMirH);
+                    reply.writeInt(g.d0W);
+                    reply.writeInt(g.d0H);
+                    reply.writeInt(g.mirX);
+                    reply.writeInt(g.mirY);
+                    reply.writeInt(g.mirW);
+                    reply.writeInt(g.mirH);
                 }
                 return true;
             } else if (code == 36) {
@@ -3327,13 +4138,16 @@ public class ExtBridge implements Runnable {
                 return true;
             } else if (code == 38) {
                 int req = data.readInt();
-                int next = (req < 0) ? ((sMirrorSideMode + 1) % 4) : Math.max(0, Math.min(3, req));
-                if (next != sMirrorSideMode) {
+                int prev = sMirrorSideMode;
+                int next = (req < 0) ? ((prev + 1) % 4) : Math.max(0, Math.min(3, req));
+                if (next != prev) {
                     sMirrorSideMode = next;
                     sSideVdAttempted = false;
                     saveConf();
                     if (sMirrorMode == 1) {
-                        sForceRebuild = true;
+                        if ((prev == 0) != (next == 0)) {
+                            sForceRebuild = true;
+                        }
                         tick();
                     }
                     notifyHelperSync();
@@ -3376,6 +4190,14 @@ public class ExtBridge implements Runnable {
                     reply.writeInt(Math.round(sCursorY));
                 }
                 return true;
+            } else if (code == 44) {
+                int reqTid = data.readInt();
+                String pkg = data.readString();
+                int modeFlag = data.readInt();
+                if (reply != null) {
+                    captureTaskSnapshotToParcel(reqTid, pkg, modeFlag, reply);
+                }
+                return true;
             } else if (code == 99) {
                 sShuttingDown = true;
                 cleanupDisplay(true);
@@ -3387,6 +4209,205 @@ public class ExtBridge implements Runnable {
                 return true;
             }
             return super.onTransact(code, data, reply, flags);
+        }
+    }
+
+    private static volatile Object sTaskSnapshotMgr;
+    private static volatile boolean sTaskSnapshotMgrChecked = false;
+
+    private static Object getTaskSnapshotManager() {
+        if (sTaskSnapshotMgr != null) return sTaskSnapshotMgr;
+        if (sTaskSnapshotMgrChecked || sAtm == null) return null;
+        sTaskSnapshotMgrChecked = true;
+        try {
+            Method m = sAtm.getClass().getMethod("getTaskSnapshotManager");
+            sTaskSnapshotMgr = m.invoke(sAtm);
+        } catch (Throwable ignored) {}
+        return sTaskSnapshotMgr;
+    }
+
+    private static Object invokeSnapshotOnTarget(Object target, int tid, boolean live) {
+        if (target == null || tid <= 0) return null;
+        if (live) {
+            try {
+                for (Method m : target.getClass().getMethods()) {
+                    if (!m.getName().equals("takeTaskSnapshot")) continue;
+                    Class<?>[] pt = m.getParameterTypes();
+                    if (pt.length == 4 && pt[0] == int.class && pt[1] == boolean.class
+                            && pt[2] == boolean.class && pt[3] == boolean.class) {
+                        Object s = m.invoke(target, tid, true, true, false);
+                        if (s != null) return s;
+                    } else if (pt.length == 3 && pt[0] == int.class && pt[1] == boolean.class && pt[2] == boolean.class) {
+                        Object s = m.invoke(target, tid, true, true);
+                        if (s != null) return s;
+                    } else if (pt.length == 2 && pt[0] == int.class && pt[1] == boolean.class) {
+                        Object s = m.invoke(target, tid, true);
+                        if (s != null) return s;
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+        try {
+            for (Method m : target.getClass().getMethods()) {
+                if (!m.getName().equals("getTaskSnapshot")) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 3 && pt[0] == int.class && pt[1] == long.class && pt[2] == int.class) {
+                    // Android 17 ITaskSnapshotManager.getTaskSnapshot(taskId, latestCaptureTime=0, RESOLUTION_ANY=3)
+                    Object s = m.invoke(target, tid, 0L, 3);
+                    if (s != null) return s;
+                } else if (pt.length == 2 && pt[0] == int.class && pt[1] == boolean.class) {
+                    Object s = m.invoke(target, tid, true);
+                    if (s != null) return s;
+                } else if (pt.length == 3 && pt[0] == int.class && pt[1] == boolean.class && pt[2] == boolean.class) {
+                    Object s = m.invoke(target, tid, true, live);
+                    if (s != null) return s;
+                } else if (pt.length == 3 && pt[0] == int.class && pt[1] == boolean.class && pt[2] == int.class) {
+                    Object s = m.invoke(target, tid, true, 3);
+                    if (s != null) return s;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static Object invokeTaskSnapshotRaw(int tid, boolean live) {
+        if (tid <= 0 || sAtm == null) return null;
+        Object mgr = getTaskSnapshotManager();
+        if (mgr != null) {
+            Object snap = invokeSnapshotOnTarget(mgr, tid, live);
+            if (snap != null) return snap;
+        }
+        return invokeSnapshotOnTarget(sAtm, tid, live);
+    }
+
+    private static boolean isProtectedSystemTaskPkg(String pkg) {
+        if (!isValidPackageName(pkg) || shouldSkipTaskPkg(pkg)) return true;
+        return "android".equals(pkg)
+                || pkg.contains("permissioncontroller")
+                || pkg.contains("packageinstaller")
+                || pkg.contains("keychain")
+                || pkg.contains("keyguard")
+                || "com.android.phone".equals(pkg)
+                || "com.android.server.telecom".equals(pkg);
+    }
+
+    private static boolean isTaskAllowedForExtControl(int taskId, String expectedPkg, boolean blockDisplay0Settings) {
+        if (taskId <= 0) return false;
+        try {
+            for (String qName : new String[]{"getTasks", "getRecentTasks"}) {
+                List<?> list = invokeTaskQuery(qName);
+                if (list == null) continue;
+                for (Object t : list) {
+                    if (t == null) continue;
+                    int tid = "getRecentTasks".equals(qName)
+                            ? readIntField(t, "taskId", readIntField(t, "persistentId", readIntField(t, "id", -1)))
+                            : readIntField(t, "taskId", readIntField(t, "id", -1));
+                    if (tid != taskId) continue;
+                    String tPkg = extractTaskPkg(t);
+                    int did = readIntField(t, "displayId", -1);
+                    if (isProtectedSystemTaskPkg(tPkg)) return false;
+                    if (expectedPkg != null && !expectedPkg.isEmpty() && !expectedPkg.equals(tPkg)) return false;
+                    if (sVdId > 0 && did == sVdId) return true;
+                    if (blockDisplay0Settings && "com.android.settings".equals(tPkg)) return false;
+                    return sCtx != null && sCtx.getPackageManager().getLaunchIntentForPackage(tPkg) != null;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private static void captureTaskSnapshotToParcel(int reqTid, String pkg, int modeFlag, Parcel reply) {
+        String validPkg = isValidPackageName(pkg) ? pkg : null;
+        int tid = reqTid > 0 ? reqTid : findTaskIdForPkg(validPkg);
+        if (tid > 0 && !isTaskAllowedForExtControl(tid, validPkg, true)) {
+            tid = -1;
+        }
+        Rect bounds = (tid > 0) ? getTaskBounds(tid) : null;
+        if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+            reply.writeInt(1);
+            reply.writeInt(bounds.left);
+            reply.writeInt(bounds.top);
+            reply.writeInt(bounds.right);
+            reply.writeInt(bounds.bottom);
+        } else {
+            reply.writeInt(0);
+        }
+        if (tid <= 0) {
+            reply.writeInt(0);
+            return;
+        }
+        boolean live = (modeFlag & 1) != 0;
+        boolean forceJpeg = (modeFlag & 2) != 0;
+        HardwareBuffer hb = null;
+        Bitmap hwBmp = null;
+        Bitmap swBmp = null;
+        try {
+            Object snap = invokeTaskSnapshotRaw(tid, live);
+            if (snap == null) {
+                reply.writeInt(0);
+                return;
+            }
+            try {
+                hb = (HardwareBuffer) snap.getClass().getMethod("getHardwareBuffer").invoke(snap);
+            } catch (Throwable ignored) {}
+            if (hb == null || hb.isClosed() || hb.getWidth() <= 0 || hb.getHeight() <= 0) {
+                reply.writeInt(0);
+                return;
+            }
+            ColorSpace cs = null;
+            try {
+                cs = (ColorSpace) snap.getClass().getMethod("getColorSpace").invoke(snap);
+            } catch (Throwable ignored) {}
+
+            if (!forceJpeg) {
+                int csOrdinal = ColorSpace.Named.SRGB.ordinal();
+                if (cs != null && cs.getId() >= 0 && cs.getId() < ColorSpace.Named.values().length) {
+                    csOrdinal = cs.getId();
+                }
+                reply.writeInt(1);
+                reply.writeInt(csOrdinal);
+                hb.writeToParcel(reply, 0);
+                return;
+            }
+
+            hwBmp = Bitmap.wrapHardwareBuffer(hb, cs != null ? cs : ColorSpace.get(ColorSpace.Named.SRGB));
+            if (hwBmp == null) {
+                reply.writeInt(0);
+                return;
+            }
+            swBmp = hwBmp.copy(Bitmap.Config.ARGB_8888, false);
+            if (swBmp == null) {
+                reply.writeInt(0);
+                return;
+            }
+            int w = swBmp.getWidth();
+            int h = swBmp.getHeight();
+            if (Math.max(w, h) > 600) {
+                float sc = 600f / Math.max(w, h);
+                Bitmap scaled = Bitmap.createScaledBitmap(swBmp,
+                        Math.max(1, Math.round(w * sc)), Math.max(1, Math.round(h * sc)), true);
+                if (scaled != swBmp) {
+                    swBmp.recycle();
+                    swBmp = scaled;
+                }
+            }
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(32768);
+            swBmp.compress(Bitmap.CompressFormat.JPEG, 78, baos);
+            byte[] jpeg = baos.toByteArray();
+            reply.writeInt(2);
+            reply.writeByteArray(jpeg);
+        } catch (Throwable t) {
+            reply.writeInt(0);
+        } finally {
+            if (swBmp != null && !swBmp.isRecycled()) {
+                try { swBmp.recycle(); } catch (Throwable ignored) {}
+            }
+            if (hwBmp != null && !hwBmp.isRecycled()) {
+                try { hwBmp.recycle(); } catch (Throwable ignored) {}
+            }
+            if (hb != null && !hb.isClosed()) {
+                try { hb.close(); } catch (Throwable ignored) {}
+            }
         }
     }
 
@@ -3695,54 +4716,66 @@ public class ExtBridge implements Runnable {
 
     private static boolean switchToTaskOnVd(int taskId, String pkg) {
         if (sVdId <= 0) return false;
-        int mode = getAppMode(pkg);
+        String safePkg = isValidPackageName(pkg) ? pkg : null;
+        if (safePkg != null && isProtectedSystemTaskPkg(safePkg) && !"com.android.settings".equals(safePkg)) {
+            return false;
+        }
+        int safeTid = (taskId > 0 && isTaskAllowedForExtControl(taskId, safePkg, false)) ? taskId : -1;
+        if (safeTid <= 0 && safePkg == null) return false;
+        int mode = getAppMode(safePkg);
         try {
-            if (sSplitActive && pkg != null && !pkg.isEmpty() && !"com.extbridge.helper".equals(pkg)) {
-                int slot = matchOrAutoFillSplitSlot(pkg);
-                if (slot >= 0) {
-                    if (slot == 0) {
-                        if (taskId > 0) sSplitSlot0TaskId = taskId;
-                        sSplitSlot0Pkg = pkg;
-                    } else {
-                        if (taskId > 0) sSplitSlot1TaskId = taskId;
-                        sSplitSlot1Pkg = pkg;
+            synchronized (sSplitLock) {
+                if (sSplitActive && safePkg != null && !"com.extbridge.helper".equals(safePkg)) {
+                    int slot = matchOrAutoFillSplitSlot(safePkg);
+                    if (slot >= 0) {
+                        sLastSplitActionMs = SystemClock.uptimeMillis();
+                        if (slot == 0) {
+                            if (safeTid > 0) sSplitSlot0TaskId = safeTid;
+                            sSplitSlot0Pkg = safePkg;
+                        } else {
+                            if (safeTid > 0) sSplitSlot1TaskId = safeTid;
+                            sSplitSlot1Pkg = safePkg;
+                        }
+                        relayoutSplitTasks(true);
+                        notifyHelperSync();
+                        return true;
                     }
-                    relayoutSplitTasks(true);
-                    notifyHelperSync();
-                    return true;
+                    exitSplitAndRestore(false);
                 }
-                exitSplitAndRestore(false);
             }
-            applyAppModeCompat(pkg, mode, false);
-            if (taskId > 0 && sAtm != null) {
+            applyAppModeCompat(safePkg, mode, false);
+            if (safeTid > 0 && sAtm != null) {
                 try {
                     for (Method m : sAtm.getClass().getMethods()) {
                         if (m.getName().equals("moveRootTaskToDisplay") && m.getParameterCount() == 2) {
-                            m.invoke(sAtm, taskId, sVdId);
+                            m.invoke(sAtm, safeTid, sVdId);
                             break;
                         }
                     }
                 } catch (Throwable ignored) {}
-                int prevWm = getTaskWindowingMode(taskId);
-                detachFreeformAndEnsureFullscreen(taskId, prevWm == 5 || prevWm == 6);
+                int prevWm = getTaskWindowingMode(safeTid);
+                detachFreeformAndEnsureFullscreen(safeTid, prevWm != 1 && prevWm != 0);
 
                 ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
                 Bundle b = opts.toBundle();
                 for (Method m : sAtm.getClass().getMethods()) {
                     if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
-                        m.invoke(sAtm, taskId, b);
-                        if (sHandler != null) {
-                            sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+                        Object rc = m.invoke(sAtm, safeTid, b);
+                        if (!(rc instanceof Integer) || (Integer) rc >= 0) {
+                            if (sHandler != null) {
+                                sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+                            }
+                            return true;
                         }
-                        return true;
+                        break;
                     }
                 }
             }
         } catch (Throwable ignored) {}
 
         try {
-            if (pkg != null && !pkg.isEmpty()) {
-                Intent li = sCtx.getPackageManager().getLaunchIntentForPackage(pkg);
+            if (safePkg != null) {
+                Intent li = sCtx.getPackageManager().getLaunchIntentForPackage(safePkg);
                 if (li != null) {
                     li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
@@ -4039,8 +5072,8 @@ public class ExtBridge implements Runnable {
         resizeTaskBoundsOnly(taskId, bounds, forceSyncIfEqual);
     }
 
-    private static void bringSplitTaskFront(int taskId, Rect bounds) {
-        if (taskId <= 0 || sAtm == null || sVdId <= 0) return;
+    private static boolean bringSplitTaskFront(int taskId, Rect bounds) {
+        if (taskId <= 0 || sAtm == null || sVdId <= 0) return false;
         try {
             ActivityOptions opts = ActivityOptions.makeBasic();
             opts.setLaunchDisplayId(sVdId);
@@ -4051,11 +5084,12 @@ public class ExtBridge implements Runnable {
             Bundle b = opts.toBundle();
             for (Method m : sAtm.getClass().getMethods()) {
                 if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
-                    m.invoke(sAtm, taskId, b);
-                    return;
+                    Object rc = m.invoke(sAtm, taskId, b);
+                    return !(rc instanceof Integer) || (Integer) rc >= 0;
                 }
             }
         } catch (Throwable ignored) {}
+        return false;
     }
 
     private static void applySplitSlot(int slot, int knownTid, String pkg, String cls, boolean launchIfMissing) {
@@ -4068,13 +5102,16 @@ public class ExtBridge implements Runnable {
             else sSplitSlot1TaskId = tid;
             ensureTaskResizeableAndMultiWindow(tid, bounds, launchIfMissing);
             if (launchIfMissing) {
-                bringSplitTaskFront(tid, bounds);
-                ensureTaskResizeableAndMultiWindow(tid, bounds, true);
-                if (sHandler != null) {
-                    sHandler.postDelayed(() -> verifySplitSlotAsync(slot, pkg), 180L);
+                if (bringSplitTaskFront(tid, bounds)) {
+                    ensureTaskResizeableAndMultiWindow(tid, bounds, true);
+                    if (sHandler != null) {
+                        sHandler.postDelayed(() -> verifySplitSlotAsync(slot, pkg), 180L);
+                    }
+                    return;
                 }
+            } else {
+                return;
             }
-            return;
         }
         if (!launchIfMissing || sMStartActivity == null || sCtx == null) return;
         try {
@@ -4174,6 +5211,12 @@ public class ExtBridge implements Runnable {
     private static void ensureLauncherTaskFullscreenInBg() {
         int lTid = findExtLauncherTaskId();
         if (lTid <= 0) return;
+        int wm = getTaskWindowingMode(lTid);
+        Rect b = getTaskBounds(lTid);
+        if (wm == 1 && (b == null || b.isEmpty()
+                || (b.left == 0 && b.top == 0 && b.width() == sVirtW && b.height() == sVirtH))) {
+            return;
+        }
         detachFreeformAndEnsureFullscreen(lTid, true);
     }
 
@@ -4197,12 +5240,7 @@ public class ExtBridge implements Runnable {
             Intent intent = new Intent();
             intent.setComponent(new ComponentName("com.extbridge.helper", "com.extbridge.helper.LauncherActivity"));
             intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
-            if (sCtlBinder != null) {
-                Bundle b = new Bundle();
-                b.putBinder("cb", sCtlBinder);
-                intent.putExtras(b);
-                intent.putExtra("extId", sVdId);
-            }
+            intent.putExtra("extId", sVdId);
             ActivityOptions opts = ActivityOptions.makeBasic();
             opts.setLaunchDisplayId(sVdId);
             opts.setLaunchBounds(bounds);
@@ -4230,6 +5268,7 @@ public class ExtBridge implements Runnable {
     private static void relayoutSplitTasks(boolean bringFront) {
         synchronized (sSplitLock) {
             if (!sSplitActive || sVdId <= 0) return;
+            sLastSplitActionMs = SystemClock.uptimeMillis();
             int emptySlot = getEmptySplitSlot();
             if (emptySlot >= 0) {
                 syncLauncherForSplit(emptySlot, bringFront);
@@ -4252,20 +5291,29 @@ public class ExtBridge implements Runnable {
     private static boolean handleSplitAction(int action, int arg, String pkg, String cls) {
         synchronized (sSplitLock) {
             if (sVdId <= 0 || sAtm == null) return false;
+            sLastSplitActionMs = SystemClock.uptimeMillis();
             if (action == 1 || action == 2) {
                 int slot = (action == 1) ? 0 : 1;
-                if (pkg == null || pkg.isEmpty() || "com.extbridge.helper".equals(pkg)) return false;
+                if (!shouldCompatOverridePkg(pkg)) return false;
+                String safeCls = null;
+                if (cls != null && !cls.isEmpty()) {
+                    if (!isAllowedLaunchTarget(pkg, cls)) return false;
+                    safeCls = cls;
+                } else if (sCtx == null || sCtx.getPackageManager().getLaunchIntentForPackage(pkg) == null) {
+                    return false;
+                }
+                int safeArg = (arg > 0 && isTaskAllowedForExtControl(arg, pkg, false)) ? arg : -1;
                 sSplitActive = true;
                 if (slot == 0) {
                     sSplitSlot0Pkg = pkg;
-                    sSplitSlot0TaskId = arg;
+                    sSplitSlot0TaskId = safeArg;
                     if (pkg.equals(sSplitSlot1Pkg)) {
                         sSplitSlot1Pkg = "";
                         sSplitSlot1TaskId = -1;
                     }
                 } else {
                     sSplitSlot1Pkg = pkg;
-                    sSplitSlot1TaskId = arg;
+                    sSplitSlot1TaskId = safeArg;
                     if (pkg.equals(sSplitSlot0Pkg)) {
                         sSplitSlot0Pkg = "";
                         sSplitSlot0TaskId = -1;
@@ -4278,12 +5326,12 @@ public class ExtBridge implements Runnable {
                     ensureLauncherTaskFullscreenInBg();
                 }
                 if (slot == 0) {
-                    applySplitSlot(0, sSplitSlot0TaskId, sSplitSlot0Pkg, cls, true);
+                    applySplitSlot(0, sSplitSlot0TaskId, sSplitSlot0Pkg, safeCls, true);
                     if (sSplitSlot1Pkg != null && !sSplitSlot1Pkg.isEmpty()) {
                         applySplitSlot(1, sSplitSlot1TaskId, sSplitSlot1Pkg, null, true);
                     }
                 } else {
-                    applySplitSlot(1, sSplitSlot1TaskId, sSplitSlot1Pkg, cls, true);
+                    applySplitSlot(1, sSplitSlot1TaskId, sSplitSlot1Pkg, safeCls, true);
                     if (sSplitSlot0Pkg != null && !sSplitSlot0Pkg.isEmpty()) {
                         applySplitSlot(0, sSplitSlot0TaskId, sSplitSlot0Pkg, null, true);
                     }
@@ -4305,7 +5353,7 @@ public class ExtBridge implements Runnable {
                             int did = readIntField(t, "displayId", -1);
                             if (onlyExt && did != sVdId) continue;
                             String p = extractTaskPkg(t);
-                            if (shouldSkipTaskPkg(p) || "android".equals(p)) continue;
+                            if (isProtectedSystemTaskPkg(p) || !shouldCompatOverridePkg(p)) continue;
                             int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
                             if (tid > 0 && !cands.contains(p)) {
                                 cands.add(p);
@@ -4321,7 +5369,7 @@ public class ExtBridge implements Runnable {
                         for (Object t : recent) {
                             if (t == null) continue;
                             String p = extractTaskPkg(t);
-                            if (shouldSkipTaskPkg(p) || "android".equals(p)) continue;
+                            if (isProtectedSystemTaskPkg(p) || !shouldCompatOverridePkg(p)) continue;
                             int tid = readIntField(t, "taskId", readIntField(t, "persistentId", readIntField(t, "id", -1)));
                             if (tid > 0 && !cands.contains(p)) {
                                 cands.add(p);
@@ -4372,21 +5420,43 @@ public class ExtBridge implements Runnable {
         }
     }
 
+    private static void restoreLeavingSplitTask(String leavingPkg, int leavingTid) {
+        if ((leavingPkg == null || leavingPkg.isEmpty()) && leavingTid <= 0) return;
+        int tid = leavingTid > 0 ? leavingTid : findTaskIdForPkg(leavingPkg);
+        if (tid > 0 && getAppMode(leavingPkg) != 3) {
+            detachFreeformAndEnsureFullscreen(tid, true);
+        }
+        if (leavingPkg != null && !leavingPkg.isEmpty()) {
+            int cfgMode = getAppMode(leavingPkg);
+            if (cfgMode != 1) {
+                applyAppModeCompat(leavingPkg, cfgMode, false);
+            }
+        }
+    }
+
     private static void detachPkgFromSplit(String pkg, int taskId) {
         synchronized (sSplitLock) {
             if (!sSplitActive) return;
             boolean changed = false;
+            String old0Pkg = null, old1Pkg = null;
+            int old0Tid = -1, old1Tid = -1;
             if ((taskId > 0 && taskId == sSplitSlot0TaskId) || (pkg != null && !pkg.isEmpty() && pkg.equals(sSplitSlot0Pkg))) {
+                old0Pkg = sSplitSlot0Pkg;
+                old0Tid = sSplitSlot0TaskId;
                 sSplitSlot0Pkg = "";
                 sSplitSlot0TaskId = -1;
                 changed = true;
             }
             if ((taskId > 0 && taskId == sSplitSlot1TaskId) || (pkg != null && !pkg.isEmpty() && pkg.equals(sSplitSlot1Pkg))) {
+                old1Pkg = sSplitSlot1Pkg;
+                old1Tid = sSplitSlot1TaskId;
                 sSplitSlot1Pkg = "";
                 sSplitSlot1TaskId = -1;
                 changed = true;
             }
             if (!changed) return;
+            restoreLeavingSplitTask(old0Pkg, old0Tid);
+            restoreLeavingSplitTask(old1Pkg, old1Tid);
             boolean has0 = sSplitSlot0Pkg != null && !sSplitSlot0Pkg.isEmpty();
             boolean has1 = sSplitSlot1Pkg != null && !sSplitSlot1Pkg.isEmpty();
             if (!has0 && !has1) {
@@ -4408,19 +5478,10 @@ public class ExtBridge implements Runnable {
             String p1 = sSplitSlot1Pkg;
             clearSplitState();
             ensureLauncherTaskFullscreenInBg();
-            Rect fullBounds = new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH));
-            if (t1 > 0 && getAppMode(p1) != 3) {
-                clearTaskAlwaysOnTop(t1);
-                forceTaskWindowingMode(t1, 1);
-                resizeTaskBoundsOnly(t1, fullBounds, false);
-            }
-            if (t0 > 0 && getAppMode(p0) != 3) {
-                clearTaskAlwaysOnTop(t0);
-                forceTaskWindowingMode(t0, 1);
-                resizeTaskBoundsOnly(t0, fullBounds, false);
-                if (focusSlot0) {
-                    switchToTaskOnVd(t0, p0);
-                }
+            restoreLeavingSplitTask(p1, t1);
+            restoreLeavingSplitTask(p0, t0);
+            if (t0 > 0 && getAppMode(p0) != 3 && focusSlot0) {
+                switchToTaskOnVd(t0, p0);
             }
             notifyHelperSync();
         }
@@ -4429,25 +5490,28 @@ public class ExtBridge implements Runnable {
     /** Switches a task from floating Freeform small window (5) back to Fullscreen (1); enabling Freeform is forbidden in DeX mode. */
     private static int setTaskLiveWindowMode(int taskId, String pkg, int enableFreeform) {
         if (sVdId <= 0 || sAtm == null) return -1;
-        int tid = taskId > 0 ? taskId : findTaskIdForPkg(pkg);
+        String safePkg = isValidPackageName(pkg) ? pkg : null;
+        int tid = (taskId > 0 && isTaskAllowedForExtControl(taskId, safePkg, false))
+                ? taskId
+                : (safePkg != null ? findTaskIdForPkg(safePkg) : -1);
         boolean currentlyFf = tid > 0 && getTaskWindowingMode(tid) == 5;
         boolean wantFf = enableFreeform < 0 ? !currentlyFf : (enableFreeform != 0);
         if (wantFf) {
             return -2;
         }
 
-        if (sSplitActive && pkg != null && !pkg.isEmpty()) {
-            detachPkgFromSplit(pkg, tid);
+        if (sSplitActive && safePkg != null) {
+            detachPkgFromSplit(safePkg, tid);
         }
 
-        if (pkg != null && !pkg.isEmpty()) {
+        if (safePkg != null) {
             synchronized (sAppModes) {
-                if (Integer.valueOf(3).equals(sAppModes.get(pkg))) {
-                    sAppModes.remove(pkg);
+                if (Integer.valueOf(3).equals(sAppModes.get(safePkg))) {
+                    sAppModes.remove(safePkg);
                     saveAppModesLocked();
                 }
             }
-            applyAppModeCompat(pkg, getAppMode(pkg), true);
+            applyAppModeCompat(safePkg, getAppMode(safePkg), true);
         }
 
         if (tid > 0) {
@@ -4459,10 +5523,7 @@ public class ExtBridge implements Runnable {
                     }
                 }
             } catch (Throwable ignored) {}
-            clearTaskAlwaysOnTop(tid);
-            Rect fullBounds = new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH));
-            forceTaskWindowingMode(tid, 1);
-            resizeTaskBoundsOnly(tid, fullBounds, true);
+            detachFreeformAndEnsureFullscreen(tid, true);
             try {
                 Bundle b = makeExtLaunchOptionsForMode(sVdId, 1).toBundle();
                 for (Method m : sAtm.getClass().getMethods()) {
@@ -4476,9 +5537,9 @@ public class ExtBridge implements Runnable {
             return 0;
         }
 
-        if (pkg != null && !pkg.isEmpty() && sCtx != null && sMStartActivity != null) {
+        if (safePkg != null && shouldCompatOverridePkg(safePkg) && sCtx != null && sMStartActivity != null) {
             try {
-                Intent li = sCtx.getPackageManager().getLaunchIntentForPackage(pkg);
+                Intent li = sCtx.getPackageManager().getLaunchIntentForPackage(safePkg);
                 if (li != null) {
                     li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, 1);
@@ -4492,6 +5553,9 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean removeTaskById(int taskId) {
+        if (!isTaskAllowedForExtControl(taskId, null, true)) {
+            return false;
+        }
         boolean ok = removeTaskRaw(taskId);
         if (ok && sSplitActive) {
             detachPkgFromSplit(null, taskId);
@@ -4504,19 +5568,18 @@ public class ExtBridge implements Runnable {
     /**
      * Prevents MIUI Home's shared Flutter Dock state machine from being corrupted by stale or
      * secondary-display com.miui.home tasks (e.g. left over from earlier external-desktop builds).
-     * When multiple com.miui.home tasks or a non-Display-0 com.miui.home task are detected, removes
-     * the secondary task(s) and restarts com.miui.home cleanly on Display 0 only if needed.
+     * Only inspects ExtBridge's own virtual displays (sVdId / sSideVdId) or startup stale configs,
+     * with adaptive backoff so unrelated displays never trigger com.miui.home restarts.
      */
     private static void sanitizeSystemHomeTasks(boolean checkCreatedDisplayConfig) {
         long now = SystemClock.uptimeMillis();
-        if (now - sLastHomeSanitizeMs < 15000L) return;
+        if (!checkCreatedDisplayConfig && (now - sLastHomeSanitizeMs < sHomeSanitizeIntervalMs)) return;
 
-        int homeCount = 0;
         int disp0Count = 0;
-        boolean hasNonZeroDisplay = false;
+        boolean hasOurVirtualDisplayLeak = false;
         boolean homeTopOnDisp0 = false;
         boolean seenTopOnDisp0 = false;
-        ArrayList<Integer> nonZeroTaskIds = new ArrayList<>();
+        ArrayList<Integer> leakedTaskIds = new ArrayList<>();
         ArrayList<Integer> dupDisp0TaskIds = new ArrayList<>();
 
         try {
@@ -4531,35 +5594,45 @@ public class ExtBridge implements Runnable {
                         homeTopOnDisp0 = "com.miui.home".equals(pkg);
                     }
                     if (!"com.miui.home".equals(pkg)) continue;
-                    homeCount++;
                     int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
-                    if (did != 0) {
-                        hasNonZeroDisplay = true;
-                        if (tid > 0) nonZeroTaskIds.add(tid);
-                    } else {
-                        disp0Count++;
-                        if (disp0Count > 1 && tid > 0) dupDisp0TaskIds.add(tid);
+                    boolean isOurVd = (sVdId > 0 && did == sVdId) || (sSideVdId > 0 && did == sSideVdId);
+                    if (isOurVd || (checkCreatedDisplayConfig && did > 0 && (sExtId <= 0 || did != sExtId))) {
+                        hasOurVirtualDisplayLeak = true;
+                        if (tid > 0) leakedTaskIds.add(tid);
+                    } else if (did == 0) {
+                        Object top = readObjField(t, "topActivity");
+                        Object base = readObjField(t, "baseActivity");
+                        String topCls = (top instanceof ComponentName) ? ((ComponentName) top).getClassName() : "";
+                        String baseCls = (base instanceof ComponentName) ? ((ComponentName) base).getClassName() : "";
+                        boolean isLauncherTask = topCls.contains("Launcher") || baseCls.contains("Launcher")
+                                || (topCls.isEmpty() && baseCls.isEmpty());
+                        if (isLauncherTask) {
+                            disp0Count++;
+                            if (disp0Count > 1 && tid > 0) dupDisp0TaskIds.add(tid);
+                        }
                     }
                 }
             }
         } catch (Throwable ignored) {}
 
         boolean staleCreatedConfig = false;
-        if (checkCreatedDisplayConfig && !hasNonZeroDisplay && homeCount <= 1) {
+        if (checkCreatedDisplayConfig && !hasOurVirtualDisplayLeak && dupDisp0TaskIds.isEmpty()) {
             staleCreatedConfig = hasStaleMiuiHomeCreatedConfig();
         }
 
-        if (!hasNonZeroDisplay && homeCount <= 1 && !staleCreatedConfig) {
+        if (!hasOurVirtualDisplayLeak && dupDisp0TaskIds.isEmpty() && !staleCreatedConfig) {
+            sHomeSanitizeIntervalMs = 15000L;
             return;
         }
 
         sLastHomeSanitizeMs = now;
-        System.out.println("EXTBRIDGE_SANITIZE_MIUI_HOME count=" + homeCount
-                + " nonZero=" + hasNonZeroDisplay
+        sHomeSanitizeIntervalMs = Math.min(60000L, sHomeSanitizeIntervalMs * 2L);
+        System.out.println("EXTBRIDGE_SANITIZE_MIUI_HOME leaked=" + hasOurVirtualDisplayLeak
+                + " dup0=" + dupDisp0TaskIds.size()
                 + " staleCfg=" + staleCreatedConfig
                 + " homeTop0=" + homeTopOnDisp0);
 
-        for (int tid : nonZeroTaskIds) {
+        for (int tid : leakedTaskIds) {
             removeTaskRaw(tid);
         }
         for (int tid : dupDisp0TaskIds) {
@@ -4610,7 +5683,7 @@ public class ExtBridge implements Runnable {
                         while (q < seg.length() && Character.isDigit(seg.charAt(q))) q++;
                         if (q > p) {
                             int cfgDid = Integer.parseInt(seg.substring(p, q));
-                            if (cfgDid != 0) return true;
+                            if (cfgDid != 0 && (sExtId <= 0 || cfgDid != sExtId)) return true;
                         }
                     }
                 }
@@ -4621,37 +5694,42 @@ public class ExtBridge implements Runnable {
     }
 
     private static String runCmdOut(String... cmd) {
-        StringBuilder sb = new StringBuilder();
+        final StringBuilder sb = new StringBuilder();
         Process p = null;
         try {
             p = new ProcessBuilder(cmd).redirectErrorStream(true).start();
             try { p.getOutputStream().close(); } catch (Throwable ignored) {}
-            final Process proc = p;
-            Thread killer = new Thread(() -> {
-                try {
-                    if (!proc.waitFor(3000L, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                        proc.destroyForcibly();
+            final java.io.InputStream in = p.getInputStream();
+            Thread reader = new Thread(() -> {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(in))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        synchronized (sb) {
+                            if (sb.length() < 262144) {
+                                sb.append(line).append('\n');
+                            }
+                        }
                     }
                 } catch (Throwable ignored) {}
-            }, "ExtCmdTimeout");
-            killer.setDaemon(true);
-            killer.start();
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    if (sb.length() < 262144) {
-                        sb.append(line).append('\n');
-                    }
-                }
+            }, "ExtCmdReader");
+            reader.setDaemon(true);
+            reader.start();
+
+            boolean finished = p.waitFor(3000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (!finished) {
+                try { p.destroyForcibly(); } catch (Throwable ignored) {}
+                try { in.close(); } catch (Throwable ignored) {}
             }
-            p.waitFor(3000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+            reader.join(250L);
         } catch (Throwable ignored) {
         } finally {
             if (p != null) {
                 try { p.destroyForcibly(); } catch (Throwable ignored) {}
             }
         }
-        return sb.toString();
+        synchronized (sb) {
+            return sb.toString();
+        }
     }
 
     private static void refreshSysStringsIfNeeded(boolean wifiOn, boolean btOn) {
@@ -4733,77 +5811,182 @@ public class ExtBridge implements Runnable {
 
     private static final Object sScreenDimLock = new Object();
 
+    private static boolean writeDimBackupAtomic(int mode, int brightInt, float brightFloat) {
+        File bak = new File(DIM_BACKUP_PATH);
+        File tmp = new File(DIM_BACKUP_PATH + ".tmp");
+        try {
+            if (tmp.exists()) tmp.delete();
+            byte[] payload = (mode + "|" + brightInt + "|" + brightFloat + "\n")
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            try (FileOutputStream fos = new FileOutputStream(tmp, false)) {
+                fos.write(payload);
+                fos.flush();
+                fos.getFD().sync();
+            }
+            tmp.setReadable(false, false);
+            tmp.setReadable(true, true);
+            tmp.setWritable(false, false);
+            tmp.setWritable(true, true);
+            if (bak.exists() && !tmp.renameTo(bak)) {
+                bak.delete();
+                if (!tmp.renameTo(bak)) return false;
+            } else if (!bak.exists() && !tmp.renameTo(bak)) {
+                return false;
+            }
+            return bak.exists() && bak.length() > 0;
+        } catch (Throwable t) {
+            try { tmp.delete(); } catch (Throwable ignored) {}
+            return false;
+        }
+    }
+
+    private static void restoreOrphanScreenDimBackup() {
+        synchronized (sScreenDimLock) {
+            File bak = new File(DIM_BACKUP_PATH);
+            if (!bak.exists()) return;
+            sSavedBrightMode = 0;
+            sSavedBrightInt = 800;
+            sSavedBrightFloat = 0.35f;
+            try (BufferedReader br = new BufferedReader(new FileReader(bak))) {
+                String ln = br.readLine();
+                if (ln != null && !ln.trim().isEmpty()) {
+                    String[] p = ln.trim().split("\\|");
+                    if (p.length >= 1) sSavedBrightMode = Integer.parseInt(p[0].trim());
+                    if (p.length >= 2) sSavedBrightInt = Integer.parseInt(p[1].trim());
+                    if (p.length >= 3) {
+                        float parsedF = Float.parseFloat(p[2].trim());
+                        if (Float.isFinite(parsedF)) sSavedBrightFloat = parsedF;
+                    }
+                }
+            } catch (Throwable parseErr) {
+                // Corrupt backup: never delete without restoring safe visible brightness first!
+                System.err.println("EXTBRIDGE_DIM_BACKUP_CORRUPT restoring safe default: " + parseErr);
+            }
+            sScreenDimmed = true;
+            setMainScreenDim(0);
+        }
+    }
+
     private static boolean setMainScreenDim(int arg) {
         synchronized (sScreenDimLock) {
             try {
                 boolean wantDim = (arg < 0) ? !sScreenDimmed : (arg == 1);
-                if (!wantDim && !sScreenDimmed) {
+                if (!wantDim && !sScreenDimmed && !new File(DIM_BACKUP_PATH).exists()) {
                     return true;
                 }
                 if (wantDim) {
-                if (!sScreenDimmed) {
-                    sSavedBrightMode = 0;
-                    sSavedBrightInt = 100;
-                    sSavedBrightFloat = -1f;
+                    float minFloat = 0.00171f;
+                    float curFloatFromBi = -1f;
                     try {
-                        String cur = runCmdOut("sh", "-c",
-                                "printf '%s|%s|%s' \"$(settings get system screen_brightness_mode)\" "
-                                + "\"$(settings get system screen_brightness)\" "
-                                + "\"$(cmd display get-brightness --id 0)\"");
-                        if (cur != null) {
-                            String[] parts = cur.trim().split("\\|");
-                            if (parts.length >= 1) {
-                                try { sSavedBrightMode = Integer.parseInt(parts[0].trim()); } catch (Throwable ignored) {}
-                            }
-                            if (parts.length >= 2) {
-                                try { sSavedBrightInt = Integer.parseInt(parts[1].trim()); } catch (Throwable ignored) {}
-                            }
-                            if (parts.length >= 3) {
-                                try {
-                                    float f = Float.parseFloat(parts[2].trim());
-                                    if (f > 0f && f <= 1f) sSavedBrightFloat = f;
-                                } catch (Throwable ignored) {}
+                        if (sDm != null) {
+                            Display d0 = sDm.getDisplay(0);
+                            if (d0 != null) {
+                                Object bi = Display.class.getMethod("getBrightnessInfo").invoke(d0);
+                                if (bi != null) {
+                                    float bm = bi.getClass().getField("brightnessMinimum").getFloat(bi);
+                                    if (bm > 0f && bm <= 0.1f) minFloat = bm;
+                                    float cb = bi.getClass().getField("brightness").getFloat(bi);
+                                    if (cb > 0f && cb <= 1f) curFloatFromBi = cb;
+                                }
                             }
                         }
                     } catch (Throwable ignored) {}
-                }
-                float minFloat = 0.00171f;
-                try {
-                    if (sDm != null) {
-                        Display d0 = sDm.getDisplay(0);
-                        if (d0 != null) {
-                            Object bi = Display.class.getMethod("getBrightnessInfo").invoke(d0);
-                            if (bi != null) {
-                                float bm = bi.getClass().getField("brightnessMinimum").getFloat(bi);
-                                if (bm > 0f && bm <= 0.1f) minFloat = bm;
+
+                    if (!sScreenDimmed) {
+                        sSavedBrightMode = 0;
+                        sSavedBrightInt = 1024;
+                        sSavedBrightFloat = curFloatFromBi;
+                        try {
+                            sSavedBrightMode = Settings.System.getInt(sCtx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS_MODE, 0);
+                            sSavedBrightInt = Settings.System.getInt(sCtx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 1024);
+                        } catch (Throwable ignored) {
+                            String cur = runCmdOut("sh", "-c",
+                                    "printf '%s|%s' \"$(settings get system screen_brightness_mode)\" "
+                                    + "\"$(settings get system screen_brightness)\"");
+                            if (cur != null) {
+                                String[] parts = cur.trim().split("\\|");
+                                if (parts.length >= 1) {
+                                    try { sSavedBrightMode = Integer.parseInt(parts[0].trim()); } catch (Throwable ignored2) {}
+                                }
+                                if (parts.length >= 2) {
+                                    try { sSavedBrightInt = Integer.parseInt(parts[1].trim()); } catch (Throwable ignored2) {}
+                                }
                             }
                         }
+                        if (!writeDimBackupAtomic(sSavedBrightMode, sSavedBrightInt, sSavedBrightFloat)) {
+                            System.err.println("EXTBRIDGE_SCREEN_DIM_ABORT backup write failed");
+                            return false;
+                        }
                     }
-                } catch (Throwable ignored) {}
 
-                runCmdOut("sh", "-c",
-                        "settings put system screen_brightness_mode 0; "
-                        + "settings put system screen_brightness 1; "
-                        + "cmd display set-brightness " + String.format(java.util.Locale.US, "%.6f", minFloat) + " --id 0");
-                sScreenDimmed = true;
-                System.out.println("EXTBRIDGE_SCREEN_DIM=1 min=" + minFloat + " savedMode=" + sSavedBrightMode + " savedFloat=" + sSavedBrightFloat);
-                return true;
-            } else {
-                int restoreInt = Math.max(1, Math.min(255, sSavedBrightInt > 0 ? sSavedBrightInt : 100));
-                float restoreFloat = (sSavedBrightFloat > 0f && sSavedBrightFloat <= 1f)
-                        ? sSavedBrightFloat : (restoreInt / 255f);
-                runCmdOut("sh", "-c",
-                        "settings put system screen_brightness " + restoreInt + "; "
-                        + "cmd display set-brightness " + String.format(java.util.Locale.US, "%.6f", restoreFloat) + " --id 0; "
-                        + "settings put system screen_brightness_mode " + (sSavedBrightMode == 1 ? 1 : 0));
-                sScreenDimmed = false;
-                System.out.println("EXTBRIDGE_SCREEN_DIM=0 restoreFloat=" + restoreFloat + " mode=" + sSavedBrightMode);
-                return true;
+                    runCmdOut("sh", "-c",
+                            "settings put system screen_brightness_mode 0; "
+                            + "settings put system screen_brightness 1; "
+                            + "cmd display set-brightness " + String.format(java.util.Locale.US, "%.6f", minFloat) + " 2>/dev/null || true");
+                    sScreenDimmed = true;
+                    System.out.println("EXTBRIDGE_SCREEN_DIM=1 min=" + minFloat + " savedMode=" + sSavedBrightMode + " savedInt=" + sSavedBrightInt + " savedFloat=" + sSavedBrightFloat);
+                    return true;
+                } else {
+                    int restoreInt = Math.max(20, sSavedBrightInt > 1 ? sSavedBrightInt : 800);
+                    int restoreMode = (sSavedBrightMode == 1) ? 1 : 0;
+                    try {
+                        if (sCtx != null) {
+                            Settings.System.putInt(sCtx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, restoreInt);
+                            Settings.System.putInt(sCtx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS_MODE, restoreMode);
+                        }
+                    } catch (Throwable ignored) {}
+                    String floatCmd = (Float.isFinite(sSavedBrightFloat) && sSavedBrightFloat > 0.002f && sSavedBrightFloat <= 1f)
+                            ? ("cmd display set-brightness " + String.format(java.util.Locale.US, "%.6f", sSavedBrightFloat) + " 2>/dev/null || true; ")
+                            : "";
+                    runCmdOut("sh", "-c",
+                            "settings put system screen_brightness " + restoreInt + "; "
+                            + floatCmd
+                            + "settings put system screen_brightness_mode " + restoreMode);
+                    int verifyInt = -1;
+                    try {
+                        if (sCtx != null) {
+                            verifyInt = Settings.System.getInt(sCtx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, -1);
+                        }
+                    } catch (Throwable ignored) {}
+                    if (verifyInt <= 1) {
+                        String rd = runCmdOut("settings", "get", "system", "screen_brightness");
+                        try { if (rd != null) verifyInt = Integer.parseInt(rd.trim()); } catch (Throwable ignored) {}
+                    }
+                    sScreenDimmed = false;
+                    if (verifyInt > 1) {
+                        try { new File(DIM_BACKUP_PATH).delete(); } catch (Throwable ignored) {}
+                    } else {
+                        System.err.println("EXTBRIDGE_SCREEN_DIM_RESTORE_UNVERIFIED keeping backup verifyInt=" + verifyInt);
+                    }
+                    System.out.println("EXTBRIDGE_SCREEN_DIM=0 restoreInt=" + restoreInt + " verifyInt=" + verifyInt + " restoreFloat=" + sSavedBrightFloat + " mode=" + restoreMode);
+                    return verifyInt > 1;
+                }
+            } catch (Throwable t) {
+                System.out.println("EXTBRIDGE_SCREEN_DIM_ERR=" + t);
+                return false;
             }
-        } catch (Throwable t) {
-            System.out.println("EXTBRIDGE_SCREEN_DIM_ERR=" + t);
-            return false;
         }
+    }
+
+    private static boolean isAllowedSettingsAction(String action) {
+        if (action == null || action.isEmpty()) return false;
+        switch (action) {
+            case Settings.ACTION_SETTINGS:
+            case Settings.ACTION_WIFI_SETTINGS:
+            case Settings.ACTION_BLUETOOTH_SETTINGS:
+            case Settings.ACTION_DISPLAY_SETTINGS:
+            case Settings.ACTION_SOUND_SETTINGS:
+            case Settings.ACTION_AIRPLANE_MODE_SETTINGS:
+            case Settings.ACTION_BATTERY_SAVER_SETTINGS:
+            case Settings.ACTION_CAST_SETTINGS:
+            case Settings.ACTION_ACCESSIBILITY_SETTINGS:
+            case Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS:
+            case Settings.ACTION_MANAGE_OVERLAY_PERMISSION:
+            case Settings.ACTION_APPLICATION_DETAILS_SETTINGS:
+            case Settings.ACTION_WIRELESS_SETTINGS:
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -4841,10 +6024,10 @@ public class ExtBridge implements Runnable {
                     Settings.Global.putInt(sCtx.getContentResolver(), "low_power", target ? 1 : 0);
                 }
                 return true;
-            } else if (act == 5 && str != null && !str.isEmpty()) { // Open settings action on sVdId
+            } else if (act == 5 && isAllowedSettingsAction(str)) { // Open allowlisted Settings action on Display 0 or sVdId
                 Intent i = new Intent(str);
                 i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                int targetDid = (arg >= 0) ? arg : (sVdId > 0 ? sVdId : 0);
+                int targetDid = (arg == 0) ? 0 : (sVdId > 0 ? sVdId : 0);
                 ActivityOptions opts = ActivityOptions.makeBasic();
                 opts.setLaunchDisplayId(targetDid);
                 sMStartActivity.invoke(sAtm, null, "com.android.shell", null, i, null, null, null, 0, 0, null, opts.toBundle());
@@ -4855,6 +6038,7 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean grantAppWidgetBind() {
+        if (getVerifiedHelperUid() <= 0) return false;
         try {
             Class<?> sm = Class.forName("android.os.ServiceManager");
             IBinder awB = (IBinder) sm.getMethod("getService", String.class).invoke(null, "appwidget");

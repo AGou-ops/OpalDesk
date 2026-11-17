@@ -67,6 +67,34 @@ public class SideControlActivity extends Activity implements TextureView.Surface
     private int mLastStageW = 0, mLastStageH = 0;
     private boolean mLastWideBoost = true;
     private int mLastWingSlot = -1;
+    private boolean mSideTouchDown = false;
+    private float mLastSideTouchX = 0f;
+    private float mLastSideTouchY = 0f;
+
+    private boolean ensureOnDisplay0() {
+        try {
+            android.view.Display d = getDisplay();
+            if (d != null && d.getDisplayId() != 0) {
+                Intent i = new Intent(this, SideControlActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_MULTIPLE_TASK);
+                android.app.ActivityOptions opts = android.app.ActivityOptions.makeBasic();
+                opts.setLaunchDisplayId(0);
+                startActivity(i, opts.toBundle());
+                finishAndRemoveTask();
+                return true;
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    private void cancelHeldSideTouchIfNeeded() {
+        if (!mSideTouchDown) return;
+        mSideTouchDown = false;
+        final float sx = mLastSideTouchX;
+        final float sy = mLastSideTouchY;
+        if (mRippleOverlay != null) mRippleOverlay.setTouchPoint(-1f, -1f, false);
+        new Thread(() -> BridgeClient.sendSideTouch(MotionEvent.ACTION_CANCEL, sx, sy)).start();
+    }
 
     private final Runnable mFrameTick = new Runnable() {
         @Override
@@ -83,17 +111,21 @@ public class SideControlActivity extends Activity implements TextureView.Surface
                 TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics()));
     }
 
-    private TextView makeBtn(String text, int bgColor) {
+    private TextView makeBtn(String text, int bgColor, int iconKind) {
         TextView tv = new TextView(this);
         tv.setText(text);
         tv.setTextColor(Color.WHITE);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
-        tv.setGravity(Gravity.CENTER);
+        tv.setGravity(Gravity.CENTER_VERTICAL);
+        tv.setSingleLine(true);
         tv.setPadding(dp(12), dp(8), dp(12), dp(8));
+        if (iconKind > 0) {
+            HyperUi.setStartIcon(tv, iconKind, Color.WHITE, 14f, 5f);
+        }
         GradientDrawable gd = new GradientDrawable();
         gd.setColor(bgColor);
-        gd.setCornerRadius(dp(9));
-        gd.setStroke(dp(1), 0x33FFFFFF);
+        gd.setCornerRadius(dp(13));
+        gd.setStroke(dp(1), 0x24FFFFFF);
         tv.setBackground(gd);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -105,6 +137,8 @@ public class SideControlActivity extends Activity implements TextureView.Surface
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (ensureOnDisplay0()) return;
+        getWindow().getDecorView().setFilterTouchesWhenObscured(true);
         mHandler = new Handler(Looper.getMainLooper());
         mTouchExec = Executors.newSingleThreadExecutor();
 
@@ -120,17 +154,18 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         LinearLayout header = mHeaderView;
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(dp(14), dp(10), dp(14), dp(8));
+        header.setPadding(dp(16), dp(10), dp(14), dp(10));
         header.setBackgroundColor(mTheme.headerBgColor);
 
         LinearLayout titleCol = new LinearLayout(this);
         titleCol.setOrientation(LinearLayout.VERTICAL);
         mTitleView = new TextView(this);
         TextView title = mTitleView;
-        title.setText("🪞 黑边副屏镜像直控");
+        title.setText("副屏镜像直控");
         title.setTextColor(mTheme.titleColor);
         title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f);
         title.getPaint().setFakeBoldText(true);
+        HyperUi.setStartIcon(title, HyperUi.ICON_SIDEBAR, HyperUi.HYPER_BLUE, 17f, 6f);
         titleCol.addView(title);
 
         mTvInfo = new TextView(this);
@@ -140,16 +175,20 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         titleCol.addView(mTvInfo);
         header.addView(titleCol, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        mBtnZoomMode = makeBtn("🔍 宽屏易触:开", 0xFF0369A1);
+        mBtnZoomMode = makeBtn("宽屏易触", HyperUi.HYPER_BLUE, HyperUi.ICON_ZOOM);
         mBtnZoomMode.setOnClickListener(v -> {
             mWideTouchBoost = !mWideTouchBoost;
-            mBtnZoomMode.setText(mWideTouchBoost ? "🔍 宽屏易触:开" : "📐 原比例");
+            mBtnZoomMode.setText(mWideTouchBoost ? "宽屏易触" : "原比例");
+            HyperUi.setStartIcon(mBtnZoomMode,
+                    mWideTouchBoost ? HyperUi.ICON_ZOOM : HyperUi.ICON_RATIO, Color.WHITE, 14f, 5f);
+            ((GradientDrawable) mBtnZoomMode.getBackground()).setColor(
+                    mWideTouchBoost ? HyperUi.HYPER_BLUE : HyperUi.CHIP_INACTIVE);
             mLastMetaW = 0;
             syncStageLayoutAndMeta();
         });
         header.addView(mBtnZoomMode);
 
-        TextView btnClose = makeBtn("✕ 退出", 0xFF334155);
+        TextView btnClose = makeBtn("退出", HyperUi.CHIP_INACTIVE, HyperUi.ICON_CLOSE);
         btnClose.setOnClickListener(v -> finish());
         header.addView(btnClose);
         root.addView(header);
@@ -160,12 +199,12 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         mWingSwitchRow.setGravity(Gravity.CENTER);
         mWingSwitchRow.setPadding(dp(12), dp(6), dp(12), dp(4));
         mWingSwitchRow.setVisibility(View.GONE);
-        mBtnWingLeft = makeBtn("◀ 左/上侧信息条", 0xFF0284C7);
+        mBtnWingLeft = makeBtn("左/上侧信息条", HyperUi.HYPER_BLUE, HyperUi.ICON_CHEVRON_LEFT);
         mBtnWingLeft.setOnClickListener(v -> {
             mWingSlot = 0;
             updateWingBtns();
         });
-        mBtnWingRight = makeBtn("▶ 右/下侧信息条", 0xFF1E293B);
+        mBtnWingRight = makeBtn("右/下侧信息条", HyperUi.CHIP_INACTIVE, HyperUi.ICON_CHEVRON_RIGHT);
         mBtnWingRight.setOnClickListener(v -> {
             mWingSlot = 1;
             updateWingBtns();
@@ -181,8 +220,8 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         mMirrorCardFrame = new FrameLayout(this);
         GradientDrawable cardBg = new GradientDrawable();
         cardBg.setColor(0xFF0B1221);
-        cardBg.setCornerRadius(dp(14));
-        cardBg.setStroke(dp(1), 0xFF38BDF8);
+        cardBg.setCornerRadius(dp(18));
+        cardBg.setStroke(dp(1), HyperUi.HYPER_BLUE);
         mMirrorCardFrame.setBackground(cardBg);
         mMirrorCardFrame.setClipToOutline(true);
 
@@ -200,7 +239,7 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         mMirrorStage.addView(mMirrorCardFrame, cardLp);
 
         mTvEmptyHint = new TextView(this);
-        mTvEmptyHint.setText("当前未处于「原生镜像+融合边栏」模式\n请在控制台开启「📺 原生镜像」并选择边栏对齐后使用");
+        mTvEmptyHint.setText("当前未处于「原生镜像 + 融合边栏」模式\n请在控制台开启「原生镜像」并选择边栏对齐后使用");
         mTvEmptyHint.setTextColor(0xFF94A3B8);
         mTvEmptyHint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
         mTvEmptyHint.setGravity(Gravity.CENTER);
@@ -221,7 +260,7 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         bar.setGravity(Gravity.CENTER_VERTICAL);
         bar.setPadding(dp(10), dp(8), dp(10), dp(10));
 
-        TextView btnAlign = makeBtn("⇄ 切换边栏方位", 0xFF1E40AF);
+        TextView btnAlign = makeBtn("切换边栏方位", HyperUi.HYPER_BLUE, HyperUi.ICON_SWAP);
         btnAlign.setOnClickListener(v -> mTouchExec.execute(() -> {
             int cur = BridgeClient.getStatus().mirrorSideMode;
             int next = (cur == BridgeClient.MIRROR_SIDE_ALIGN_LEFT)
@@ -231,24 +270,24 @@ public class SideControlActivity extends Activity implements TextureView.Surface
             BridgeService.refreshFromReceiver(this);
         }));
 
-        TextView btnMain = makeBtn("🎛 预设卡 / 小组件配置", 0xFF0F766E);
+        TextView btnMain = makeBtn("卡片与小组件配置", HyperUi.CHIP_INACTIVE, HyperUi.ICON_SLIDERS);
         btnMain.setOnClickListener(v -> {
             startActivity(new Intent(this, MainActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP));
         });
 
-        TextView btnTp = makeBtn("🖐 切到触摸板", 0xFF334155);
+        TextView btnTp = makeBtn("大触摸板", HyperUi.CHIP_INACTIVE, HyperUi.ICON_TOUCHPAD);
         btnTp.setOnClickListener(v -> {
             startActivity(new Intent(this, TouchpadActivity.class)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP));
         });
 
-        TextView btnDex = makeBtn("🖥 切回DeX", 0xFF334155);
+        TextView btnDex = makeBtn("切回 DeX", HyperUi.CHIP_INACTIVE, HyperUi.ICON_DEX);
         btnDex.setOnClickListener(v -> mTouchExec.execute(() -> {
             BridgeClient.setMirrorMode(BridgeClient.MIRROR_MODE_DEX);
             BridgeService.refreshFromReceiver(this);
             runOnUiThread(() -> {
-                Toast.makeText(this, "已切回 DeX 扩展模式", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, "已切回 DeX 扩展桌面", Toast.LENGTH_SHORT).show();
                 finish();
             });
         }));
@@ -264,8 +303,10 @@ public class SideControlActivity extends Activity implements TextureView.Surface
     }
 
     private void updateWingBtns() {
-        ((GradientDrawable) mBtnWingLeft.getBackground()).setColor(mWingSlot == 0 ? 0xFF0284C7 : 0xFF1E293B);
-        ((GradientDrawable) mBtnWingRight.getBackground()).setColor(mWingSlot == 1 ? 0xFF0284C7 : 0xFF1E293B);
+        ((GradientDrawable) mBtnWingLeft.getBackground()).setColor(
+                mWingSlot == 0 ? HyperUi.HYPER_BLUE : HyperUi.CHIP_INACTIVE);
+        ((GradientDrawable) mBtnWingRight.getBackground()).setColor(
+                mWingSlot == 1 ? HyperUi.HYPER_BLUE : HyperUi.CHIP_INACTIVE);
         mLastMetaW = 0;
         syncStageLayoutAndMeta();
     }
@@ -391,6 +432,13 @@ public class SideControlActivity extends Activity implements TextureView.Surface
         float ry = Math.max(0f, Math.min(1f, ev.getY() / (float) mTextureView.getHeight()));
         final float sx = meta[0] + rx * meta[2];
         final float sy = meta[1] + ry * meta[3];
+        mLastSideTouchX = sx;
+        mLastSideTouchY = sy;
+        if (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_MOVE) {
+            mSideTouchDown = true;
+        } else if (act == MotionEvent.ACTION_UP || act == MotionEvent.ACTION_CANCEL) {
+            mSideTouchDown = false;
+        }
         if (mRippleOverlay != null) {
             boolean show = (act == MotionEvent.ACTION_DOWN || act == MotionEvent.ACTION_MOVE);
             mRippleOverlay.setTouchPoint(ev.getX(), ev.getY(), show);
@@ -413,6 +461,7 @@ public class SideControlActivity extends Activity implements TextureView.Surface
 
     @Override
     protected void onPause() {
+        cancelHeldSideTouchIfNeeded();
         mRunning = false;
         mHandler.removeCallbacks(mFrameTick);
         super.onPause();
@@ -420,6 +469,7 @@ public class SideControlActivity extends Activity implements TextureView.Surface
 
     @Override
     protected void onDestroy() {
+        cancelHeldSideTouchIfNeeded();
         mRunning = false;
         if (mHandler != null) mHandler.removeCallbacksAndMessages(null);
         if (mTexSurface != null) {
