@@ -4,6 +4,20 @@
 
 ---
 
+## v3.4.2 (`versionCode: 21`) — 2026-11-18
+
+### 🐛 关键兼容修复：小米平板工作台小窗劫持防护 & 21:9 带鱼屏原生适配
+- **彻底解决开启「小米工作台模式 / 强制桌面模式」时扩展屏桌面与应用被强转为居中悬浮小窗 (`•••`) 及鼠标无法拖拽窗口的问题**
+  - 在小米平板 6S Pro（HyperOS 3）等开启系统自带「工作台模式 (`miui_dkt_mode`)」或开发者选项「强制使用桌面模式 (`force_desktop_mode_on_external_displays`)」的设备上，系统会将默认 `WINDOWING_MODE_UNDEFINED (0)` 的可缩放窗口强行拦截为 `WINDOWING_MODE_FREEFORM (5)` 悬浮小窗，且小米原生小窗顶部 `•••` 仅绑定主屏触摸、外接鼠标无法拖动。
+  - 现统一在 `makeExtLaunchOptionsForMode` 中为所有非分屏扩展桌面启动（含 `LauncherActivity` 及 `mode = 0 / 1 / 2` 应用）显式指定 `WINDOWING_MODE_FULLSCREEN (1)` 与空 `launchBounds`；`applyDisplayFullscreenPolicy` 始终保持 `VirtualDisplay` 容器默认模式为 `FULLSCREEN (1)`。
+  - 修复 `enforceRunningExtTasksFullscreen` 通过 `configuration.windowConfiguration.getWindowingMode()` 精确识别窗口模式（原 `readIntField` 在 Android 11–16 恒回退为 `1`），对任何被系统偷偷切入 `FREEFORM (5)` 的扩展屏非分屏任务实时自动剥离 `alwaysOnTop`、恢复 `FULLSCREEN (1)` 并重同步 `SurfaceFlinger` 边界；Dock `⊞ 桌面` (`relaunchLauncher`) 同步接入全屏恢复闭环，并清理 `switchToTaskOnVd` 历史残留的 `mode == 3` 分支。
+- **原生适配 `3440×1440` / `2560×1080` (21:9 带鱼屏) 与 EDID 最优物理模式智能识别**
+  - 控制台快捷预设新增 **`3440×1440 (21:9 准4K)`** 与 **`2560×1080 (21:9 带鱼)`**。
+  - 新增 `pickBestNativeEdidMode`（智能过滤 `3840×2160@30Hz` 等低刷 HDMI 兼容档位，优先挑选 `≥50Hz` 最大像素原生面板档位，如 `#128 3440×1440@60Hz`）：首次插入外接显示器时若 `3:2` 平板系统默认协商在 `2048×1536` / `2560×1600`，会自动尝试切换至显示器原生满幅宽屏档位。
+  - 修复控制台 **「↺ 恢复推荐默认」** 硬编码 `2560×1440` 的问题，改为动态匹配当前外接显示器 EDID 最优原生分辨率并同步下发物理模式请求。
+
+---
+
 ## v3.4.1 (`versionCode: 20`) — 2026-11-17
 
 ### ✨ 核心功能新增（v3.3.x → v3.4.1 功能汇总）

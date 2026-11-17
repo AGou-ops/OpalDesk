@@ -48,8 +48,10 @@ import java.util.Map;
 public class MainActivity extends Activity {
     private static final int[][] RES_PRESETS = {
             {3840, 2160},
+            {3440, 1440},
             {2560, 1600},
             {2560, 1440},
+            {2560, 1080},
             {1920, 1200},
             {1920, 1080},
             {1600, 900},
@@ -57,8 +59,10 @@ public class MainActivity extends Activity {
     };
     private static final String[] RES_LABELS = {
             "3840×2160\n4K 超采",
+            "3440×1440\n21:9 准4K",
             "2560×1600\n2.5K 16:10",
             "2560×1440\n2K 原生★",
+            "2560×1080\n21:9 带鱼",
             "1920×1200\n16:10",
             "1920×1080\n1080p 16:9",
             "1600×900\n900p 16:9",
@@ -118,6 +122,9 @@ public class MainActivity extends Activity {
     private LinearLayout mPhysModesWrap;
     private boolean mEdidExpanded = false;
     private String mLastModesRaw = "";
+    private int mLastPhysW = 0;
+    private int mLastPhysH = 0;
+    private float mLastPhysFps = 60f;
 
     private AlertDialog mActivationDialog;
     private AlertDialog mPermDialog;
@@ -768,13 +775,7 @@ public class MainActivity extends Activity {
         TextView btnApply = makeActionBtn("✓ 应用渲染分辨率与设置", 0xFF16A34A);
         btnApply.setOnClickListener(v -> applyChosenConfig());
         TextView btnReset = makeActionBtn("↺ 恢复推荐默认", 0xFF334155);
-        btnReset.setOnClickListener(v -> {
-            mSelW = 2560; mSelH = 1440; mSelDpi = 160; mSelFps = 60f; mSelRot = 0; mSelPhysModeId = -1;
-            mEdW.setText("2560"); mEdH.setText("1440");
-            if (mEdDpi != null) mEdDpi.setText("160");
-            updateSelectionStyles();
-            applyChosenConfig();
-        });
+        btnReset.setOnClickListener(v -> applyMonitorRecommendedDefault());
         applyRow.addView(btnApply);
         applyRow.addView(btnReset);
         rateCard.addView(applyRow);
@@ -957,6 +958,11 @@ public class MainActivity extends Activity {
             if (mBtnFullscreenPolicy != null) {
                 mBtnFullscreenPolicy.setText(st.fullscreenPolicy == 1 ? "⛶ 桌面锁横屏:开" : "⛶ 桌面锁横屏:关");
             }
+            if (st.physW > 0 && st.physH > 0) {
+                mLastPhysW = st.physW;
+                mLastPhysH = st.physH;
+                mLastPhysFps = st.physFps > 10f ? st.physFps : 60f;
+            }
             if (!st.modesRaw.equals(mLastModesRaw)) {
                 mLastModesRaw = st.modesRaw;
                 rebuildPhysModes(st.modesRaw);
@@ -1013,6 +1019,87 @@ public class MainActivity extends Activity {
             } catch (Throwable ignored) {}
         }
         addChipWrap(mPhysModesWrap, modeBtns);
+    }
+
+    private void applyMonitorRecommendedDefault() {
+        int bestModeId = -1;
+        int bestW = 0;
+        int bestH = 0;
+        float bestFps = 60f;
+
+        String raw = mLastModesRaw;
+        if (raw != null && !raw.isEmpty()) {
+            boolean has50Plus = false;
+            for (String item : raw.split(";")) {
+                String[] kv = item.split(":");
+                if (kv.length != 2) continue;
+                try {
+                    String[] rf = kv[1].split("@");
+                    String[] wh = rf[0].split("x");
+                    int pw = Integer.parseInt(wh[0]);
+                    int ph = Integer.parseInt(wh[1]);
+                    float pf = Float.parseFloat(rf[1]);
+                    if (Math.max(pw, ph) >= 640 && Math.min(pw, ph) >= 480 && pf >= 49.5f) {
+                        has50Plus = true;
+                        break;
+                    }
+                } catch (Throwable ignored) {}
+            }
+
+            long bestArea = -1L;
+            float bestFpsScore = -1f;
+            for (String item : raw.split(";")) {
+                String[] kv = item.split(":");
+                if (kv.length != 2) continue;
+                try {
+                    int modeId = Integer.parseInt(kv[0]);
+                    String[] rf = kv[1].split("@");
+                    String[] wh = rf[0].split("x");
+                    int pw = Integer.parseInt(wh[0]);
+                    int ph = Integer.parseInt(wh[1]);
+                    float pf = Float.parseFloat(rf[1]);
+                    if (Math.max(pw, ph) < 640 || Math.min(pw, ph) < 480) continue;
+                    if (has50Plus && pf < 49.5f) continue;
+                    long area = (long) pw * (long) ph;
+                    float fpsScore = Math.min(pf, 120f);
+                    if (area > bestArea || (area == bestArea && fpsScore > bestFpsScore + 0.2f)) {
+                        bestArea = area;
+                        bestFpsScore = fpsScore;
+                        bestModeId = modeId;
+                        bestW = pw;
+                        bestH = ph;
+                        bestFps = pf;
+                    }
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        if (bestW <= 0 || bestH <= 0) {
+            if (mLastPhysW >= 640 && mLastPhysH >= 480) {
+                bestW = mLastPhysW;
+                bestH = mLastPhysH;
+                bestFps = mLastPhysFps;
+            } else {
+                bestW = 2560;
+                bestH = 1440;
+                bestFps = 60f;
+            }
+        }
+
+        int minEdge = Math.min(bestW, bestH);
+        int recDpi = minEdge >= 2000 ? 240 : (minEdge >= 1520 ? 200 : 160);
+
+        mSelW = bestW;
+        mSelH = bestH;
+        mSelDpi = recDpi;
+        mSelFps = bestFps;
+        mSelRot = 0;
+        mSelPhysModeId = bestModeId;
+        mEdW.setText(String.valueOf(bestW));
+        mEdH.setText(String.valueOf(bestH));
+        if (mEdDpi != null) mEdDpi.setText(String.valueOf(recDpi));
+        updateSelectionStyles();
+        applyChosenConfig();
     }
 
     private void updateSelectionStyles() {

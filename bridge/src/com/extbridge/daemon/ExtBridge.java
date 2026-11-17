@@ -786,9 +786,7 @@ public class ExtBridge implements Runnable {
             }
             reassert();
             checkInput();
-            if (sFullscreenPolicy == 1) {
-                enforceRunningExtTasksFullscreen();
-            }
+            enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1);
             if (extId != sLastPushedExtId) {
                 sLastPushedExtId = extId;
                 if (sHelperProcToken == null || !sHelperProcToken.pingBinder()) {
@@ -812,14 +810,75 @@ public class ExtBridge implements Runnable {
         return Math.max(120, Math.min(280, Math.round(minEdge * 160f / 1440f)));
     }
 
+    /**
+     * Picks the best native panel EDID mode (preferring >=50Hz so 4K@30Hz compatibility timings
+     * do not override true native 3440x1440@60Hz or 2560x1440@60Hz+ panel modes).
+     */
+    private static Display.Mode pickBestNativeEdidMode(Display ext) {
+        if (ext == null) return null;
+        try {
+            Display.Mode[] modes = ext.getSupportedModes();
+            if (modes == null || modes.length == 0) return null;
+            boolean has50Plus = false;
+            for (Display.Mode m : modes) {
+                if (m != null && m.getRefreshRate() >= 49.5f && isValidDims(m.getPhysicalWidth(), m.getPhysicalHeight())) {
+                    has50Plus = true;
+                    break;
+                }
+            }
+            Display.Mode best = null;
+            long bestArea = -1L;
+            float bestFpsScore = -1f;
+            for (Display.Mode m : modes) {
+                if (m == null) continue;
+                int mw = m.getPhysicalWidth();
+                int mh = m.getPhysicalHeight();
+                float mf = m.getRefreshRate();
+                if (!isValidDims(mw, mh)) continue;
+                if (has50Plus && mf < 49.5f) continue;
+                long area = (long) mw * (long) mh;
+                // Prefer smooth refresh up to 120Hz cleanly without penalizing 60Hz native ultrawides
+                float fpsScore = Math.min(mf, 120f);
+                if (area > bestArea || (area == bestArea && fpsScore > bestFpsScore + 0.2f)) {
+                    best = m;
+                    bestArea = area;
+                    bestFpsScore = fpsScore;
+                }
+            }
+            return best;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static void attachDisplay(int extId) {
         try {
-            if (!sHasUserConf && isValidDims(sPhysW, sPhysH)) {
-                boolean physSwap = (normalizeRot(sVirtRot) & 1) == 1;
-                sVirtW = physSwap ? sPhysH : sPhysW;
-                sVirtH = physSwap ? sPhysW : sPhysH;
-                sVirtDpi = computeAutoDpi(sVirtW, sVirtH);
-                sVirtFps = (sPhysFps >= 20f && sPhysFps <= 240f) ? sPhysFps : 60f;
+            if (!sHasUserConf) {
+                Display extDisp = findExternalDisplay();
+                Display.Mode bestNative = pickBestNativeEdidMode(extDisp);
+                if (extDisp != null && bestNative != null) {
+                    long curArea = (long) Math.max(0, sPhysW) * (long) Math.max(0, sPhysH);
+                    long bestArea = (long) bestNative.getPhysicalWidth() * (long) bestNative.getPhysicalHeight();
+                    if (bestArea > curArea || (bestArea == curArea && sPhysFps < 49.5f && bestNative.getRefreshRate() >= 49.5f)) {
+                        if (invokeSetUserPreferredMode(extId, bestNative)) {
+                            SystemClock.sleep(120);
+                            Display refreshed = findExternalDisplay();
+                            Display.Mode nm = (refreshed != null) ? refreshed.getMode() : null;
+                            if (nm != null) {
+                                sPhysW = nm.getPhysicalWidth();
+                                sPhysH = nm.getPhysicalHeight();
+                                sPhysFps = nm.getRefreshRate();
+                            }
+                        }
+                    }
+                }
+                if (isValidDims(sPhysW, sPhysH)) {
+                    boolean physSwap = (normalizeRot(sVirtRot) & 1) == 1;
+                    sVirtW = physSwap ? sPhysH : sPhysW;
+                    sVirtH = physSwap ? sPhysW : sPhysH;
+                    sVirtDpi = computeAutoDpi(sVirtW, sVirtH);
+                    sVirtFps = (sPhysFps >= 20f && sPhysFps <= 240f) ? sPhysFps : 60f;
+                }
             }
             System.out.println("EXTBRIDGE_ATTACHING extId=" + extId + " phys=" + sPhysW + "x" + sPhysH + "@" + sPhysFps + " virt=" + sVirtW + "x" + sVirtH + "@" + sVirtDpi + " rot=" + (sVirtRot * 90));
             Class<?> scCls = Class.forName("android.view.SurfaceControl");
@@ -2387,6 +2446,13 @@ public class ExtBridge implements Runnable {
                     }
                 }
             }
+            int preTid = isExtLauncher ? findExtLauncherTaskId() : findTaskIdForPkg(pkg);
+            if (preTid > 0) {
+                int preWm = getTaskWindowingMode(preTid);
+                if (preWm == 5 || (isExtLauncher && preWm != 1 && preWm != 0)) {
+                    detachFreeformAndEnsureFullscreen(preTid, true);
+                }
+            }
             int mode = getAppMode(pkg);
             applyAppModeCompat(pkg, mode, false);
             Intent intent = new Intent();
@@ -2400,6 +2466,9 @@ public class ExtBridge implements Runnable {
             }
             ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
             Object rc = sMStartActivity.invoke(sAtm, null, "com.android.shell", null, intent, null, null, null, 0, 0, null, opts.toBundle());
+            if (sHandler != null) {
+                sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+            }
             return !(rc instanceof Integer) || (Integer) rc >= 0;
         } catch (Throwable t) {
             t.printStackTrace();
@@ -2427,10 +2496,11 @@ public class ExtBridge implements Runnable {
         opts.setLaunchDisplayId(displayId);
         if (displayId > 0) {
             try {
-                // Freeform small window mode (5) is disallowed in DeX / Extended mode
-                if (mode == 1) {
-                    ActivityOptions.class.getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
-                }
+                // Freeform small window mode (5) is disallowed in DeX / Extended mode:
+                // always explicitly pass WINDOWING_MODE_FULLSCREEN (1) + null launchBounds so
+                // Xiaomi Workstation Mode (MiuiFreeform) / force_desktop_mode cannot hijack tasks into Freeform (5).
+                opts.setLaunchBounds(null);
+                ActivityOptions.class.getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
             } catch (Throwable ignored) {}
         }
         return opts;
@@ -2524,7 +2594,9 @@ public class ExtBridge implements Runnable {
         try {
             for (Method m : sWm.getClass().getMethods()) {
                 if (m.getName().equals("setDisplayWindowingMode") && m.getParameterCount() == 2) {
-                    m.invoke(sWm, vdId, enable ? 1 : 0);
+                    // Always keep VirtualDisplay default container mode as FULLSCREEN (1), never UNDEFINED (0),
+                    // otherwise force_desktop_mode_on_external_displays=1 defaults the display to FREEFORM (5).
+                    m.invoke(sWm, vdId, 1);
                     break;
                 }
             }
@@ -2602,9 +2674,65 @@ public class ExtBridge implements Runnable {
         } catch (Throwable ignored) {}
     }
 
-    private static void enforceRunningExtTasksFullscreen() {
-        if (sVdId <= 0 || sAtm == null) return;
+    private static int extractTaskWindowingMode(Object t) {
+        if (t == null) return 0;
+        int wm = readIntField(t, "windowingMode", 0);
+        if (wm != 0) return wm;
         try {
+            Object cfg = t.getClass().getField("configuration").get(t);
+            if (cfg != null) {
+                Object wc = cfg.getClass().getField("windowConfiguration").get(cfg);
+                if (wc != null) {
+                    Object r = wc.getClass().getMethod("getWindowingMode").invoke(wc);
+                    if (r instanceof Integer) return (Integer) r;
+                }
+            }
+        } catch (Throwable ignored) {}
+        return 0;
+    }
+
+    private static boolean isLauncherTaskInfo(Object t) {
+        if (t == null || !"com.extbridge.helper".equals(extractTaskPkg(t))) return false;
+        try {
+            Object top = null;
+            try { top = t.getClass().getField("topActivity").get(t); } catch (Throwable ignored) {}
+            if (top == null) {
+                try { top = t.getClass().getField("baseActivity").get(t); } catch (Throwable ignored) {}
+            }
+            return (top instanceof ComponentName) && ((ComponentName) top).getClassName().contains("LauncherActivity");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void detachFreeformAndEnsureFullscreen(int taskId, boolean syncFullBounds) {
+        if (taskId <= 0 || sAtm == null) return;
+        if (!applyWctForTask(taskId, Boolean.FALSE, 1, new Rect())) {
+            clearTaskAlwaysOnTop(taskId);
+            forceTaskWindowingMode(taskId, 1);
+        }
+        if (syncFullBounds) {
+            Rect fullBounds = new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH));
+            resizeTaskBoundsOnly(taskId, fullBounds, true);
+            applyWctForTask(taskId, Boolean.FALSE, 1, new Rect());
+        }
+    }
+
+    private static void enforceRunningExtTasksFullscreen(boolean enforceCompat) {
+        if (sVdId <= 0 || sAtm == null || sMirrorMode != 0) return;
+        try {
+            boolean splitOn;
+            int emptySlot;
+            String s0Pkg, s1Pkg;
+            int s0Tid, s1Tid;
+            synchronized (sSplitLock) {
+                splitOn = sSplitActive;
+                emptySlot = getEmptySplitSlot();
+                s0Pkg = sSplitSlot0Pkg != null ? sSplitSlot0Pkg : "";
+                s1Pkg = sSplitSlot1Pkg != null ? sSplitSlot1Pkg : "";
+                s0Tid = sSplitSlot0TaskId;
+                s1Tid = sSplitSlot1TaskId;
+            }
             List<?> running = invokeTaskQuery("getTasks");
             if (running == null) return;
             for (Object t : running) {
@@ -2612,16 +2740,34 @@ public class ExtBridge implements Runnable {
                 int did = readIntField(t, "displayId", -1);
                 if (did != sVdId) continue;
                 String pkg = extractTaskPkg(t);
-                if (sSplitActive && (pkg.equals(sSplitSlot0Pkg) || pkg.equals(sSplitSlot1Pkg))) continue;
-                if (!shouldCompatOverridePkg(pkg)) continue;
+                int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                boolean isLauncher = isLauncherTaskInfo(t);
+                if (splitOn) {
+                    if ((tid > 0 && (tid == s0Tid || tid == s1Tid))
+                            || (!pkg.isEmpty() && (pkg.equals(s0Pkg) || pkg.equals(s1Pkg)))) {
+                        continue;
+                    }
+                    if (isLauncher && emptySlot >= 0) {
+                        continue;
+                    }
+                }
+                int wmode = extractTaskWindowingMode(t);
+                if (isLauncher) {
+                    if (tid > 0 && wmode != 1 && wmode != 0) {
+                        detachFreeformAndEnsureFullscreen(tid, true);
+                    }
+                    continue;
+                }
+                // Rescue any DeX task hijacked into MIUI Freeform (5) so mouse never gets stuck unable to drag
+                if (tid > 0 && wmode == 5) {
+                    detachFreeformAndEnsureFullscreen(tid, true);
+                    wmode = 1;
+                }
+                if (!enforceCompat || !shouldCompatOverridePkg(pkg)) continue;
                 int mode = getAppMode(pkg);
                 applyAppModeCompat(pkg, mode, false);
-                if (mode == 1) {
-                    int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
-                    int wmode = readIntField(t, "windowingMode", 1);
-                    if (tid > 0 && wmode != 1) {
-                        forceTaskWindowingMode(tid, 1);
-                    }
+                if (mode == 1 && tid > 0 && wmode != 1 && wmode != 0) {
+                    detachFreeformAndEnsureFullscreen(tid, wmode == 6);
                 }
             }
         } catch (Throwable ignored) {}
@@ -2639,13 +2785,16 @@ public class ExtBridge implements Runnable {
         int lTid = findExtLauncherTaskId();
         if (lTid > 0 && sAtm != null) {
             try {
-                clearTaskAlwaysOnTop(lTid);
-                forceTaskWindowingMode(lTid, 1);
+                int prevWm = getTaskWindowingMode(lTid);
+                detachFreeformAndEnsureFullscreen(lTid, prevWm != 1);
                 ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, 1);
                 Bundle b = opts.toBundle();
                 for (Method m : sAtm.getClass().getMethods()) {
                     if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
                         m.invoke(sAtm, lTid, b);
+                        if (sHandler != null) {
+                            sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+                        }
                         notifyHelperSync();
                         return true;
                     }
@@ -2872,7 +3021,15 @@ public class ExtBridge implements Runnable {
                 injectKey(KeyEvent.KEYCODE_BACK, 0);
                 return true;
             } else if (code == 12) {
-                launchLauncher();
+                boolean useHalfPicker;
+                synchronized (sSplitLock) {
+                    useHalfPicker = sSplitActive && getEmptySplitSlot() >= 0;
+                }
+                if (useHalfPicker) {
+                    launchLauncher();
+                } else {
+                    minimizeToExtHome(-1, null);
+                }
                 return true;
             } else if (code == 13) {
                 injectKey(KeyEvent.KEYCODE_HOME, 0);
@@ -3566,18 +3723,17 @@ public class ExtBridge implements Runnable {
                         }
                     }
                 } catch (Throwable ignored) {}
-                if (mode == 1) {
-                    clearTaskAlwaysOnTop(taskId);
-                    forceTaskWindowingMode(taskId, 1);
-                } else if (mode == 3) {
-                    forceTaskWindowingMode(taskId, 5);
-                }
+                int prevWm = getTaskWindowingMode(taskId);
+                detachFreeformAndEnsureFullscreen(taskId, prevWm == 5 || prevWm == 6);
 
                 ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
                 Bundle b = opts.toBundle();
                 for (Method m : sAtm.getClass().getMethods()) {
                     if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
                         m.invoke(sAtm, taskId, b);
+                        if (sHandler != null) {
+                            sHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1), 180L);
+                        }
                         return true;
                     }
                 }
@@ -4018,9 +4174,7 @@ public class ExtBridge implements Runnable {
     private static void ensureLauncherTaskFullscreenInBg() {
         int lTid = findExtLauncherTaskId();
         if (lTid <= 0) return;
-        clearTaskAlwaysOnTop(lTid);
-        forceTaskWindowingMode(lTid, 1);
-        resizeTaskBoundsOnly(lTid, new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH)), false);
+        detachFreeformAndEnsureFullscreen(lTid, true);
     }
 
     private static void syncLauncherForSplit(int emptySlot, boolean bringFront) {
