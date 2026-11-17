@@ -68,11 +68,18 @@ public class LauncherActivity extends Activity {
     private TextView mBtnClear;
     private TextView mTvEmpty;
     private GridView mGrid;
+    private TextView mTitleView;
+    private TextView mBtnModeTip;
+    private TextView mBtnWpRefresh;
     private TextView mHeaderInfo;
+    private TextView mSplitBanner;
     private AppAdapter mAdapter;
     private String mQuery = "";
     private Bitmap mLastWpBitmap;
     private int mAppliedDensityDpi = 0;
+    private boolean mCompactSplitMode = false;
+    private int mLastLayoutW = 0;
+    private int mLastLayoutH = 0;
     private static String sPendingQuery = "";
     private Map<String, Integer> mAppModes = new HashMap<>();
 
@@ -80,6 +87,7 @@ public class LauncherActivity extends Activity {
         @Override
         public void onReceive(Context context, Intent intent) {
             refreshHeader();
+            adjustColumns();
             refreshAppModesAsync();
         }
     };
@@ -109,11 +117,15 @@ public class LauncherActivity extends Activity {
         } catch (Throwable ignored) {}
         loadAppsAsync();
         loadWallpaperAsync(false);
-        BridgeClient.setOnBinderReady(() -> runOnUiThread(() -> {
+        BridgeClient.setOnBinderReady(mBinderReadyCb);
+    }
+
+    private final Runnable mBinderReadyCb = () -> runOnUiThread(() -> {
+        if (!isFinishing() && !isDestroyed()) {
             refreshHeader();
             loadWallpaperAsync(false);
-        }));
-    }
+        }
+    });
 
     @Override
     protected void onStart() {
@@ -130,6 +142,7 @@ public class LauncherActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        BridgeClient.removeOnBinderReady(mBinderReadyCb);
         BridgeService.clearLauncherOverlayHost(mOverlayHost);
         try { unregisterReceiver(mSyncRx); } catch (Throwable ignored) {}
         super.onDestroy();
@@ -242,16 +255,32 @@ public class LauncherActivity extends Activity {
         top.setGravity(Gravity.CENTER_VERTICAL);
         top.setPadding(dp(4), 0, dp(4), dp(12));
 
-        TextView title = new TextView(this);
-        title.setText("ExtBridge 扩展桌面");
-        title.setTextColor(Color.WHITE);
-        title.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15f);
-        title.getPaint().setFakeBoldText(true);
-        title.setShadowLayer(dpF(4f), 0f, dpF(1.5f), 0xAA000000);
+        mTitleView = new TextView(this);
+        mTitleView.setText("ExtBridge 扩展桌面");
+        mTitleView.setTextColor(Color.WHITE);
+        mTitleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15f);
+        mTitleView.getPaint().setFakeBoldText(true);
+        mTitleView.setShadowLayer(dpF(4f), 0f, dpF(1.5f), 0xAA000000);
         LinearLayout.LayoutParams tLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        tLp.rightMargin = dp(16);
-        top.addView(title, tLp);
+        tLp.rightMargin = dp(12);
+        top.addView(mTitleView, tLp);
+
+        mSplitBanner = new TextView(this);
+        mSplitBanner.setTextColor(0xFFBAE6FD);
+        mSplitBanner.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f);
+        mSplitBanner.getPaint().setFakeBoldText(true);
+        mSplitBanner.setPadding(dp(9), dp(4), dp(9), dp(4));
+        GradientDrawable splitBanBg = new GradientDrawable();
+        splitBanBg.setColor(0x660284C7);
+        splitBanBg.setCornerRadius(dpF(14f));
+        splitBanBg.setStroke(1, 0x8838BDF8);
+        mSplitBanner.setBackground(splitBanBg);
+        mSplitBanner.setVisibility(View.GONE);
+        LinearLayout.LayoutParams sbanLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sbanLp.rightMargin = dp(8);
+        top.addView(mSplitBanner, sbanLp);
 
         // Frosted glass Search box container
         LinearLayout searchBox = new LinearLayout(this);
@@ -313,40 +342,40 @@ public class LauncherActivity extends Activity {
         sbLp.rightMargin = dp(12);
         top.addView(searchBox, sbLp);
 
-        TextView btnModeTip = new TextView(this);
-        btnModeTip.setText("🧩 显示模式");
-        btnModeTip.setTextColor(0xFFBAE6FD);
-        btnModeTip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
-        btnModeTip.setPadding(dp(11), dp(5), dp(11), dp(5));
+        mBtnModeTip = new TextView(this);
+        mBtnModeTip.setText("🧩 显示模式");
+        mBtnModeTip.setTextColor(0xFFBAE6FD);
+        mBtnModeTip.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
+        mBtnModeTip.setPadding(dp(11), dp(5), dp(11), dp(5));
         GradientDrawable mtBg = new GradientDrawable();
         mtBg.setColor(0x550C4A6E);
         mtBg.setCornerRadius(dpF(15f));
         mtBg.setStroke(1, 0x5538BDF8);
-        btnModeTip.setBackground(mtBg);
-        btnModeTip.setOnClickListener(v -> showAllAppModesPicker());
+        mBtnModeTip.setBackground(mtBg);
+        mBtnModeTip.setOnClickListener(v -> showAllAppModesPicker());
         LinearLayout.LayoutParams mtLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         mtLp.rightMargin = dp(8);
-        top.addView(btnModeTip, mtLp);
+        top.addView(mBtnModeTip, mtLp);
 
-        TextView btnWpRefresh = new TextView(this);
-        btnWpRefresh.setText("🖼 同步壁纸");
-        btnWpRefresh.setTextColor(0xFFE2E8F0);
-        btnWpRefresh.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
-        btnWpRefresh.setPadding(dp(11), dp(5), dp(11), dp(5));
+        mBtnWpRefresh = new TextView(this);
+        mBtnWpRefresh.setText("🖼 同步壁纸");
+        mBtnWpRefresh.setTextColor(0xFFE2E8F0);
+        mBtnWpRefresh.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f);
+        mBtnWpRefresh.setPadding(dp(11), dp(5), dp(11), dp(5));
         GradientDrawable wpBg = new GradientDrawable();
         wpBg.setColor(0x55121A2A);
         wpBg.setCornerRadius(dpF(15f));
         wpBg.setStroke(1, 0x3AFFFFFF);
-        btnWpRefresh.setBackground(wpBg);
-        btnWpRefresh.setOnClickListener(v -> {
+        mBtnWpRefresh.setBackground(wpBg);
+        mBtnWpRefresh.setOnClickListener(v -> {
             loadWallpaperAsync(true);
             Toast.makeText(this, "正在同步平板原机壁纸...", Toast.LENGTH_SHORT).show();
         });
         LinearLayout.LayoutParams wpLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         wpLp.rightMargin = dp(10);
-        top.addView(btnWpRefresh, wpLp);
+        top.addView(mBtnWpRefresh, wpLp);
 
         mHeaderInfo = new TextView(this);
         mHeaderInfo.setTextColor(0xFFE0F2FE);
@@ -404,6 +433,18 @@ public class LauncherActivity extends Activity {
         mRoot.addView(mOverlayHost, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
+        mRoot.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or2, ob) -> {
+            int w = r - l;
+            int h = b - t;
+            if (Math.abs(w - mLastLayoutW) > 6 || Math.abs(h - mLastLayoutH) > 6) {
+                mLastLayoutW = w;
+                mLastLayoutH = h;
+                mRoot.post(() -> {
+                    adjustColumns();
+                    refreshHeader();
+                });
+            }
+        });
         setContentView(mRoot);
         mContent.requestFocus();
         adjustColumns();
@@ -453,14 +494,68 @@ public class LauncherActivity extends Activity {
     private void adjustColumns() {
         if (mGrid == null) return;
         DisplayMetrics dm = getResources().getDisplayMetrics();
-        float dpW = dm.widthPixels / Math.max(0.5f, dm.density) - 52f;
-        int cols = Math.max(5, Math.min(14, Math.round(dpW / 165f)));
+        int winW = (mRoot != null && mRoot.getWidth() > 0) ? mRoot.getWidth() : dm.widthPixels;
+        int winH = (mRoot != null && mRoot.getHeight() > 0) ? mRoot.getHeight() : dm.heightPixels;
+        BridgeClient.Status st = BridgeClient.getStatus();
+        boolean singleEmpty = st.connected && st.splitActive == 1
+                && ((st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty())
+                        != (st.splitSlot1Pkg == null || st.splitSlot1Pkg.isEmpty()));
+        boolean compact = singleEmpty
+                || (st.connected && (winW < st.virtW * 0.88f || winH < st.virtH * 0.88f));
+        float density = Math.max(0.5f, dm.density);
+        float dpW = winW / density - (compact ? 24f : 52f);
+        int cols = compact
+                ? Math.max(3, Math.min(8, Math.round(dpW / 108f)))
+                : Math.max(5, Math.min(14, Math.round(dpW / 165f)));
         mGrid.setNumColumns(cols);
+        if (compact != mCompactSplitMode) {
+            mCompactSplitMode = compact;
+            if (mContent != null) {
+                mContent.setPadding(
+                        dp(compact ? 12 : 26), dp(compact ? 10 : 14),
+                        dp(compact ? 12 : 26), dp(compact ? 60 : 62));
+            }
+            mGrid.setVerticalSpacing(dp(compact ? 8 : 12));
+            mGrid.setHorizontalSpacing(dp(compact ? 5 : 8));
+            if (mAdapter != null) mAdapter.notifyDataSetChanged();
+        }
     }
 
     private void refreshHeader() {
         if (mHeaderInfo == null) return;
         BridgeClient.Status st = BridgeClient.getStatus();
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        int winW = (mRoot != null && mRoot.getWidth() > 0) ? mRoot.getWidth() : dm.widthPixels;
+        int winH = (mRoot != null && mRoot.getHeight() > 0) ? mRoot.getHeight() : dm.heightPixels;
+        boolean singleEmpty = st.connected && st.splitActive == 1
+                && ((st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty())
+                        != (st.splitSlot1Pkg == null || st.splitSlot1Pkg.isEmpty()));
+        boolean compact = singleEmpty
+                || (st.connected && (winW < st.virtW * 0.88f || winH < st.virtH * 0.88f));
+
+        if (mTitleView != null) {
+            mTitleView.setText(compact ? "DeX 桌面" : "ExtBridge 扩展桌面");
+            mTitleView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, compact ? 13f : 15f);
+        }
+        if (mBtnModeTip != null) mBtnModeTip.setVisibility(compact ? View.GONE : View.VISIBLE);
+        if (mBtnWpRefresh != null) mBtnWpRefresh.setVisibility(compact ? View.GONE : View.VISIBLE);
+        if (mHeaderInfo != null) mHeaderInfo.setVisibility(compact ? View.GONE : View.VISIBLE);
+
+        if (mSplitBanner != null) {
+            if (singleEmpty) {
+                boolean port = st.virtH > st.virtW;
+                boolean slot0Empty = st.splitSlot0Pkg == null || st.splitSlot0Pkg.isEmpty();
+                String side = port ? (slot0Empty ? "上屏" : "下屏") : (slot0Empty ? "左屏" : "右屏");
+                mSplitBanner.setText("◫ 点选填入" + side);
+                mSplitBanner.setVisibility(View.VISIBLE);
+            } else {
+                mSplitBanner.setVisibility(View.GONE);
+            }
+        }
+        if (mSearchInput != null) {
+            mSearchInput.setHint(compact ? "搜索并点击加入分屏..." : "搜索应用名 / 拼音首字母 / 包名 (回车打开)");
+        }
+
         if (st.connected) {
             mHeaderInfo.setText(st.virtW + "×" + st.virtH + " · " + st.virtDpi + "dpi · "
                     + Math.round(st.virtFps) + "Hz · " + (st.inputToExt == 1 ? "扩展键鼠" : "平板键鼠"));
@@ -545,14 +640,6 @@ public class LauncherActivity extends Activity {
                 try {
                     if (mode == BridgeClient.APP_MODE_LAND_FULL) {
                         opts.getClass().getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
-                    } else if (mode == BridgeClient.APP_MODE_FREEFORM) {
-                        opts.getClass().getMethod("setLaunchWindowingMode", int.class).invoke(opts, 5);
-                        DisplayMetrics dm = getResources().getDisplayMetrics();
-                        int w = Math.max(420, (int) (dm.widthPixels * 0.44f));
-                        int h = Math.max(540, (int) (dm.heightPixels * 0.84f));
-                        int l = Math.max(0, (dm.widthPixels - w) / 2);
-                        int t = Math.max(20, (dm.heightPixels - h) / 2 - dp(16));
-                        opts.setLaunchBounds(new Rect(l, t, l + w, t + h));
                     }
                 } catch (Throwable ignored) {}
             }
@@ -621,16 +708,31 @@ public class LauncherActivity extends Activity {
     private void showAppModeDialog(AppEntry e) {
         if (e == null) return;
         int cur = getAppModeLocal(e.pkg);
+        android.util.DisplayMetrics dm = getResources().getDisplayMetrics();
+        boolean port = dm.heightPixels > dm.widthPixels;
+        String slot0Label = port ? "◫ 分屏：放到上屏（支持任意比例调节）" : "◫ 分屏：放到左屏（支持任意比例调节）";
+        String slot1Label = port ? "◫ 分屏：放到下屏（支持任意比例调节）" : "◫ 分屏：放到右屏（支持任意比例调节）";
         String[] labels = {
+                slot0Label,
+                slot1Label,
                 (cur == 0 ? "● " : "") + "跟随系统默认（推荐微信 / 夸克 / 正常原生适配应用）",
                 (cur == 1 ? "● " : "") + "强制横屏全屏（适合红果短剧等竖屏视频类 App）",
-                (cur == 2 ? "● " : "") + "竖屏居中兼容（适合拼多多等固定比例竖屏页面）",
-                (cur == 3 ? "● " : "") + "自由小窗模式（以可缩放悬浮窗形式启动）"
+                (cur == 2 ? "● " : "") + "竖屏居中兼容（适合拼多多等固定比例竖屏页面）"
         };
         new AlertDialog.Builder(this)
                 .setTitle(e.label + "\n" + e.pkg)
                 .setItems(labels, (dialog, which) -> {
-                    final int chosen = which;
+                    if (which == 0 || which == 1) {
+                        final int slot = which;
+                        String sideTxt = port ? (slot == 0 ? "上屏" : "下屏") : (slot == 0 ? "左屏" : "右屏");
+                        Toast.makeText(this, "已放入分屏【" + sideTxt + "】： " + e.label, Toast.LENGTH_SHORT).show();
+                        new Thread(() -> {
+                            BridgeClient.assignSplitSlot(slot, e.pkg, e.cls);
+                            runOnUiThread(() -> BridgeService.refreshFromReceiver(this));
+                        }).start();
+                        return;
+                    }
+                    final int chosen = which - 2;
                     Toast.makeText(this, "正在应用【" + BridgeClient.appModeLabel(chosen) + "】并重启应用...", Toast.LENGTH_SHORT).show();
                     new Thread(() -> {
                         BridgeClient.setAppMode(e.pkg, chosen, true);
@@ -703,6 +805,18 @@ public class LauncherActivity extends Activity {
                 card.addView(badge, bLp);
             }
             AppEntry e = mApps.get(pos);
+            boolean compact = mCompactSplitMode;
+            int iconPx = dp(compact ? 40 : 54);
+            card.setPadding(dp(compact ? 4 : 6), dp(compact ? 5 : 8), dp(compact ? 4 : 6), dp(compact ? 5 : 8));
+            ViewGroup.LayoutParams curIvLp = iv.getLayoutParams();
+            if (curIvLp instanceof LinearLayout.LayoutParams && curIvLp.width != iconPx) {
+                curIvLp.width = iconPx;
+                curIvLp.height = iconPx;
+                ((LinearLayout.LayoutParams) curIvLp).bottomMargin = dp(compact ? 4 : 6);
+                iv.setLayoutParams(curIvLp);
+            }
+            tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, compact ? 10.5f : 11.5f);
+            badge.setTextSize(TypedValue.COMPLEX_UNIT_DIP, compact ? 8.5f : 9.5f);
             iv.setImageDrawable(e.icon);
             tv.setText(e.label);
             int mode = getAppModeLocal(e.pkg);

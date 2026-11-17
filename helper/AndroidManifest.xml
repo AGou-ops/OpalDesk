@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.extbridge.helper"
-    android:versionCode="8"
-    android:versionName="3.2.3">
+    android:versionCode="20"
+    android:versionName="3.4.1">
 
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -46,6 +46,25 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden" />
 
         <activity
+            android:name=".SideControlActivity"
+            android:exported="true"
+            android:label="ExtBridge 副屏直控"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.extbridge.helper.tablet"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+
+        <activity
+            android:name=".SideMouseCaptureActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:resizeableActivity="false"
+            android:launchMode="singleInstance"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen"
+            android:taskAffinity="com.extbridge.helper.capture"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+
+        <activity
             android:name=".LauncherActivity"
             android:exported="true"
             android:label="ExtBridge 桌面"
@@ -87,6 +106,11 @@
                 <action android:name="com.extbridge.helper.REBUILD" />
                 <action android:name="com.extbridge.helper.LAUNCH_EXT_HOME" />
                 <action android:name="com.extbridge.helper.TOGGLE_MIRROR" />
+                <action android:name="com.extbridge.helper.MIR_EDGE_CAPTURE" />
+                <action android:name="com.extbridge.helper.SET_MIRROR_SIDE_MODE" />
+                <action android:name="com.extbridge.helper.SPLIT_ACTION" />
+                <action android:name="com.extbridge.helper.SET_ROTATION" />
+                <action android:name="com.extbridge.helper.SET_DOCK_AUTO_HIDE" />
                 <action android:name="com.extbridge.helper.EXIT_ALL" />
             </intent-filter>
         </receiver>

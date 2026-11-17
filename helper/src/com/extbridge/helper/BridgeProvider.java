@@ -16,8 +16,19 @@ public class BridgeProvider extends ContentProvider {
         return true;
     }
 
+    private boolean isTrustedCaller() {
+        int uid = Binder.getCallingUid();
+        if (uid == 0 || uid == 1000 || uid == 2000) return true;
+        return uid == android.os.Process.myUid();
+    }
+
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
+        if (!isTrustedCaller()) {
+            Bundle denied = new Bundle();
+            denied.putBoolean("ok", false);
+            return denied;
+        }
         if ("setBinder".equals(method) && extras != null) {
             if (BridgeService.sUserStopping) {
                 Bundle denied = new Bundle();
@@ -25,7 +36,7 @@ public class BridgeProvider extends ContentProvider {
                 return denied;
             }
             IBinder b = extras.getBinder("cb");
-            if (b != null) {
+            if (b != null && b.pingBinder()) {
                 BridgeClient.setBinder(b);
                 BridgeService.ensureStarted(getContext());
                 BridgeService.refreshFromReceiver(getContext());

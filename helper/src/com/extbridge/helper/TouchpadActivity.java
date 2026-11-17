@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
+import android.content.Intent;
 import android.content.res.Configuration;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -25,6 +26,9 @@ import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class TouchpadActivity extends Activity {
     private static final float[] SPEEDS = {1.0f, 1.6f, 2.3f, 3.2f};
@@ -60,6 +64,15 @@ public class TouchpadActivity extends Activity {
     }
 
     private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService mIoExec = Executors.newSingleThreadExecutor();
+    private final Object mMoveLock = new Object();
+    private float mPendingDx = 0f;
+    private float mPendingDy = 0f;
+    private boolean mMoveInFlight = false;
+    private volatile boolean mTpDestroyed = false;
+    private final Runnable mBinderReadyCb = () -> mHandler.post(() -> {
+        if (!mTpDestroyed) refreshStatus();
+    });
     private int mVirtW = 2560;
     private int mVirtH = 1440;
     private int mCurX = 1280;
@@ -92,7 +105,7 @@ public class TouchpadActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        BridgeClient.setOnBinderReady(() -> mHandler.post(this::refreshStatus));
+        BridgeClient.setOnBinderReady(mBinderReadyCb);
         if (BridgeClient.getService() == null) BridgeClient.requestBinder(this);
         refreshStatus();
     }
@@ -100,7 +113,16 @@ public class TouchpadActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        BridgeClient.setOnBinderReady(null);
+        BridgeClient.removeOnBinderReady(mBinderReadyCb);
+    }
+
+    @Override
+    protected void onDestroy() {
+        mTpDestroyed = true;
+        BridgeClient.removeOnBinderReady(mBinderReadyCb);
+        mHandler.removeCallbacksAndMessages(null);
+        mIoExec.shutdownNow();
+        super.onDestroy();
     }
 
     @Override
@@ -294,6 +316,11 @@ public class TouchpadActivity extends Activity {
             updateOrientationLayout();
         });
 
+        TextView btnSideCtrl = makeBtn("🪞 副屏直控", 0xFF0F766E);
+        btnSideCtrl.setOnClickListener(v -> startActivity(
+                new Intent(this, SideControlActivity.class)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_SINGLE_TOP)));
+
         TextView btnIme = makeBtn("⌨ 键盘", 0xFF0284C7);
         btnIme.setOnClickListener(v -> toggleImeDock(!mImeVisible));
 
@@ -304,6 +331,7 @@ public class TouchpadActivity extends Activity {
         bar.addView(mBtnReach);
         View spacer = new View(this);
         bar.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
+        bar.addView(btnSideCtrl);
         bar.addView(btnIme);
         barScroll.addView(bar, new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -454,15 +482,72 @@ public class TouchpadActivity extends Activity {
         }
     }
 
-    private void sendMouseSync(int type, float a1, float a2) {
-        int[] xy = BridgeClient.sendMouse(type, a1, a2);
-        if (xy != null && xy.length >= 2) {
-            mCurX = xy[0];
-            mCurY = xy[1];
-            BridgeService.moveCursor(mCurX, mCurY, mDragLocked || type == 3);
-            updateCoordLabel();
-            if (xy.length >= 3) updateInjectWarn(xy[2]);
+    private void applyMouseResultOnUi(int type, int[] xy) {
+        if (mTpDestroyed || xy == null || xy.length < 2) return;
+        mCurX = xy[0];
+        mCurY = xy[1];
+        BridgeService.moveCursor(mCurX, mCurY, mDragLocked || type == 3);
+        updateCoordLabel();
+        if (xy.length >= 3) updateInjectWarn(xy[2]);
+    }
+
+    private void sendMouseSync(final int type, final float a1, final float a2) {
+        if (mTpDestroyed || mIoExec.isShutdown()) return;
+        if (type == 0) {
+            boolean launch = false;
+            synchronized (mMoveLock) {
+                mPendingDx += a1;
+                mPendingDy += a2;
+                if (!mMoveInFlight) {
+                    mMoveInFlight = true;
+                    launch = true;
+                }
+            }
+            if (!launch) return;
+            try {
+                mIoExec.execute(() -> {
+                    try {
+                        while (!mTpDestroyed && !mIoExec.isShutdown()) {
+                            float dx, dy;
+                            synchronized (mMoveLock) {
+                                dx = mPendingDx;
+                                dy = mPendingDy;
+                                mPendingDx = 0f;
+                                mPendingDy = 0f;
+                                if (Math.abs(dx) < 0.01f && Math.abs(dy) < 0.01f) {
+                                    mMoveInFlight = false;
+                                    break;
+                                }
+                            }
+                            int[] xy = BridgeClient.sendMouse(0, dx, dy);
+                            if (xy != null && xy.length >= 2) {
+                                mHandler.post(() -> applyMouseResultOnUi(0, xy));
+                            }
+                        }
+                    } finally {
+                        synchronized (mMoveLock) {
+                            mMoveInFlight = false;
+                        }
+                    }
+                });
+            } catch (Throwable ignored) {
+                synchronized (mMoveLock) {
+                    mPendingDx = 0f;
+                    mPendingDy = 0f;
+                    mMoveInFlight = false;
+                }
+            }
+            return;
         }
+        try {
+            mIoExec.execute(() -> {
+                if (mTpDestroyed) return;
+                int[] xy = BridgeClient.sendMouse(type, a1, a2);
+                if (xy != null && xy.length >= 2) {
+                    mHandler.post(() -> applyMouseResultOnUi(type, xy));
+                }
+            });
+        } catch (Throwable ignored) {}
     }
 
     private TextView makeBtn(String txt, int color) {
@@ -665,7 +750,7 @@ public class TouchpadActivity extends Activity {
                     invalidate();
                     if (mMode == 3) {
                         sendMouseSync(4, 0f, 0f);
-                    } else if ((mMode == 1 || mMode == 4) && (now - mDownTime) < 220 && mTotalMove < tapSlop) {
+                    } else if ((mMode == 1 || mMode == 4) && (now - mDownTime) < 270 && mTotalMove < tapSlop) {
                         sendMouseSync(1, 0f, 0f);
                         mLastTapUpTime = now;
                     }

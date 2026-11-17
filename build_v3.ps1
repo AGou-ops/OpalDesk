@@ -85,8 +85,9 @@ $javaFiles += @(Get-ChildItem -Recurse -Filter "*.java" "$BUILD\helper_gen" | Fo
 & javac -encoding UTF-8 --release 11 -cp $ANDROID_JAR -d "$BUILD\helper_classes" @javaFiles
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$helperClasses = Get-ChildItem -Recurse -Filter "*.class" "$BUILD\helper_classes" | ForEach-Object { $_.FullName }
-& "$BT\d8.bat" --min-api 30 --lib $ANDROID_JAR --output "$BUILD\helper_dex" @helperClasses
+& jar cf "$BUILD\helper_classes.jar" -C "$BUILD\helper_classes" .
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& "$BT\d8.bat" --min-api 30 --lib $ANDROID_JAR --output "$BUILD\helper_dex" "$BUILD\helper_classes.jar"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "=== 4. Packaging, aligning, and signing exthelper.apk ==="

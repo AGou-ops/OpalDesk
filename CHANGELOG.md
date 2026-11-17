@@ -4,6 +4,54 @@
 
 ---
 
+## v3.4.1 (`versionCode: 20`) — 2026-11-17
+
+### ✨ 核心功能新增（v3.3.x → v3.4.1 功能汇总）
+- **原生镜像模式全面重塑为「信息侧边栏 + 系统小组件工作台」**
+  - **4 种画面与黑边排版形态**：支持关闭（`0`）、镜像右移 + 左侧合并宽侧边栏（`1`）、镜像左移 + 右侧合并宽侧边栏（`2`）与居中双翼对称侧边栏（`3`），支持按不同显示器分辨率与屏幕比例自动适配排版，避免黑边空间浪费。
+  - **14 款可自由替换与排序的预设信息组件**：内置 `大数字时钟`、`电池温压详情`、`Wi-Fi 与信号`、`蓝牙与外设`、`音频通道与音量`（支持直接点按 `➖/🔇/➕`）、`媒体播放与切歌`（支持点按 `⏮/⏯/⏭`）、`日历与近期日程`、`内存与系统负载`、`实时网速监控`、`存储与亮度信息`、`专注番茄钟`、`快捷桌面便签`、`镜像快捷控制台` 与 `主屏最低亮度` 卡片，字体全面放大清晰易读。
+  - **6 款主题配色 + 自定义颜色**：支持 `极夜深蓝`、`OLED纯黑`、`晨雾浅白`、`赛博紫青`、`翡翠墨绿`、`暖暮琥珀` 及自定义背景纯色，同步适配前景色高对比度。
+  - **系统桌面小组件 (`AppWidget`) 接入与防拉伸保护**：支持左/右槽位绑定任意系统/第三方小组件，并提供 `自动原比例 / 方形 1:1 / 竖屏 3:4 / 宽屏 16:9 / 铺满槽位` 5 档高度比例锁定，解决窄栏中 AppWidget 异常拉伸变形问题。
+- **外置鼠标外屏显示、自由跨屏 & 无键鼠「副屏直控」**
+  - 修复原生镜像下外置鼠标仅显示在主屏而不在外接屏显示的问题，实现实体鼠标**从镜像区左右边缘无缝跨入黑边侧边栏**点按、滚轮与右键操作小组件，并修复边缘碰触时误弹出 ExtBridge 主界面的 Bug（通过边缘捕获边界保护及 `SideMouseCaptureActivity` 协同）。
+  - 提供 **`0.9x 精细 / 1.4x 标准 / 1.9x 流畅 / 2.6x 极速 / 3.4x 飞快`** 五档副屏光标灵敏度与 DPI 密度自适应，兼顾低分与 4K 高分显示器手感。
+  - 新增主屏 **`副屏直控` (`SideControlActivity`)** 并升级虚拟触控板直接点按小组件能力，无外置键鼠时在平板/手机屏即可手指触控操作镜像副屏所有组件与 AppWidget；同时保护平板主屏原有桌面布局不受破坏。
+- **主屏一键黑屏 & 最低亮度省电双向闭环**
+  - DeX 底部 Dock 快捷控制浮窗新增 **「🌙 一键黑屏 (平板最低亮度)」**，镜像侧边栏同步配备 **「🌙 主屏最低亮度」** 卡片：一键将平板/手机主屏背光压至硬件最低 `1` 并叠加防误触遮罩（支持 `NavAssistService` 无障碍层级兜底）。
+  - 支持双击黑屏遮罩安全退出并精确还原进入前亮度，且在服务销毁、断开外接屏或停止退出时强制执行亮度恢复。
+
+### 🛡️ 全量代码审查修复、性能与内存优化
+- **Daemon (`ExtBridge.java`)**：
+  - 为输入队列、光标追踪、分屏状态与亮度调节补充细粒度互斥锁（`sInputLock` / `sCursorLock` / `sSplitLock` / `sScreenDimLock`），并缓存 `SurfaceControl` / `Transaction` 反射句柄（统一由 `closeSurfaceTx` 释放）。
+  - 修复特定条件下 `VirtualDisplay` 每 `1.5s` 循环重建（区分 `NATIVE_MIRROR_STOCK`、引入 `sSideVdAttempted` 保护、`physSizeChanged` 判断）；`startMirrorCursorPoller` 改为自适应退避轮询（`16ms → 50ms → 150ms`）与基于时间戳的边缘防抖。
+  - 强化 `BridgeBinder` 调用方 UID ACL 鉴权 (`isTrustedCaller`)，限制 `runCmdOut` 256KB 输出与 3 秒超时；修复 Captured Mirror 鼠标右键/中键（`actionType 6/7`）与 `code 42` 重入捕获保护，并确保 `cleanupDisplay` 幂等恢复亮度。
+- **Helper (`BridgeService.java` / 客户端 / 接收器 / 清单)**：
+  - 将 `ActivityManager.MemoryInfo`、`TrafficStats`、`StatFs` 与 `SCREEN_BRIGHTNESS` 读取移出主线程 `refreshMirrorSideViews()`；`mPomoTickTask` 仅在计时运行期调度；图标 `LruCache` 使用 `cloneDrawable()`，预分配高频绘制视图中的 `RectF` / `Path`，`QuickTile` 复用 `GradientDrawable`。
+  - 增加 `mDestroyed`、`mPollSeq` 序号守卫与 `safeBgExecute` / `safePost`；`detachExtOverlays(boolean keepBlackout)` 防止切层误撤黑屏；`BridgeProvider` 限制调用方 UID 白名单；`BridgeClient` 改用 `CopyOnWriteArraySet` 与 `linkToDeath` / `pingBinder()`；`MainActivity`、`TouchpadActivity` 与 `LauncherActivity` 在生命周期结束移除监听；`TouchpadActivity` 鼠标移动合并异步节流；`ControlReceiver` 使用 `goAsync()` 异步响应并在 `AndroidManifest.xml` 补齐 11 项 Action 声明。
+
+### 📚 图文文档与发布构建
+- 新增完整实机截图集 [`docs/images/`](docs/images/)（11 张实机全流程截图）、完整图文使用说明书 [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)、更新 [README.md](README.md) 与发布说明 [`docs/RELEASE_v3.4.1.md`](docs/RELEASE_v3.4.1.md)。
+
+---
+
+## v3.3.0 (`versionCode: 9`) — 2026-11-17
+
+### ✨ 全新特性：DeX 自由分屏模式 & Dock 栏自动隐藏
+- **DeX 独立桌面分屏模式（横屏左右 / 竖屏上下 + 自由调比例）**
+  - 自动适配输出方向：当扩展屏为横屏（`virtW >= virtH`）时自动启用**左右分屏**；旋转 `90°/270°` 或竖屏分辨率（`virtH > virtW`）时自动切换为**上下分屏**，旋转屏幕即时重排两个分屏窗口。
+  - **可拖拽悬浮分屏分割条 + 实时比例调整（`25% ~ 75%`）**：分屏接缝处出现高对比度磨砂分割手柄，按住拖拽可实时调节左右/上下窗口占比，松手自动动态调整双任务尺寸（无需重启应用）；轻点分割条或 Dock「◫ 分屏」可呼出快捷浮窗，支持 `3:7 / 4:6 / 5:5 / 6:4 / 7:3` 一键预设、`⇄/⇅ 互换位置` 与 `✕ 退出分屏`。
+  - **多种分屏入口**：
+    - Dock 栏新增 **`◫ 分屏`** 快捷按钮（一键将最近两个应用拼屏，或呼出控制浮窗）；
+    - 扩展桌面应用图标 **长按 / 鼠标右键菜单** 新增 **`◫ 分屏：放到左屏 / 右屏`**（竖屏下自动显示为 **`放到上屏 / 下屏`**），放入单侧后继续轻点桌面任意第二个应用即可自动补全另一侧。
+  - 后台 `ExtBridge` 在放入分屏时自动对任务执行 `setTaskResizeable` + `WINDOWING_MODE_FREEFORM` 转换与边界重排，解决部分应用默认 `fullscreen` 无法直接调整尺寸的问题。
+- **Dock 栏自动隐藏与底边唤醒**
+  - 默认开启「应用内 Dock 自动隐藏」（可在 Dock 快捷面板 **`📌 Dock自动隐藏`** 或手机控制台切换为「始终固定显示」）：
+    - 在扩展桌面主页或快捷面板展开时 Dock 保持常驻可见；
+    - 进入全屏/分屏应用且无操作闲置约 `2.6s` 后，Dock 自动平滑向下收起，仅在屏幕底端居中保留纤细的交互式触发指示条。
+    - 将实体鼠标或触摸板光标移至外接屏底边中央、悬停或轻点底边触发条，Dock 立即平滑弹起唤醒；鼠标悬停在 Dock 栏区域内时自动延迟隐藏不误收。
+
+---
+
 ## v3.2.3 (`versionCode: 8`) — 2026-11-17
 
 ### 🐛 关键问题修复（外接屏无法点击启动 / 输入注入静默失效）

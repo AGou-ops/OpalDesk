@@ -3,6 +3,9 @@ package com.extbridge.helper;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.NotificationManager;
+import android.appwidget.AppWidgetHost;
+import android.appwidget.AppWidgetManager;
+import android.appwidget.AppWidgetProviderInfo;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -12,12 +15,14 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.UserHandle;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -27,6 +32,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -59,8 +65,8 @@ public class MainActivity extends Activity {
             "1280×720\n720p 省流"
     };
 
-    private static final int[] DPI_PRESETS = {160, 200, 240, 280, 320};
-    private static final String[] DPI_LABELS = {"160\n超高密", "200\n紧凑桌面", "240\n标准★", "280\n大字", "320\n超大"};
+    private static final int[] DPI_PRESETS = {100, 120, 140, 160, 200, 240, 280, 320};
+    private static final String[] DPI_LABELS = {"100\n极微PC", "120\n桌面极小", "140\n桌面紧凑", "160\n高密★", "200\n适中", "240\n大屏标准", "280\n偏大", "320\n超大"};
     private static final float[] FPS_PRESETS = {165f, 144f, 120f, 90f, 75f, 60f};
     private static final String PREF_ONBOARDING = "extbridge_onboarding";
     private static final String KEY_STARTUP_PERMS_DONE = "startup_perms_done";
@@ -84,15 +90,29 @@ public class MainActivity extends Activity {
     private TextView mTvStatusTitle;
     private TextView mTvStatusDetail;
     private TextView mBtnToggleInput;
-    private TextView mBtnToggleMirror;
+    private TextView mBtnModeDex;
+    private TextView mBtnModeMirror;
     private TextView mBtnFullscreenPolicy;
     private TextView mBtnAppModes;
     private TextView mBtnActivate;
+    private final List<TextView> mMirrorSideChips = new ArrayList<>();
+    private final List<TextView> mMirrorThemeChips = new ArrayList<>();
+    private final List<TextView> mMirrorSpeedChips = new ArrayList<>();
+    private TextView mBtnMirrorLeftWidget;
+    private TextView mBtnMirrorRightWidget;
+    private TextView mTvMirrorSideInfo;
+    private LinearLayout mMirrorPresetWrap;
+    private final List<TextView> mMirrorPresetChips = new ArrayList<>();
+    private static final int REQ_BIND_APPWIDGET = 4101;
+    private static final int REQ_CONF_APPWIDGET = 4102;
+    private int mPendingWidgetSlot = -1;
+    private int mPendingWidgetId = -1;
     private TextView mTvSwInfo;
     private TextView mTvPhysNotice;
     private TextView mTvGestureStatus;
     private EditText mEdW;
     private EditText mEdH;
+    private EditText mEdDpi;
     private TextView mBtnToggleEdid;
     private LinearLayout mEdidPanel;
     private LinearLayout mPhysModesWrap;
@@ -191,10 +211,14 @@ public class MainActivity extends Activity {
         return false;
     }
 
+    private final Runnable mBinderReadyCb = () -> mHandler.post(() -> {
+        if (!isFinishing() && !isDestroyed()) refreshStatus(true);
+    });
+
     @Override
     protected void onResume() {
         super.onResume();
-        BridgeClient.setOnBinderReady(() -> mHandler.post(() -> refreshStatus(true)));
+        BridgeClient.setOnBinderReady(mBinderReadyCb);
         if (BridgeClient.getService() == null) BridgeClient.requestBinder(this);
         BridgeService.sUserStopping = false;
         BridgeService.ensureStarted(this);
@@ -224,7 +248,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
-        BridgeClient.setOnBinderReady(null);
+        BridgeClient.removeOnBinderReady(mBinderReadyCb);
         mHandler.removeCallbacks(mRefreshLoop);
         mHandler.removeCallbacks(mAutoPromptCheck);
     }
@@ -336,16 +360,13 @@ public class MainActivity extends Activity {
         });
         heroBtns.add(btnRebuild);
 
-        mBtnToggleMirror = makeActionBtn("📺 切换镜像 (当前:DeX)", 0xFF7C3AED);
-        mBtnToggleMirror.setOnClickListener(v -> {
-            int m = BridgeClient.toggleMirrorMode();
-            Toast.makeText(this,
-                    m == 1 ? "已切换为【原生镜像模式】" : "已切换为【ExtBridge DeX 独立桌面】",
-                    Toast.LENGTH_SHORT).show();
-            BridgeService.refreshFromReceiver(this);
-            refreshStatus(false);
-        });
-        heroBtns.add(mBtnToggleMirror);
+        mBtnModeDex = makeActionBtn("🖥 DeX 扩展", 0xFF0F766E);
+        mBtnModeDex.setOnClickListener(v -> switchDisplayMode(BridgeClient.MIRROR_MODE_DEX));
+        heroBtns.add(mBtnModeDex);
+
+        mBtnModeMirror = makeActionBtn("📺 原生镜像", 0xFF334155);
+        mBtnModeMirror.setOnClickListener(v -> switchDisplayMode(BridgeClient.MIRROR_MODE_MIRROR));
+        heroBtns.add(mBtnModeMirror);
 
         mBtnFullscreenPolicy = makeActionBtn("⛶ 桌面锁横屏:开", 0xFF0E7490);
         mBtnFullscreenPolicy.setOnClickListener(v -> {
@@ -357,6 +378,20 @@ public class MainActivity extends Activity {
             refreshStatus(false);
         });
         heroBtns.add(mBtnFullscreenPolicy);
+
+        TextView btnDockAutoHide = makeActionBtn(
+                BridgeService.isDockAutoHideEnabled(this) ? "📌 Dock自动隐藏:开" : "📌 Dock自动隐藏:关",
+                0xFF334155);
+        btnDockAutoHide.setOnClickListener(v -> {
+            boolean next = !BridgeService.isDockAutoHideEnabled(this);
+            BridgeService.setDockAutoHideEnabled(this, next);
+            ((TextView) v).setText(next ? "📌 Dock自动隐藏:开" : "📌 Dock自动隐藏:关");
+            Toast.makeText(this,
+                    next ? "已开启：进入应用后 Dock 自动隐藏（鼠标移到底边唤醒）"
+                         : "已关闭：Dock 栏将始终固定在屏幕底部",
+                    Toast.LENGTH_SHORT).show();
+        });
+        heroBtns.add(btnDockAutoHide);
 
         mBtnAppModes = makeActionBtn("🧩 分应用显示模式 (微信/夸克/红果…)", 0xFF0284C7);
         mBtnAppModes.setOnClickListener(v -> showAppModesDialog());
@@ -378,6 +413,142 @@ public class MainActivity extends Activity {
 
         addChipWrap(statusCard, heroBtns);
         root.addView(statusCard);
+
+        // Card 1.5: Native Mirror Sidebar & System AppWidget Card
+        LinearLayout mirrorSideCard = makeCard();
+        addCardHeader(mirrorSideCard, "原生镜像模式 · 画面对齐与融合智能边栏");
+        mTvMirrorSideInfo = new TextView(this);
+        mTvMirrorSideInfo.setText("主屏画面始终保持 100% 满高不缩小；推荐「主屏靠左」或「主屏靠右」，将两侧留白合并为一侧宽大融合边栏，集中显示电量/Wi-Fi/蓝牙/音频/媒体/日历与系统小组件。");
+        mTvMirrorSideInfo.setTextColor(0xFF94A3B8);
+        mTvMirrorSideInfo.setTextSize(12f);
+        mTvMirrorSideInfo.setPadding(0, 0, 0, 10);
+        mirrorSideCard.addView(mTvMirrorSideInfo);
+
+        String[] sideLabels = {
+                "🎞 纯黑居中\n无边栏 · 100%画面",
+                "◀ 靠左/靠上★\n右/下融合大边栏",
+                "▶ 靠右/靠下\n左/上融合大边栏",
+                "⏸ 主屏居中\n对称双信息条"
+        };
+        List<View> sideChipViews = new ArrayList<>();
+        mMirrorSideChips.clear();
+        for (int i = 0; i < sideLabels.length; i++) {
+            final int sm = i;
+            TextView chip = makeChip(sideLabels[i]);
+            chip.setOnClickListener(v -> {
+                int next = BridgeClient.setMirrorSideMode(sm);
+                Toast.makeText(this, "镜像布局已切换为【" + BridgeClient.mirrorSideModeLabel(next >= 0 ? next : sm) + "】", Toast.LENGTH_SHORT).show();
+                BridgeService.refreshFromReceiver(this);
+                refreshStatus(false);
+            });
+            mMirrorSideChips.add(chip);
+            sideChipViews.add(chip);
+        }
+        addChipWrap(mirrorSideCard, sideChipViews);
+
+        List<View> widgetBtns = new ArrayList<>();
+        TextView btnSideMirrorCtrl = makeActionBtn("🪞 副屏直控（镜像触控边栏）", 0xFF0284C7);
+        btnSideMirrorCtrl.setOnClickListener(v -> {
+            android.app.ActivityOptions o0 = android.app.ActivityOptions.makeBasic();
+            o0.setLaunchDisplayId(0);
+            startActivity(new Intent(this, SideControlActivity.class), o0.toBundle());
+        });
+        widgetBtns.add(btnSideMirrorCtrl);
+
+        mBtnMirrorLeftWidget = makeActionBtn("➕ 设置边栏小组件 1", 0xFF1E293B);
+        mBtnMirrorLeftWidget.setOnClickListener(v -> showMirrorWidgetMenu(0));
+        widgetBtns.add(mBtnMirrorLeftWidget);
+
+        mBtnMirrorRightWidget = makeActionBtn("➕ 设置边栏小组件 2", 0xFF1E293B);
+        mBtnMirrorRightWidget.setOnClickListener(v -> showMirrorWidgetMenu(1));
+        widgetBtns.add(mBtnMirrorRightWidget);
+        TextView widgetSpacer = new TextView(this);
+        widgetSpacer.setTextSize(4f);
+        mirrorSideCard.addView(widgetSpacer);
+        addChipWrap(mirrorSideCard, widgetBtns);
+
+        TextView presetHdr = new TextView(this);
+        presetHdr.setText("🎛 边栏预设信息卡配置（点击任一卡片可替换 / 上下调序 / 移除，共 "
+                + BridgeClient.MIRROR_PRESET_KEYS.length + " 种可选）：");
+        presetHdr.setTextColor(0xFFCBD5E1);
+        presetHdr.setTextSize(12f);
+        presetHdr.setPadding(0, 12, 0, 6);
+        mirrorSideCard.addView(presetHdr);
+
+        mMirrorPresetWrap = new LinearLayout(this);
+        mMirrorPresetWrap.setOrientation(LinearLayout.VERTICAL);
+        mirrorSideCard.addView(mMirrorPresetWrap);
+
+        List<View> presetActBtns = new ArrayList<>();
+        TextView btnAddPreset = makeActionBtn("➕ 添加预设卡", 0xFF0F766E);
+        btnAddPreset.setOnClickListener(v -> showAddMirrorPresetDialog());
+        presetActBtns.add(btnAddPreset);
+        TextView btnEditMemo = makeActionBtn("📝 编辑便签文字", 0xFF1E293B);
+        btnEditMemo.setOnClickListener(v -> showEditMirrorMemoDialog());
+        presetActBtns.add(btnEditMemo);
+        TextView btnResetPresets = makeActionBtn("↺ 恢复默认卡片", 0xFF334155);
+        btnResetPresets.setOnClickListener(v -> {
+            BridgeService.setMirrorPresetSlots(this, null);
+            refreshMirrorSideCardUi();
+            Toast.makeText(this, "已恢复默认 7 个边栏预设信息卡", Toast.LENGTH_SHORT).show();
+        });
+        presetActBtns.add(btnResetPresets);
+        TextView pSp = new TextView(this);
+        pSp.setTextSize(4f);
+        mirrorSideCard.addView(pSp);
+        addChipWrap(mirrorSideCard, presetActBtns);
+        refreshMirrorPresetChips();
+
+        TextView themeHdr = new TextView(this);
+        themeHdr.setText("🎨 副屏背景配色与文字主题（即时生效）：");
+        themeHdr.setTextColor(0xFFCBD5E1);
+        themeHdr.setTextSize(12f);
+        themeHdr.setPadding(0, 14, 0, 6);
+        mirrorSideCard.addView(themeHdr);
+
+        mMirrorThemeChips.clear();
+        List<View> themeViews = new ArrayList<>();
+        for (int i = 0; i < BridgeClient.MIRROR_THEME_KEYS.length; i++) {
+            final String tKey = BridgeClient.MIRROR_THEME_KEYS[i];
+            final String tTitle = BridgeClient.MIRROR_THEME_TITLES[i];
+            TextView tChip = makeChip(tTitle);
+            tChip.setOnClickListener(v -> {
+                if ("custom".equals(tKey)) {
+                    showCustomMirrorColorDialog();
+                } else {
+                    BridgeService.setMirrorThemeId(this, tKey);
+                    refreshMirrorSideCardUi();
+                    Toast.makeText(this, "已切换副屏配色：" + tTitle, Toast.LENGTH_SHORT).show();
+                }
+            });
+            mMirrorThemeChips.add(tChip);
+            themeViews.add(tChip);
+        }
+        addChipWrap(mirrorSideCard, themeViews);
+
+        TextView speedHdr = new TextView(this);
+        speedHdr.setText("🖱 副屏鼠标跨越移动灵敏度（带加速度防迟滞）：");
+        speedHdr.setTextColor(0xFFCBD5E1);
+        speedHdr.setTextSize(12f);
+        speedHdr.setPadding(0, 14, 0, 6);
+        mirrorSideCard.addView(speedHdr);
+
+        mMirrorSpeedChips.clear();
+        List<View> speedViews = new ArrayList<>();
+        for (int i = 0; i < BridgeClient.MIRROR_SPEED_LABELS.length; i++) {
+            final int sIdx = i;
+            TextView sChip = makeChip(BridgeClient.MIRROR_SPEED_LABELS[i]);
+            sChip.setOnClickListener(v -> {
+                BridgeService.setMirrorCursorSpeedIdx(this, sIdx);
+                refreshMirrorSideCardUi();
+                Toast.makeText(this, "副屏鼠标灵敏度：" + BridgeClient.MIRROR_SPEED_LABELS[sIdx], Toast.LENGTH_SHORT).show();
+            });
+            mMirrorSpeedChips.add(sChip);
+            speedViews.add(sChip);
+        }
+        addChipWrap(mirrorSideCard, speedViews);
+
+        root.addView(mirrorSideCard);
 
         // Card 2: Resolution + Custom
         LinearLayout resCard = makeCard();
@@ -480,7 +651,7 @@ public class MainActivity extends Activity {
 
         // Card 3: DPI + Refresh Rate
         LinearLayout rateCard = makeCard();
-        addCardHeader(rateCard, "界面缩放 DPI (仅调整桌面图标与文字大小)");
+        addCardHeader(rateCard, "界面缩放 DPI (数值越小，外接屏界面/图标越紧凑小巧)");
         List<View> dpiViews = new ArrayList<>();
         mDpiChips.clear();
         for (int i = 0; i < DPI_PRESETS.length; i++) {
@@ -488,12 +659,34 @@ public class MainActivity extends Activity {
             TextView chip = makeChip(DPI_LABELS[i]);
             chip.setOnClickListener(v -> {
                 mSelDpi = dpi;
+                if (mEdDpi != null) mEdDpi.setText(String.valueOf(dpi));
                 updateSelectionStyles();
             });
             mDpiChips.add(chip);
             dpiViews.add(chip);
         }
         addChipWrap(rateCard, dpiViews);
+
+        LinearLayout customDpiRow = new LinearLayout(this);
+        customDpiRow.setOrientation(LinearLayout.HORIZONTAL);
+        customDpiRow.setGravity(Gravity.CENTER_VERTICAL);
+        customDpiRow.setPadding(0, 10, 0, 0);
+
+        TextView customDpiLbl = new TextView(this);
+        customDpiLbl.setText("自定义 DPI (80~640): ");
+        customDpiLbl.setTextColor(0xFF94A3B8);
+        customDpiLbl.setTextSize(13f);
+        customDpiRow.addView(customDpiLbl);
+
+        mEdDpi = makeNumBox(String.valueOf(mSelDpi));
+        customDpiRow.addView(mEdDpi);
+
+        TextView customDpiHint = new TextView(this);
+        customDpiHint.setText("  填完点下方「应用」即可生效");
+        customDpiHint.setTextColor(0xFF64748B);
+        customDpiHint.setTextSize(12f);
+        customDpiRow.addView(customDpiHint);
+        rateCard.addView(customDpiRow);
 
         mBtnToggleEdid = new TextView(this);
         mBtnToggleEdid.setText("▸ 高级：外接物理信号与帧率尝试 (受设备固件限制)");
@@ -562,6 +755,7 @@ public class MainActivity extends Activity {
         btnPhoneTabletPreset.setOnClickListener(v -> {
             mSelW = 1920; mSelH = 1080; mSelDpi = 240; mSelFps = 60f; mSelRot = 0; mSelPhysModeId = -1;
             mEdW.setText("1920"); mEdH.setText("1080");
+            if (mEdDpi != null) mEdDpi.setText("240");
             updateSelectionStyles();
             applyChosenConfig();
         });
@@ -575,8 +769,9 @@ public class MainActivity extends Activity {
         btnApply.setOnClickListener(v -> applyChosenConfig());
         TextView btnReset = makeActionBtn("↺ 恢复推荐默认", 0xFF334155);
         btnReset.setOnClickListener(v -> {
-            mSelW = 2560; mSelH = 1440; mSelDpi = 240; mSelFps = 60f; mSelRot = 0; mSelPhysModeId = -1;
+            mSelW = 2560; mSelH = 1440; mSelDpi = 160; mSelFps = 60f; mSelRot = 0; mSelPhysModeId = -1;
             mEdW.setText("2560"); mEdH.setText("1440");
+            if (mEdDpi != null) mEdDpi.setText("160");
             updateSelectionStyles();
             applyChosenConfig();
         });
@@ -637,44 +832,58 @@ public class MainActivity extends Activity {
                 mSelH = ch;
             }
         } catch (Throwable ignored) {}
+        try {
+            if (mEdDpi != null) {
+                int cd = Integer.parseInt(mEdDpi.getText().toString().trim());
+                if (cd >= 80 && cd <= 640) {
+                    mSelDpi = cd;
+                }
+            }
+        } catch (Throwable ignored) {}
     }
 
     private void applyChosenConfig() {
         syncCustomWHFields();
-
-        BridgeClient.ApplyResult res = BridgeClient.applyConfigDetailed(mSelW, mSelH, mSelDpi, mSelFps, mSelPhysModeId, mSelRot);
-        if (!res.ok) {
-            if (mTvPhysNotice != null) mTvPhysNotice.setVisibility(View.GONE);
-            Toast.makeText(this, "应用失败，请确认 ExtBridge 后台服务正在运行", Toast.LENGTH_SHORT).show();
-        } else if (res.physResult == -1 && res.physW > 0) {
-            String hint = "ℹ️ 虚拟桌面已切换为 " + mSelW + "×" + mSelH + "；显示器 EDID 不支持 "
-                    + Math.round(mSelFps) + "Hz，外接物理输出保持 " + res.physW + "×" + res.physH
-                    + "@" + Math.round(res.physFps) + "Hz，已自动缩放适配。";
-            if (mTvPhysNotice != null) {
-                mTvPhysNotice.setText(hint);
-                mTvPhysNotice.setVisibility(View.VISIBLE);
-            }
-            Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
-        } else if ((res.physResult == -2 || res.physResult == -3) && res.physW > 0) {
-            String hint = "ℹ️ 虚拟桌面已切换为 " + mSelW + "×" + mSelH + "；当前系统固件锁定外接物理输出为 "
-                    + res.physW + "×" + res.physH + "@" + Math.round(res.physFps) + "Hz，已自动通过硬件缩放铺满。";
-            if (mTvPhysNotice != null) {
-                mTvPhysNotice.setText(hint);
-                mTvPhysNotice.setVisibility(View.VISIBLE);
-            }
-            Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
-        } else {
-            if (mTvPhysNotice != null) mTvPhysNotice.setVisibility(View.GONE);
-            String physNote = (res.physW > 0)
-                    ? (" | 物理:" + res.physW + "×" + res.physH + "@" + Math.round(res.physFps) + "Hz")
-                    : "";
-            Toast.makeText(this,
-                    "已应用虚拟渲染：" + mSelW + "×" + mSelH + " · " + BridgeClient.rotationLabel(mSelRot)
-                            + " · " + mSelDpi + "dpi" + physNote,
-                    Toast.LENGTH_SHORT).show();
-        }
-        BridgeService.refreshFromReceiver(this);
-        refreshStatus(false);
+        final int w = mSelW, h = mSelH, dpi = mSelDpi, physId = mSelPhysModeId, rot = mSelRot;
+        final float fps = mSelFps;
+        new Thread(() -> {
+            final BridgeClient.ApplyResult res = BridgeClient.applyConfigDetailed(w, h, dpi, fps, physId, rot);
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (!res.ok) {
+                    if (mTvPhysNotice != null) mTvPhysNotice.setVisibility(View.GONE);
+                    Toast.makeText(this, "应用失败，请确认 ExtBridge 后台服务正在运行", Toast.LENGTH_SHORT).show();
+                } else if (res.physResult == -1 && res.physW > 0) {
+                    String hint = "ℹ️ 虚拟桌面已切换为 " + w + "×" + h + "；显示器 EDID 不支持 "
+                            + Math.round(fps) + "Hz，外接物理输出保持 " + res.physW + "×" + res.physH
+                            + "@" + Math.round(res.physFps) + "Hz，已自动缩放适配。";
+                    if (mTvPhysNotice != null) {
+                        mTvPhysNotice.setText(hint);
+                        mTvPhysNotice.setVisibility(View.VISIBLE);
+                    }
+                    Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
+                } else if ((res.physResult == -2 || res.physResult == -3) && res.physW > 0) {
+                    String hint = "ℹ️ 虚拟桌面已切换为 " + w + "×" + h + "；当前系统固件锁定外接物理输出为 "
+                            + res.physW + "×" + res.physH + "@" + Math.round(res.physFps) + "Hz，已自动通过硬件缩放铺满。";
+                    if (mTvPhysNotice != null) {
+                        mTvPhysNotice.setText(hint);
+                        mTvPhysNotice.setVisibility(View.VISIBLE);
+                    }
+                    Toast.makeText(this, hint, Toast.LENGTH_LONG).show();
+                } else {
+                    if (mTvPhysNotice != null) mTvPhysNotice.setVisibility(View.GONE);
+                    String physNote = (res.physW > 0)
+                            ? (" | 物理:" + res.physW + "×" + res.physH + "@" + Math.round(res.physFps) + "Hz")
+                            : "";
+                    Toast.makeText(this,
+                            "已应用虚拟渲染：" + w + "×" + h + " · " + BridgeClient.rotationLabel(rot)
+                                    + " · " + dpi + "dpi" + physNote,
+                            Toast.LENGTH_SHORT).show();
+                }
+                BridgeService.refreshFromReceiver(this);
+                refreshStatus(false);
+            });
+        }).start();
     }
 
     private void refreshStatus(boolean syncSelection) {
@@ -684,7 +893,7 @@ public class MainActivity extends Activity {
             mTvStatusTitle.setTextColor(0xFFF87171);
             mTvStatusDetail.setText("请通过「Root 一键激活」「本机无线调试」或「电脑 ADB 命令」一键激活，无需手动传输任何脚本。");
             mBtnToggleInput.setText("⇄ 切换键鼠方向");
-            if (mBtnToggleMirror != null) mBtnToggleMirror.setText("📺 切换模式 (镜像/DeX)");
+            updateModeButtonsUi(BridgeClient.MIRROR_MODE_DEX, false);
             if (mBtnFullscreenPolicy != null) mBtnFullscreenPolicy.setText("⛶ 全屏策略");
             if (mBtnActivate != null) mBtnActivate.setVisibility(View.VISIBLE);
         } else {
@@ -705,6 +914,7 @@ public class MainActivity extends Activity {
                 mSelRot = st.virtRot;
                 mEdW.setText(String.valueOf(mSelW));
                 mEdH.setText(String.valueOf(mSelH));
+                if (mEdDpi != null) mEdDpi.setText(String.valueOf(mSelDpi));
                 updateSelectionStyles();
             } else if (syncSelection || (mEdW != null && !mEdW.hasFocus() && mEdH != null && !mEdH.hasFocus()
                     && (mSelRot != st.virtRot || mSelW != st.virtW || mSelH != st.virtH))) {
@@ -715,14 +925,15 @@ public class MainActivity extends Activity {
                     mSelRot = st.virtRot;
                     mEdW.setText(String.valueOf(mSelW));
                     mEdH.setText(String.valueOf(mSelH));
+                    if (mEdDpi != null && !mEdDpi.hasFocus()) mEdDpi.setText(String.valueOf(st.virtDpi));
                     updateSelectionStyles();
                 }
             }
             if (st.mirrorMode == 1 && st.extId > 0) {
                 mTvStatusTitle.setText("● 原生镜像模式 · 物理 Display #" + st.extId);
                 mTvStatusTitle.setTextColor(0xFFA78BFA);
-                mTvStatusDetail.setText("外接屏正在原生同步手机/平板主屏（ExtBridge DeX 独立桌面已暂停）。\n"
-                        + "点击上方「🖥 切回 DeX 模式」或下拉通知栏按钮可随时切回独立大屏。\n"
+                mTvStatusDetail.setText("外接屏正在原生同步手机/平板主屏（独立桌面已暂停）。\n"
+                        + "点击上方「🖥 DeX 扩展」或下拉通知栏按钮可随时切回。\n"
                         + "外接物理输出：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz");
             } else if (st.vdId > 0) {
                 mTvStatusTitle.setText("● 已连接扩展屏 · 物理 Display #" + st.extId + " -> 扩展 Display #" + st.vdId);
@@ -731,7 +942,7 @@ public class MainActivity extends Activity {
                 String injectWarn = st.injectStatus == -1
                         ? "\n⚠ 输入注入被系统拦截 (INJECT_EVENTS)：请前往手机「开发者选项」开启「USB 调试（安全设置）/ 允许模拟点击」"
                         : "";
-                mTvStatusDetail.setText("当前键鼠控制：【" + target + "】  (检测到外接设备 " + st.extInputCnt + " 个)\n"
+                mTvStatusDetail.setText("输出模式：【" + BridgeClient.mirrorModeLabel(st.mirrorMode) + "】 | 键鼠：【" + target + "】 (外接设备 " + st.extInputCnt + " 个)\n"
                         + "虚拟渲染画布：" + st.virtW + "×" + st.virtH + " (" + BridgeClient.rotationLabel(st.virtRot) + ") @ " + st.virtDpi + "dpi · 目标 " + Math.round(st.virtFps) + "Hz (" + st.renderMode + ") · 锁向:" + (st.fullscreenPolicy == 1 ? "开" : "关") + "\n"
                         + "外接物理输出：" + st.physW + "×" + st.physH + " @ " + String.format("%.1f", st.physFps) + "Hz (系统/EDID协商)"
                         + injectWarn);
@@ -739,12 +950,10 @@ public class MainActivity extends Activity {
                 mTvStatusTitle.setText("● 后台服务待机中 · 请插入 Type-C 外接显示器");
                 mTvStatusTitle.setTextColor(0xFFFBBF24);
                 mTvStatusDetail.setText("已保存目标预设：" + st.virtW + "×" + st.virtH + " (" + BridgeClient.rotationLabel(st.virtRot) + ") @ " + st.virtDpi + "dpi · " + Math.round(st.virtFps) + "Hz"
-                        + (st.mirrorMode == 1 ? " (当前开关为原生镜像模式)" : ""));
+                        + " (模式:" + BridgeClient.mirrorModeLabel(st.mirrorMode) + ")");
             }
             mBtnToggleInput.setText(st.inputToExt == 1 ? "⇄ 键鼠切回平板 (当前:扩展)" : "⇄ 键鼠切回扩展 (当前:平板)");
-            if (mBtnToggleMirror != null) {
-                mBtnToggleMirror.setText(st.mirrorMode == 1 ? "🖥 切回 DeX 模式 (当前:镜像)" : "📺 切换镜像模式 (当前:DeX)");
-            }
+            updateModeButtonsUi(st.mirrorMode, true);
             if (mBtnFullscreenPolicy != null) {
                 mBtnFullscreenPolicy.setText(st.fullscreenPolicy == 1 ? "⛶ 桌面锁横屏:开" : "⛶ 桌面锁横屏:关");
             }
@@ -834,7 +1043,7 @@ public class MainActivity extends Activity {
             if (pw > 0 && ph > 0) { cw = pw; ch = ph; }
         } catch (Throwable ignored) {}
         int minPx = Math.min(cw, ch);
-        int swDp = Math.round(minPx * 160f / Math.max(120, mSelDpi));
+        int swDp = Math.round(minPx * 160f / Math.max(80, mSelDpi));
         boolean tabletLayout = swDp >= 600;
         mTvSwInfo.setText("当前等效最小宽度 sw" + swDp + "dp → "
                 + (tabletLayout ? "✅ 已达平板大屏阈值 (sw≥600dp，视频软件优先横向大屏)"
@@ -903,6 +1112,445 @@ public class MainActivity extends Activity {
         bg.setStroke(1, 0x3364748B);
         tv.setBackground(bg);
         return tv;
+    }
+
+    private void switchDisplayMode(int mode) {
+        int m = BridgeClient.setMirrorMode(mode);
+        Toast.makeText(this, "已切换为【" + BridgeClient.mirrorModeLabel(m >= 0 ? m : mode) + "】", Toast.LENGTH_SHORT).show();
+        BridgeService.refreshFromReceiver(this);
+        refreshStatus(false);
+    }
+
+    private void updateModeButtonsUi(int mirrorMode, boolean connected) {
+        setActionBtnBg(mBtnModeDex, (connected && mirrorMode == BridgeClient.MIRROR_MODE_DEX) ? 0xFF0F766E : 0xFF334155);
+        setActionBtnBg(mBtnModeMirror, (connected && mirrorMode == BridgeClient.MIRROR_MODE_MIRROR) ? 0xFF7C3AED : 0xFF334155);
+        refreshMirrorSideCardUi();
+    }
+
+    private void refreshMirrorSideCardUi() {
+        int activeSide = 1;
+        BridgeClient.Status st = BridgeClient.getStatus();
+        if (st.connected) activeSide = st.mirrorSideMode;
+        for (int i = 0; i < mMirrorSideChips.size(); i++) {
+            boolean sel = (i == activeSide);
+            TextView tv = mMirrorSideChips.get(i);
+            GradientDrawable bg = (GradientDrawable) tv.getBackground();
+            bg.setColor(sel ? 0xFF4C1D95 : 0xFF1E293B);
+            bg.setStroke(sel ? 2 : 1, sel ? 0xFFA78BFA : 0x3364748B);
+            tv.setTextColor(sel ? Color.WHITE : 0xFFCBD5E1);
+        }
+        updateMirrorWidgetBtnLabel(mBtnMirrorLeftWidget, 0, "小组件1");
+        updateMirrorWidgetBtnLabel(mBtnMirrorRightWidget, 1, "小组件2");
+        refreshMirrorPresetChips();
+
+        String activeTheme = BridgeService.getMirrorThemeId(this);
+        for (int i = 0; i < mMirrorThemeChips.size() && i < BridgeClient.MIRROR_THEME_KEYS.length; i++) {
+            boolean sel = BridgeClient.MIRROR_THEME_KEYS[i].equals(activeTheme);
+            TextView tv = mMirrorThemeChips.get(i);
+            GradientDrawable bg = (GradientDrawable) tv.getBackground();
+            bg.setColor(sel ? 0xFF0369A1 : 0xFF1E293B);
+            bg.setStroke(sel ? 2 : 1, sel ? 0xFF38BDF8 : 0x3364748B);
+            tv.setTextColor(sel ? Color.WHITE : 0xFFCBD5E1);
+        }
+        int speedIdx = BridgeService.getMirrorCursorSpeedIdx(this);
+        for (int i = 0; i < mMirrorSpeedChips.size(); i++) {
+            boolean sel = (i == speedIdx);
+            TextView tv = mMirrorSpeedChips.get(i);
+            GradientDrawable bg = (GradientDrawable) tv.getBackground();
+            bg.setColor(sel ? 0xFF0F766E : 0xFF1E293B);
+            bg.setStroke(sel ? 2 : 1, sel ? 0xFF2DD4BF : 0x3364748B);
+            tv.setTextColor(sel ? Color.WHITE : 0xFFCBD5E1);
+        }
+    }
+
+    private void refreshMirrorPresetChips() {
+        if (mMirrorPresetWrap == null) return;
+        mMirrorPresetWrap.removeAllViews();
+        mMirrorPresetChips.clear();
+        List<String> slots = BridgeService.getMirrorPresetSlots(this);
+        List<View> chips = new ArrayList<>();
+        for (int i = 0; i < slots.size(); i++) {
+            final int idx = i;
+            final String key = slots.get(i);
+            TextView chip = makeChip((idx + 1) + ". " + BridgeClient.mirrorPresetTitle(key) + " ▾");
+            GradientDrawable bg = (GradientDrawable) chip.getBackground();
+            bg.setColor(0xFF1E293B);
+            bg.setStroke(1, 0x4438BDF8);
+            chip.setTextColor(0xFFE2E8F0);
+            chip.setOnClickListener(v -> showPresetSlotActionDialog(idx, key));
+            mMirrorPresetChips.add(chip);
+            chips.add(chip);
+        }
+        addChipWrap(mMirrorPresetWrap, chips);
+    }
+
+    private void showPresetSlotActionDialog(int idx, String key) {
+        List<String> slots = BridgeService.getMirrorPresetSlots(this);
+        List<String> actions = new ArrayList<>();
+        actions.add("🔄 替换为其他预设组件…");
+        if (idx > 0) actions.add("⬆ 上移一位");
+        if (idx < slots.size() - 1) actions.add("⬇ 下移一位");
+        if ("memo".equals(key)) actions.add("📝 编辑快捷便签文字…");
+        if (slots.size() > 1) actions.add("🗑 移除此卡片");
+
+        new AlertDialog.Builder(this)
+                .setTitle("第 " + (idx + 1) + " 个卡片：" + BridgeClient.mirrorPresetTitle(key))
+                .setItems(actions.toArray(new String[0]), (d, which) -> {
+                    String act = actions.get(which);
+                    if (act.startsWith("🔄")) {
+                        showReplaceMirrorPresetDialog(idx);
+                    } else if (act.startsWith("⬆") && idx > 0) {
+                        String cur = slots.remove(idx);
+                        slots.add(idx - 1, cur);
+                        BridgeService.setMirrorPresetSlots(this, slots);
+                        refreshMirrorPresetChips();
+                    } else if (act.startsWith("⬇") && idx < slots.size() - 1) {
+                        String cur = slots.remove(idx);
+                        slots.add(idx + 1, cur);
+                        BridgeService.setMirrorPresetSlots(this, slots);
+                        refreshMirrorPresetChips();
+                    } else if (act.startsWith("📝")) {
+                        showEditMirrorMemoDialog();
+                    } else if (act.startsWith("🗑") && slots.size() > 1) {
+                        slots.remove(idx);
+                        BridgeService.setMirrorPresetSlots(this, slots);
+                        refreshMirrorPresetChips();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showReplaceMirrorPresetDialog(int replaceIdx) {
+        String[] labels = new String[BridgeClient.MIRROR_PRESET_KEYS.length];
+        for (int i = 0; i < BridgeClient.MIRROR_PRESET_KEYS.length; i++) {
+            labels[i] = BridgeClient.MIRROR_PRESET_TITLES[i] + "\n   " + BridgeClient.MIRROR_PRESET_DESCS[i];
+        }
+        new AlertDialog.Builder(this)
+                .setTitle(replaceIdx >= 0 ? "选择要替换成的预设组件" : "添加边栏预设信息卡")
+                .setItems(labels, (d, which) -> {
+                    String picked = BridgeClient.MIRROR_PRESET_KEYS[which];
+                    List<String> slots = BridgeService.getMirrorPresetSlots(this);
+                    if (replaceIdx >= 0 && replaceIdx < slots.size()) {
+                        slots.set(replaceIdx, picked);
+                    } else {
+                        slots.add(picked);
+                    }
+                    BridgeService.setMirrorPresetSlots(this, slots);
+                    refreshMirrorPresetChips();
+                    Toast.makeText(this, "已更新边栏预设组件：" + BridgeClient.mirrorPresetTitle(picked), Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showAddMirrorPresetDialog() {
+        showReplaceMirrorPresetDialog(-1);
+    }
+
+    private void showEditMirrorMemoDialog() {
+        EditText ed = new EditText(this);
+        ed.setText(BridgeService.getMirrorMemoText(this));
+        ed.setTextColor(Color.WHITE);
+        ed.setHint("输入要在外屏边栏显示的便签 / 待办 / 提醒…");
+        ed.setMinLines(3);
+        ed.setPadding(36, 24, 36, 24);
+        new AlertDialog.Builder(this)
+                .setTitle("编辑「📝 快捷桌面便签」内容")
+                .setView(ed)
+                .setPositiveButton("保存并同步", (d, w) -> {
+                    BridgeService.setMirrorMemoText(this, ed.getText().toString().trim());
+                    Toast.makeText(this, "便签内容已同步到外接屏边栏", Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void updateMirrorWidgetBtnLabel(TextView btn, int slot, String prefix) {
+        if (btn == null) return;
+        int wid = BridgeService.getMirrorWidgetId(this, slot);
+        if (wid > 0) {
+            try {
+                AppWidgetProviderInfo info = AppWidgetManager.getInstance(this).getAppWidgetInfo(wid);
+                if (info != null) {
+                    String lbl = String.valueOf(info.loadLabel(getPackageManager()));
+                    int rIdx = BridgeService.getMirrorWidgetRatio(this, slot);
+                    String rLbl = (rIdx > 0 && rIdx < BridgeClient.MIRROR_WIDGET_RATIO_LABELS.length)
+                            ? (" [" + BridgeClient.MIRROR_WIDGET_RATIO_LABELS[rIdx] + "]") : "";
+                    btn.setText("🧩 " + prefix + ": " + lbl + rLbl);
+                    setActionBtnBg(btn, 0xFF0369A1);
+                    return;
+                }
+            } catch (Throwable ignored) {}
+        }
+        btn.setText("➕ 设置" + prefix);
+        setActionBtnBg(btn, 0xFF334155);
+    }
+
+    private void showCustomMirrorColorDialog() {
+        final String[] colorNames = {
+                "午夜藏青 (#0B132B)", "深海孔雀绿 (#072227)", "暗夜酒红 (#2B0B18)",
+                "钛空深灰 (#1C1E26)", "抹茶雅白 (#E8F3EA)", "暖杏米白 (#FBF6EE)"
+        };
+        final int[] colorVals = {
+                0xFF0B132B, 0xFF072227, 0xFF2B0B18, 0xFF1C1E26, 0xFFE8F3EA, 0xFFFBF6EE
+        };
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(36, 20, 36, 12);
+
+        TextView tip = new TextView(this);
+        tip.setText("输入十六进制颜色代码（如 #1A2B3C），或点按下方快捷色板：");
+        tip.setTextColor(0xFFCBD5E1);
+        tip.setTextSize(12.5f);
+        box.addView(tip);
+
+        final EditText ed = new EditText(this);
+        int curBg = BridgeService.getMirrorCustomBg(this);
+        ed.setText(String.format(java.util.Locale.US, "#%06X", (0x00FFFFFF & curBg)));
+        ed.setTextColor(Color.WHITE);
+        ed.setSingleLine(true);
+        box.addView(ed);
+
+        for (int i = 0; i < colorNames.length; i++) {
+            final int cVal = colorVals[i];
+            TextView sw = makeChip("● " + colorNames[i]);
+            sw.setOnClickListener(v -> ed.setText(String.format(java.util.Locale.US, "#%06X", (0x00FFFFFF & cVal))));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = 10;
+            box.addView(sw, lp);
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle("🎨 自定义副屏背景颜色")
+                .setView(box)
+                .setPositiveButton("应用颜色", (d, w) -> {
+                    String raw = ed.getText().toString().trim();
+                    if (!raw.startsWith("#")) raw = "#" + raw;
+                    try {
+                        int parsed = Color.parseColor(raw);
+                        BridgeService.setMirrorCustomBg(this, parsed);
+                        refreshMirrorSideCardUi();
+                        Toast.makeText(this, "已应用自定义副屏颜色：" + raw, Toast.LENGTH_SHORT).show();
+                    } catch (Throwable ignored) {
+                        Toast.makeText(this, "颜色格式无效，请输入 #RRGGBB", Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .show();
+    }
+
+    private void showMirrorWidgetMenu(int slot) {
+        String sideName = (slot == 0) ? "左侧边栏" : "右侧边栏";
+        int curId = BridgeService.getMirrorWidgetId(this, slot);
+        if (curId > 0) {
+            int curRatio = BridgeService.getMirrorWidgetRatio(this, slot);
+            String curRatioLbl = BridgeClient.MIRROR_WIDGET_RATIO_LABELS[curRatio];
+            new AlertDialog.Builder(this)
+                    .setTitle(sideName + "系统小组件")
+                    .setItems(new String[]{
+                            "🔄 更换系统小组件…",
+                            "📐 调整显示比例（当前：" + curRatioLbl + "）…",
+                            "🗑 清除已绑定的小组件"
+                    }, (d, which) -> {
+                        if (which == 0) {
+                            openMirrorWidgetPicker(slot);
+                        } else if (which == 1) {
+                            new AlertDialog.Builder(this)
+                                    .setTitle("选择小组件显示比例（防止异常拉伸）")
+                                    .setSingleChoiceItems(BridgeClient.MIRROR_WIDGET_RATIO_LABELS, curRatio, (dd, rWhich) -> {
+                                        BridgeService.setMirrorWidgetRatio(this, slot, rWhich);
+                                        refreshMirrorSideCardUi();
+                                        dd.dismiss();
+                                        Toast.makeText(this, "小组件比例已设为：" + BridgeClient.MIRROR_WIDGET_RATIO_LABELS[rWhich], Toast.LENGTH_SHORT).show();
+                                    })
+                                    .setNegativeButton("取消", null)
+                                    .show();
+                        } else {
+                            BridgeService.setMirrorWidgetId(this, slot, -1);
+                            refreshMirrorSideCardUi();
+                            Toast.makeText(this, "已清除" + sideName + "小组件", Toast.LENGTH_SHORT).show();
+                        }
+                    })
+                    .setNegativeButton("取消", null)
+                    .show();
+        } else {
+            openMirrorWidgetPicker(slot);
+        }
+    }
+
+    private void openMirrorWidgetPicker(int slot) {
+        new Thread(() -> {
+            BridgeClient.ensureAppWidgetPermission();
+            AppWidgetManager awm = AppWidgetManager.getInstance(this);
+            List<AppWidgetProviderInfo> providers = awm.getInstalledProviders();
+            PackageManager pm = getPackageManager();
+            final List<AppWidgetProviderInfo> sorted = new ArrayList<>();
+            if (providers != null) sorted.addAll(providers);
+            Collections.sort(sorted, (a, b) -> {
+                String la = String.valueOf(a.loadLabel(pm));
+                String lb = String.valueOf(b.loadLabel(pm));
+                return la.compareToIgnoreCase(lb);
+            });
+            runOnUiThread(() -> {
+                if (sorted.isEmpty()) {
+                    Toast.makeText(this, "未检测到可用的系统小组件", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                ScrollView sv = new ScrollView(this);
+                LinearLayout list = new LinearLayout(this);
+                list.setOrientation(LinearLayout.VERTICAL);
+                list.setPadding(24, 16, 24, 16);
+                sv.addView(list);
+
+                final AlertDialog dlg = new AlertDialog.Builder(this)
+                        .setTitle("选择要嵌入" + (slot == 0 ? "左栏" : "右栏") + "的系统小组件")
+                        .setView(sv)
+                        .setNegativeButton("取消", null)
+                        .create();
+
+                for (AppWidgetProviderInfo info : sorted) {
+                    LinearLayout row = new LinearLayout(this);
+                    row.setOrientation(LinearLayout.HORIZONTAL);
+                    row.setGravity(Gravity.CENTER_VERTICAL);
+                    row.setPadding(16, 14, 16, 14);
+                    GradientDrawable bg = new GradientDrawable();
+                    bg.setColor(0xFF1E293B);
+                    bg.setCornerRadius(14f);
+                    row.setBackground(bg);
+
+                    ImageView iv = new ImageView(this);
+                    try {
+                        Drawable ic = info.loadIcon(this, DisplayMetrics.DENSITY_HIGH);
+                        if (ic == null) ic = pm.getApplicationIcon(info.provider.getPackageName());
+                        iv.setImageDrawable(ic);
+                    } catch (Throwable ignored) {}
+                    LinearLayout.LayoutParams ivLp = new LinearLayout.LayoutParams(64, 64);
+                    ivLp.rightMargin = 18;
+                    row.addView(iv, ivLp);
+
+                    LinearLayout txt = new LinearLayout(this);
+                    txt.setOrientation(LinearLayout.VERTICAL);
+                    TextView tvTitle = new TextView(this);
+                    tvTitle.setText(info.loadLabel(pm));
+                    tvTitle.setTextColor(Color.WHITE);
+                    tvTitle.setTextSize(14f);
+                    tvTitle.getPaint().setFakeBoldText(true);
+                    txt.addView(tvTitle);
+
+                    String appLbl = info.provider.getPackageName();
+                    try {
+                        appLbl = pm.getApplicationLabel(pm.getApplicationInfo(appLbl, 0)).toString();
+                    } catch (Throwable ignored) {}
+                    TextView tvSub = new TextView(this);
+                    tvSub.setText(appLbl + " · " + info.minWidth + "×" + info.minHeight + "dp");
+                    tvSub.setTextColor(0xFF94A3B8);
+                    tvSub.setTextSize(11.5f);
+                    txt.addView(tvSub);
+                    row.addView(txt, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+                    row.setOnClickListener(v -> {
+                        dlg.dismiss();
+                        bindChosenMirrorWidget(slot, info);
+                    });
+
+                    LinearLayout.LayoutParams rLp = new LinearLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+                    rLp.bottomMargin = 10;
+                    list.addView(row, rLp);
+                }
+                dlg.show();
+            });
+        }).start();
+    }
+
+    private void bindChosenMirrorWidget(int slot, AppWidgetProviderInfo info) {
+        AppWidgetHost host = new AppWidgetHost(getApplicationContext(), BridgeService.MIRROR_WIDGET_HOST_ID);
+        AppWidgetManager awm = AppWidgetManager.getInstance(this);
+        int id = host.allocateAppWidgetId();
+        boolean bound = false;
+        try {
+            bound = awm.bindAppWidgetIdIfAllowed(id, info.provider);
+        } catch (Throwable ignored) {}
+        if (bound) {
+            finalizeOrConfigureWidget(slot, id, info, host);
+        } else {
+            mPendingWidgetSlot = slot;
+            mPendingWidgetId = id;
+            try {
+                Intent intent = new Intent(AppWidgetManager.ACTION_APPWIDGET_BIND);
+                intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id);
+                intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_PROVIDER, info.provider);
+                startActivityForResult(intent, REQ_BIND_APPWIDGET);
+            } catch (Throwable t) {
+                try { host.deleteAppWidgetId(id); } catch (Throwable ignored) {}
+                Toast.makeText(this, "该系统小组件授权绑定失败（需激活守护进程或手动授权）", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
+    private void finalizeOrConfigureWidget(int slot, int widgetId, AppWidgetProviderInfo info, AppWidgetHost host) {
+        boolean needConf = (info != null && info.configure != null);
+        if (needConf && Build.VERSION.SDK_INT >= 28) {
+            if ((info.widgetFeatures & AppWidgetProviderInfo.WIDGET_FEATURE_CONFIGURATION_OPTIONAL) != 0) {
+                needConf = false;
+            }
+        }
+        if (needConf) {
+            mPendingWidgetSlot = slot;
+            mPendingWidgetId = widgetId;
+            try {
+                host.startAppWidgetConfigureActivityForResult(this, widgetId, 0, REQ_CONF_APPWIDGET, null);
+                return;
+            } catch (Throwable ignored) {}
+        }
+        BridgeService.setMirrorWidgetId(this, slot, widgetId);
+        refreshMirrorSideCardUi();
+        Toast.makeText(this, "已嵌入" + (slot == 0 ? "左栏" : "右栏") + "（若在横屏镜像建议点「宽边栏+小组件」）", Toast.LENGTH_LONG).show();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_BIND_APPWIDGET && mPendingWidgetSlot >= 0) {
+            int wid = mPendingWidgetId;
+            int slot = mPendingWidgetSlot;
+            mPendingWidgetSlot = -1;
+            mPendingWidgetId = -1;
+            AppWidgetHost host = new AppWidgetHost(getApplicationContext(), BridgeService.MIRROR_WIDGET_HOST_ID);
+            if (resultCode == RESULT_OK && wid > 0) {
+                AppWidgetProviderInfo info = AppWidgetManager.getInstance(this).getAppWidgetInfo(wid);
+                finalizeOrConfigureWidget(slot, wid, info, host);
+            } else if (wid > 0) {
+                try { host.deleteAppWidgetId(wid); } catch (Throwable ignored) {}
+            }
+        } else if (requestCode == REQ_CONF_APPWIDGET && mPendingWidgetSlot >= 0) {
+            int wid = mPendingWidgetId;
+            int slot = mPendingWidgetSlot;
+            mPendingWidgetSlot = -1;
+            mPendingWidgetId = -1;
+            if (resultCode == RESULT_OK && wid > 0) {
+                BridgeService.setMirrorWidgetId(this, slot, wid);
+                refreshMirrorSideCardUi();
+            } else if (wid > 0) {
+                try {
+                    new AppWidgetHost(getApplicationContext(), BridgeService.MIRROR_WIDGET_HOST_ID).deleteAppWidgetId(wid);
+                } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private void setActionBtnBg(TextView tv, int color) {
+        if (tv == null) return;
+        if (tv.getBackground() instanceof GradientDrawable) {
+            ((GradientDrawable) tv.getBackground()).setColor(color);
+        } else {
+            GradientDrawable bg = new GradientDrawable();
+            bg.setColor(color);
+            bg.setCornerRadius(14f);
+            tv.setBackground(bg);
+        }
     }
 
     private TextView makeActionBtn(String txt, int color) {
@@ -1916,8 +2564,7 @@ public class MainActivity extends Activity {
             pill.setPadding(16, 8, 16, 8);
             GradientDrawable pBg = new GradientDrawable();
             int pColor = r.mode == BridgeClient.APP_MODE_LAND_FULL ? 0xFF0284C7
-                    : (r.mode == BridgeClient.APP_MODE_PORT_COMPAT ? 0xFFD97706
-                    : (r.mode == BridgeClient.APP_MODE_FREEFORM ? 0xFF7C3AED : 0xFF334155));
+                    : (r.mode == BridgeClient.APP_MODE_PORT_COMPAT ? 0xFFD97706 : 0xFF334155);
             pBg.setColor(pColor);
             pBg.setCornerRadius(12f);
             pill.setBackground(pBg);
@@ -1949,8 +2596,7 @@ public class MainActivity extends Activity {
         String[] choices = {
                 (row.mode == 0 ? "● " : "") + "跟随系统默认（不注入兼容参数，推荐微信/夸克/拼多多）",
                 (row.mode == 1 ? "● " : "") + "强制横屏全屏（适合红果短剧等无法横屏的视频 App）",
-                (row.mode == 2 ? "● " : "") + "竖屏居中兼容（保持手机竖屏比例不拉伸变形）",
-                (row.mode == 3 ? "● " : "") + "自由小窗模式（以 PC 自由缩放小窗打开）"
+                (row.mode == 2 ? "● " : "") + "竖屏居中兼容（保持手机竖屏比例不拉伸变形）"
         };
         new AlertDialog.Builder(this)
                 .setTitle(row.label + "\n" + row.pkg)
