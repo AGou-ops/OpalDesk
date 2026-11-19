@@ -88,17 +88,23 @@ public final class PreferencesStore {
         self.preferredCodec = codecRaw.flatMap { ExtCastVideoCodec(rawValue: UInt8($0)) } ?? .hevc
 
         let storedBitrate = defaults.integer(forKey: Key.bitrateKbps)
-        self.bitrateKbps = storedBitrate > 0 ? min(max(storedBitrate, 4000), 32000) : 16000
+        self.bitrateKbps = storedBitrate > 0
+            ? DisplayPresets.clampBitrateKbps(storedBitrate)
+            : DisplayPresets.defaultBitrateKbps
 
         let modeRaw = defaults.object(forKey: Key.defaultDisplayMode) as? Int
         let parsedMode = modeRaw.flatMap { ExtCastDisplayMode(rawValue: UInt8($0)) }
         self.defaultDisplayMode = (parsedMode == .mirror) ? .mirror : .dex
 
         let storedDPI = defaults.integer(forKey: Key.defaultDPI)
-        self.defaultDPI = storedDPI > 0 ? storedDPI : 240
+        self.defaultDPI = DisplayPresets.dpiOptions.contains(storedDPI)
+            ? storedDPI
+            : DisplayPresets.defaultDPI
 
         let storedFPS = defaults.integer(forKey: Key.targetFPS)
-        self.targetFPS = [60, 90, 120].contains(storedFPS) ? storedFPS : 60
+        self.targetFPS = DisplayPresets.fpsOptions.contains(storedFPS)
+            ? storedFPS
+            : DisplayPresets.defaultFPS
 
         self.audioEnabled = defaults.object(forKey: Key.audioEnabled) as? Bool ?? true
         self.mapCommandToCtrl = defaults.object(forKey: Key.mapCommandToCtrl) as? Bool ?? true
@@ -112,7 +118,9 @@ public final class PreferencesStore {
 
         self.adaptiveSingleEnabled = defaults.object(forKey: Key.adaptiveSingleEnabled) as? Bool ?? true
         let storedWidthDp = defaults.integer(forKey: Key.defaultSingleWidthDp)
-        self.defaultSingleWidthDp = storedWidthDp > 0 ? min(max(storedWidthDp, 320), 1200) : 460
+        self.defaultSingleWidthDp = storedWidthDp > 0
+            ? DisplayPresets.clampSingleWidthDp(storedWidthDp)
+            : DisplayPresets.defaultSingleWidthDp
 
         let backendRaw = defaults.string(forKey: Key.inputBackend) ?? ExtCastInputBackend.auto.rawValue
         self.inputBackend = ExtCastInputBackend(rawValue: backendRaw) ?? .auto

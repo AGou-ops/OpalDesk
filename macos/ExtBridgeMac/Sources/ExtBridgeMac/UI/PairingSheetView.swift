@@ -21,6 +21,8 @@ public struct PairingSheetView: View {
         self.onCancel = onCancel
     }
 
+    private var pinLength: Int { DisplayPresets.pairingPinLength }
+
     public var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 12) {
@@ -47,44 +49,40 @@ public struct PairingSheetView: View {
                         .font(.system(size: 16, weight: .semibold, design: .monospaced))
                         .textSelection(.enabled)
                     Spacer()
-                    Text("SHA-256")
-                        .font(.caption2.weight(.medium))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor.opacity(0.14), in: Capsule())
-                        .foregroundStyle(Color.accentColor)
+                    StatusBadgeView(
+                        text: "SHA-256",
+                        color: .accentColor,
+                        font: .caption2.weight(.medium),
+                        horizontalPadding: 6
+                    )
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.1), lineWidth: 1)
-                )
+                .extBridgeCardContainer(cornerRadius: 8, borderOpacity: 0.1)
 
-                Text("确认与 Android 端「Mac / 无线大屏」页面上的证书指纹一致后，输入下方 6 位一次性配对码。")
+                Text("确认与 Android 端「Mac / 无线大屏」页面上的证书指纹一致后，输入下方 \(pinLength) 位一次性配对码。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
 
-            // 6-digit PIN field
+            // One-time PIN field
             VStack(alignment: .leading, spacing: 6) {
-                Text("6 位一次性配对 PIN 码")
+                Text("\(pinLength) 位一次性配对 PIN 码")
                     .font(.subheadline.weight(.medium))
 
-                TextField("000000", text: $pinCode)
+                TextField(String(repeating: "0", count: pinLength), text: $pinCode)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 22, weight: .semibold, design: .monospaced))
                     .multilineTextAlignment(.center)
                     .focused($isPinFocused)
                     .onChange(of: pinCode) { _, newValue in
-                        let digitsOnly = String(newValue.filter(\.isNumber).prefix(6))
+                        let digitsOnly = String(newValue.filter(\.isNumber).prefix(pinLength))
                         if digitsOnly != newValue {
                             pinCode = digitsOnly
                         }
                     }
                     .onSubmit {
-                        if pinCode.count == 6 && !context.isSubmitting {
+                        if pinCode.count == pinLength && !context.isSubmitting {
                             onSubmit(pinCode)
                         }
                     }
@@ -121,7 +119,7 @@ public struct PairingSheetView: View {
                     onSubmit(pinCode)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(pinCode.count != 6 || context.isSubmitting)
+                .disabled(pinCode.count != pinLength || context.isSubmitting)
                 .keyboardShortcut(.defaultAction)
             }
         }

@@ -37,9 +37,10 @@ public struct FileTransferProgress: Sendable, Equatable, Identifiable {
     }
 }
 
-public enum FileSenderError: Error, Sendable, LocalizedError {
+public enum FileSenderError: Error, Sendable, Equatable, LocalizedError {
     case directoryNotSupported(String)
     case unreadableFile(String)
+    case fileNameTooLong(String)
 
     public var errorDescription: String? {
         switch self {
@@ -47,13 +48,17 @@ public enum FileSenderError: Error, Sendable, LocalizedError {
             return "暂不支持直接发送文件夹：\(name)"
         case .unreadableFile(let name):
             return "无法读取文件：\(name)"
+        case .fileNameTooLong(let name):
+            return "文件名过长（超过 \(ExtCastProtocol.maxFileNameUTF8Bytes) 字节 UTF-8 上限）：\(name.prefix(64))"
         }
     }
 }
 
 /// Streams local macOS files to Android over ExtCast `0x28 FILE_TRANSFER_CHUNK` in 256 KiB slices
-/// without loading full files into memory.
+/// without loading full files into memory, applying async backpressure pacing and evicting finished transfers.
 public final class FileSender: Sendable {
+    private static let minimumChunkSize = 4096
+
     private struct MutableState {
         var nextTransferId: UInt32 = 1
         var activeTransfers: [UInt32: FileTransferProgress] = [:]
@@ -63,15 +68,21 @@ public final class FileSender: Sendable {
     private let chunkSize: Int
     private let state = OSAllocatedUnfairLock(initialState: MutableState())
 
-    public init(chunkSize: Int = ExtCastProtocol.defaultFileChunkSize) {
-        self.chunkSize = max(chunkSize, 4096)
+    /// Exposed internally for unit tests verifying terminal transfer eviction.
+    var trackedTransferCount: Int {
+        state.withLock { $0.activeTransfers.count }
     }
 
-    /// Starts streaming a local file URL through `sendFrame`, emitting progress snapshots via `onProgress`.
+    public init(chunkSize: Int = ExtCastProtocol.defaultFileChunkSize) {
+        self.chunkSize = max(chunkSize, Self.minimumChunkSize)
+    }
+
+    /// Starts streaming a local file URL through `sendFrame` (which may suspend for backpressure),
+    /// emitting progress snapshots via `onProgress`.
     @discardableResult
     public func sendFile(
         at url: URL,
-        sendFrame: @escaping @Sendable (ExtCastFrame) -> Void,
+        sendFrame: @escaping @Sendable (ExtCastFrame) async -> Void,
         onProgress: @escaping @Sendable (FileTransferProgress) -> Void
     ) throws -> UInt32 {
         let resourceValues = try url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey])
@@ -83,6 +94,9 @@ public final class FileSender: Sendable {
         }
 
         let fileName = url.lastPathComponent
+        guard fileName.utf8.count <= ExtCastProtocol.maxFileNameUTF8Bytes else {
+            throw FileSenderError.fileNameTooLong(fileName)
+        }
         let totalSize = Int64(resourceValues.fileSize ?? 0)
 
         let transferId: UInt32 = state.withLock { s in
@@ -117,7 +131,7 @@ public final class FileSender: Sendable {
         return transferId
     }
 
-    /// Cancels an active transfer and notifies Android with `ABORT`.
+    /// Cancels an active transfer, evicts it from tracking, and notifies Android with `ABORT`.
     public func cancel(
         transferId: UInt32,
         sendFrame: @escaping @Sendable (ExtCastFrame) -> Void,
@@ -125,28 +139,29 @@ public final class FileSender: Sendable {
     ) {
         let (task, updated): (Task<Void, Never>?, FileTransferProgress?) = state.withLock { s in
             let t = s.activeTasks.removeValue(forKey: transferId)
-            guard var progress = s.activeTransfers[transferId] else {
+            guard var progress = s.activeTransfers.removeValue(forKey: transferId) else {
                 return (t, nil)
             }
             progress.status = .cancelled
-            s.activeTransfers[transferId] = progress
             return (t, progress)
         }
         task?.cancel()
-        let abortPayload = FileTransferChunkPayload(transferId: transferId, chunkFlags: .abort)
-        sendFrame(.fileTransferChunk(abortPayload))
+        sendAbortSync(transferId: transferId, sendFrame: sendFrame)
         if let updated {
             onProgress(updated)
         }
     }
 
-    /// Processes an incoming `0x13 FILE_TRANSFER_ACK` from Android.
+    /// Processes an incoming `0x13 FILE_TRANSFER_ACK` from Android and evicts the completed entry.
     public func handleAck(
         _ ack: FileTransferAckPayload,
         onProgress: @escaping @Sendable (FileTransferProgress) -> Void
     ) {
         let updated: FileTransferProgress? = state.withLock { s in
-            guard var progress = s.activeTransfers[ack.transferId] else { return nil }
+            s.activeTasks.removeValue(forKey: ack.transferId)
+            guard var progress = s.activeTransfers.removeValue(forKey: ack.transferId) else {
+                return nil
+            }
             switch ack.status {
             case .ok:
                 progress.sentBytes = progress.totalBytes
@@ -154,8 +169,6 @@ public final class FileSender: Sendable {
             case .error:
                 progress.status = .failed(reason: ack.pathOrError)
             }
-            s.activeTransfers[ack.transferId] = progress
-            s.activeTasks.removeValue(forKey: ack.transferId)
             return progress
         }
         if let updated {
@@ -163,31 +176,48 @@ public final class FileSender: Sendable {
         }
     }
 
+    // MARK: - Private Streaming Loop
+
     private func streamFile(
         transferId: UInt32,
         url: URL,
         fileName: String,
         totalSize: Int64,
         chunkSize: Int,
-        sendFrame: @escaping @Sendable (ExtCastFrame) -> Void,
+        sendFrame: @escaping @Sendable (ExtCastFrame) async -> Void,
         onProgress: @escaping @Sendable (FileTransferProgress) -> Void
     ) async {
-        let startPayload = FileTransferChunkPayload(
-            transferId: transferId,
-            chunkFlags: .start,
-            fileName: fileName,
-            totalSize: totalSize
-        )
-        sendFrame(.fileTransferChunk(startPayload))
+        let startFrame: ExtCastFrame
+        do {
+            let startPayload = FileTransferChunkPayload(
+                transferId: transferId,
+                chunkFlags: .start,
+                fileName: fileName,
+                totalSize: totalSize
+            )
+            startFrame = try ExtCastFrame.fileTransferChunk(startPayload)
+        } catch {
+            ExtBridgeLog.file.error("Failed to encode START chunk for transfer \(transferId): \(error.localizedDescription, privacy: .public)")
+            await markFailed(transferId: transferId, reason: error.localizedDescription, sendFrame: sendFrame, onProgress: onProgress)
+            return
+        }
+        await sendFrame(startFrame)
 
         let handle: FileHandle
         do {
             handle = try FileHandle(forReadingFrom: url)
         } catch {
-            markFailed(transferId: transferId, reason: error.localizedDescription, sendFrame: sendFrame, onProgress: onProgress)
+            ExtBridgeLog.file.error("Failed to open file \(fileName, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            await markFailed(transferId: transferId, reason: error.localizedDescription, sendFrame: sendFrame, onProgress: onProgress)
             return
         }
-        defer { try? handle.close() }
+        defer {
+            do {
+                try handle.close()
+            } catch {
+                ExtBridgeLog.file.warning("Failed to close file handle for \(fileName, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
 
         var sentBytes: Int64 = 0
         do {
@@ -195,12 +225,12 @@ public final class FileSender: Sendable {
                 guard let chunk = try handle.read(upToCount: chunkSize), !chunk.isEmpty else {
                     break
                 }
-                let dataPayload = FileTransferChunkPayload(
+                let dataFrame = try ExtCastFrame.fileTransferChunk(FileTransferChunkPayload(
                     transferId: transferId,
                     chunkFlags: .data,
                     data: chunk
-                )
-                sendFrame(.fileTransferChunk(dataPayload))
+                ))
+                await sendFrame(dataFrame)
                 sentBytes += Int64(chunk.count)
                 let currentSentBytes = sentBytes
 
@@ -214,11 +244,12 @@ public final class FileSender: Sendable {
                     onProgress(snapshot)
                 }
 
-                // Gentle yield every chunk so real-time input/ping frames are never starved.
+                // Yield between chunks so real-time input/ping frames are never starved.
                 await Task.yield()
             }
         } catch {
-            markFailed(transferId: transferId, reason: error.localizedDescription, sendFrame: sendFrame, onProgress: onProgress)
+            ExtBridgeLog.file.error("File read/encode failed during transfer \(transferId): \(error.localizedDescription, privacy: .public)")
+            await markFailed(transferId: transferId, reason: error.localizedDescription, sendFrame: sendFrame, onProgress: onProgress)
             return
         }
 
@@ -226,8 +257,16 @@ public final class FileSender: Sendable {
             return
         }
 
-        let endPayload = FileTransferChunkPayload(transferId: transferId, chunkFlags: .end)
-        sendFrame(.fileTransferChunk(endPayload))
+        do {
+            let endFrame = try ExtCastFrame.fileTransferChunk(
+                FileTransferChunkPayload(transferId: transferId, chunkFlags: .end)
+            )
+            await sendFrame(endFrame)
+        } catch {
+            ExtBridgeLog.file.error("Failed to encode END chunk for transfer \(transferId): \(error.localizedDescription, privacy: .public)")
+            await markFailed(transferId: transferId, reason: error.localizedDescription, sendFrame: sendFrame, onProgress: onProgress)
+            return
+        }
 
         let awaiting: FileTransferProgress? = state.withLock { s in
             s.activeTasks.removeValue(forKey: transferId)
@@ -245,20 +284,39 @@ public final class FileSender: Sendable {
     private func markFailed(
         transferId: UInt32,
         reason: String,
-        sendFrame: @escaping @Sendable (ExtCastFrame) -> Void,
+        sendFrame: @escaping @Sendable (ExtCastFrame) async -> Void,
         onProgress: @escaping @Sendable (FileTransferProgress) -> Void
-    ) {
-        let abortPayload = FileTransferChunkPayload(transferId: transferId, chunkFlags: .abort)
-        sendFrame(.fileTransferChunk(abortPayload))
+    ) async {
+        do {
+            let abortFrame = try ExtCastFrame.fileTransferChunk(
+                FileTransferChunkPayload(transferId: transferId, chunkFlags: .abort)
+            )
+            await sendFrame(abortFrame)
+        } catch {
+            ExtBridgeLog.file.error("Failed to encode ABORT chunk for transfer \(transferId): \(error.localizedDescription, privacy: .public)")
+        }
         let updated: FileTransferProgress? = state.withLock { s in
             s.activeTasks.removeValue(forKey: transferId)
-            guard var p = s.activeTransfers[transferId] else { return nil }
+            guard var p = s.activeTransfers.removeValue(forKey: transferId) else { return nil }
             p.status = .failed(reason: reason)
-            s.activeTransfers[transferId] = p
             return p
         }
         if let updated {
             onProgress(updated)
+        }
+    }
+
+    private func sendAbortSync(
+        transferId: UInt32,
+        sendFrame: @escaping @Sendable (ExtCastFrame) -> Void
+    ) {
+        do {
+            let abortFrame = try ExtCastFrame.fileTransferChunk(
+                FileTransferChunkPayload(transferId: transferId, chunkFlags: .abort)
+            )
+            sendFrame(abortFrame)
+        } catch {
+            ExtBridgeLog.file.error("Failed to encode ABORT chunk for transfer \(transferId): \(error.localizedDescription, privacy: .public)")
         }
     }
 }

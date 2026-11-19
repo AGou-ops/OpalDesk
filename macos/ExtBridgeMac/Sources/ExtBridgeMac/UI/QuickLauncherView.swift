@@ -2,7 +2,7 @@ import ExtBridgeCore
 import SwiftUI
 
 /// Spotlight / Raycast-style translucent phone app quick launcher (`⌘K`).
-/// Queries `0x2A LIST_APPS`, caches installed & running Android apps, provides real-time fuzzy search,
+/// Queries `0x2A LIST_APPS`, filters installed & running Android apps via `AppFuzzyMatcher`,
 /// and offers one-click "弹出独立窗（推荐）", "居中宽幅打开", and "自由窗口打开".
 public struct QuickLauncherView: View {
     @Bindable public var model: AppModel
@@ -16,32 +16,14 @@ public struct QuickLauncherView: View {
     }
 
     private var filteredApps: [RemoteAppInfo] {
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return model.remoteApps
-        }
-        let needle = trimmed.lowercased()
-        return model.remoteApps
-            .compactMap { app -> (app: RemoteAppInfo, score: Int)? in
-                let score = Self.fuzzyScore(needle: needle, app: app)
-                return score > 0 ? (app, score) : nil
-            }
-            .sorted { lhs, rhs in
-                if lhs.score != rhs.score { return lhs.score > rhs.score }
-                if lhs.app.runningOnExt != rhs.app.runningOnExt { return lhs.app.runningOnExt }
-                return lhs.app.displayLabel.localizedCaseInsensitiveCompare(rhs.app.displayLabel) == .orderedAscending
-            }
-            .map(\.app)
+        AppFuzzyMatcher.filter(model.remoteApps, query: query)
     }
 
     public var body: some View {
         ZStack {
-            // Dimming click-outside backdrop
             Color.black.opacity(0.38)
                 .ignoresSafeArea()
-                .onTapGesture {
-                    dismiss()
-                }
+                .onTapGesture(perform: dismiss)
 
             VStack(spacing: 0) {
                 searchHeader
@@ -63,32 +45,14 @@ public struct QuickLauncherView: View {
             selectedIndex = 0
             isSearchFocused = true
         }
-        .onChange(of: query) { _, _ in
-            selectedIndex = 0
-        }
-        .onKeyPress(.escape) {
-            dismiss()
-            return .handled
-        }
-        .onKeyPress(.downArrow) {
-            let count = filteredApps.count
-            if count > 0 {
-                selectedIndex = (selectedIndex + 1) % count
-            }
-            return .handled
-        }
-        .onKeyPress(.upArrow) {
-            let count = filteredApps.count
-            if count > 0 {
-                selectedIndex = (selectedIndex - 1 + count) % count
-            }
-            return .handled
-        }
+        .onChange(of: query) { _, _ in selectedIndex = 0 }
+        .onKeyPress(.escape) { dismiss(); return .handled }
+        .onKeyPress(.downArrow) { moveSelection(by: 1); return .handled }
+        .onKeyPress(.upArrow) { moveSelection(by: -1); return .handled }
         .onKeyPress(.return) {
             let apps = filteredApps
             guard !apps.isEmpty else { return .ignored }
-            let idx = min(max(selectedIndex, 0), apps.count - 1)
-            model.popoutApp(apps[idx])
+            model.popoutApp(apps[min(max(selectedIndex, 0), apps.count - 1)])
             return .handled
         }
     }
@@ -107,23 +71,17 @@ public struct QuickLauncherView: View {
                 .focused($isSearchFocused)
 
             if !query.isEmpty {
-                Button {
-                    query = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                Button { query = "" } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
                 .help("清除搜索")
             }
 
             if model.isLoadingApps {
-                ProgressView()
-                    .controlSize(.small)
+                ProgressView().controlSize(.small)
             } else {
-                Button {
-                    model.requestAppList()
-                } label: {
+                Button { model.requestAppList() } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(.secondary)
@@ -144,28 +102,15 @@ public struct QuickLauncherView: View {
         if apps.isEmpty {
             VStack(spacing: 10) {
                 if model.isLoadingApps {
-                    ProgressView()
-                        .controlSize(.regular)
-                    Text("正在从手机获取应用列表...")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    ProgressView().controlSize(.regular)
+                    Text("正在从手机获取应用列表...").font(.callout).foregroundStyle(.secondary)
                 } else if model.remoteApps.isEmpty {
-                    Image(systemName: "app.dashed")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.secondary)
-                    Text("暂未获取到手机应用列表")
-                        .font(.subheadline.weight(.medium))
-                    Button("重新加载") {
-                        model.requestAppList()
-                    }
-                    .buttonStyle(.bordered)
+                    Image(systemName: "app.dashed").font(.system(size: 30)).foregroundStyle(.secondary)
+                    Text("暂未获取到手机应用列表").font(.subheadline.weight(.medium))
+                    Button("重新加载") { model.requestAppList() }.buttonStyle(.bordered)
                 } else {
-                    Image(systemName: "magnifyingglass")
-                        .font(.system(size: 26))
-                        .foregroundStyle(.secondary)
-                    Text("未找到与「\(query)」匹配的手机应用")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    Image(systemName: "magnifyingglass").font(.system(size: 26)).foregroundStyle(.secondary)
+                    Text("未找到与「\(query)」匹配的手机应用").font(.callout).foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -177,9 +122,7 @@ public struct QuickLauncherView: View {
                         ForEach(Array(apps.enumerated()), id: \.element.id) { index, app in
                             appRow(app: app, isSelected: index == selectedIndex)
                                 .id(app.id)
-                                .onTapGesture {
-                                    selectedIndex = index
-                                }
+                                .onTapGesture { selectedIndex = index }
                         }
                     }
                     .padding(10)
@@ -187,9 +130,7 @@ public struct QuickLauncherView: View {
                 .frame(minHeight: 220, maxHeight: 340)
                 .onChange(of: selectedIndex) { _, newIdx in
                     guard apps.indices.contains(newIdx) else { return }
-                    withAnimation(.easeOut(duration: 0.12)) {
-                        proxy.scrollTo(apps[newIdx].id, anchor: .center)
-                    }
+                    withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(apps[newIdx].id, anchor: .center) }
                 }
             }
         }
@@ -201,57 +142,42 @@ public struct QuickLauncherView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text(app.displayLabel)
-                        .font(.system(size: 13, weight: .semibold))
-                        .lineLimit(1)
-
+                    Text(app.displayLabel).font(.system(size: 13, weight: .semibold)).lineLimit(1)
                     if app.runningOnExt {
-                        Text("运行中")
-                            .font(.system(size: 10, weight: .semibold))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 1)
-                            .background(Color.green.opacity(0.18), in: Capsule())
-                            .foregroundStyle(.green)
+                        StatusBadgeView(
+                            text: "运行中",
+                            color: .green,
+                            font: .system(size: 10, weight: .semibold),
+                            horizontalPadding: 6,
+                            verticalPadding: 1,
+                            backgroundOpacity: 0.18
+                        )
                     }
                 }
-                Text(app.pkg)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                Text(app.pkg).font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
             }
 
             Spacer(minLength: 8)
 
             HStack(spacing: 6) {
-                Button {
-                    model.popoutApp(app)
-                } label: {
-                    Label("弹出独立窗", systemImage: "macwindow.badge.plus")
-                        .font(.system(size: 11, weight: .semibold))
+                Button { model.popoutApp(app) } label: {
+                    Label("弹出独立窗", systemImage: "macwindow.badge.plus").font(.system(size: 11, weight: .semibold))
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .help("把该应用独立弹出到主窗口外部（推荐）")
 
-                Button {
-                    model.launchApp(app, mode: .adaptive)
-                } label: {
-                    Text("居中宽幅")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("在主大屏以黄金单应用宽幅打开")
+                Button("居中宽幅") { model.launchApp(app, mode: .adaptive) }
+                    .font(.system(size: 11, weight: .medium))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("在主大屏以黄金单应用宽幅打开")
 
-                Button {
-                    model.launchApp(app, mode: .freeform)
-                } label: {
-                    Text("自由窗口")
-                        .font(.system(size: 11, weight: .medium))
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("在主大屏以自由缩放窗口打开")
+                Button("自由窗口") { model.launchApp(app, mode: .freeform) }
+                    .font(.system(size: 11, weight: .medium))
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("在主大屏以自由缩放窗口打开")
             }
         }
         .padding(.horizontal, 10)
@@ -270,12 +196,8 @@ public struct QuickLauncherView: View {
         let initial = String(app.displayLabel.prefix(1)).uppercased()
         let tint = Self.deterministicColor(for: app.pkg)
         return ZStack {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(tint.opacity(0.2))
-                .frame(width: 32, height: 32)
-            Text(initial.isEmpty ? "A" : initial)
-                .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(tint)
+            RoundedRectangle(cornerRadius: 8, style: .continuous).fill(tint.opacity(0.2)).frame(width: 32, height: 32)
+            Text(initial.isEmpty ? "A" : initial).font(.system(size: 14, weight: .bold)).foregroundStyle(tint)
         }
     }
 
@@ -286,9 +208,7 @@ public struct QuickLauncherView: View {
             Text("共 \(filteredApps.count) 个应用 · 独立窗 \(model.popoutManager.controllers.count)/\(PopoutWindowManager.maxConcurrentWindows)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-
             Spacer()
-
             HStack(spacing: 10) {
                 keyHint("↑↓", label: "选择")
                 keyHint("↩", label: "弹出独立窗（推荐）")
@@ -306,41 +226,17 @@ public struct QuickLauncherView: View {
                 .padding(.horizontal, 5)
                 .padding(.vertical, 2)
                 .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
-            Text(label)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text(label).font(.caption).foregroundStyle(.secondary)
         }
     }
 
-    private func dismiss() {
-        model.isQuickLauncherPresented = false
+    private func moveSelection(by delta: Int) {
+        let count = filteredApps.count
+        guard count > 0 else { return }
+        selectedIndex = (selectedIndex + delta + count) % count
     }
 
-    // MARK: - Fuzzy Matching & Styling
-
-    private static func fuzzyScore(needle: String, app: RemoteAppInfo) -> Int {
-        let label = app.displayLabel.lowercased()
-        let pkg = app.pkg.lowercased()
-
-        if label == needle { return 1000 }
-        if label.hasPrefix(needle) { return 850 }
-        if label.contains(needle) { return 650 }
-        if pkg.contains(needle) { return 450 }
-        if isSubsequence(needle, of: label) { return 300 }
-        if isSubsequence(needle, of: pkg) { return 180 }
-        return 0
-    }
-
-    private static func isSubsequence(_ needle: String, of haystack: String) -> Bool {
-        var idx = haystack.startIndex
-        for ch in needle {
-            guard let found = haystack[idx...].firstIndex(of: ch) else {
-                return false
-            }
-            idx = haystack.index(after: found)
-        }
-        return true
-    }
+    private func dismiss() { model.isQuickLauncherPresented = false }
 
     private static func deterministicColor(for key: String) -> Color {
         let palette: [Color] = [.blue, .teal, .indigo, .green, .orange, .purple, .pink, .cyan]

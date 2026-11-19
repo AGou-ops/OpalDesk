@@ -1,16 +1,16 @@
 import AppKit
-import ExtBridgeCore
 import SwiftUI
 
+enum WindowID {
+    static let main = "main"
+}
+
+@MainActor
 final class ExtBridgeAppDelegate: NSObject, NSApplicationDelegate {
     var onTerminate: (@MainActor () -> Void)?
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let onTerminate {
-            MainActor.assumeIsolated {
-                onTerminate()
-            }
-        }
+        onTerminate?()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -25,7 +25,7 @@ struct ExtBridgeMacApp: App {
     @State private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("ExtBridgeMac", id: "main") {
+        WindowGroup("ExtBridgeMac", id: WindowID.main) {
             Group {
                 if model.isShowingDisplayCanvas {
                     DisplayWindowView(model: model)
@@ -36,11 +36,7 @@ struct ExtBridgeMacApp: App {
                 }
             }
             .frame(minWidth: 760, minHeight: 500)
-            .onAppear {
-                appDelegate.onTerminate = { [model] in
-                    model.cleanupOnTerminate()
-                }
-            }
+            .onAppear(perform: registerTerminationHandler)
         }
         .defaultSize(width: 1120, height: 700)
         .commands {
@@ -113,6 +109,7 @@ struct ExtBridgeMacApp: App {
 
         MenuBarExtra {
             MenuBarView(model: model)
+                .onAppear(perform: registerTerminationHandler)
         } label: {
             Image(systemName: model.isAuthenticated ? "macbook.and.iphone" : "display")
                 .symbolRenderingMode(.hierarchical)
@@ -121,6 +118,12 @@ struct ExtBridgeMacApp: App {
 
         Settings {
             SettingsView(model: model)
+        }
+    }
+
+    private func registerTerminationHandler() {
+        appDelegate.onTerminate = { [model] in
+            model.cleanupOnTerminate()
         }
     }
 

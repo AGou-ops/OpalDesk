@@ -47,11 +47,11 @@ struct ExtCastV11AndPopoutTests {
         #expect(legacyDecoded.appActivity == "")
     }
 
-    @Test("DEVICE_STATE v1.1 new fields roundtrip and default cleanly on v1.0 JSON")
+    @Test("DEVICE_STATE v1.1 new fields roundtrip and default cleanly aligned with Java on v1.0 JSON")
     func deviceStateV11Roundtrip() throws {
         let state = DeviceStatePayload(
             deviceName: "Xiaomi 15 Ultra",
-            sinkType: ExtCastSinkType.remoteWiFiADB.rawValue,
+            sinkType: 4,
             displayMode: 0,
             width: 2560,
             height: 1440,
@@ -65,7 +65,7 @@ struct ExtCastV11AndPopoutTests {
             injectStatus: ExtCastInjectStatus.uhid.rawValue,
             adaptiveSingleEnabled: true,
             defaultSingleWidthDp: 460,
-            activeLayoutMode: "ADAPTIVE_SINGLE",
+            activeLayoutMode: ExtCastLayoutMode.adaptiveSingle.rawValue,
             topAppPackage: "com.xingin.xhs",
             topAppLabel: "小红书"
         )
@@ -76,15 +76,23 @@ struct ExtCastV11AndPopoutTests {
         #expect(decoded.adaptiveSingleEnabled == true)
         #expect(decoded.defaultSingleWidthDp == 460)
         #expect(decoded.activeLayoutMode == "ADAPTIVE_SINGLE")
+        #expect(decoded.layoutMode == .adaptiveSingle)
         #expect(decoded.topAppPackage == "com.xingin.xhs")
         #expect(decoded.topAppLabel == "小红书")
 
         let minimalJSON = Data(#"{"deviceName":"LegacyPhone"}"#.utf8)
         let defaulted = try DeviceStatePayload.decode(from: minimalJSON)
+        let fresh = DeviceStatePayload(deviceName: "LegacyPhone")
+        #expect(defaulted == fresh)
+        #expect(defaulted.width == 1920)
+        #expect(defaulted.height == 1080)
+        #expect(defaulted.bitrateKbps == 12000)
+        #expect(defaulted.audioEnabled == false)
         #expect(defaulted.adaptiveSingleEnabled == true)
-        #expect(defaulted.defaultSingleWidthDp == 460)
+        #expect(defaulted.defaultSingleWidthDp == DisplayPresets.defaultSingleWidthDp)
         #expect(defaulted.injectStatus == 0)
-        #expect(defaulted.activeLayoutMode == "")
+        #expect(defaulted.activeLayoutMode == ExtCastLayoutMode.fullscreen.rawValue)
+        #expect(defaulted.layoutMode == .fullscreen)
         #expect(defaulted.topAppPackage == "")
         #expect(defaulted.topAppLabel == "")
     }
@@ -146,16 +154,12 @@ struct ExtCastV11AndPopoutTests {
         #expect(frames[3].payload.isEmpty)
     }
 
-    @Test("0x2B WINDOW_ACTION covers all v1.1 actions with exact JSON schema")
+    @Test("0x2B WINDOW_ACTION covers all active v1.1 typed actions with exact JSON schema and clamping")
     func windowActionPayloads() throws {
         let actions: [WindowActionPayload] = [
             .setAdaptiveSingle(enabled: true, defaultWidthDp: 460),
             .setSingleWidth(pkg: "com.tencent.mm", widthPct: 42, remember: true),
             .launchApp(pkg: "com.tencent.mm", cls: ".ui.LauncherUI", mode: .adaptive, slot: 0),
-            .updateWindow(taskId: 123, pkg: "com.tencent.mm", mode: .freeform, left: 100, top: 80, right: 700, bottom: 1000, remember: true),
-            .focusWindow(taskId: 123),
-            .closeWindow(taskId: 123),
-            .minimizeWindow(taskId: 123),
             .setTiling(topology: .split3Master, pkgs: ["com.a", "com.b", "com.c"], ratios: [55, 45]),
             .reloadAppDpi(pkg: "com.tencent.mm"),
             .returnToDesktop(pkg: "com.tencent.mm", taskId: 123),
@@ -173,6 +177,12 @@ struct ExtCastV11AndPopoutTests {
             let decodedAction = try WindowActionPayload.decode(from: decodedFrame.payload)
             #expect(decodedAction == action)
         }
+
+        // Verify shared clamping constants
+        #expect(WindowActionPayload.setAdaptiveSingle(enabled: true, defaultWidthDp: 100).defaultWidthDp == 320)
+        #expect(WindowActionPayload.setAdaptiveSingle(enabled: true, defaultWidthDp: 9999).defaultWidthDp == 1200)
+        #expect(WindowActionPayload.setSingleWidth(pkg: "a", widthPct: 5).widthPct == 28)
+        #expect(WindowActionPayload.setSingleWidth(pkg: "a", widthPct: 200).widthPct == 100)
 
         // Verify exact JSON keys on set_adaptive_single and set_input_backend
         let adaptiveJSON = try JSONSerialization.jsonObject(
@@ -324,5 +334,34 @@ struct ExtCastV11AndPopoutTests {
         // Direct PNG passthrough preserves exact bytes when under limit
         let passthrough = try #require(ClipboardSyncManager.normalizePNGData(converted, isTIFF: false))
         #expect(passthrough == converted)
+    }
+
+    @Test("AppFuzzyMatcher ranks exact, prefix, contains, package, subsequence, and running tiebreakers")
+    func appFuzzyMatcherRanking() {
+        let apps = [
+            RemoteAppInfo(pkg: "com.tencent.mm", label: "WeChat", runningOnExt: false),
+            RemoteAppInfo(pkg: "com.example.chat", label: "ChatBox", runningOnExt: true),
+            RemoteAppInfo(pkg: "com.example.ch", label: "Ch", runningOnExt: false),
+            RemoteAppInfo(pkg: "com.wechat.tools", label: "Toolkit", runningOnExt: false)
+        ]
+
+        // Blank query returns input unchanged
+        #expect(AppFuzzyMatcher.filter(apps, query: "   ") == apps)
+
+        // Exact > prefix > contains > package > subsequence
+        let chResults = AppFuzzyMatcher.filter(apps, query: "ch")
+        #expect(chResults.map(\.pkg) == [
+            "com.example.ch",      // exact label ("ch")
+            "com.example.chat",    // label prefix ("chatbox")
+            "com.tencent.mm",      // label contains ("wechat")
+            "com.wechat.tools"     // package contains ("com.wechat.tools")
+        ])
+
+        // Subsequence match on label ("wct" -> WeChat)
+        let subseq = AppFuzzyMatcher.filter(apps, query: "wct")
+        #expect(subseq.first?.pkg == "com.tencent.mm")
+
+        // Non-matching query returns empty
+        #expect(AppFuzzyMatcher.filter(apps, query: "zzzzz").isEmpty)
     }
 }

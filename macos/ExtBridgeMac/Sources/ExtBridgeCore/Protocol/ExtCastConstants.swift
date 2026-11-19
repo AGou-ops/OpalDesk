@@ -1,6 +1,6 @@
 import Foundation
 
-/// ExtCast v1 wire-protocol constants and typed enumerations.
+/// ExtCast v1.1 wire-protocol constants and typed enumerations.
 /// All multi-byte integers on the wire use Big-Endian (network byte order).
 public enum ExtCastProtocol {
     public static let version: Int = 1
@@ -8,9 +8,13 @@ public enum ExtCastProtocol {
     public static let headerSize: Int = 18
     public static let maxPayloadLength: UInt32 = 16 * 1024 * 1024 // 16 MiB
     public static let maxTouchPointers: Int = 16
+    public static let maxFileNameUTF8Bytes: Int = Int(UInt16.max) // 65535 bytes
     public static let bonjourServiceType: String = "_extbridge._tcp"
     public static let abstractSocketName: String = "extbridge_stream"
     public static let defaultWifiPort: UInt16 = 19876
+    public static let defaultWidth: Int = 1920
+    public static let defaultHeight: Int = 1080
+    public static let defaultDeviceStateBitrateKbps: Int = 12000
     public static let defaultFileChunkSize: Int = 256 * 1024 // 256 KiB
     public static let maxClipboardImageBytes: Int = 8 * 1024 * 1024 // 8 MiB
     public static let flagClipboardImagePng: UInt8 = 0x01
@@ -93,12 +97,15 @@ public enum ExtCastDisplayMode: UInt8, Sendable, CaseIterable {
     }
 }
 
-public enum ExtCastSinkType: Int, Sendable, CaseIterable {
-    case none = 0
-    case physical = 1
-    case remoteUSB = 2
-    case remoteWiFi = 3
-    case remoteWiFiADB = 4
+public enum ExtCastLayoutMode: String, Codable, Sendable, CaseIterable, Equatable {
+    case fullscreen = "FULLSCREEN"
+    case adaptiveSingle = "ADAPTIVE_SINGLE"
+    case freeform = "FREEFORM"
+    case split2H = "SPLIT_2_H"
+    case split2V = "SPLIT_2_V"
+    case split3Master = "SPLIT_3_MASTER"
+    case split3Cols = "SPLIT_3_COLS"
+    case grid2x2 = "GRID_2X2"
 }
 
 public enum ExtCastTransportHint: String, Codable, Sendable, CaseIterable {
@@ -215,7 +222,6 @@ public enum ExtCastInputTextMode: UInt8, Sendable, CaseIterable {
     case commitTextPaste = 0
     case setClipboardOnly = 1
 
-    public static let pasteImage: ExtCastInputTextMode = .commitTextPaste
     public static let setClipboardImageOnly: ExtCastInputTextMode = .setClipboardOnly
 }
 
@@ -249,6 +255,7 @@ public enum ExtCastCodecError: Error, Sendable, Equatable, LocalizedError {
     case invalidMagic([UInt8])
     case unknownFrameType(UInt8)
     case payloadTooLarge(UInt32)
+    case fieldTooLong(field: String, length: Int, maxLength: Int)
     case truncatedPayload(expected: Int, actual: Int)
     case invalidEnumValue(field: String, rawValue: UInt32)
     case invalidUTF8(field: String)
@@ -263,6 +270,8 @@ public enum ExtCastCodecError: Error, Sendable, Equatable, LocalizedError {
             return String(format: "Unknown ExtCast frame type: 0x%02X", raw)
         case .payloadTooLarge(let length):
             return "ExtCast payload length \(length) exceeds maximum \(ExtCastProtocol.maxPayloadLength)"
+        case let .fieldTooLong(field, length, maxLength):
+            return "ExtCast field '\(field)' length \(length) exceeds maximum \(maxLength)"
         case .truncatedPayload(let expected, let actual):
             return "Truncated ExtCast payload: expected at least \(expected) bytes, got \(actual)"
         case .invalidEnumValue(let field, let raw):

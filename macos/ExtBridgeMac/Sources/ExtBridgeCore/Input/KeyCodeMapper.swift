@@ -1,6 +1,5 @@
 import AppKit
 import Carbon.HIToolbox
-import Foundation
 
 /// Android `android.view.KeyEvent` meta-state bitmasks.
 public enum AndroidMetaState {
@@ -102,15 +101,40 @@ public enum KeyCodeMapper {
         return meta
     }
 
+    /// Returns the `NSEvent.ModifierFlags` bit corresponding to a modifier virtual keyCode (`kVK_*`),
+    /// or `nil` if `macKeyCode` is not a modifier key.
+    public static func modifierFlag(for macKeyCode: UInt16) -> NSEvent.ModifierFlags? {
+        switch Int(macKeyCode) {
+        case kVK_Shift, kVK_RightShift:
+            return .shift
+        case kVK_Control, kVK_RightControl:
+            return .control
+        case kVK_Option, kVK_RightOption:
+            return .option
+        case kVK_Command, kVK_RightCommand:
+            return .command
+        case kVK_CapsLock:
+            return .capsLock
+        default:
+            return nil
+        }
+    }
+
+    /// Resolves whether a `flagsChanged` transition for `macKeyCode` is a key-down or key-up event.
+    public static func modifierKeyAction(
+        for macKeyCode: UInt16,
+        currentFlags: NSEvent.ModifierFlags,
+        previousFlags: NSEvent.ModifierFlags
+    ) -> ExtCastKeyAction {
+        if let flag = modifierFlag(for: macKeyCode) {
+            return currentFlags.contains(flag) ? .down : .up
+        }
+        return currentFlags.rawValue > previousFlags.rawValue ? .down : .up
+    }
+
     /// Returns `true` when `macKeyCode` is itself a modifier key (Shift/Ctrl/Option/Command/CapsLock).
     public static func isModifierKeyCode(_ macKeyCode: UInt16) -> Bool {
-        switch Int(macKeyCode) {
-        case kVK_Shift, kVK_RightShift, kVK_Control, kVK_RightControl,
-             kVK_Option, kVK_RightOption, kVK_Command, kVK_RightCommand, kVK_CapsLock:
-            return true
-        default:
-            return false
-        }
+        modifierFlag(for: macKeyCode) != nil
     }
 
     // Complete ANSI macOS CGKeyCode -> Android KeyEvent.KEYCODE_* lookup table.

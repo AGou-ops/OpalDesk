@@ -136,6 +136,14 @@ struct SessionAndSecurityTests {
         let finalState = stateBox.withLock { $0 }
         #expect(finalState.connected == true)
         #expect(finalState.authOk == true)
+
+        // Verify sendPaced completes cleanly and drains in-flight bytes back to 0.
+        await session.sendPaced(.ping(778))
+        for _ in 0..<50 {
+            if session.inFlightByteCount == 0 { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        #expect(session.inFlightByteCount == 0)
     }
 
     @Test("Real AAC-LC encode -> AudioStreamPlayer decode roundtrip succeeds at 48kHz stereo")
@@ -217,5 +225,84 @@ struct SessionAndSecurityTests {
         )
         #expect(decoded != nil)
         #expect(decoded?.frameLength == 1024)
+    }
+
+    @Test("Rejects empty, punctuation-only, and 15-char hex TLS fingerprints before dialing")
+    func rejectsMalformedTLSPinBoundaries() async throws {
+        for badPin in ["", "----::::", "0123456789abcde"] {
+            let receivedError = OSAllocatedUnfairLock<ExtCastSessionError?>(initialState: nil)
+            let session = ExtCastSession()
+
+            let endpoint = ExtCastEndpoint(
+                target: .hostPort(host: "127.0.0.1", port: ExtCastProtocol.defaultWifiPort),
+                security: .tlsPinned(expectedFingerprint: badPin),
+                autoReconnect: false
+            )
+            session.connect(to: endpoint) { event in
+                if case .error(let err) = event {
+                    receivedError.withLock { $0 = err }
+                }
+            }
+
+            for _ in 0..<50 {
+                if receivedError.withLock({ $0 != nil }) { break }
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+
+            #expect(receivedError.withLock { $0 } == .missingExpectedFingerprint)
+            session.disconnect()
+        }
+    }
+
+    @Test("BonjourBrowser parses NWTXTRecord keys and builds normalized DiscoveredBonjourDevice")
+    func bonjourTXTRecordParsingAndDeviceBuilder() {
+        var record = NWTXTRecord()
+        record[BonjourBrowser.TXTRecordKey.name] = "Xiaomi 15 Ultra"
+        record[BonjourBrowser.TXTRecordKey.model] = "25010PN30C"
+        record[BonjourBrowser.TXTRecordKey.fingerprint] = "A1B2-C3D4-E5F6-0718"
+        record[BonjourBrowser.TXTRecordKey.version] = "1.1"
+        record["unknown_key"] = "ignored"
+
+        let parsed = BonjourBrowser.parseTXTRecord(record)
+        #expect(parsed[BonjourBrowser.TXTRecordKey.name] == "Xiaomi 15 Ultra")
+        #expect(parsed[BonjourBrowser.TXTRecordKey.model] == "25010PN30C")
+        #expect(parsed[BonjourBrowser.TXTRecordKey.fingerprint] == "A1B2-C3D4-E5F6-0718")
+        #expect(parsed[BonjourBrowser.TXTRecordKey.version] == "1.1")
+        #expect(parsed["unknown_key"] == nil)
+
+        let device = BonjourBrowser.makeDevice(serviceName: "ExtBridge-Phone", domain: "local.", txt: parsed)
+        #expect(device.id == "ExtBridge-Phone.local.")
+        #expect(device.displayName == "Xiaomi 15 Ultra")
+        #expect(device.model == "25010PN30C")
+        #expect(device.fingerprintPrefix == "a1b2c3d4e5f60718")
+        #expect(device.shortFingerprint == "A1B2-C3D4-E5F6-0718")
+        #expect(device.protocolVersion == "1.1")
+
+        // Verify NWEndpoint service parameters preserve wire service type `_extbridge._tcp`.
+        if case let .service(name, type, domain, _) = device.nwEndpoint {
+            #expect(name == "ExtBridge-Phone")
+            #expect(type == ExtCastProtocol.bonjourServiceType)
+            #expect(domain == "local.")
+        } else {
+            Issue.record("Expected NWEndpoint.service for DiscoveredBonjourDevice")
+        }
+
+        // Empty TXT record falls back to serviceName and protocol version defaults.
+        let emptyParsed = BonjourBrowser.parseTXTRecord(NWTXTRecord())
+        #expect(emptyParsed.isEmpty)
+        let fallbackDevice = BonjourBrowser.makeDevice(serviceName: "FallbackPhone", domain: "local.", txt: emptyParsed)
+        #expect(fallbackDevice.displayName == "FallbackPhone")
+        #expect(fallbackDevice.model == "")
+        #expect(fallbackDevice.fingerprintPrefix == "")
+        #expect(fallbackDevice.shortFingerprint == "—")
+        #expect(fallbackDevice.protocolVersion == String(ExtCastProtocol.version))
+
+        // Invalid non-UTF-8 raw data entry in TXT record is safely skipped without crashing.
+        var binaryRecord = NWTXTRecord()
+        binaryRecord.setEntry(.data(Data([0xFF, 0xFE, 0x80])), for: BonjourBrowser.TXTRecordKey.name)
+        binaryRecord.setEntry(.data(Data("Pixel 9".utf8)), for: BonjourBrowser.TXTRecordKey.model)
+        let binaryParsed = BonjourBrowser.parseTXTRecord(binaryRecord)
+        #expect(binaryParsed[BonjourBrowser.TXTRecordKey.name] == nil)
+        #expect(binaryParsed[BonjourBrowser.TXTRecordKey.model] == "Pixel 9")
     }
 }

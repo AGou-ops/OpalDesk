@@ -100,5 +100,79 @@ struct AnnexBParserTests {
         #expect(throws: AnnexBError.incompleteParameterSets(.hevc)) {
             _ = try AnnexBParser.makeFormatDescription(from: incompleteHEVC, codec: .hevc)
         }
+
+        // Empty Data entries inside parameter sets must throw cleanly instead of force-unwrapping nil baseAddress.
+        let emptyElementH264 = ExtractedParameterSets(sps: [Data()], pps: [sampleH264PPS])
+        #expect(!emptyElementH264.isComplete(for: .h264))
+        #expect(throws: AnnexBError.incompleteParameterSets(.h264)) {
+            _ = try AnnexBParser.makeFormatDescription(from: emptyElementH264, codec: .h264)
+        }
+    }
+
+    @Test("Empty parameter-set Data across H.264 PPS and HEVC VPS/SPS/PPS safely throws without crashing")
+    func emptyDataParameterSetsAcrossCodecsThrowSafely() {
+        let validVPS = Data([0x40, 0x01, 0x0C, 0x01])
+        let validHEVCSPS = Data([0x42, 0x01, 0x01, 0x60])
+        let validHEVCPPS = Data([0x44, 0x01, 0xC1, 0x72])
+
+        let badH264Cases: [ExtractedParameterSets] = [
+            ExtractedParameterSets(sps: [sampleH264SPS], pps: [Data()]),
+            ExtractedParameterSets(sps: [sampleH264SPS, Data()], pps: [sampleH264PPS]),
+            ExtractedParameterSets(sps: [sampleH264SPS], pps: [sampleH264PPS, Data()])
+        ]
+        for bad in badH264Cases {
+            #expect(!bad.isComplete(for: .h264))
+            #expect(throws: AnnexBError.incompleteParameterSets(.h264)) {
+                _ = try AnnexBParser.makeFormatDescription(from: bad, codec: .h264)
+            }
+        }
+
+        let badHEVCCases: [ExtractedParameterSets] = [
+            ExtractedParameterSets(vps: [Data()], sps: [validHEVCSPS], pps: [validHEVCPPS]),
+            ExtractedParameterSets(vps: [validVPS], sps: [Data()], pps: [validHEVCPPS]),
+            ExtractedParameterSets(vps: [validVPS], sps: [validHEVCSPS], pps: [Data()]),
+            ExtractedParameterSets(vps: [validVPS, Data()], sps: [validHEVCSPS], pps: [validHEVCPPS])
+        ]
+        for bad in badHEVCCases {
+            #expect(!bad.isComplete(for: .hevc))
+            #expect(throws: AnnexBError.incompleteParameterSets(.hevc)) {
+                _ = try AnnexBParser.makeFormatDescription(from: bad, codec: .hevc)
+            }
+        }
+    }
+
+    @Test("splitNALUnits and convertToLengthPrefixed handle short buffers, trailing zeros, AUDs, and non-IDR/CRA slices")
+    func splitAndConvertEdgeCases() {
+        #expect(AnnexBParser.splitNALUnits(from: Data(), codec: .h264).isEmpty)
+        #expect(AnnexBParser.splitNALUnits(from: Data([0x00, 0x00, 0x01]), codec: .h264).isEmpty)
+        #expect(AnnexBParser.splitNALUnits(from: Data([0x11, 0x22, 0x33, 0x44, 0x55]), codec: .h264).isEmpty)
+
+        // AUD (type 9) + non-IDR P-slice (type 1) with trailing zero padding before next start code
+        let aud = Data([0x09, 0x10])
+        let pSlice = Data([0x41, 0x9A, 0x22, 0x33])
+        var h264Stream = Data([0x00, 0x00, 0x00, 0x01])
+        h264Stream.append(aud)
+        h264Stream.append(contentsOf: [0x00, 0x00]) // trailing zero padding before start code
+        h264Stream.append(contentsOf: [0x00, 0x00, 0x00, 0x01])
+        h264Stream.append(pSlice)
+
+        let h264Units = AnnexBParser.splitNALUnits(from: h264Stream, codec: .h264)
+        #expect(h264Units.count == 2)
+        #expect(h264Units[0] == AnnexBNALUnit(data: aud, nalType: AnnexBParser.h264AUD))
+        #expect(h264Units[1] == AnnexBNALUnit(data: pSlice, nalType: 1))
+
+        let (avcc, isKey) = AnnexBParser.convertToLengthPrefixed(units: h264Units, codec: .h264)
+        #expect(isKey == false)
+        #expect(avcc.count == 4 + pSlice.count)
+        #expect(avcc.dropFirst(4) == pSlice)
+
+        // HEVC AUD (35 -> 0x46) stripped; IDR_N_LP (20 -> 0x28) & CRA (21 -> 0x2A) detected as keyframes.
+        for keyType: UInt8 in [AnnexBParser.hevcIDRW, AnnexBParser.hevcIDRN, AnnexBParser.hevcCRA] {
+            let audUnit = AnnexBNALUnit(data: Data([0x46, 0x01, 0x50]), nalType: AnnexBParser.hevcAUD)
+            let keyUnit = AnnexBNALUnit(data: Data([keyType << 1, 0x01, 0xAA]), nalType: keyType)
+            let (hvcc, hasKey) = AnnexBParser.convertToLengthPrefixed(units: [audUnit, keyUnit], codec: .hevc)
+            #expect(hasKey == true)
+            #expect(hvcc.dropFirst(4) == keyUnit.data)
+        }
     }
 }

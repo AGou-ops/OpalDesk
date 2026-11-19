@@ -1,6 +1,6 @@
 import Foundation
 
-/// A single ExtCast v1 wire frame with fixed 18-byte header and variable payload.
+/// A single ExtCast v1.1 wire frame with fixed 18-byte header and variable payload.
 public struct ExtCastFrame: Sendable, Equatable {
     public var type: ExtCastFrameType
     public var flags: UInt8
@@ -40,7 +40,7 @@ public struct ExtCastFrame: Sendable, Equatable {
         return writer.data
     }
 
-    // MARK: - Convenience Frame Builders
+    // MARK: - Uplink Frame Builders (Mac -> Android)
 
     public static func hello(_ payload: HelloPayload) throws -> ExtCastFrame {
         ExtCastFrame(type: .hello, payload: try payload.encode())
@@ -78,20 +78,12 @@ public struct ExtCastFrame: Sendable, Equatable {
         )
     }
 
-    public static func clipboardImagePush(_ payload: ClipboardImagePushPayload) throws -> ExtCastFrame {
-        ExtCastFrame(
-            type: .clipboardPush,
-            flags: ExtCastProtocol.flagClipboardImagePng,
-            payload: try payload.encode()
-        )
-    }
-
     public static func systemAction(_ payload: SystemActionPayload) -> ExtCastFrame {
         ExtCastFrame(type: .systemAction, payload: payload.encode())
     }
 
-    public static func fileTransferChunk(_ payload: FileTransferChunkPayload) -> ExtCastFrame {
-        ExtCastFrame(type: .fileTransferChunk, payload: payload.encode())
+    public static func fileTransferChunk(_ payload: FileTransferChunkPayload) throws -> ExtCastFrame {
+        ExtCastFrame(type: .fileTransferChunk, payload: try payload.encode())
     }
 
     public static func requestWifiUpgrade() -> ExtCastFrame {
@@ -106,14 +98,6 @@ public struct ExtCastFrame: Sendable, Equatable {
         ExtCastFrame(type: .windowAction, payload: try payload.encode())
     }
 
-    public static func wifiUpgradeReady(_ payload: WifiUpgradeReadyPayload) throws -> ExtCastFrame {
-        ExtCastFrame(type: .wifiUpgradeReady, payload: try payload.encode())
-    }
-
-    public static func appList(_ payload: AppListPayload) throws -> ExtCastFrame {
-        ExtCastFrame(type: .appList, payload: try payload.encode())
-    }
-
     public static func ping(_ pingId: UInt64) -> ExtCastFrame {
         ExtCastFrame(type: .ping, payload: PingPongPayload(pingId: pingId).encode())
     }
@@ -122,6 +106,8 @@ public struct ExtCastFrame: Sendable, Equatable {
 /// Streaming ring-buffered decoder for TCP byte streams that handles arbitrary
 /// packet fragmentation (half-packets) and coalescing (sticky packets).
 public struct ExtCastStreamDecoder: Sendable {
+    private static let compactionThresholdBytes = 64 * 1024
+
     private var storage: [UInt8]
     private var readIndex: Int = 0
     private var writeIndex: Int = 0
@@ -250,8 +236,7 @@ public struct ExtCastStreamDecoder: Sendable {
             return
         }
         // Compact once consumed prefix exceeds 64 KiB and at least half of written span.
-        let compactionThreshold = 64 * 1024
-        if readIndex >= compactionThreshold && readIndex * 2 >= writeIndex {
+        if readIndex >= Self.compactionThresholdBytes && readIndex * 2 >= writeIndex {
             let unread = writeIndex - readIndex
             storage.replaceSubrange(0..<unread, with: storage[readIndex..<writeIndex])
             readIndex = 0

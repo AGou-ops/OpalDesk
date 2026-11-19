@@ -127,7 +127,7 @@ struct ExtCastFrameTests {
         // 0x10 DEVICE_STATE
         let ds = DeviceStatePayload(
             deviceName: "Xiaomi 15 Pro",
-            sinkType: ExtCastSinkType.remoteUSB.rawValue,
+            sinkType: 2,
             displayMode: 0,
             width: 1920,
             height: 1080,
@@ -247,16 +247,34 @@ struct ExtCastFrameTests {
             fileName: "测试报告.pdf",
             totalSize: 1_048_576
         )
-        #expect(try FileTransferChunkPayload.decode(from: startChunk.encode()) == startChunk)
+        #expect(try FileTransferChunkPayload.decode(from: try startChunk.encode()) == startChunk)
 
         let dataChunk = FileTransferChunkPayload(
             transferId: 5,
             chunkFlags: .data,
             data: Data([1, 2, 3, 4, 5, 6, 7, 8])
         )
-        #expect(try FileTransferChunkPayload.decode(from: dataChunk.encode()) == dataChunk)
+        #expect(try FileTransferChunkPayload.decode(from: try dataChunk.encode()) == dataChunk)
 
         let endChunk = FileTransferChunkPayload(transferId: 5, chunkFlags: .end)
-        #expect(try FileTransferChunkPayload.decode(from: endChunk.encode()) == endChunk)
+        #expect(try FileTransferChunkPayload.decode(from: try endChunk.encode()) == endChunk)
+    }
+
+    @Test("FileTransferChunkPayload throws fieldTooLong when UTF-8 filename exceeds 65535 bytes")
+    func fileTransferChunkRejectsOversizedFileName() {
+        let oversizedName = String(repeating: "a", count: ExtCastProtocol.maxFileNameUTF8Bytes + 1)
+        let chunk = FileTransferChunkPayload(
+            transferId: 99,
+            chunkFlags: .start,
+            fileName: oversizedName,
+            totalSize: 10
+        )
+        #expect(throws: ExtCastCodecError.fieldTooLong(
+            field: "fileTransferChunk.fileName",
+            length: ExtCastProtocol.maxFileNameUTF8Bytes + 1,
+            maxLength: ExtCastProtocol.maxFileNameUTF8Bytes
+        )) {
+            _ = try chunk.encode()
+        }
     }
 }

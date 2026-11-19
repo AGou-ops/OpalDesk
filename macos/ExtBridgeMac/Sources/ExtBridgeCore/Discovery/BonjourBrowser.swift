@@ -45,6 +45,14 @@ public struct DiscoveredBonjourDevice: Sendable, Equatable, Identifiable, Hashab
 
 /// Real-time Bonjour browser discovering `_extbridge._tcp` Android hosts on the local network.
 public final class BonjourBrowser: Sendable {
+    enum TXTRecordKey {
+        static let name = "name"
+        static let model = "model"
+        static let fingerprint = "fp"
+        static let version = "ver"
+        static let allKeys = [name, model, fingerprint, version]
+    }
+
     private struct MutableState {
         var browser: NWBrowser?
         var devices: [DiscoveredBonjourDevice] = []
@@ -56,10 +64,6 @@ public final class BonjourBrowser: Sendable {
     private let state = OSAllocatedUnfairLock(initialState: MutableState())
 
     public init() {}
-
-    public func currentDevices() -> [DiscoveredBonjourDevice] {
-        state.withLock { $0.devices }
-    }
 
     public func start(
         onUpdate: @escaping @Sendable ([DiscoveredBonjourDevice]) -> Void,
@@ -83,6 +87,9 @@ public final class BonjourBrowser: Sendable {
 
         browser.stateUpdateHandler = { [weak self] newState in
             guard let self else { return }
+            if case .failed(let error) = newState {
+                ExtBridgeLog.session.error("Bonjour browser failed: \(error.localizedDescription, privacy: .public)")
+            }
             let callback = self.state.withLock { $0.onStateChange }
             callback?(newState)
         }
@@ -120,38 +127,48 @@ public final class BonjourBrowser: Sendable {
                 continue
             }
             let txt = extractTXTRecord(from: result.metadata)
-            let device = DiscoveredBonjourDevice(
-                serviceName: name,
-                domain: domain,
-                displayName: txt["name"] ?? name,
-                model: txt["model"] ?? "",
-                fingerprintPrefix: txt["fp"] ?? "",
-                protocolVersion: txt["ver"] ?? "1"
-            )
-            list.append(device)
+            list.append(makeDevice(serviceName: name, domain: domain, txt: txt))
         }
         return list.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
+    static func makeDevice(
+        serviceName: String,
+        domain: String,
+        txt: [String: String]
+    ) -> DiscoveredBonjourDevice {
+        DiscoveredBonjourDevice(
+            serviceName: serviceName,
+            domain: domain,
+            displayName: txt[TXTRecordKey.name] ?? serviceName,
+            model: txt[TXTRecordKey.model] ?? "",
+            fingerprintPrefix: txt[TXTRecordKey.fingerprint] ?? "",
+            protocolVersion: txt[TXTRecordKey.version] ?? String(ExtCastProtocol.version)
+        )
     }
 
     private static func extractTXTRecord(from metadata: NWBrowser.Result.Metadata) -> [String: String] {
         guard case let .bonjour(record) = metadata else {
             return [:]
         }
+        return parseTXTRecord(record)
+    }
+
+    static func parseTXTRecord(_ record: NWTXTRecord) -> [String: String] {
         var dict: [String: String] = [:]
-        for key in ["name", "model", "fp", "ver"] {
-            if let entry = record.getEntry(for: key) {
-                switch entry {
-                case .string(let value):
-                    dict[key] = value
-                case .data(let data):
-                    if let str = String(data: data, encoding: .utf8) {
-                        dict[key] = str
-                    }
-                case .none, .empty:
-                    break
-                @unknown default:
-                    break
+        for key in TXTRecordKey.allKeys {
+            guard let entry = record.getEntry(for: key) else { continue }
+            switch entry {
+            case .string(let value):
+                dict[key] = value
+            case .data(let data):
+                if let str = String(data: data, encoding: .utf8) {
+                    dict[key] = str
                 }
+            case .none, .empty:
+                break
+            @unknown default:
+                break
             }
         }
         return dict

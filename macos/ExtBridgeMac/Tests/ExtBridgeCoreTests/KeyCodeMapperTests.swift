@@ -70,4 +70,30 @@ struct KeyCodeMapperTests {
         #expect((meta & AndroidMetaState.metaOn) != 0)
         #expect((meta & AndroidMetaState.ctrlOn) == 0)
     }
+
+    @Test("Maps modifier virtual keyCodes via Carbon kVK_* constants for down and up transitions")
+    func modifierKeyHelperTransitions() {
+        let cases: [(Int, NSEvent.ModifierFlags)] = [
+            (kVK_Shift, .shift),
+            (kVK_RightShift, .shift),
+            (kVK_Control, .control),
+            (kVK_RightControl, .control),
+            (kVK_Option, .option),
+            (kVK_RightOption, .option),
+            (kVK_Command, .command),
+            (kVK_RightCommand, .command),
+            (kVK_CapsLock, .capsLock)
+        ]
+
+        for (vk, expectedFlag) in cases {
+            let code = UInt16(vk)
+            #expect(KeyCodeMapper.isModifierKeyCode(code))
+            #expect(KeyCodeMapper.modifierFlag(for: code) == expectedFlag)
+            #expect(KeyCodeMapper.modifierKeyAction(for: code, currentFlags: expectedFlag, previousFlags: []) == .down)
+            #expect(KeyCodeMapper.modifierKeyAction(for: code, currentFlags: [], previousFlags: expectedFlag) == .up)
+        }
+
+        #expect(!KeyCodeMapper.isModifierKeyCode(UInt16(kVK_ANSI_A)))
+        #expect(KeyCodeMapper.modifierFlag(for: UInt16(kVK_ANSI_A)) == nil)
+    }
 }

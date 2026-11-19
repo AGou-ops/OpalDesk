@@ -24,11 +24,14 @@ public struct ExtractedParameterSets: Sendable, Equatable {
     }
 
     public func isComplete(for codec: ExtCastVideoCodec) -> Bool {
+        let validSPS = !sps.isEmpty && sps.allSatisfy { !$0.isEmpty }
+        let validPPS = !pps.isEmpty && pps.allSatisfy { !$0.isEmpty }
         switch codec {
         case .h264:
-            return !sps.isEmpty && !pps.isEmpty
+            return validSPS && validPPS
         case .hevc:
-            return !vps.isEmpty && !sps.isEmpty && !pps.isEmpty
+            let validVPS = !vps.isEmpty && vps.allSatisfy { !$0.isEmpty }
+            return validVPS && validSPS && validPPS
         }
     }
 }
@@ -53,7 +56,6 @@ public enum AnnexBError: Error, Sendable, Equatable, LocalizedError {
 public enum AnnexBParser {
     // H.264 NAL unit types (5-bit header: byte0 & 0x1F)
     public static let h264IDR: UInt8 = 5
-    public static let h264SEI: UInt8 = 6
     public static let h264SPS: UInt8 = 7
     public static let h264PPS: UInt8 = 8
     public static let h264AUD: UInt8 = 9
@@ -197,11 +199,14 @@ public enum AnnexBParser {
         case .hevc:
             orderedSets = parameterSets.vps + parameterSets.sps + parameterSets.pps
         }
+        guard orderedSets.allSatisfy({ !$0.isEmpty }) else {
+            throw AnnexBError.incompleteParameterSets(codec)
+        }
 
         let sizes = orderedSets.map { $0.count }
         var formatDescription: CMVideoFormatDescription?
 
-        let status: OSStatus = withUnsafeBytePointers(to: orderedSets) { pointers in
+        let status: OSStatus = try withUnsafeBytePointers(to: orderedSets, codec: codec) { pointers in
             pointers.withUnsafeBufferPointer { ptrBuf in
                 sizes.withUnsafeBufferPointer { sizeBuf in
                     guard let ptrBase = ptrBuf.baseAddress, let sizeBase = sizeBuf.baseAddress else {
@@ -265,21 +270,24 @@ public enum AnnexBParser {
         units.append(AnnexBNALUnit(data: Data(bytes: base.advanced(by: start), count: end - start), nalType: nalType))
     }
 
-    /// Recursively pins each `Data` buffer so every base pointer remains valid for the duration of `body`.
+    /// Recursively pins each non-empty `Data` buffer so every base pointer remains valid for the duration of `body`.
     private static func withUnsafeBytePointers<R>(
         to buffers: [Data],
+        codec: ExtCastVideoCodec,
         index: Int = 0,
         accumulated: [UnsafePointer<UInt8>] = [],
         _ body: ([UnsafePointer<UInt8>]) -> R
-    ) -> R {
+    ) throws -> R {
         if index == buffers.count {
             return body(accumulated)
         }
-        return buffers[index].withUnsafeBytes { rawBuffer in
-            let ptr = rawBuffer.bindMemory(to: UInt8.self).baseAddress!
+        return try buffers[index].withUnsafeBytes { rawBuffer in
+            guard let ptr = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                throw AnnexBError.incompleteParameterSets(codec)
+            }
             var next = accumulated
             next.append(ptr)
-            return withUnsafeBytePointers(to: buffers, index: index + 1, accumulated: next, body)
+            return try withUnsafeBytePointers(to: buffers, codec: codec, index: index + 1, accumulated: next, body)
         }
     }
 }

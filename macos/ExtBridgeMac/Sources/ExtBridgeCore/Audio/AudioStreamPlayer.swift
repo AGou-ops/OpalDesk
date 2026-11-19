@@ -3,71 +3,13 @@ import AudioToolbox
 import Foundation
 import os
 
-/// Parsed parameters from a 2-byte MPEG-4 AudioSpecificConfig (ISO/IEC 14496-3).
-public struct AudioSpecificConfigInfo: Sendable, Equatable {
-    public let audioObjectType: UInt8
-    public let sampleRate: UInt32
-    public let channels: UInt8
-
-    private static let sampleRateTable: [UInt32] = [
-        96000, 88200, 64000, 48000, 44100, 32000,
-        24000, 22050, 16000, 12000, 11025, 8000, 7350
-    ]
-
-    public static func parse(_ data: Data) -> AudioSpecificConfigInfo? {
-        guard data.count >= 2 else { return nil }
-        let b0 = data[data.startIndex]
-        let b1 = data[data.startIndex + 1]
-        let objectType = (b0 >> 3) & 0x1F
-        let freqIndex = Int(((b0 & 0x07) << 1) | ((b1 >> 7) & 0x01))
-        let channelConfig = (b1 >> 3) & 0x0F
-
-        guard freqIndex >= 0 && freqIndex < sampleRateTable.count else { return nil }
-        let sr = sampleRateTable[freqIndex]
-        let ch: UInt8 = channelConfig == 7 ? 8 : max(1, channelConfig)
-        return AudioSpecificConfigInfo(audioObjectType: objectType, sampleRate: sr, channels: ch)
-    }
-
-    /// Wraps raw AudioSpecificConfig bytes inside an MPEG-4 ES_Descriptor (`esds` payload)
-    /// suitable for CoreAudio `kAudioFormatMPEG4AAC` magicCookie.
-    public static func wrapInESDS(_ asc: Data) -> Data {
-        guard !asc.isEmpty && asc.count <= 127 else { return Data() }
-        // DecoderSpecificInfo (tag 0x05)
-        var dsi: [UInt8] = [0x05, UInt8(asc.count)]
-        dsi.append(contentsOf: asc)
-
-        // DecoderConfigDescriptor (tag 0x04):
-        // objectTypeIndication=0x40 (MPEG-4 Audio), streamType=0x15 (Audio upstream=0 reserved=1),
-        // bufferSizeDB=0, maxBitrate=256000, avgBitrate=128000
-        var dcdBody: [UInt8] = [
-            0x40,
-            0x15,
-            0x00, 0x18, 0x00,
-            0x00, 0x03, 0xE8, 0x00,
-            0x00, 0x01, 0xF4, 0x00
-        ]
-        dcdBody.append(contentsOf: dsi)
-        var dcd: [UInt8] = [0x04, UInt8(dcdBody.count)]
-        dcd.append(contentsOf: dcdBody)
-
-        // SLConfigDescriptor (tag 0x06): predefined=2
-        let slc: [UInt8] = [0x06, 0x01, 0x02]
-
-        // ES_Descriptor (tag 0x03): ES_ID=0, flags=0
-        var esdBody: [UInt8] = [0x00, 0x00, 0x00]
-        esdBody.append(contentsOf: dcd)
-        esdBody.append(contentsOf: slc)
-        var esds: [UInt8] = [0x03, UInt8(esdBody.count)]
-        esds.append(contentsOf: esdBody)
-        return Data(esds)
-    }
-}
-
 /// Real-time low-latency audio decoder and playback engine backed by `AVAudioEngine` + `AVAudioConverter`.
-/// Decodes Android ExtCast AAC-LC (48kHz stereo), Opus, or PCM-16 audio streams with mute support
+/// Decodes Android ExtCast AAC-LC (48kHz stereo) or PCM-16 audio streams with mute support
 /// and bounded jitter-buffer overflow protection.
 public final class AudioStreamPlayer: @unchecked Sendable {
     private static let maxScheduledBuffers = 8
+    private static let aacFramesPerPacket: AVAudioFrameCount = 1024
+    private static let minimumSampleRate: UInt32 = 8000
 
     private struct AtomicMetrics: Sendable {
         var isMuted: Bool = false
@@ -93,7 +35,13 @@ public final class AudioStreamPlayer: @unchecked Sendable {
     }
 
     deinit {
-        stop()
+        // Never dispatch synchronously onto `audioQueue` in `deinit`: if the last strong
+        // reference drops inside an `audioQueue` block, `audioQueue.sync` would deadlock.
+        // At `deinit`, no other reference can touch `engine` or `playerNode`.
+        playerNode.stop()
+        if engine.isRunning {
+            engine.stop()
+        }
     }
 
     public var isMuted: Bool {
@@ -122,25 +70,23 @@ public final class AudioStreamPlayer: @unchecked Sendable {
     }
 
     public func stop() {
-        audioQueue.sync {
-            playerNode.stop()
-            if engine.isRunning {
-                engine.stop()
-            }
-            isConfigured = false
-            converter = nil
-            inputFormat = nil
-            outputFormat = nil
-            metrics.withLock { $0.pendingBufferCount = 0 }
+        metrics.withLock { $0.pendingBufferCount = 0 }
+        audioQueue.async { [weak self] in
+            self?.stopOnQueue()
         }
     }
 
-    /// Standalone synchronous decode helper (also used by unit tests to verify AAC-LC / PCM-16 decoding without opening audio hardware).
+    /// Standalone synchronous converter builder (also used by unit tests to verify AAC-LC / PCM-16 decoding without opening audio hardware).
     public static func makeConverter(
         for config: AudioConfigPayload
     ) -> (inputFormat: AVAudioFormat, outputFormat: AVAudioFormat, converter: AVAudioConverter)? {
+        guard config.codec == .aacLC || config.codec == .pcm16 else {
+            ExtBridgeLog.audio.warning("Unsupported ExtCast audio codec rawValue=\(config.codec.rawValue)")
+            return nil
+        }
+
         let ascInfo = config.codec == .aacLC ? AudioSpecificConfigInfo.parse(config.codecSpecificData) : nil
-        let sampleRate = Double(ascInfo?.sampleRate ?? max(config.sampleRate, 8000))
+        let sampleRate = Double(ascInfo?.sampleRate ?? max(config.sampleRate, minimumSampleRate))
         let channels = AVAudioChannelCount(ascInfo?.channels ?? max(config.channels, 1))
 
         guard let outputFormat = AVAudioFormat(
@@ -149,8 +95,13 @@ public final class AudioStreamPlayer: @unchecked Sendable {
             channels: channels,
             interleaved: false
         ) else {
+            ExtBridgeLog.audio.error("Failed to create PCM Float32 output format (sr=\(sampleRate), ch=\(channels))")
             return nil
         }
+
+        let esdsCookie: Data = (config.codec == .aacLC && !config.codecSpecificData.isEmpty)
+            ? AudioSpecificConfigInfo.wrapInESDS(config.codecSpecificData)
+            : Data()
 
         let inputFormat: AVAudioFormat?
         switch config.codec {
@@ -160,34 +111,17 @@ public final class AudioStreamPlayer: @unchecked Sendable {
                 mFormatID: kAudioFormatMPEG4AAC,
                 mFormatFlags: UInt32(MPEG4ObjectID.AAC_LC.rawValue),
                 mBytesPerPacket: 0,
-                mFramesPerPacket: 1024,
+                mFramesPerPacket: aacFramesPerPacket,
                 mBytesPerFrame: 0,
                 mChannelsPerFrame: channels,
                 mBitsPerChannel: 0,
                 mReserved: 0
             )
             let fmt = AVAudioFormat(streamDescription: &asbd)
-            if !config.codecSpecificData.isEmpty {
-                let esds = AudioSpecificConfigInfo.wrapInESDS(config.codecSpecificData)
-                if !esds.isEmpty {
-                    fmt?.magicCookie = esds
-                }
+            if !esdsCookie.isEmpty {
+                fmt?.magicCookie = esdsCookie
             }
             inputFormat = fmt
-
-        case .opus:
-            var asbd = AudioStreamBasicDescription(
-                mSampleRate: sampleRate,
-                mFormatID: kAudioFormatOpus,
-                mFormatFlags: 0,
-                mBytesPerPacket: 0,
-                mFramesPerPacket: 960,
-                mBytesPerFrame: 0,
-                mChannelsPerFrame: channels,
-                mBitsPerChannel: 0,
-                mReserved: 0
-            )
-            inputFormat = AVAudioFormat(streamDescription: &asbd)
 
         case .pcm16:
             inputFormat = AVAudioFormat(
@@ -196,19 +130,20 @@ public final class AudioStreamPlayer: @unchecked Sendable {
                 channels: channels,
                 interleaved: true
             )
+
+        case .opus:
+            return nil
         }
 
         guard let inFmt = inputFormat,
               let converter = AVAudioConverter(from: inFmt, to: outputFormat)
         else {
+            ExtBridgeLog.audio.error("Failed to create AVAudioConverter for codec rawValue=\(config.codec.rawValue)")
             return nil
         }
 
-        if config.codec == .aacLC && !config.codecSpecificData.isEmpty {
-            let esds = AudioSpecificConfigInfo.wrapInESDS(config.codecSpecificData)
-            if !esds.isEmpty {
-                converter.magicCookie = esds
-            }
+        if !esdsCookie.isEmpty {
+            converter.magicCookie = esdsCookie
         }
 
         return (inFmt, outputFormat, converter)
@@ -227,8 +162,7 @@ public final class AudioStreamPlayer: @unchecked Sendable {
             guard bytesPerFrame > 0 else { return nil }
             let frameCount = AVAudioFrameCount(payload.count / bytesPerFrame)
             guard frameCount > 0,
-                  let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount),
-                  let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: frameCount)
+                  let inputBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount)
             else {
                 return nil
             }
@@ -240,24 +174,9 @@ public final class AudioStreamPlayer: @unchecked Sendable {
                     }
                 }
             }
-            var error: NSError?
-            var didProvide = false
-            let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-                if didProvide {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-                didProvide = true
-                outStatus.pointee = .haveData
-                return inputBuffer
-            }
-            guard status != .error && error == nil && outputBuffer.frameLength > 0 else {
-                return nil
-            }
-            return outputBuffer
+            return convertSingleBuffer(inputBuffer, using: converter, outputFormat: outputFormat, frameCapacity: frameCount)
 
-        case .aacLC, .opus:
-            let frameCapacity: AVAudioFrameCount = (codec == .aacLC) ? 1024 : 960
+        case .aacLC:
             let compressed = AVAudioCompressedBuffer(
                 format: inputFormat,
                 packetCapacity: 1,
@@ -275,30 +194,63 @@ public final class AudioStreamPlayer: @unchecked Sendable {
                 mVariableFramesInPacket: 0,
                 mDataByteSize: UInt32(payload.count)
             )
+            return convertSingleBuffer(
+                compressed,
+                using: converter,
+                outputFormat: outputFormat,
+                frameCapacity: aacFramesPerPacket
+            )
 
-            guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: frameCapacity) else {
-                return nil
-            }
-
-            var error: NSError?
-            var supplied = false
-            let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-                if supplied {
-                    outStatus.pointee = .noDataNow
-                    return nil
-                }
-                supplied = true
-                outStatus.pointee = .haveData
-                return compressed
-            }
-            guard status != .error && error == nil && outputBuffer.frameLength > 0 else {
-                return nil
-            }
-            return outputBuffer
+        case .opus:
+            ExtBridgeLog.audio.warning("Ignoring audio packet for unsupported codec: opus")
+            return nil
         }
     }
 
-    // MARK: - Private Playback Pipeline (runs on `audioQueue`)
+    // MARK: - Private Decode & Playback Pipeline
+
+    private static func convertSingleBuffer(
+        _ inputBuffer: AVAudioBuffer,
+        using converter: AVAudioConverter,
+        outputFormat: AVAudioFormat,
+        frameCapacity: AVAudioFrameCount
+    ) -> AVAudioPCMBuffer? {
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: frameCapacity) else {
+            return nil
+        }
+        var error: NSError?
+        var supplied = false
+        let status = converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            if supplied {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            outStatus.pointee = .haveData
+            return inputBuffer
+        }
+        if status == .error || error != nil {
+            ExtBridgeLog.audio.warning("AVAudioConverter failed: \(error?.localizedDescription ?? "status=\(status.rawValue)", privacy: .public)")
+            return nil
+        }
+        guard outputBuffer.frameLength > 0 else {
+            return nil
+        }
+        return outputBuffer
+    }
+
+    private func stopOnQueue() {
+        playerNode.stop()
+        if engine.isRunning {
+            engine.stop()
+        }
+        isConfigured = false
+        currentConfig = nil
+        converter = nil
+        inputFormat = nil
+        outputFormat = nil
+        metrics.withLock { $0.pendingBufferCount = 0 }
+    }
 
     private func configureOnQueue(_ config: AudioConfigPayload) {
         playerNode.stop()
@@ -322,6 +274,7 @@ public final class AudioStreamPlayer: @unchecked Sendable {
             try engine.start()
             playerNode.play()
         } catch {
+            ExtBridgeLog.audio.error("Failed to start AVAudioEngine during configure: \(error.localizedDescription, privacy: .public)")
             isConfigured = false
             return
         }
@@ -367,7 +320,12 @@ public final class AudioStreamPlayer: @unchecked Sendable {
         }
 
         if !engine.isRunning {
-            try? engine.start()
+            do {
+                try engine.start()
+            } catch {
+                ExtBridgeLog.audio.error("Failed to restart AVAudioEngine for playback: \(error.localizedDescription, privacy: .public)")
+                return
+            }
         }
         if !playerNode.isPlaying {
             playerNode.play()

@@ -106,9 +106,11 @@ private struct TrustStoreSnapshot: Codable, Sendable {
 }
 
 /// Thread-safe persistent store for this Mac's clientId and paired Android device trust records.
+/// Persists to disk atomically BEFORE committing in-memory updates so RAM and disk never diverge.
 public final class TrustStore: Sendable {
     private let storageURL: URL
     private let state: OSAllocatedUnfairLock<TrustStoreSnapshot>
+    private let writeLock = NSLock()
 
     public static func defaultStorageURL() -> URL {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -120,10 +122,16 @@ public final class TrustStore: Sendable {
 
     public init(storageURL: URL = TrustStore.defaultStorageURL()) {
         self.storageURL = storageURL
-        let loaded = TrustStore.loadFromDisk(url: storageURL)
+        let (loaded, needsPersist) = TrustStore.loadFromDisk(url: storageURL)
         self.state = OSAllocatedUnfairLock(initialState: loaded)
-        if !FileManager.default.fileExists(atPath: storageURL.path) {
-            try? persist(loaded)
+        if needsPersist {
+            do {
+                try persist(loaded)
+            } catch {
+                ExtBridgeLog.trust.warning(
+                    "Failed to initialize trust store at \(storageURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
         }
     }
 
@@ -153,20 +161,13 @@ public final class TrustStore: Sendable {
         }
     }
 
-    public func find(byId id: String) -> TrustedDevice? {
-        state.withLock { snapshot in
-            snapshot.devices.first { $0.id == id }
-        }
-    }
-
     @discardableResult
     public func upsert(_ device: TrustedDevice) throws -> TrustedDevice {
-        var prepared = device
-        prepared.certFingerprint = FingerprintUtil.normalize(device.certFingerprint)
-        prepared.lastConnectedAt = Date()
-        let incoming = prepared
+        var incoming = device
+        incoming.certFingerprint = FingerprintUtil.normalize(device.certFingerprint)
+        incoming.lastConnectedAt = Date()
 
-        let (updatedSnapshot, resolvedDevice): (TrustStoreSnapshot, TrustedDevice) = state.withLock { snapshot in
+        return try commitMutation { snapshot in
             if let index = snapshot.devices.firstIndex(where: {
                 $0.id == incoming.id
                     || (!incoming.certFingerprint.isEmpty && $0.certFingerprint == incoming.certFingerprint)
@@ -188,46 +189,88 @@ public final class TrustStore: Sendable {
                 }
                 existing.lastConnectedAt = incoming.lastConnectedAt
                 snapshot.devices[index] = existing
-                return (snapshot, existing)
+                return existing
             } else {
                 snapshot.devices.append(incoming)
-                return (snapshot, incoming)
+                return incoming
             }
         }
-
-        try persist(updatedSnapshot)
-        return resolvedDevice
     }
 
     public func revoke(id: String) throws {
-        let updatedSnapshot: TrustStoreSnapshot = state.withLock { snapshot in
+        try commitMutation { snapshot in
             snapshot.devices.removeAll { $0.id == id }
-            return snapshot
         }
-        try persist(updatedSnapshot)
     }
 
     public func revokeAll() throws {
-        let updatedSnapshot: TrustStoreSnapshot = state.withLock { snapshot in
+        try commitMutation { snapshot in
             snapshot.devices.removeAll()
-            return snapshot
         }
-        try persist(updatedSnapshot)
     }
 
-    private static func loadFromDisk(url: URL) -> TrustStoreSnapshot {
-        guard let data = try? Data(contentsOf: url) else {
-            return TrustStoreSnapshot(clientId: UUID().uuidString.lowercased(), devices: [])
+    // MARK: - Persistence
+
+    /// Computes a mutated snapshot, persists it atomically to disk FIRST, and only commits
+    /// to in-memory state if persistence succeeds — preventing RAM/disk divergence.
+    private func commitMutation<R>(_ mutate: (inout TrustStoreSnapshot) -> R) throws -> R {
+        try writeLock.withLock {
+            var candidate = state.withLock { $0 }
+            let result = mutate(&candidate)
+            try persist(candidate)
+            let committed = candidate
+            state.withLock { $0 = committed }
+            return result
         }
+    }
+
+    private static func loadFromDisk(url: URL) -> (snapshot: TrustStoreSnapshot, needsPersist: Bool) {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: url.path) else {
+            return (TrustStoreSnapshot(clientId: UUID().uuidString.lowercased(), devices: []), true)
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch {
+            ExtBridgeLog.trust.error(
+                "Failed to read trust store at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return (TrustStoreSnapshot(clientId: UUID().uuidString.lowercased(), devices: []), false)
+        }
+
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        if var decoded = try? decoder.decode(TrustStoreSnapshot.self, from: data) {
+        do {
+            var decoded = try decoder.decode(TrustStoreSnapshot.self, from: data)
             if decoded.clientId.isEmpty {
                 decoded.clientId = UUID().uuidString.lowercased()
+                return (decoded, true)
             }
-            return decoded
+            return (decoded, false)
+        } catch {
+            ExtBridgeLog.trust.error(
+                "Corrupt trust store JSON at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public); backing up before reset"
+            )
+            backupCorruptFile(at: url)
+            return (TrustStoreSnapshot(clientId: UUID().uuidString.lowercased(), devices: []), true)
         }
-        return TrustStoreSnapshot(clientId: UUID().uuidString.lowercased(), devices: [])
+    }
+
+    private static func backupCorruptFile(at url: URL) {
+        let fm = FileManager.default
+        let backupURL = url.appendingPathExtension("corrupt")
+        do {
+            if fm.fileExists(atPath: backupURL.path) {
+                try fm.removeItem(at: backupURL)
+            }
+            try fm.moveItem(at: url, to: backupURL)
+        } catch {
+            ExtBridgeLog.trust.error(
+                "Failed to back up corrupt trust store to \(backupURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     private func persist(_ snapshot: TrustStoreSnapshot) throws {
@@ -238,6 +281,13 @@ public final class TrustStore: Sendable {
         encoder.dateEncodingStrategy = .iso8601
         let data = try encoder.encode(snapshot)
         try data.write(to: storageURL, options: [.atomic])
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: storageURL.path)
+        let path = storageURL.path
+        do {
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        } catch {
+            ExtBridgeLog.trust.warning(
+                "Failed to set 0600 permissions on trust store \(path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 }

@@ -1,7 +1,7 @@
 import AVFoundation
+import CoreGraphics
 import CoreMedia
 import Foundation
-import QuartzCore
 import os
 
 public struct VideoRendererMetrics: Sendable, Equatable {
@@ -21,6 +21,10 @@ public struct VideoRendererMetrics: Sendable, Equatable {
 /// Accepts Annex-B `VIDEO_CONFIG` and `VIDEO_FRAME` payloads, automatically handles dynamic
 /// resolution/parameter-set changes, and requests IDR keyframes on decoder recovery.
 public final class VideoDisplayRenderer: @unchecked Sendable {
+    private static let maxPendingDecodeFrames: Int = 4
+    private static let hudUpdateIntervalNs: UInt64 = 500_000_000 // 0.5s
+    private static let idrThrottleIntervalNs: UInt64 = 500_000_000 // 0.5s
+
     private struct DecoderState {
         var codec: ExtCastVideoCodec = .hevc
         var parameterSets = ExtractedParameterSets()
@@ -62,10 +66,6 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
         }
     }
 
-    public func currentMetrics() -> VideoRendererMetrics {
-        state.withLock { $0.metrics }
-    }
-
     public func reset() {
         decodeQueue.async { [weak self] in
             guard let self else { return }
@@ -73,6 +73,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
                 s.parameterSets = ExtractedParameterSets()
                 s.formatDescription = nil
                 s.awaitingKeyframe = true
+                s.pendingDecodeFrames = 0
                 s.windowFrameCount = 0
                 s.windowByteCount = 0
                 s.windowStartNs = DispatchTime.now().uptimeNanoseconds
@@ -89,9 +90,17 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
             let units = AnnexBParser.splitNALUnits(from: config.csd, codec: config.codec)
             let extracted = AnnexBParser.extractParameterSets(from: units, codec: config.codec)
 
-            let createdFormat: CMVideoFormatDescription? = extracted.isComplete(for: config.codec)
-                ? try? AnnexBParser.makeFormatDescription(from: extracted, codec: config.codec)
-                : nil
+            let createdFormat: CMVideoFormatDescription?
+            if extracted.isComplete(for: config.codec) {
+                do {
+                    createdFormat = try AnnexBParser.makeFormatDescription(from: extracted, codec: config.codec)
+                } catch {
+                    ExtBridgeLog.video.error("Failed to build format description from VIDEO_CONFIG: \(error.localizedDescription, privacy: .public)")
+                    createdFormat = nil
+                }
+            } else {
+                createdFormat = nil
+            }
 
             let metricsSnapshot: VideoRendererMetrics = self.state.withLock { s in
                 s.codec = config.codec
@@ -116,7 +125,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
     public func enqueueFrame(payload: Data, flags: ExtCastVideoFrameFlags, timestampUs: Int64) {
         let isMarkedKey = flags.contains(.keyframe)
         let shouldDropBacklog: Bool = state.withLock { s in
-            if s.pendingDecodeFrames >= 4 && !isMarkedKey {
+            if s.pendingDecodeFrames >= Self.maxPendingDecodeFrames && !isMarkedKey {
                 s.metrics.droppedFrames += 1
                 s.awaitingKeyframe = true
                 return true
@@ -146,6 +155,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
 
         let renderer = sampleRenderer
         if renderer.status == .failed {
+            ExtBridgeLog.video.warning("AVSampleBufferVideoRenderer entered failed state; flushing and requesting IDR")
             renderer.flush()
             state.withLock { $0.awaitingKeyframe = true }
             requestIDRThrottled()
@@ -234,7 +244,8 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
         }
 
         let finalSets = merged
-        if let newFormat = try? AnnexBParser.makeFormatDescription(from: finalSets, codec: codec) {
+        do {
+            let newFormat = try AnnexBParser.makeFormatDescription(from: finalSets, codec: codec)
             let dims = CMVideoFormatDescriptionGetDimensions(newFormat)
             state.withLock { s in
                 s.parameterSets = finalSets
@@ -244,6 +255,8 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
                     s.metrics.height = Int(dims.height)
                 }
             }
+        } catch {
+            ExtBridgeLog.video.error("Failed to update inline format description: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -268,6 +281,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
             blockBufferOut: &blockBuffer
         )
         guard allocStatus == kCMBlockBufferNoErr, let blockBuffer else {
+            ExtBridgeLog.video.warning("CMBlockBufferCreateWithMemoryBlock failed: status=\(allocStatus)")
             return nil
         }
 
@@ -281,6 +295,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
             )
         }
         guard copyStatus == kCMBlockBufferNoErr else {
+            ExtBridgeLog.video.warning("CMBlockBufferReplaceDataBytes failed: status=\(copyStatus)")
             return nil
         }
 
@@ -306,6 +321,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
             sampleBufferOut: &sampleBuffer
         )
         guard sampleStatus == noErr, let sampleBuffer else {
+            ExtBridgeLog.video.warning("CMSampleBufferCreateReady failed: status=\(sampleStatus)")
             return nil
         }
 
@@ -344,7 +360,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
             s.windowByteCount += byteCount
 
             let elapsedNs = nowNs > s.windowStartNs ? nowNs - s.windowStartNs : 0
-            if elapsedNs >= 500_000_000 { // Update HUD stats every 0.5s
+            if elapsedNs >= Self.hudUpdateIntervalNs {
                 let seconds = Double(elapsedNs) / 1_000_000_000.0
                 s.metrics.currentFPS = Double(s.windowFrameCount) / seconds
                 s.metrics.bitrateKbps = (Double(s.windowByteCount) * 8.0) / (seconds * 1000.0)
@@ -364,7 +380,7 @@ public final class VideoDisplayRenderer: @unchecked Sendable {
     private func requestIDRThrottled() {
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let shouldFire: Bool = state.withLock { s in
-            if nowNs > s.lastIDRRequestNs && (nowNs - s.lastIDRRequestNs) < 500_000_000 {
+            if nowNs > s.lastIDRRequestNs && (nowNs - s.lastIDRRequestNs) < Self.idrThrottleIntervalNs {
                 return false
             }
             s.lastIDRRequestNs = nowNs

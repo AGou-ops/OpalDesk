@@ -1,54 +1,6 @@
-import CryptoKit
 import Foundation
 import Network
-import Security
 import os
-
-public enum ExtCastTransportSecurity: Sendable, Equatable {
-    /// Localhost plaintext TCP over ADB USB port forwarding (`127.0.0.1:<port>`).
-    case wiredLocalhostPlaintext
-    /// Wireless TLS 1.2/1.3 with strict leaf-certificate SHA-256 TOFU pinning.
-    /// `expectedFingerprint` must be a 64-char SHA-256 hex digest or a >=16-char Bonjour prefix.
-    case tlsPinned(expectedFingerprint: String)
-}
-
-public struct ExtCastEndpoint: Sendable, Equatable {
-    public enum Target: Sendable, Equatable {
-        case hostPort(host: String, port: UInt16)
-        case bonjour(serviceName: String, domain: String)
-    }
-
-    public var target: Target
-    public var security: ExtCastTransportSecurity
-    public var autoReconnect: Bool
-
-    public init(
-        target: Target,
-        security: ExtCastTransportSecurity,
-        autoReconnect: Bool = true
-    ) {
-        self.target = target
-        self.security = security
-        self.autoReconnect = autoReconnect
-    }
-
-    public var nwEndpoint: NWEndpoint {
-        switch target {
-        case let .hostPort(host, port):
-            return .hostPort(
-                host: NWEndpoint.Host(host),
-                port: NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(integerLiteral: ExtCastProtocol.defaultWifiPort)
-            )
-        case let .bonjour(serviceName, domain):
-            return .service(
-                name: serviceName,
-                type: ExtCastProtocol.bonjourServiceType,
-                domain: domain,
-                interface: nil
-            )
-        }
-    }
-}
 
 public enum ExtCastSessionState: Sendable, Equatable {
     case idle
@@ -59,37 +11,6 @@ public enum ExtCastSessionState: Sendable, Equatable {
     case disconnected
 }
 
-public enum ExtCastSessionError: Error, Sendable, Equatable, LocalizedError {
-    case missingExpectedFingerprint
-    case missingPeerCertificate
-    case certificateFingerprintMismatch(expected: String, actual: String)
-    case connectionFailed(String)
-    case protocolError(String)
-    case probeTimedOut
-    case sendBackpressureDropped
-
-    public var errorDescription: String? {
-        switch self {
-        case .missingExpectedFingerprint:
-            return "拒绝未固定指纹的 TLS 连接：请先校验 Android 设备的证书短指纹"
-        case .missingPeerCertificate:
-            return "对端未提供有效的 TLS 叶证书"
-        case let .certificateFingerprintMismatch(expected, actual):
-            let expShort = FingerprintUtil.formatShort(expected)
-            let actShort = FingerprintUtil.formatShort(actual)
-            return "TLS 证书指纹不匹配（预期 \(expShort)，实际 \(actShort)），已中止连接以防中间人攻击"
-        case .connectionFailed(let reason):
-            return "网络连接失败：\(reason)"
-        case .protocolError(let reason):
-            return "协议解析错误：\(reason)"
-        case .probeTimedOut:
-            return "探测设备 TLS 证书超时，请确认手机端已开启无线大屏服务且处于同一局域网"
-        case .sendBackpressureDropped:
-            return "发送缓冲区拥塞，已丢弃低优先级帧"
-        }
-    }
-}
-
 public enum ExtCastSessionEvent: Sendable {
     case stateChanged(ExtCastSessionState)
     case verifiedPeerFingerprint(String)
@@ -98,13 +19,23 @@ public enum ExtCastSessionEvent: Sendable {
     case error(ExtCastSessionError)
 }
 
-/// Manages an asynchronous ExtCast v1 transport connection over `Network.framework`.
+/// Manages an asynchronous ExtCast v1.1 transport connection over `Network.framework`.
 /// Handles wired plaintext localhost and wireless TLS 1.2/1.3 with strict TOFU SHA-256 pinning,
-/// streaming frame reassembly, ping/pong RTT telemetry, send backpressure, and auto-reconnect.
+/// streaming frame reassembly, ping/pong RTT telemetry, bounded send backpressure, and auto-reconnect.
 public final class ExtCastSession: Sendable {
     private static let heartbeatIntervalNs: UInt64 = 2_000_000_000 // 2 seconds
-    private static let maxInFlightBytes: Int = 4 * 1024 * 1024 // 4 MiB backpressure limit
+    private static let stalePingCutoffNs: UInt64 = 15_000_000_000 // 15 seconds
+    private static let receiveChunkSize: Int = 256 * 1024 // 256 KiB
+    private static let maxDroppableInFlightBytes: Int = 4 * 1024 * 1024 // 4 MiB
+    private static let pacedInFlightLimitBytes: Int = 2 * 1024 * 1024 // 2 MiB
+    private static let maxHardInFlightBytes: Int = 16 * 1024 * 1024 // 16 MiB OOM guard
     private static let maxReconnectAttempts: Int = 5
+    private static let maxReconnectDelaySeconds: Double = 8.0
+
+    private struct CapacityWaiter {
+        let limit: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
 
     private struct MutableState {
         var endpoint: ExtCastEndpoint?
@@ -113,6 +44,8 @@ public final class ExtCastSession: Sendable {
         var sessionState: ExtCastSessionState = .idle
         var eventHandler: (@Sendable (ExtCastSessionEvent) -> Void)?
         var inFlightBytes: Int = 0
+        var nextWaiterId: UInt64 = 1
+        var capacityWaiters: [UInt64: CapacityWaiter] = [:]
         var nextPingId: UInt64 = 1
         var pendingPings: [UInt64: UInt64] = [:]
         var verifiedFingerprint: String?
@@ -143,6 +76,10 @@ public final class ExtCastSession: Sendable {
         state.withLock { $0.verifiedFingerprint }
     }
 
+    public var inFlightByteCount: Int {
+        state.withLock { $0.inFlightBytes }
+    }
+
     public func connect(
         to endpoint: ExtCastEndpoint,
         onEvent: @escaping @Sendable (ExtCastSessionEvent) -> Void
@@ -166,38 +103,103 @@ public final class ExtCastSession: Sendable {
     }
 
     /// Sends an ExtCast frame. Set `allowDropOnCongestion: true` for high-frequency pointer moves
-    /// so backpressure never stalls interactive latency.
+    /// so backpressure never stalls interactive latency. Non-droppable frames are guarded by a hard
+    /// 16 MiB in-flight memory cap.
     public func send(_ frame: ExtCastFrame, allowDropOnCongestion: Bool = false) {
         let encoded: Data
         do {
             encoded = try frame.encode()
         } catch {
+            ExtBridgeLog.session.error("Failed to encode frame type=\(frame.type.rawValue): \(error.localizedDescription, privacy: .public)")
             emit(.error(.protocolError(error.localizedDescription)))
             return
         }
 
-        let (connection, accepted): (NWConnection?, Bool) = state.withLock { s in
+        enum EnqueueDecision {
+            case send(NWConnection)
+            case droppedLowPriority
+            case bufferOverflow(currentBytes: Int)
+            case notConnected
+        }
+
+        let decision: EnqueueDecision = state.withLock { s in
             guard s.sessionState == .connected, let conn = s.connection else {
-                return (nil, false)
+                return .notConnected
             }
-            if allowDropOnCongestion && (s.inFlightBytes + encoded.count > Self.maxInFlightBytes) {
-                return (nil, false)
+            let projected = s.inFlightBytes + encoded.count
+            if allowDropOnCongestion && projected > Self.maxDroppableInFlightBytes {
+                return .droppedLowPriority
             }
-            s.inFlightBytes += encoded.count
-            return (conn, true)
+            if !allowDropOnCongestion && projected > Self.maxHardInFlightBytes {
+                return .bufferOverflow(currentBytes: s.inFlightBytes)
+            }
+            s.inFlightBytes = projected
+            return .send(conn)
         }
 
-        guard accepted, let connection else {
+        switch decision {
+        case .notConnected, .droppedLowPriority:
             return
+        case .bufferOverflow(let currentBytes):
+            ExtBridgeLog.session.error("Send buffer overflow: inFlight=\(currentBytes) incoming=\(encoded.count) limit=\(Self.maxHardInFlightBytes)")
+            emit(.error(.sendBufferOverflow))
+            return
+        case .send(let connection):
+            dispatchSend(encoded, over: connection)
+        }
+    }
+
+    /// Sends a bulk frame (e.g. file transfer chunk) after awaiting in-flight buffer capacity,
+    /// preventing unbounded memory growth on slow networks.
+    public func sendPaced(_ frame: ExtCastFrame) async {
+        await waitForSendCapacity(limit: Self.pacedInFlightLimitBytes)
+        guard !Task.isCancelled else { return }
+        send(frame, allowDropOnCongestion: false)
+    }
+
+    /// Suspends until `inFlightBytes < limit`, the session leaves `.connected`, or the task is cancelled.
+    public func waitForSendCapacity(limit: Int = 2 * 1024 * 1024) async {
+        let clampedLimit = max(limit, 1)
+        let waiterId: UInt64 = state.withLock { s in
+            let id = s.nextWaiterId
+            s.nextWaiterId &+= 1
+            return id
         }
 
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                let shouldResumeImmediately: Bool = state.withLock { s in
+                    if Task.isCancelled || s.sessionState != .connected || s.inFlightBytes < clampedLimit {
+                        return true
+                    }
+                    s.capacityWaiters[waiterId] = CapacityWaiter(limit: clampedLimit, continuation: continuation)
+                    return false
+                }
+                if shouldResumeImmediately {
+                    continuation.resume()
+                }
+            }
+        } onCancel: { [weak self] in
+            guard let self else { return }
+            let waiter = self.state.withLock { $0.capacityWaiters.removeValue(forKey: waiterId) }
+            waiter?.continuation.resume()
+        }
+    }
+
+    // MARK: - Internal Connection Lifecycle
+
+    private func dispatchSend(_ encoded: Data, over connection: NWConnection) {
         let byteCount = encoded.count
         connection.send(content: encoded, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            let isCurrent: Bool = self.state.withLock { s in
-                guard s.connection === connection else { return false }
+            let (isCurrent, readyWaiters): (Bool, [CheckedContinuation<Void, Never>]) = self.state.withLock { s in
+                guard s.connection === connection else { return (false, []) }
                 s.inFlightBytes = max(0, s.inFlightBytes - byteCount)
-                return !s.isExplicitDisconnect
+                let ready = Self.popSatisfiedWaiters(from: &s)
+                return (!s.isExplicitDisconnect, ready)
+            }
+            for continuation in readyWaiters {
+                continuation.resume()
             }
             if isCurrent, let error {
                 self.handleConnectionFailure(error: error)
@@ -205,121 +207,42 @@ public final class ExtCastSession: Sendable {
         })
     }
 
-    /// Connects briefly to a TLS endpoint, extracts the server leaf certificate SHA-256 fingerprint,
-    /// and immediately aborts the handshake before any application payload is sent.
-    /// Used for safe TOFU verification on manual IP:Port connections.
-    public static func probeCertificateFingerprint(
-        host: String,
-        port: UInt16,
-        timeoutSeconds: Double = 5.0
-    ) async throws -> String {
-        let endpoint = NWEndpoint.hostPort(
-            host: NWEndpoint.Host(host),
-            port: NWEndpoint.Port(rawValue: port) ?? NWEndpoint.Port(integerLiteral: ExtCastProtocol.defaultWifiPort)
-        )
-        return try await probeCertificateFingerprint(nwEndpoint: endpoint, timeoutSeconds: timeoutSeconds)
-    }
-
-    public static func probeCertificateFingerprint(
-        nwEndpoint: NWEndpoint,
-        timeoutSeconds: Double = 5.0
-    ) async throws -> String {
-        final class ProbeBox: Sendable {
-            let lock = OSAllocatedUnfairLock<(resumed: Bool, connection: NWConnection?, timeoutTask: Task<Void, Never>?)>(
-                initialState: (false, nil, nil)
-            )
-            let queue = DispatchQueue(label: "com.extbridge.mac.tls-probe", qos: .userInitiated)
-        }
-
-        let box = ProbeBox()
-        return try await withCheckedThrowingContinuation { continuation in
-            let finish: @Sendable (Result<String, Error>) -> Void = { result in
-                let resources: (NWConnection?, Task<Void, Never>?)? = box.lock.withLock { s in
-                    guard !s.resumed else { return nil }
-                    s.resumed = true
-                    let conn = s.connection
-                    let task = s.timeoutTask
-                    s.connection = nil
-                    s.timeoutTask = nil
-                    return (conn, task)
-                }
-                guard let (conn, task) = resources else { return }
-                task?.cancel()
-                conn?.cancel()
-                continuation.resume(with: result)
-            }
-
-            let tlsOptions = NWProtocolTLS.Options()
-            sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
-            sec_protocol_options_set_verify_block(
-                tlsOptions.securityProtocolOptions,
-                { _, secTrust, verifyComplete in
-                    defer {
-                        // Always reject probe handshake so zero ExtCast bytes leave the host before user approval.
-                        verifyComplete(false)
-                    }
-                    guard let fingerprint = ExtCastSession.extractLeafCertificateSHA256(from: secTrust) else {
-                        finish(.failure(ExtCastSessionError.missingPeerCertificate))
-                        return
-                    }
-                    finish(.success(fingerprint))
-                },
-                box.queue
-            )
-
-            let tcpOptions = NWProtocolTCP.Options()
-            tcpOptions.connectionTimeout = max(1, Int(ceil(timeoutSeconds)))
-            let params = NWParameters(tls: tlsOptions, tcp: tcpOptions)
-            let connection = NWConnection(to: nwEndpoint, using: params)
-
-            let timeoutTask = Task.detached(priority: .utility) {
-                let ns = UInt64(max(timeoutSeconds, 0.5) * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: ns)
-                guard !Task.isCancelled else { return }
-                finish(.failure(ExtCastSessionError.probeTimedOut))
-            }
-
-            box.lock.withLock {
-                $0.connection = connection
-                $0.timeoutTask = timeoutTask
-            }
-
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .failed(let error):
-                    finish(.failure(ExtCastSessionError.connectionFailed(error.localizedDescription)))
-                case .waiting(let error):
-                    finish(.failure(ExtCastSessionError.connectionFailed(error.localizedDescription)))
-                default:
-                    break
-                }
-            }
-
-            connection.start(queue: box.queue)
-        }
-    }
-
-    // MARK: - Internal Connection Lifecycle
-
     private func startConnection(endpoint: ExtCastEndpoint) {
         if case let .tlsPinned(expected) = endpoint.security {
             let normalized = FingerprintUtil.normalize(expected)
             guard normalized.count >= FingerprintUtil.minimumPrefixHexLength else {
+                ExtBridgeLog.session.error("Rejected TLS connect without valid fingerprint pin")
                 transition(to: .failed(ExtCastSessionError.missingExpectedFingerprint.localizedDescription))
                 emit(.error(.missingExpectedFingerprint))
                 return
             }
         }
 
-        let params = makeParameters(for: endpoint)
+        let params = ExtCastTLSConfiguration.makeParameters(
+            for: endpoint,
+            trustStore: trustStore,
+            verifyQueue: networkQueue,
+            onVerified: { [weak self] actualHex in
+                guard let self else { return }
+                self.state.withLock { $0.verifiedFingerprint = actualHex }
+                self.emit(.verifiedPeerFingerprint(actualHex))
+            },
+            onVerificationError: { [weak self] tlsError in
+                self?.state.withLock { $0.tlsVerificationError = tlsError }
+            }
+        )
         let connection = NWConnection(to: endpoint.nwEndpoint, using: params)
 
-        state.withLock {
-            $0.connection = connection
-            $0.decoder.reset()
-            $0.inFlightBytes = 0
-            $0.pendingPings.removeAll()
-            $0.tlsVerificationError = nil
+        let staleWaiters: [CheckedContinuation<Void, Never>] = state.withLock { s in
+            s.connection = connection
+            s.decoder.reset()
+            s.inFlightBytes = 0
+            s.pendingPings.removeAll()
+            s.tlsVerificationError = nil
+            return Self.popAllWaiters(from: &s)
+        }
+        for continuation in staleWaiters {
+            continuation.resume()
         }
 
         transition(to: .connecting)
@@ -330,96 +253,6 @@ public final class ExtCastSession: Sendable {
         }
 
         connection.start(queue: networkQueue)
-    }
-
-    private func makeParameters(for endpoint: ExtCastEndpoint) -> NWParameters {
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.noDelay = true
-        tcpOptions.enableKeepalive = true
-        tcpOptions.keepaliveIdle = 10
-        tcpOptions.connectionTimeout = 8
-
-        switch endpoint.security {
-        case .wiredLocalhostPlaintext:
-            return NWParameters(tls: nil, tcp: tcpOptions)
-
-        case .tlsPinned(let expectedFingerprint):
-            let tlsOptions = NWProtocolTLS.Options()
-            sec_protocol_options_set_min_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv12)
-            sec_protocol_options_set_max_tls_protocol_version(tlsOptions.securityProtocolOptions, .TLSv13)
-
-            // Resolve strongest pin: if TrustStore already has a full 64-char pin matching this prefix/host,
-            // enforce the full 64-char pin so a shorter Bonjour prefix cannot downgrade an existing trust entry.
-            let effectiveExpected = resolveStrongestPin(expectedFingerprint: expectedFingerprint, endpoint: endpoint)
-
-            sec_protocol_options_set_verify_block(
-                tlsOptions.securityProtocolOptions,
-                { [weak self] _, secTrust, verifyComplete in
-                    guard let self else {
-                        verifyComplete(false)
-                        return
-                    }
-                    guard let actualHex = ExtCastSession.extractLeafCertificateSHA256(from: secTrust) else {
-                        self.state.withLock { $0.tlsVerificationError = .missingPeerCertificate }
-                        verifyComplete(false)
-                        return
-                    }
-
-                    guard FingerprintUtil.matches(actualFullHex: actualHex, expected: effectiveExpected) else {
-                        self.state.withLock {
-                            $0.tlsVerificationError = .certificateFingerprintMismatch(
-                                expected: effectiveExpected,
-                                actual: actualHex
-                            )
-                        }
-                        verifyComplete(false)
-                        return
-                    }
-
-                    self.state.withLock {
-                        $0.verifiedFingerprint = actualHex
-                    }
-                    self.emit(.verifiedPeerFingerprint(actualHex))
-                    verifyComplete(true)
-                },
-                networkQueue
-            )
-
-            return NWParameters(tls: tlsOptions, tcp: tcpOptions)
-        }
-    }
-
-    private func resolveStrongestPin(expectedFingerprint: String, endpoint: ExtCastEndpoint) -> String {
-        let normalized = FingerprintUtil.normalize(expectedFingerprint)
-        if normalized.count == FingerprintUtil.fullHexLength {
-            return normalized
-        }
-        guard let trustStore else {
-            return normalized
-        }
-        if let knownByFp = trustStore.find(byFingerprint: normalized),
-           FingerprintUtil.isValidFullHex(knownByFp.certFingerprint)
-        {
-            return knownByFp.certFingerprint
-        }
-        if case let .hostPort(host, port) = endpoint.target,
-           let knownByHost = trustStore.find(byHost: host, port: port),
-           FingerprintUtil.isValidFullHex(knownByHost.certFingerprint)
-        {
-            return knownByHost.certFingerprint
-        }
-        return normalized
-    }
-
-    private static func extractLeafCertificateSHA256(from secTrust: sec_trust_t) -> String? {
-        let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
-        guard let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
-              let leaf = chain.first
-        else {
-            return nil
-        }
-        let derData = SecCertificateCopyData(leaf) as Data
-        return FingerprintUtil.sha256Hex(of: derData)
     }
 
     private func handleConnectionState(_ newState: NWConnection.State, connection: NWConnection) {
@@ -456,7 +289,7 @@ public final class ExtCastSession: Sendable {
     }
 
     private func receiveNextChunk(from connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] content, _, isComplete, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: Self.receiveChunkSize) { [weak self] content, _, isComplete, error in
             guard let self else { return }
 
             let isStillCurrent: Bool = self.state.withLock {
@@ -503,17 +336,24 @@ public final class ExtCastSession: Sendable {
             }
 
         case .failure(let error):
+            ExtBridgeLog.session.error("Protocol decode error: \(error.localizedDescription, privacy: .public)")
             abortWithFatalError(.protocolError(error.localizedDescription))
         }
     }
 
     private func handlePongFrame(_ frame: ExtCastFrame) {
-        guard let pong = try? PingPongPayload.decode(from: frame.payload) else { return }
+        let pong: PingPongPayload
+        do {
+            pong = try PingPongPayload.decode(from: frame.payload)
+        } catch {
+            ExtBridgeLog.session.warning("Failed to decode PONG payload: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+
         let nowNs = DispatchTime.now().uptimeNanoseconds
         let sentNs: UInt64? = state.withLock { s in
             let sent = s.pendingPings.removeValue(forKey: pong.pingId)
-            // Prune stale pings older than 15s to keep the map tiny.
-            let cutoff = nowNs > 15_000_000_000 ? nowNs - 15_000_000_000 : 0
+            let cutoff = nowNs > Self.stalePingCutoffNs ? nowNs - Self.stalePingCutoffNs : 0
             s.pendingPings = s.pendingPings.filter { $0.value >= cutoff }
             return sent
         }
@@ -526,7 +366,11 @@ public final class ExtCastSession: Sendable {
     private func startHeartbeat() {
         let task = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: Self.heartbeatIntervalNs)
+                do {
+                    try await Task.sleep(nanoseconds: Self.heartbeatIntervalNs)
+                } catch {
+                    break
+                }
                 guard !Task.isCancelled, let self else { break }
                 let pingId: UInt64? = self.state.withLock { s in
                     guard s.sessionState == .connected else { return nil }
@@ -549,6 +393,7 @@ public final class ExtCastSession: Sendable {
     }
 
     private func handleRemoteEOF() {
+        ExtBridgeLog.session.info("Remote ExtCast peer closed connection (EOF)")
         let shouldReconnect = shouldAttemptReconnect()
         cleanupActiveConnection()
         if shouldReconnect {
@@ -567,6 +412,7 @@ public final class ExtCastSession: Sendable {
         let wasExplicit = state.withLock { $0.isExplicitDisconnect }
         guard !wasExplicit else { return }
 
+        ExtBridgeLog.session.warning("ExtCast connection error: \(error.localizedDescription, privacy: .public)")
         let sessionError = ExtCastSessionError.connectionFailed(error.localizedDescription)
         emit(.error(sessionError))
 
@@ -609,10 +455,15 @@ public final class ExtCastSession: Sendable {
         guard let endpoint else { return }
 
         transition(to: .reconnecting(attempt: attempt))
-        let delaySeconds = min(Double(1 << (attempt - 1)), 8.0)
+        let delaySeconds = min(Double(1 << (attempt - 1)), Self.maxReconnectDelaySeconds)
+        ExtBridgeLog.session.info("Scheduling reconnect attempt \(attempt) in \(delaySeconds, privacy: .public)s")
 
         let task = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            do {
+                try await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            } catch {
+                return
+            }
             guard !Task.isCancelled, let self else { return }
             let stillActive = self.state.withLock { !$0.isExplicitDisconnect }
             guard stillActive else { return }
@@ -628,45 +479,53 @@ public final class ExtCastSession: Sendable {
     }
 
     private func cleanupActiveConnection() {
-        let (conn, heartbeat) = state.withLock { s -> (NWConnection?, Task<Void, Never>?) in
-            let c = s.connection
-            let h = s.heartbeatTask
-            s.connection = nil
-            s.heartbeatTask = nil
-            s.inFlightBytes = 0
-            s.pendingPings.removeAll()
-            s.decoder.reset()
-            return (c, h)
-        }
-        heartbeat?.cancel()
-        conn?.stateUpdateHandler = nil
-        conn?.cancel()
+        teardownConnection(explicitDisconnect: false, emitDisconnected: false)
     }
 
     private func disconnectInternal(emitDisconnected: Bool) {
-        let (conn, heartbeat, reconnect, handler) = state.withLock {
-            s -> (NWConnection?, Task<Void, Never>?, Task<Void, Never>?, (@Sendable (ExtCastSessionEvent) -> Void)?) in
-            s.isExplicitDisconnect = true
-            let c = s.connection
-            let h = s.heartbeatTask
-            let r = s.reconnectTask
-            let ev = s.eventHandler
+        teardownConnection(explicitDisconnect: true, emitDisconnected: emitDisconnected)
+    }
+
+    private func teardownConnection(explicitDisconnect: Bool, emitDisconnected: Bool) {
+        struct TornDownResources {
+            let connection: NWConnection?
+            let heartbeat: Task<Void, Never>?
+            let reconnect: Task<Void, Never>?
+            let handler: (@Sendable (ExtCastSessionEvent) -> Void)?
+            let waiters: [CheckedContinuation<Void, Never>]
+        }
+
+        let resources: TornDownResources = state.withLock { s in
+            let conn = s.connection
+            let hb = s.heartbeatTask
+            let rc = explicitDisconnect ? s.reconnectTask : nil
+            let ev = emitDisconnected ? s.eventHandler : nil
             s.connection = nil
             s.heartbeatTask = nil
-            s.reconnectTask = nil
             s.inFlightBytes = 0
             s.pendingPings.removeAll()
             s.decoder.reset()
-            s.sessionState = .disconnected
-            return (c, h, r, ev)
+            if explicitDisconnect {
+                s.isExplicitDisconnect = true
+                s.reconnectTask = nil
+                s.sessionState = .disconnected
+            }
+            return TornDownResources(
+                connection: conn,
+                heartbeat: hb,
+                reconnect: rc,
+                handler: ev,
+                waiters: Self.popAllWaiters(from: &s)
+            )
         }
-        heartbeat?.cancel()
-        reconnect?.cancel()
-        conn?.stateUpdateHandler = nil
-        conn?.cancel()
-        if emitDisconnected {
-            handler?(.stateChanged(.disconnected))
+        for continuation in resources.waiters {
+            continuation.resume()
         }
+        resources.heartbeat?.cancel()
+        resources.reconnect?.cancel()
+        resources.connection?.stateUpdateHandler = nil
+        resources.connection?.cancel()
+        resources.handler?(.stateChanged(.disconnected))
     }
 
     private func transition(to newState: ExtCastSessionState) {
@@ -677,5 +536,26 @@ public final class ExtCastSession: Sendable {
     private func emit(_ event: ExtCastSessionEvent) {
         let handler = state.withLock { $0.eventHandler }
         handler?(event)
+    }
+
+    private static func popSatisfiedWaiters(from state: inout MutableState) -> [CheckedContinuation<Void, Never>] {
+        guard !state.capacityWaiters.isEmpty else { return [] }
+        var ready: [CheckedContinuation<Void, Never>] = []
+        let keys = state.capacityWaiters.compactMap { id, waiter in
+            state.inFlightBytes < waiter.limit ? id : nil
+        }
+        for key in keys {
+            if let removed = state.capacityWaiters.removeValue(forKey: key) {
+                ready.append(removed.continuation)
+            }
+        }
+        return ready
+    }
+
+    private static func popAllWaiters(from state: inout MutableState) -> [CheckedContinuation<Void, Never>] {
+        guard !state.capacityWaiters.isEmpty else { return [] }
+        let continuations = state.capacityWaiters.values.map(\.continuation)
+        state.capacityWaiters.removeAll()
+        return continuations
     }
 }
