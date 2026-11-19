@@ -65,6 +65,18 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 
+import com.extbridge.daemon.audio.AudioStreamCapturer;
+import com.extbridge.daemon.security.TrustStoreManager;
+import com.extbridge.daemon.sink.DisplaySink;
+import com.extbridge.daemon.sink.RemoteStreamSink;
+import com.extbridge.daemon.stream.ExtCastProtocol;
+import com.extbridge.daemon.stream.RemoteInputBridge;
+import com.extbridge.daemon.stream.RemoteStreamServer;
+import com.extbridge.daemon.stream.UhidInputDevice;
+import com.extbridge.daemon.window.DesktopWindowManager;
+import com.extbridge.daemon.window.TilingLayoutEngine;
+import com.extbridge.daemon.window.TilingLayoutEngine.WindowRect;
+
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -79,12 +91,15 @@ import java.lang.reflect.Method;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -94,7 +109,7 @@ import java.util.regex.Pattern;
 public class ExtBridge implements Runnable {
     private static final String BINDER_DESC = "com.extbridge.daemon.IBridgeControl";
     private static final String EXPECTED_HELPER_CERT_SHA256 =
-            "e4f67b3012a16633006c64bfc9d5a95c7bdda10826bd729777c2a3066f49117c";
+            BridgeBuildConfig.EXPECTED_HELPER_CERT_SHA256;
     private static final Pattern PKG_NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+)+$");
     private static final Pattern CLS_NAME_PATTERN = Pattern.compile("^[a-zA-Z0-9_$]+(\\.[a-zA-Z0-9_$]+)+$");
     private static final String CONF_PATH = "/data/local/tmp/extbridge.conf";
@@ -326,6 +341,34 @@ public class ExtBridge implements Runnable {
     private static int sSavedBrightInt = 100;
     private static float sSavedBrightFloat = -1f;
 
+    // Dual-path remote streaming (USB/Wi-Fi ADB abstract socket + on-demand Wi-Fi TLS 1.2/1.3)
+    private static volatile int sActiveSinkType = DisplaySink.SINK_NONE;
+    private static volatile TrustStoreManager sTrustStore;
+    private static volatile RemoteStreamServer sRemoteServer;
+    private static volatile RemoteStreamSink sRemoteSink;
+    private static volatile RemoteInputBridge sRemoteInputBridge;
+    private static volatile AudioStreamCapturer sAudioCapturer;
+    private static volatile VirtualDisplay sRemoteMirrorVd;
+    private static volatile int sRemoteCodecPref = RemoteStreamSink.CODEC_PREF_AUTO_HEVC;
+    private static volatile int sSessionCodecPref = RemoteStreamSink.CODEC_PREF_AUTO_HEVC;
+    private static volatile int sRemoteMaxBitrateKbps = 20_000;
+    private static volatile int sRemoteRequestedBitrateKbps = 12_000;
+    private static volatile boolean sRemoteAudioPref = true;
+    private static volatile long sLastRemoteStatePushMs = 0L;
+
+    // v4.1 Desktop window manager, UHID virtual input backend, and concurrent standalone app sessions
+    private static final DesktopWindowManager sWindowManager = new DesktopWindowManager();
+    private static final int INPUT_BACKEND_AUTO = 0;
+    private static final int INPUT_BACKEND_INJECT = 1;
+    private static final int INPUT_BACKEND_UHID = 2;
+    private static volatile int sInputBackendMode = INPUT_BACKEND_AUTO;
+    private static volatile boolean sUhidAutoActivated = false;
+    private static final Object sUhidLock = new Object();
+    private static final HashMap<Integer, UhidInputDevice> sUhidDevices = new HashMap<>();
+    private static volatile int sDesktopSessionId = -1;
+    private static final ConcurrentHashMap<Integer, StandaloneAppSession> sStandaloneSessions = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, String> sAppLabelCache = new ConcurrentHashMap<>();
+
     private static boolean isTrustedDaemonServerUid(int uid) {
         return uid == 0 || uid == 1000 || uid == 2000;
     }
@@ -421,6 +464,7 @@ public class ExtBridge implements Runnable {
                     String cmd = br.readLine();
                     if ("SHUTDOWN".equals(cmd)) {
                         sShuttingDown = true;
+                        try { shutdownRemoteStreaming(); } catch (Throwable ignored) {}
                         try { cleanupDisplay(true); } catch (Throwable ignored) {}
                         try {
                             sock.getOutputStream().write("DONE\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -491,6 +535,18 @@ public class ExtBridge implements Runnable {
                 return;
             }
             Looper.prepareMainLooper();
+            final Thread mainThread = Thread.currentThread();
+            final Thread.UncaughtExceptionHandler prevUeh = Thread.getDefaultUncaughtExceptionHandler();
+            Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+                System.err.println("EXTBRIDGE_UNCAUGHT_EXCEPTION thread="
+                        + (thread != null ? thread.getName() : "unknown") + ": " + throwable);
+                if (throwable != null) {
+                    throwable.printStackTrace();
+                }
+                if (thread == mainThread && prevUeh != null) {
+                    prevUeh.uncaughtException(thread, throwable);
+                }
+            });
             Class<?> atCls = Class.forName("android.app.ActivityThread");
             Object at = atCls.getMethod("systemMain").invoke(null);
             Context sysCtx = (Context) atCls.getMethod("getSystemContext").invoke(at);
@@ -524,6 +580,7 @@ public class ExtBridge implements Runnable {
 
             sCtlBinder = new BridgeBinder();
             sHandler = new Handler(Looper.getMainLooper());
+            initRemoteStreaming();
             // Push Binder IMMEDIATELY on dedicated thread (<250ms) BEFORE queuing slow dumpsys/appops jobs!
             enqueuePushBinderToHelper(true);
             for (long retryDelayMs : new long[]{400L, 1100L, 2400L}) {
@@ -566,6 +623,7 @@ public class ExtBridge implements Runnable {
 
             Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                 sShuttingDown = true;
+                shutdownRemoteStreaming();
                 cleanupDisplay(true);
             }));
 
@@ -995,15 +1053,56 @@ public class ExtBridge implements Runnable {
         }
         synchronized (sDisplayLock) {
             if (sShuttingDown) return;
+            if (isRemoteSessionActive()) {
+                sActiveSinkType = sRemoteServer.getActiveSinkType();
+                sLastPushedExtId = -1;
+                if (sExtId >= 0 || sRootSc != null || sMir0Sc != null || sSideVd != null) {
+                    cleanupDisplayInternal(false, true);
+                }
+                if (sMirrorMode == 1) {
+                    if (sVd != null || sForceRebuild) {
+                        sForceRebuild = false;
+                        cleanupDisplayInternal(false, true);
+                    }
+                    if (sRemoteMirrorVd == null) {
+                        attachRemoteMirrorDisplay();
+                    }
+                } else {
+                    if (sRemoteMirrorVd != null) {
+                        try { sRemoteMirrorVd.release(); } catch (Throwable ignored) {}
+                        sRemoteMirrorVd = null;
+                    }
+                    if (sForceRebuild && sVd != null) {
+                        sForceRebuild = false;
+                        cleanupDisplayInternal(false, true);
+                    }
+                    if (sVd == null) {
+                        attachRemoteDexDisplay();
+                    } else {
+                        enforceRunningExtTasksFullscreen(sFullscreenPolicy == 1);
+                    }
+                }
+                pushRemoteDeviceState(false);
+                return;
+            }
+
+            if (sRemoteMirrorVd != null) {
+                try { sRemoteMirrorVd.release(); } catch (Throwable ignored) {}
+                sRemoteMirrorVd = null;
+            }
+
             Display ext = findExternalDisplay();
             if (ext == null) {
+                sActiveSinkType = DisplaySink.SINK_NONE;
                 sLastPushedExtId = -1;
-                if (sExtId >= 0 || sVd != null || sMir0Sc != null || sSideVd != null) {
+                if (sExtId >= 0 || sVd != null || sMir0Sc != null || sSideVd != null || sRemoteMirrorVd != null) {
                     System.out.println("EXTBRIDGE_DETACHED");
                     cleanupDisplay(false);
+                    notifyHelperSync();
                 }
                 return;
             }
+            sActiveSinkType = DisplaySink.SINK_PHYSICAL;
             int extId = ext.getDisplayId();
             int prevPhysW = sPhysW;
             int prevPhysH = sPhysH;
@@ -2048,6 +2147,10 @@ public class ExtBridge implements Runnable {
     }
 
     private static void cleanupDisplay(boolean unbindWm) {
+        cleanupDisplayInternal(unbindWm, false);
+    }
+
+    private static void cleanupDisplayInternal(boolean unbindWm, boolean keepRemoteSession) {
         synchronized (sDisplayLock) {
             if (unbindWm && sShuttingDown && sCleanupDoneOnShutdown) {
                 return;
@@ -2057,20 +2160,24 @@ public class ExtBridge implements Runnable {
             }
             stopMirrorCursorPoller();
             unregisterMirrorDisplayListener();
-            boolean extUnplugged = (findExternalDisplay() == null);
-            if (extUnplugged) {
+            boolean remoteKept = keepRemoteSession && isRemoteSessionActive();
+            boolean noActiveSink = (findExternalDisplay() == null && !remoteKept);
+            if (noActiveSink) {
                 sSideVdAttempted = false;
             }
 
             // 1. Restore main screen brightness FIRST so persistent low brightness can never survive a kill!
-            if (unbindWm || sShuttingDown || extUnplugged) {
+            if (unbindWm || sShuttingDown || noActiveSink) {
                 if (sScreenDimmed || new File(DIM_BACKUP_PATH).exists()) {
                     setMainScreenDim(0);
                 }
             }
 
-            // 2. Unbind external input device associations SECOND (before VirtualDisplay release!)
+            // 2. Unbind external input device associations & release UHID for main VD SECOND (before VirtualDisplay release!)
             unbindInput();
+            if (sVdId > 0) {
+                releaseUhidForDisplay(sVdId);
+            }
 
             // 3. Detach & remove all SurfaceControl layers + VirtualDisplays (<10ms)
             int prevExtId = sExtId;
@@ -2086,6 +2193,9 @@ public class ExtBridge implements Runnable {
             } catch (Throwable ignored) {}
             try {
                 if (sVd != null) { sVd.release(); sVd = null; }
+            } catch (Throwable ignored) {}
+            try {
+                if (sRemoteMirrorVd != null) { sRemoteMirrorVd.release(); sRemoteMirrorVd = null; }
             } catch (Throwable ignored) {}
             sCreatedVdW = 0;
             sCreatedVdH = 0;
@@ -2166,8 +2276,8 @@ public class ExtBridge implements Runnable {
             sVdUniqueId = null;
             sRenderMode = "NONE";
 
-            // 4. Exit split & reset per-app compat overrides last
-            if (unbindWm || sShuttingDown || sMirrorMode == 1 || extUnplugged) {
+            // 4. Exit split/tiling, clear managed windows & reset per-app compat overrides last
+            if (unbindWm || sShuttingDown || sMirrorMode == 1 || noActiveSink) {
                 if (sSplitActive && prevVdId > 0) {
                     try { exitSplitAndRestore(false); } catch (Throwable ignored) {}
                 } else {
@@ -2175,10 +2285,14 @@ public class ExtBridge implements Runnable {
                         clearSplitState();
                     }
                 }
+                sWindowManager.clearAllManagedWindows();
             }
-            if (unbindWm || sShuttingDown || extUnplugged) {
+            if (unbindWm || sShuttingDown || noActiveSink) {
                 restoreGlobalFullscreenPrefs();
                 resetAppFullscreenCompatAll();
+                if (!remoteKept && findExternalDisplay() == null) {
+                    sActiveSinkType = DisplaySink.SINK_NONE;
+                }
             }
         }
     }
@@ -2384,6 +2498,10 @@ public class ExtBridge implements Runnable {
     }
 
     private static void liveResizeOrRebuild() {
+        if (isRemoteSessionActive()) {
+            applyRemoteResize(sVirtW, sVirtH, sVirtDpi, sVirtFps, sRemoteRequestedBitrateKbps, sMirrorMode, sVirtRot);
+            return;
+        }
         boolean orientationAspectFlipped = (sVd != null && sCreatedVdW > 0 && sCreatedVdH > 0)
                 && ((sCreatedVdW > sCreatedVdH) != (sVirtW > sVirtH));
         if (orientationAspectFlipped) {
@@ -2437,7 +2555,7 @@ public class ExtBridge implements Runnable {
                 sCursorX = Math.min(sCursorX, sVirtW - 1f);
                 sCursorY = Math.min(sCursorY, sVirtH - 1f);
                 reassert();
-                if (sSplitActive) {
+                if (sSplitActive && !sWindowManager.isTilingActive()) {
                     if (sHandler != null) {
                         sHandler.postDelayed(() -> relayoutSplitTasks(false), 300L);
                         sHandler.postDelayed(() -> relayoutSplitTasks(false), 900L);
@@ -2445,6 +2563,10 @@ public class ExtBridge implements Runnable {
                     } else {
                         relayoutSplitTasks(false);
                     }
+                } else if (sHandler != null) {
+                    sHandler.postDelayed(ExtBridge::relayoutManagedWindowsOnResize, 300L);
+                } else {
+                    relayoutManagedWindowsOnResize();
                 }
                 notifyHelperSync();
                 System.out.println("EXTBRIDGE_RESIZED " + sVirtW + "x" + sVirtH + "@" + sVirtDpi + "fps=" + sVirtFps + " rot=" + (sVirtRot * 90));
@@ -2548,30 +2670,235 @@ public class ExtBridge implements Runnable {
     }
 
     private static boolean invokeInjectInputMode(InputEvent ev, int targetDisplayId, int mode) {
-        if (ev == null || targetDisplayId < 0 || sIIm == null || sMInjectInput == null) return false;
+        if (ev == null || targetDisplayId < 0) return false;
+        String uniqueId = resolveDisplayUniqueId(targetDisplayId);
+        int[] dims = resolveDisplayDimensions(targetDisplayId);
+        return invokeInjectInputForDisplay(ev, targetDisplayId, mode, uniqueId, dims[0], dims[1]);
+    }
+
+    private static String resolveDisplayUniqueId(int displayId) {
+        if (displayId <= 0) return null;
+        if (displayId == sVdId && sVdUniqueId != null) {
+            return sVdUniqueId;
+        }
+        for (StandaloneAppSession sas : sStandaloneSessions.values()) {
+            if (sas != null && !sas.closed && sas.appVdId == displayId && sas.appVdUniqueId != null) {
+                return sas.appVdUniqueId;
+            }
+        }
+        try {
+            if (sDm != null) {
+                Display d = sDm.getDisplay(displayId);
+                if (d != null) {
+                    return (String) Display.class.getMethod("getUniqueId").invoke(d);
+                }
+            }
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private static int[] resolveDisplayDimensions(int displayId) {
+        if (displayId == 0) {
+            if (sD0W <= 0 || sD0H <= 0) {
+                Point p = readDisplay0RealSize();
+                if (p != null && p.x > 0 && p.y > 0) {
+                    sD0W = p.x;
+                    sD0H = p.y;
+                }
+            }
+            return new int[]{sD0W > 0 ? sD0W : sVirtW, sD0H > 0 ? sD0H : sVirtH};
+        }
+        if (displayId == sVdId) {
+            return new int[]{Math.max(1, sVirtW), Math.max(1, sVirtH)};
+        }
+        for (StandaloneAppSession sas : sStandaloneSessions.values()) {
+            if (sas != null && !sas.closed && sas.appVdId == displayId) {
+                return new int[]{Math.max(1, sas.width), Math.max(1, sas.height)};
+            }
+        }
+        return new int[]{Math.max(1, sVirtW), Math.max(1, sVirtH)};
+    }
+
+    private static boolean invokeInjectInputForDisplay(
+            InputEvent ev,
+            int targetDisplayId,
+            int mode,
+            String vdUniqueId,
+            int dispW,
+            int dispH) {
+        if (ev == null || targetDisplayId < 0) return false;
+
+        int backend = sInputBackendMode;
+        if (backend == INPUT_BACKEND_UHID || (backend == INPUT_BACKEND_AUTO && sUhidAutoActivated)) {
+            if (injectViaUhid(ev, targetDisplayId, vdUniqueId, dispW, dispH)) {
+                if (sLastInjectStatus != 2) {
+                    sLastInjectStatus = 2;
+                    broadcastInjectStatusChanged();
+                }
+                return true;
+            }
+            if (backend == INPUT_BACKEND_UHID) {
+                if (sLastInjectStatus != -1) {
+                    sLastInjectStatus = -1;
+                    broadcastInjectStatusChanged();
+                }
+                return false;
+            }
+        }
+
+        if (sIIm == null || sMInjectInput == null) {
+            return false;
+        }
         try {
             if (sMSetDisplayId != null) sMSetDisplayId.invoke(ev, targetDisplayId);
             Object res = sMInjectInput.invoke(sIIm, ev, mode);
             boolean ok = !(res instanceof Boolean) || (Boolean) res;
-            if (ok) sLastInjectStatus = 1;
+            if (ok && sLastInjectStatus != 1) {
+                sLastInjectStatus = 1;
+                broadcastInjectStatusChanged();
+            }
             return ok;
         } catch (Throwable t) {
             if (mode != 0) {
-                return invokeInjectInputMode(ev, targetDisplayId, 0);
+                return invokeInjectInputForDisplay(ev, targetDisplayId, 0, vdUniqueId, dispW, dispH);
             }
             Throwable root = (t instanceof InvocationTargetException && t.getCause() != null) ? t.getCause() : t;
             if (root instanceof SecurityException) {
-                sLastInjectStatus = -1;
                 long now = SystemClock.uptimeMillis();
                 if (now - sLastInjectDenyLogMs > 5000L) {
                     sLastInjectDenyLogMs = now;
                     System.err.println("EXTBRIDGE_INJECT_SECURITY_DENIED: " + root.getMessage());
+                }
+                if (sInputBackendMode == INPUT_BACKEND_AUTO) {
+                    if (injectViaUhid(ev, targetDisplayId, vdUniqueId, dispW, dispH)) {
+                        sUhidAutoActivated = true;
+                        sLastInjectStatus = 2;
+                        System.out.println("EXTBRIDGE_UHID_AUTO_ACTIVATED displayId=" + targetDisplayId);
+                        broadcastInjectStatusChanged();
+                        return true;
+                    }
+                }
+                boolean changed = (sLastInjectStatus != -1);
+                sLastInjectStatus = -1;
+                if (changed) {
+                    broadcastInjectStatusChanged();
                 }
             } else {
                 sLastInjectStatus = -2;
                 t.printStackTrace();
             }
             return false;
+        }
+    }
+
+    private static UhidInputDevice ensureUhidForDisplay(int displayId, String vdUniqueId) {
+        if (displayId < 0) return null;
+        boolean newlyCreated = false;
+        UhidInputDevice dev;
+        synchronized (sUhidLock) {
+            dev = sUhidDevices.get(displayId);
+            if (dev != null && dev.isOpen()) {
+                String curUid = dev.getVdUniqueId();
+                boolean sameUid = (vdUniqueId == null && curUid == null)
+                        || (vdUniqueId != null && vdUniqueId.equals(curUid));
+                if (sameUid) {
+                    return dev;
+                }
+                dev.close();
+                sUhidDevices.remove(displayId);
+            }
+            try {
+                dev = UhidInputDevice.open(displayId, vdUniqueId, sIm, sIIm);
+                sUhidDevices.put(displayId, dev);
+                newlyCreated = true;
+            } catch (Throwable t) {
+                long now = SystemClock.uptimeMillis();
+                if (now - sLastInjectDenyLogMs > 5000L) {
+                    sLastInjectDenyLogMs = now;
+                    System.err.println("EXTBRIDGE_UHID_OPEN_FAILED displayId=" + displayId + ": " + t.getMessage());
+                }
+                return null;
+            }
+        }
+        if (newlyCreated && Looper.myLooper() != Looper.getMainLooper()) {
+            // Brief settle time for Linux HID probe + Android EventHub registration on first creation
+            SystemClock.sleep(60L);
+        }
+        return dev;
+    }
+
+    private static boolean injectViaUhid(InputEvent ev, int displayId, String vdUniqueId, int dispW, int dispH) {
+        UhidInputDevice dev = ensureUhidForDisplay(displayId, vdUniqueId);
+        if (dev == null) return false;
+        return dev.injectInputEvent(ev, dispW, dispH);
+    }
+
+    private static void releaseUhidForDisplay(int displayId) {
+        UhidInputDevice dev;
+        synchronized (sUhidLock) {
+            dev = sUhidDevices.remove(displayId);
+        }
+        if (dev != null) {
+            try { dev.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static void releaseAllUhidDevices() {
+        ArrayList<UhidInputDevice> list;
+        synchronized (sUhidLock) {
+            if (sUhidDevices.isEmpty()) return;
+            list = new ArrayList<>(sUhidDevices.values());
+            sUhidDevices.clear();
+        }
+        for (UhidInputDevice d : list) {
+            try { d.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    private static int setInputBackendMode(int mode) {
+        int clamped = (mode >= 0 && mode <= 2) ? mode : INPUT_BACKEND_AUTO;
+        sInputBackendMode = clamped;
+        if (clamped == INPUT_BACKEND_INJECT) {
+            sUhidAutoActivated = false;
+            releaseAllUhidDevices();
+            sLastInjectStatus = 1;
+        } else if (clamped == INPUT_BACKEND_AUTO) {
+            sUhidAutoActivated = false;
+            releaseAllUhidDevices();
+            sLastInjectStatus = 1;
+        } else {
+            // Forced UHID mode: open immediately for active displays
+            sUhidAutoActivated = true;
+            boolean anyOk = false;
+            if (sVdId > 0) {
+                anyOk |= (ensureUhidForDisplay(sVdId, sVdUniqueId) != null);
+            }
+            for (StandaloneAppSession sas : sStandaloneSessions.values()) {
+                if (sas != null && !sas.closed && sas.appVdId > 0) {
+                    anyOk |= (ensureUhidForDisplay(sas.appVdId, sas.appVdUniqueId) != null);
+                }
+            }
+            if (!anyOk && sVdId <= 0 && sStandaloneSessions.isEmpty()) {
+                // Probe /dev/uhid availability even before a VirtualDisplay is attached
+                UhidInputDevice probe = ensureUhidForDisplay(0, null);
+                if (probe != null) {
+                    anyOk = true;
+                    releaseUhidForDisplay(0);
+                }
+            }
+            sLastInjectStatus = anyOk ? 2 : -1;
+        }
+        broadcastInjectStatusChanged();
+        return sLastInjectStatus;
+    }
+
+    private static void broadcastInjectStatusChanged() {
+        notifyHelperSync();
+        pushRemoteDeviceState(true);
+        for (StandaloneAppSession sas : sStandaloneSessions.values()) {
+            if (sas != null && !sas.closed) {
+                pushStandaloneDeviceState(sas);
+            }
         }
     }
 
@@ -3169,6 +3496,16 @@ public class ExtBridge implements Runnable {
             if (sVdId <= 0 || sAtm == null || sMStartActivity == null) return false;
             if (!isAllowedLaunchTarget(pkg, cls)) return false;
             boolean isExtLauncher = "com.extbridge.helper".equals(pkg) && "com.extbridge.helper.LauncherActivity".equals(cls);
+            if (!isExtLauncher && !sSplitActive && !sWindowManager.isTilingActive()) {
+                String resolvedMode = sWindowManager.resolveLaunchMode(pkg, DesktopWindowManager.INT_MODE_AUTO);
+                if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(resolvedMode)
+                        || DesktopWindowManager.MODE_FREEFORM.equals(resolvedMode)) {
+                    int mInt = DesktopWindowManager.MODE_FREEFORM.equals(resolvedMode)
+                            ? DesktopWindowManager.INT_MODE_FREEFORM
+                            : DesktopWindowManager.INT_MODE_ADAPTIVE_SINGLE;
+                    return launchInWindowMode(pkg, cls, mInt, 0, 0, 0, 0);
+                }
+            }
             synchronized (sSplitLock) {
                 if (sSplitActive) {
                     if (isExtLauncher) {
@@ -3186,6 +3523,9 @@ public class ExtBridge implements Runnable {
                         exitSplitAndRestore(false);
                     }
                 }
+            }
+            if (!isExtLauncher && sWindowManager.isTilingActive()) {
+                setTilingLayout(TilingLayoutEngine.TOPOLOGY_NONE, Collections.emptyList(), new int[0]);
             }
             int preTid = isExtLauncher ? findExtLauncherTaskId() : findTaskIdForPkg(pkg);
             if (preTid > 0) {
@@ -3446,20 +3786,40 @@ public class ExtBridge implements Runnable {
 
     private static void detachFreeformAndEnsureFullscreen(int taskId, boolean syncFullBounds) {
         if (taskId <= 0 || sAtm == null) return;
-        if (syncFullBounds) {
+        int curWm = getTaskWindowingMode(taskId);
+        // Only pass Boolean.FALSE for alwaysOnTop when actually leaving MIUI FREEFORM (5);
+        // calling Task.setAlwaysOnTop(false) on non-freeform tasks triggers moveTaskToFront on Android 16!
+        Boolean clearAot = (curWm == 5) ? Boolean.FALSE : null;
+        if (syncFullBounds && curWm != 1) {
             Rect fullBounds = new Rect(0, 0, Math.max(600, sVirtW), Math.max(600, sVirtH));
-            // Must resize while in MULTI_WINDOW (6) so ATM.resizeTask resets SurfaceFlinger Task leash position & crop to (0,0,sVirtW,sVirtH) before entering FULLSCREEN (1)!
-            if (getTaskWindowingMode(taskId) != 6) {
-                if (!applyWctForTask(taskId, Boolean.FALSE, 6, null)) {
-                    clearTaskAlwaysOnTop(taskId);
+            // Must resize while in MULTI_WINDOW (6) so ATM.resizeTask resets SurfaceFlinger Task leash position
+            // & crop to (0,0,sVirtW,sVirtH) BEFORE entering FULLSCREEN (1), avoiding stacked Letterbox crop!
+            if (curWm != 6) {
+                if (!applyWctForTask(taskId, clearAot, 6, null)) {
+                    if (curWm == 5) clearTaskAlwaysOnTop(taskId);
                     forceTaskWindowingMode(taskId, 6);
                 }
             }
             resizeTaskBoundsOnly(taskId, fullBounds, true);
+            // Allow SurfaceFlinger/WM one frame (~55ms) to commit the (0,0) leash reset before switching to FULLSCREEN (1).
+            Runnable finishFullscreen = () -> {
+                if (!applyWctForTask(taskId, null, 1, new Rect())) {
+                    forceTaskWindowingMode(taskId, 1);
+                }
+            };
+            if (Looper.myLooper() == Looper.getMainLooper() && sHandler != null) {
+                sHandler.postDelayed(finishFullscreen, 55L);
+            } else {
+                SystemClock.sleep(55L);
+                finishFullscreen.run();
+            }
+            return;
         }
-        if (!applyWctForTask(taskId, Boolean.FALSE, 1, new Rect())) {
-            clearTaskAlwaysOnTop(taskId);
-            forceTaskWindowingMode(taskId, 1);
+        if (curWm != 1) {
+            if (!applyWctForTask(taskId, clearAot, 1, new Rect())) {
+                if (curWm == 5) clearTaskAlwaysOnTop(taskId);
+                forceTaskWindowingMode(taskId, 1);
+            }
         }
     }
 
@@ -3480,7 +3840,16 @@ public class ExtBridge implements Runnable {
             }
             List<?> running = invokeTaskQuery("getTasks");
             if (running == null) return;
-            if (splitOn && (SystemClock.uptimeMillis() - sLastSplitActionMs) > 2600L) {
+            Set<Integer> liveExtTids = new HashSet<>();
+            for (Object t : running) {
+                if (t == null) continue;
+                if (readIntField(t, "displayId", -1) != sVdId) continue;
+                int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                if (tid > 0) liveExtTids.add(tid);
+            }
+            sWindowManager.pruneDeadTasks(liveExtTids);
+
+            if (splitOn && !sWindowManager.isTilingActive() && (SystemClock.uptimeMillis() - sLastSplitActionMs) > 2600L) {
                 boolean s0Vis = s0Pkg.isEmpty();
                 boolean s1Vis = s1Pkg.isEmpty();
                 for (Object t : running) {
@@ -3520,13 +3889,51 @@ public class ExtBridge implements Runnable {
                     }
                 }
                 int wmode = extractTaskWindowingMode(t);
+                boolean isVisible = readBoolField(t, "isVisible", false);
                 if (isLauncher) {
-                    if (tid > 0 && wmode != 1 && wmode != 0) {
+                    if (isVisible && tid > 0 && wmode != 1 && wmode != 0) {
                         detachFreeformAndEnsureFullscreen(tid, true);
                     }
                     continue;
                 }
-                // Rescue any non-split DeX task left in Freeform (5) or Multi-Window (6) back to Fullscreen (1)
+                // Never modify or yank invisible background tasks on Android 16 / HyperOS 3:
+                // applying WCT transitions on occluded background tasks steals focus & corrupts SurfaceFlinger leashes.
+                if (!isVisible) {
+                    continue;
+                }
+                // Managed windows (ADAPTIVE_SINGLE, FREEFORM, TILING) use native MULTI_WINDOW (6):
+                // exempt them from being pulled back to FULLSCREEN (1), while STILL intercepting
+                // Xiaomi FREEFORM (5) hijacks and restoring their managed MULTI_WINDOW (6) bounds!
+                if (tid > 0 && sWindowManager.isTaskManagedInMultiWindow(tid, pkg)) {
+                    if (wmode == 5) {
+                        DesktopWindowManager.ManagedWindow mw = sWindowManager.getManagedWindow(tid);
+                        Rect targetBounds = (mw != null && mw.bounds != null && !mw.bounds.isEmpty())
+                                ? mw.bounds.toAndroidRect()
+                                : sWindowManager.computeAdaptiveSingleBounds(
+                                        sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), pkg, 0, 0).toAndroidRect();
+                        ensureTaskResizeableAndMultiWindow(tid, targetBounds, true);
+                    }
+                    continue;
+                }
+                // Auto-apply adaptive golden single width to untracked visible user tasks when enabled
+                if (tid > 0 && !isProtectedSystemTaskPkg(pkg)
+                        && sWindowManager.shouldAutoApplyAdaptiveSingle(tid, pkg)) {
+                    WindowRect adaptiveRect = sWindowManager.computeAdaptiveSingleBounds(
+                            sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), pkg, 0, 0);
+                    if (adaptiveRect.width() < sVirtW - 16) {
+                        sWindowManager.putManagedWindow(
+                                tid, pkg, DesktopWindowManager.MODE_ADAPTIVE_SINGLE, adaptiveRect, true, -1);
+                        ensureTaskResizeableAndMultiWindow(tid, adaptiveRect.toAndroidRect(), true);
+                    } else {
+                        sWindowManager.putManagedWindow(
+                                tid, pkg, DesktopWindowManager.MODE_FULLSCREEN, adaptiveRect, true, -1);
+                        if (wmode != 1 && wmode != 0) {
+                            detachFreeformAndEnsureFullscreen(tid, true);
+                        }
+                    }
+                    continue;
+                }
+                // Rescue any unmanaged visible DeX task left in MIUI Freeform (5) or stale Multi-Window (6) back to Fullscreen (1)
                 if (tid > 0 && wmode != 1 && wmode != 0) {
                     detachFreeformAndEnsureFullscreen(tid, true);
                     wmode = 1;
@@ -3547,6 +3954,7 @@ public class ExtBridge implements Runnable {
         if (sSplitActive) {
             exitSplitAndRestore(false);
         }
+        sWindowManager.minimizeAllSingleWindows();
         int lTid = findExtLauncherTaskId();
         if (lTid > 0 && sAtm != null) {
             try {
@@ -3911,13 +4319,14 @@ public class ExtBridge implements Runnable {
                         s1 = sSplitSlot1Pkg != null ? sSplitSlot1Pkg : "";
                     }
                     MirrorGeom g = sMirGeom;
+                    boolean physMirror = (sMirrorMode == 1 && !isRemoteSessionActive());
                     reply.writeInt(sExtId);
                     reply.writeInt(sVdId);
                     reply.writeInt(sPhysW);
                     reply.writeInt(sPhysH);
                     reply.writeInt(Math.round(sPhysFps * 100f));
-                    reply.writeInt(sMirrorMode == 1 ? sPhysW : sVirtW);
-                    reply.writeInt(sMirrorMode == 1 ? sPhysH : sVirtH);
+                    reply.writeInt(physMirror ? sPhysW : sVirtW);
+                    reply.writeInt(physMirror ? sPhysH : sVirtH);
                     reply.writeInt(sVirtDpi);
                     reply.writeInt(Math.round(sVirtFps * 100f));
                     reply.writeInt(sInputToExt);
@@ -3942,6 +4351,21 @@ public class ExtBridge implements Runnable {
                     reply.writeInt(g.mirY);
                     reply.writeInt(g.mirW);
                     reply.writeInt(g.mirH);
+                    // Extended ExtCast / Remote Display fields
+                    RemoteStreamServer srv = sRemoteServer;
+                    RemoteStreamSink sink = sRemoteSink;
+                    reply.writeInt(getActiveSinkType());
+                    reply.writeString(srv != null ? srv.getActivePeerName() : "");
+                    reply.writeInt((sink != null && sink.isActive()) ? sink.getBitrateKbps() : 0);
+                    reply.writeInt((sink != null && sink.isActive()) ? sink.getActualFpsX100() : 0);
+                    reply.writeInt((srv != null && srv.isWifiEnabled()) ? 1 : 0);
+                    reply.writeInt(srv != null ? srv.getWifiPort() : RemoteStreamServer.DEFAULT_WIFI_PORT);
+                    reply.writeString(srv != null ? srv.getCertFingerprint() : "");
+                    reply.writeString(srv != null ? srv.getActivePairingPin() : "");
+                    // ExtBridge v4.1 desktop window management fields
+                    reply.writeInt(sWindowManager.isAdaptiveSingleEnabled() ? 1 : 0);
+                    reply.writeInt(sWindowManager.getDefaultSingleWidthDp());
+                    reply.writeString(sWindowManager.resolveActiveLayoutMode());
                 }
                 return true;
             } else if (code == 16) {
@@ -4049,7 +4473,11 @@ public class ExtBridge implements Runnable {
                 if (sMirrorMode != 1) {
                     saveConf();
                 }
-                tick();
+                if (isRemoteSessionActive()) {
+                    applyRemoteResize(sVirtW, sVirtH, sVirtDpi, sVirtFps, sRemoteRequestedBitrateKbps, sMirrorMode, sVirtRot);
+                } else {
+                    tick();
+                }
                 notifyHelperSync();
                 if (reply != null) reply.writeInt(sMirrorMode);
                 return true;
@@ -4250,8 +4678,105 @@ public class ExtBridge implements Runnable {
                     captureTaskSnapshotToParcel(reqTid, pkg, modeFlag, reply);
                 }
                 return true;
+            } else if (code == 45) {
+                int enable = data.readInt();
+                int port = data.readInt();
+                int regeneratePin = data.readInt();
+                RemoteStreamServer.WifiConfigStatus st;
+                if (sRemoteServer != null) {
+                    st = sRemoteServer.configureWifi(enable != 0, port, regeneratePin != 0);
+                } else {
+                    st = new RemoteStreamServer.WifiConfigStatus(false, RemoteStreamServer.DEFAULT_WIFI_PORT, "", "");
+                }
+                notifyHelperSync();
+                if (reply != null) {
+                    reply.writeInt(st.enabled ? 1 : 0);
+                    reply.writeInt(st.port);
+                    reply.writeString(st.certFingerprint);
+                    reply.writeString(st.activePin);
+                }
+                return true;
+            } else if (code == 46) {
+                String list = (sTrustStore != null) ? sTrustStore.listTrustedClientsSummary() : "";
+                if (reply != null) reply.writeString(list);
+                return true;
+            } else if (code == 47) {
+                String clientId = data.readString();
+                boolean ok = (sRemoteServer != null) && sRemoteServer.revokeTrustedClient(clientId);
+                notifyHelperSync();
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            } else if (code == 48) {
+                if (sRemoteServer != null) {
+                    sRemoteServer.disconnectActiveClient("Disconnected via Helper");
+                }
+                if (reply != null) reply.writeInt(1);
+                return true;
+            } else if (code == 49) {
+                int codecPref = data.readInt();
+                int maxBitrateKbps = data.readInt();
+                int audioEnabled = data.readInt();
+                applyRemoteStreamPrefs(codecPref, maxBitrateKbps, audioEnabled != 0);
+                if (reply != null) reply.writeInt(1);
+                return true;
+            } else if (code == 50) {
+                String json = getManagedWindowsJson();
+                if (reply != null) reply.writeString(json);
+                return true;
+            } else if (code == 51) {
+                String pkg = data.readString();
+                String cls = data.readString();
+                int mode = data.readInt();
+                int left = data.readInt();
+                int top = data.readInt();
+                int right = data.readInt();
+                int bottom = data.readInt();
+                boolean ok = launchInWindowMode(pkg, cls, mode, left, top, right, bottom);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            } else if (code == 52) {
+                int taskId = data.readInt();
+                String pkg = data.readString();
+                int mode = data.readInt();
+                int left = data.readInt();
+                int top = data.readInt();
+                int right = data.readInt();
+                int bottom = data.readInt();
+                int rememberPref = data.readInt();
+                boolean ok = updateWindowBounds(taskId, pkg, mode, left, top, right, bottom, rememberPref != 0);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            } else if (code == 53) {
+                String topology = data.readString();
+                String pkgsCsv = data.readString();
+                String ratiosCsv = data.readString();
+                boolean ok = setTilingLayout(
+                        topology,
+                        TilingLayoutEngine.parsePkgsCsv(pkgsCsv),
+                        TilingLayoutEngine.parseRatiosCsv(ratiosCsv));
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            } else if (code == 54) {
+                int taskId = data.readInt();
+                String pkg = data.readString();
+                int action = data.readInt();
+                boolean ok = windowLifecycleAction(taskId, pkg, action);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            } else if (code == 55) {
+                int enabled = data.readInt();
+                int defaultWidthDp = data.readInt();
+                setAdaptiveSingleConfig(enabled != 0, defaultWidthDp);
+                if (reply != null) reply.writeInt(1);
+                return true;
+            } else if (code == 56) {
+                int backendMode = data.readInt();
+                int activeStatus = setInputBackendMode(backendMode);
+                if (reply != null) reply.writeInt(activeStatus);
+                return true;
             } else if (code == 99) {
                 sShuttingDown = true;
+                try { shutdownRemoteStreaming(); } catch (Throwable ignored) {}
                 cleanupDisplay(true);
                 if (reply != null) reply.writeInt(1);
                 new Thread(() -> {
@@ -4797,6 +5322,39 @@ public class ExtBridge implements Runnable {
             }
             applyAppModeCompat(safePkg, mode, false);
             if (safeTid > 0 && sAtm != null) {
+                if (sWindowManager.isTaskManagedInMultiWindow(safeTid, safePkg)) {
+                    DesktopWindowManager.ManagedWindow mw = sWindowManager.getManagedWindow(safeTid);
+                    WindowRect b = (mw != null && mw.bounds != null && !mw.bounds.isEmpty())
+                            ? mw.bounds
+                            : sWindowManager.computeAdaptiveSingleBounds(
+                                    sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), safePkg, 0, 0);
+                    ensureTaskResizeableAndMultiWindow(safeTid, b.toAndroidRect(), true);
+                    bringSplitTaskFront(safeTid, b.toAndroidRect());
+                    sWindowManager.setFocusedTask(safeTid);
+                    notifyHelperSync();
+                    pushRemoteDeviceState(true);
+                    return true;
+                }
+                if (safePkg != null && !"com.extbridge.helper".equals(safePkg)
+                        && !sSplitActive && !sWindowManager.isTilingActive()) {
+                    String resolvedMode = sWindowManager.resolveLaunchMode(safePkg, DesktopWindowManager.INT_MODE_AUTO);
+                    if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(resolvedMode)
+                            || DesktopWindowManager.MODE_FREEFORM.equals(resolvedMode)) {
+                        WindowRect b = DesktopWindowManager.MODE_FREEFORM.equals(resolvedMode)
+                                ? sWindowManager.computeNextFreeformBounds(
+                                        sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), safePkg)
+                                : sWindowManager.computeAdaptiveSingleBounds(
+                                        sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), safePkg, 0, 0);
+                        if (b.width() < sVirtW - 16 || DesktopWindowManager.MODE_FREEFORM.equals(resolvedMode)) {
+                            sWindowManager.putManagedWindow(safeTid, safePkg, resolvedMode, b, true, -1);
+                            ensureTaskResizeableAndMultiWindow(safeTid, b.toAndroidRect(), true);
+                            bringSplitTaskFront(safeTid, b.toAndroidRect());
+                            notifyHelperSync();
+                            pushRemoteDeviceState(true);
+                            return true;
+                        }
+                    }
+                }
                 try {
                     for (Method m : sAtm.getClass().getMethods()) {
                         if (m.getName().equals("moveRootTaskToDisplay") && m.getParameterCount() == 2) {
@@ -4807,6 +5365,11 @@ public class ExtBridge implements Runnable {
                 } catch (Throwable ignored) {}
                 int prevWm = getTaskWindowingMode(safeTid);
                 detachFreeformAndEnsureFullscreen(safeTid, prevWm != 1 && prevWm != 0);
+                if (safePkg != null && !"com.extbridge.helper".equals(safePkg)) {
+                    sWindowManager.putManagedWindow(
+                            safeTid, safePkg, DesktopWindowManager.MODE_FULLSCREEN,
+                            new WindowRect(0, 0, sVirtW, sVirtH), true, -1);
+                }
 
                 ActivityOptions opts = makeExtLaunchOptionsForMode(sVdId, mode);
                 Bundle b = opts.toBundle();
@@ -5087,41 +5650,7 @@ public class ExtBridge implements Runnable {
     }
 
     private static void ensureTaskResizeableAndMultiWindow(int taskId, Rect bounds, boolean forceSyncIfEqual) {
-        if (taskId <= 0 || sAtm == null) return;
-        try {
-            for (Method m : sAtm.getClass().getMethods()) {
-                if (m.getName().equals("moveRootTaskToDisplay") && m.getParameterCount() == 2) {
-                    m.invoke(sAtm, taskId, sVdId);
-                    break;
-                }
-            }
-        } catch (Throwable ignored) {}
-        boolean resModeOk = false;
-        try {
-            for (Method m : sAtm.getClass().getMethods()) {
-                if (m.getName().equals("setTaskResizeable") && m.getParameterCount() == 2) {
-                    m.invoke(sAtm, taskId, 2);
-                    resModeOk = true;
-                    break;
-                }
-            }
-        } catch (Throwable ignored) {}
-        if (!resModeOk) {
-            runCmdOut("cmd", "activity", "task", "resizeable", String.valueOf(taskId), "2");
-        }
-        // Detach MiuiFreeformModeController if task was previously FREEFORM (5)
-        if (getTaskWindowingMode(taskId) == 5) {
-            if (!applyWctForTask(taskId, Boolean.FALSE, 1, null)) {
-                clearTaskAlwaysOnTop(taskId);
-                forceTaskWindowingMode(taskId, 1);
-            }
-        }
-        // Clear alwaysOnTop and enforce MULTI_WINDOW (6) via WCT, but resize via ATM resizeTask for SF transform sync
-        if (!applyWctForTask(taskId, Boolean.FALSE, 6, null)) {
-            clearTaskAlwaysOnTop(taskId);
-            forceTaskWindowingMode(taskId, 6);
-        }
-        resizeTaskBoundsOnly(taskId, bounds, forceSyncIfEqual);
+        ensureTaskResizeableAndMultiWindowOnDisplay(taskId, sVdId, bounds, forceSyncIfEqual);
     }
 
     private static boolean bringSplitTaskFront(int taskId, Rect bounds) {
@@ -5529,6 +6058,7 @@ public class ExtBridge implements Runnable {
             String p0 = sSplitSlot0Pkg;
             String p1 = sSplitSlot1Pkg;
             clearSplitState();
+            sWindowManager.clearTilingState();
             ensureLauncherTaskFullscreenInBg();
             restoreLeavingSplitTask(p1, t1);
             restoreLeavingSplitTask(p0, t0);
@@ -5609,10 +6139,14 @@ public class ExtBridge implements Runnable {
             return false;
         }
         boolean ok = removeTaskRaw(taskId);
-        if (ok && sSplitActive) {
-            detachPkgFromSplit(null, taskId);
-        } else if (ok) {
-            notifyHelperSync();
+        if (ok) {
+            sWindowManager.removeManagedWindow(taskId);
+            if (sSplitActive) {
+                detachPkgFromSplit(null, taskId);
+            } else {
+                notifyHelperSync();
+            }
+            pushRemoteDeviceState(true);
         }
         return ok;
     }
@@ -5976,6 +6510,7 @@ public class ExtBridge implements Runnable {
                             + "settings put system screen_brightness 1; "
                             + "cmd display set-brightness " + String.format(java.util.Locale.US, "%.6f", minFloat) + " 2>/dev/null || true");
                     sScreenDimmed = true;
+                    pushRemoteDeviceState(true);
                     System.out.println("EXTBRIDGE_SCREEN_DIM=1 min=" + minFloat + " savedMode=" + sSavedBrightMode + " savedInt=" + sSavedBrightInt + " savedFloat=" + sSavedBrightFloat);
                     return true;
                 } else {
@@ -6005,6 +6540,7 @@ public class ExtBridge implements Runnable {
                         try { if (rd != null) verifyInt = Integer.parseInt(rd.trim()); } catch (Throwable ignored) {}
                     }
                     sScreenDimmed = false;
+                    pushRemoteDeviceState(true);
                     if (verifyInt > 1) {
                         try { new File(DIM_BACKUP_PATH).delete(); } catch (Throwable ignored) {}
                     } else {
@@ -6314,5 +6850,2313 @@ public class ExtBridge implements Runnable {
         reply.writeString(sCachedCalendarText != null ? sCachedCalendarText : "");
         reply.writeString(sCachedBattDetail != null ? sCachedBattDetail : "");
         reply.writeString(sCachedWifiDetail != null ? sCachedWifiDetail : "");
+    }
+
+    // ---- ExtBridge v4.1 Desktop Window Manager Runtime Operations ----
+
+    private static int computeCurrentDockInsetPx() {
+        // The floating Dock auto-hides to a 4px trigger bar and overlays apps on demand,
+        // so tiling splits and single-app adaptive windows fill 100% full height top-to-bottom.
+        return 0;
+    }
+
+    private static String resolveAppLabel(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return "";
+        String cached = sAppLabelCache.get(pkg);
+        if (cached != null) return cached;
+        String label = pkg;
+        try {
+            if (sCtx != null) {
+                PackageManager pm = sCtx.getPackageManager();
+                android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                if (ai != null) {
+                    CharSequence cs = pm.getApplicationLabel(ai);
+                    if (cs != null && cs.length() > 0) {
+                        label = cs.toString();
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (sAppLabelCache.size() < 256) {
+            sAppLabelCache.put(pkg, label);
+        }
+        return label;
+    }
+
+    private static String[] findTopUserAppOnDisplay(int displayId) {
+        if (displayId <= 0 || sAtm == null) return new String[]{"", ""};
+        try {
+            List<?> running = invokeTaskQuery("getTasks");
+            if (running != null) {
+                for (Object t : running) {
+                    if (t == null) continue;
+                    int did = readIntField(t, "displayId", -1);
+                    if (did != displayId) continue;
+                    if (!readBoolField(t, "isVisible", false)) continue;
+                    String pkg = extractTaskPkg(t);
+                    if (shouldSkipTaskPkg(pkg) || isProtectedSystemTaskPkg(pkg)) continue;
+                    return new String[]{pkg, resolveAppLabel(pkg)};
+                }
+            }
+        } catch (Throwable ignored) {}
+        return new String[]{"", ""};
+    }
+
+    private static void syncManagedWindowsWithLiveTasks() {
+        if (sVdId <= 0 || sAtm == null) return;
+        try {
+            List<?> running = invokeTaskQuery("getTasks");
+            if (running == null) return;
+            Set<Integer> liveTids = new HashSet<>();
+            int topUserTid = -1;
+            String topUserPkg = null;
+            int topUserWm = 0;
+            for (Object t : running) {
+                if (t == null) continue;
+                if (readIntField(t, "displayId", -1) != sVdId) continue;
+                int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                if (tid <= 0) continue;
+                liveTids.add(tid);
+                if (topUserTid <= 0 && readBoolField(t, "isVisible", false)) {
+                    String pkg = extractTaskPkg(t);
+                    if (!shouldSkipTaskPkg(pkg) && !isProtectedSystemTaskPkg(pkg)) {
+                        topUserTid = tid;
+                        topUserPkg = pkg;
+                        topUserWm = extractTaskWindowingMode(t);
+                    }
+                }
+            }
+            sWindowManager.pruneDeadTasks(liveTids);
+            if (topUserTid > 0) {
+                DesktopWindowManager.ManagedWindow existing = sWindowManager.getManagedWindow(topUserTid);
+                if (existing != null) {
+                    sWindowManager.setFocusedTask(topUserTid);
+                } else if (!sWindowManager.isTilingActive() && topUserPkg != null) {
+                    Rect curB = getTaskBounds(topUserTid);
+                    WindowRect wr = (curB != null && !curB.isEmpty())
+                            ? WindowRect.fromAndroidRect(curB)
+                            : new WindowRect(0, 0, sVirtW, sVirtH);
+                    String inferredMode = (topUserWm == 6 && wr.width() < sVirtW - 16)
+                            ? DesktopWindowManager.MODE_ADAPTIVE_SINGLE
+                            : DesktopWindowManager.MODE_FULLSCREEN;
+                    sWindowManager.putManagedWindow(topUserTid, topUserPkg, inferredMode, wr, true, -1);
+                }
+            } else if (!sWindowManager.isTilingActive()) {
+                sWindowManager.minimizeAllSingleWindows();
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static String getManagedWindowsJson() {
+        syncManagedWindowsWithLiveTasks();
+        return sWindowManager.toManagedWindowsJson();
+    }
+
+    private static int getRunningTaskDisplayId(int taskId) {
+        if (taskId <= 0 || sAtm == null) return -1;
+        List<?> running = invokeTaskQuery("getTasks");
+        if (running != null) {
+            for (Object t : running) {
+                if (t == null) continue;
+                int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                if (tid == taskId) {
+                    return readIntField(t, "displayId", -1);
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static int findRunningTaskIdForPkg(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return -1;
+        List<?> running = invokeTaskQuery("getTasks");
+        if (running != null) {
+            for (Object t : running) {
+                if (t == null) continue;
+                int did = readIntField(t, "displayId", -1);
+                if (did == sVdId && pkg.equals(extractTaskPkg(t))) {
+                    int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                    if (tid > 0) return tid;
+                }
+            }
+            for (Object t : running) {
+                if (t == null) continue;
+                if (pkg.equals(extractTaskPkg(t))) {
+                    int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                    if (tid > 0) return tid;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static boolean moveTaskToDisplayRaw(int taskId, int targetDisplayId) {
+        if (taskId <= 0 || targetDisplayId < 0 || sAtm == null) return false;
+        int currentDisplayId = getRunningTaskDisplayId(taskId);
+        if (currentDisplayId == targetDisplayId) {
+            return true;
+        }
+        try {
+            for (Method m : sAtm.getClass().getMethods()) {
+                if (m.getName().equals("moveRootTaskToDisplay") && m.getParameterCount() == 2) {
+                    m.invoke(sAtm, taskId, targetDisplayId);
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_MOVE_TASK_ERR tid=" + taskId + " dst=" + targetDisplayId + ": " + t.getMessage());
+        }
+        return false;
+    }
+
+    private static boolean ensureTaskResizeableAndMultiWindowOnDisplay(
+            int taskId, int displayId, Rect bounds, boolean forceSyncIfEqual) {
+        if (taskId <= 0 || displayId <= 0 || sAtm == null) return false;
+        moveTaskToDisplayRaw(taskId, displayId);
+        boolean resModeOk = false;
+        try {
+            for (Method m : sAtm.getClass().getMethods()) {
+                if (m.getName().equals("setTaskResizeable") && m.getParameterCount() == 2) {
+                    m.invoke(sAtm, taskId, 2);
+                    resModeOk = true;
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {}
+        if (!resModeOk) {
+            runCmdOut("cmd", "activity", "task", "resizeable", String.valueOf(taskId), "2");
+        }
+        int curWm = getTaskWindowingMode(taskId);
+        if (curWm == 5) {
+            if (!applyWctForTask(taskId, Boolean.FALSE, 1, null)) {
+                clearTaskAlwaysOnTop(taskId);
+                forceTaskWindowingMode(taskId, 1);
+            }
+            curWm = 1;
+        }
+        if (curWm != 6) {
+            // Pass bounds atomically when entering MULTI_WINDOW (6) and alwaysOnTop=null to avoid
+            // triggering Task.setAlwaysOnTop -> spurious moveTaskToFront or flashing fullscreen Letterbox.
+            if (!applyWctForTask(taskId, null, 6, (bounds != null && !bounds.isEmpty()) ? bounds : null)) {
+                forceTaskWindowingMode(taskId, 6);
+            }
+        }
+        if (bounds != null && !bounds.isEmpty()) {
+            resizeTaskBoundsOnly(taskId, bounds, forceSyncIfEqual);
+        }
+        return true;
+    }
+
+    private static void detachFreeformAndEnsureFullscreenOnDisplay(int taskId, int dispW, int dispH) {
+        if (taskId <= 0 || sAtm == null) return;
+        int curWm = getTaskWindowingMode(taskId);
+        if (curWm == 1) return;
+        Boolean clearAot = (curWm == 5) ? Boolean.FALSE : null;
+        Rect fullBounds = new Rect(0, 0, Math.max(480, dispW), Math.max(480, dispH));
+        if (curWm != 6) {
+            if (!applyWctForTask(taskId, clearAot, 6, null)) {
+                if (curWm == 5) clearTaskAlwaysOnTop(taskId);
+                forceTaskWindowingMode(taskId, 6);
+            }
+        }
+        resizeTaskBoundsOnly(taskId, fullBounds, true);
+        SystemClock.sleep(55L);
+        if (!applyWctForTask(taskId, null, 1, new Rect())) {
+            forceTaskWindowingMode(taskId, 1);
+        }
+    }
+
+    private static Intent resolveSafeLaunchIntent(String pkg, String cls) {
+        if (!isValidPackageName(pkg) || isProtectedSystemTaskPkg(pkg) || "com.extbridge.helper".equals(pkg)) {
+            return null;
+        }
+        if (sCtx == null) return null;
+        try {
+            if (cls != null && !cls.trim().isEmpty()) {
+                if (!isAllowedLaunchTarget(pkg, cls.trim())) return null;
+                Intent intent = new Intent();
+                intent.setComponent(new ComponentName(pkg, cls.trim()));
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+                return intent;
+            }
+            Intent li = sCtx.getPackageManager().getLaunchIntentForPackage(pkg);
+            if (li != null) {
+                li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+            }
+            return li;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean launchInWindowMode(
+            String pkg, String cls, int modeInt, int left, int top, int right, int bottom) {
+        if (sVdId <= 0 || sAtm == null || sMStartActivity == null) return false;
+        Intent intent = resolveSafeLaunchIntent(pkg, cls);
+        if (intent == null) return false;
+
+        if (sSplitActive) {
+            exitSplitAndRestore(false);
+        }
+        if (sWindowManager.isTilingActive()) {
+            sWindowManager.clearTilingState();
+        }
+
+        String targetMode = sWindowManager.resolveLaunchMode(pkg, modeInt);
+        int dockPx = computeCurrentDockInsetPx();
+        int workBottom = Math.max(360, sVirtH - dockPx);
+        boolean hasExplicitBounds = (right - left >= 200 && bottom - top >= 200);
+
+        WindowRect targetRect;
+        if (DesktopWindowManager.MODE_FULLSCREEN.equals(targetMode)) {
+            targetRect = new WindowRect(0, 0, sVirtW, sVirtH);
+        } else if (hasExplicitBounds) {
+            targetRect = DesktopWindowManager.clampBoundsToWorkArea(
+                    new WindowRect(left, top, right, bottom), sVirtW, workBottom);
+        } else if (DesktopWindowManager.MODE_FREEFORM.equals(targetMode)) {
+            targetRect = sWindowManager.computeNextFreeformBounds(sVirtW, sVirtH, sVirtDpi, dockPx, pkg);
+        } else {
+            targetRect = sWindowManager.computeAdaptiveSingleBounds(sVirtW, sVirtH, sVirtDpi, dockPx, pkg, 0, 0);
+            if (targetRect.width() >= sVirtW - 16) {
+                targetMode = DesktopWindowManager.MODE_FULLSCREEN;
+                targetRect = new WindowRect(0, 0, sVirtW, sVirtH);
+            }
+        }
+
+        boolean useMultiWindow = !DesktopWindowManager.MODE_FULLSCREEN.equals(targetMode);
+        int existingTid = findRunningTaskIdForPkg(pkg);
+        if (existingTid > 0 && isTaskAllowedForExtControl(existingTid, pkg, false)) {
+            sWindowManager.putManagedWindow(existingTid, pkg, targetMode, targetRect, true, -1);
+            if (useMultiWindow) {
+                Rect androidRect = targetRect.toAndroidRect();
+                ensureTaskResizeableAndMultiWindow(existingTid, androidRect, true);
+                bringSplitTaskFront(existingTid, androidRect);
+                ensureTaskResizeableAndMultiWindow(existingTid, androidRect, true);
+            } else {
+                if (sFullscreenPolicy == 1 && getAppMode(pkg) == 0 && shouldCompatOverridePkg(pkg)) {
+                    sBgIoExec.execute(() -> applyAppModeCompat(pkg, 1, false));
+                }
+                moveTaskToDisplayRaw(existingTid, sVdId);
+                detachFreeformAndEnsureFullscreen(existingTid, true);
+                try {
+                    Bundle b = makeExtLaunchOptionsForMode(sVdId, getAppMode(pkg)).toBundle();
+                    for (Method m : sAtm.getClass().getMethods()) {
+                        if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
+                            m.invoke(sAtm, existingTid, b);
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {}
+            }
+            notifyHelperSync();
+            pushRemoteDeviceState(true);
+            return true;
+        }
+
+        try {
+            applyAppModeCompat(pkg, getAppMode(pkg), false);
+            ActivityOptions opts = ActivityOptions.makeBasic();
+            opts.setLaunchDisplayId(sVdId);
+            if (useMultiWindow) {
+                opts.setLaunchBounds(targetRect.toAndroidRect());
+                try {
+                    ActivityOptions.class.getMethod("setLaunchWindowingMode", int.class).invoke(opts, 6);
+                } catch (Throwable ignored) {}
+            } else {
+                opts.setLaunchBounds(null);
+                try {
+                    ActivityOptions.class.getMethod("setLaunchWindowingMode", int.class).invoke(opts, 1);
+                } catch (Throwable ignored) {}
+            }
+            Object rc = sMStartActivity.invoke(
+                    sAtm, null, "com.android.shell", null, intent, null, null, null, 0, 0, null, opts.toBundle());
+            boolean ok = !(rc instanceof Integer) || (Integer) rc >= 0;
+            if (ok && sHandler != null) {
+                final String finalMode = targetMode;
+                final WindowRect finalRect = targetRect;
+                final boolean finalMw = useMultiWindow;
+                for (long delayMs : new long[]{220L, 650L}) {
+                    sHandler.postDelayed(() -> verifyLaunchedWindowAsync(pkg, finalMode, finalRect, finalMw), delayMs);
+                }
+            }
+            notifyHelperSync();
+            pushRemoteDeviceState(true);
+            return ok;
+        } catch (Throwable t) {
+            t.printStackTrace();
+            return false;
+        }
+    }
+
+    private static void verifyLaunchedWindowAsync(String pkg, String mode, WindowRect bounds, boolean useMultiWindow) {
+        if (sVdId <= 0 || pkg == null || pkg.isEmpty() || sWindowManager.isTilingActive()) return;
+        int tid = findRunningTaskIdForPkg(pkg);
+        if (tid <= 0) return;
+        sWindowManager.putManagedWindow(tid, pkg, mode, bounds, true, -1);
+        if (useMultiWindow) {
+            ensureTaskResizeableAndMultiWindow(tid, bounds.toAndroidRect(), true);
+        } else {
+            detachFreeformAndEnsureFullscreen(tid, true);
+        }
+        notifyHelperSync();
+        pushRemoteDeviceState(true);
+    }
+
+    private static boolean updateWindowBounds(
+            int taskId, String pkg, int modeInt, int left, int top, int right, int bottom, boolean rememberPref) {
+        if (sVdId <= 0 || sAtm == null) return false;
+        String safePkg = isValidPackageName(pkg) ? pkg : null;
+        int tid = (taskId > 0 && isTaskAllowedForExtControl(taskId, safePkg, false))
+                ? taskId
+                : (safePkg != null ? findTaskIdForPkg(safePkg) : -1);
+        if (tid <= 0) {
+            String[] topApp = findTopUserAppOnDisplay(sVdId);
+            if (!topApp[0].isEmpty()) {
+                safePkg = topApp[0];
+                tid = findTaskIdForPkg(safePkg);
+            }
+        }
+        if (tid <= 0 || !isTaskAllowedForExtControl(tid, safePkg, false)) return false;
+        if (safePkg == null) {
+            DesktopWindowManager.ManagedWindow mw = sWindowManager.getManagedWindow(tid);
+            if (mw != null && !mw.pkg.isEmpty()) safePkg = mw.pkg;
+        }
+
+        int dockPx = computeCurrentDockInsetPx();
+        int workBottom = Math.max(360, sVirtH - dockPx);
+        String targetMode;
+        if (modeInt == DesktopWindowManager.INT_MODE_FULLSCREEN) {
+            targetMode = DesktopWindowManager.MODE_FULLSCREEN;
+        } else if (modeInt == DesktopWindowManager.INT_MODE_FREEFORM) {
+            targetMode = DesktopWindowManager.MODE_FREEFORM;
+        } else {
+            targetMode = DesktopWindowManager.MODE_ADAPTIVE_SINGLE;
+        }
+
+        if (sWindowManager.isTilingActive()) {
+            sWindowManager.clearTilingState();
+            synchronized (sSplitLock) {
+                clearSplitState();
+            }
+        }
+
+        if (DesktopWindowManager.MODE_FULLSCREEN.equals(targetMode)) {
+            WindowRect full = new WindowRect(0, 0, sVirtW, sVirtH);
+            sWindowManager.putManagedWindow(tid, safePkg != null ? safePkg : "", DesktopWindowManager.MODE_FULLSCREEN, full, true, -1);
+            if (safePkg != null && sFullscreenPolicy == 1 && getAppMode(safePkg) == 0 && shouldCompatOverridePkg(safePkg)) {
+                final String compatPkg = safePkg;
+                sBgIoExec.execute(() -> applyAppModeCompat(compatPkg, 1, false));
+            }
+            detachFreeformAndEnsureFullscreen(tid, true);
+            if (rememberPref && safePkg != null) {
+                sWindowManager.rememberAppPref(safePkg, DesktopWindowManager.MODE_FULLSCREEN, 100, 0, null);
+            }
+        } else {
+            boolean hasExplicit = (right - left >= 200 && bottom - top >= 200);
+            WindowRect rect;
+            if (hasExplicit) {
+                rect = DesktopWindowManager.clampBoundsToWorkArea(
+                        new WindowRect(left, top, right, bottom), sVirtW, workBottom);
+            } else if (DesktopWindowManager.MODE_FREEFORM.equals(targetMode)) {
+                rect = sWindowManager.computeNextFreeformBounds(sVirtW, sVirtH, sVirtDpi, dockPx, safePkg);
+            } else {
+                rect = sWindowManager.computeAdaptiveSingleBounds(sVirtW, sVirtH, sVirtDpi, dockPx, safePkg, 0, 0);
+            }
+            if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(targetMode) && rect.width() >= sVirtW - 16) {
+                WindowRect full = new WindowRect(0, 0, sVirtW, sVirtH);
+                sWindowManager.putManagedWindow(tid, safePkg != null ? safePkg : "", DesktopWindowManager.MODE_FULLSCREEN, full, true, -1);
+                if (safePkg != null && sFullscreenPolicy == 1 && getAppMode(safePkg) == 0 && shouldCompatOverridePkg(safePkg)) {
+                    final String compatPkg = safePkg;
+                    sBgIoExec.execute(() -> applyAppModeCompat(compatPkg, 1, false));
+                }
+                detachFreeformAndEnsureFullscreen(tid, true);
+                if (rememberPref && safePkg != null) {
+                    sWindowManager.rememberAppPref(safePkg, DesktopWindowManager.MODE_FULLSCREEN, 100, 0, null);
+                }
+            } else {
+                sWindowManager.putManagedWindow(tid, safePkg != null ? safePkg : "", targetMode, rect, true, -1);
+                ensureTaskResizeableAndMultiWindow(tid, rect.toAndroidRect(), true);
+                if (rememberPref && safePkg != null) {
+                    if (DesktopWindowManager.MODE_FREEFORM.equals(targetMode)) {
+                        sWindowManager.rememberAppPref(safePkg, DesktopWindowManager.MODE_FREEFORM, 0, 0, rect);
+                    } else {
+                        int pct = Math.max(DesktopWindowManager.MIN_WIDTH_PCT,
+                                Math.min(DesktopWindowManager.MAX_WIDTH_PCT, Math.round(rect.width() * 100f / Math.max(1, sVirtW))));
+                        int dp = Math.round(rect.width() * 160f / Math.max(120, sVirtDpi));
+                        sWindowManager.rememberAppPref(safePkg, DesktopWindowManager.MODE_ADAPTIVE_SINGLE, pct, dp, null);
+                    }
+                }
+            }
+        }
+        notifyHelperSync();
+        pushRemoteDeviceState(true);
+        return true;
+    }
+
+    private static boolean setSingleWidthPct(String pkg, int widthPct, boolean remember) {
+        if (sVdId <= 0 || sAtm == null) return false;
+        String targetPkg = isValidPackageName(pkg) ? pkg : "";
+        if (targetPkg.isEmpty()) {
+            String[] topApp = findTopUserAppOnDisplay(sVdId);
+            targetPkg = topApp[0];
+        }
+        if (targetPkg.isEmpty()) return false;
+        int tid = findTaskIdForPkg(targetPkg);
+        if (tid <= 0) return false;
+        int clampedPct = DesktopWindowManager.clampWidthPct(widthPct);
+        if (clampedPct >= 98) {
+            return updateWindowBounds(tid, targetPkg, DesktopWindowManager.INT_MODE_FULLSCREEN,
+                    0, 0, sVirtW, sVirtH, remember);
+        }
+        WindowRect rect = sWindowManager.computeAdaptiveSingleBounds(
+                sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), targetPkg, clampedPct, 0);
+        return updateWindowBounds(tid, targetPkg, DesktopWindowManager.INT_MODE_ADAPTIVE_SINGLE,
+                rect.left, rect.top, rect.right, rect.bottom, remember);
+    }
+
+    private static boolean setTilingLayout(String topologyRaw, List<String> reqPkgs, int[] reqRatios) {
+        if (sVdId <= 0 || sAtm == null) return false;
+        String norm = TilingLayoutEngine.normalizeTopology(topologyRaw);
+        if (TilingLayoutEngine.TOPOLOGY_NONE.equals(norm)) {
+            int[] prevTids = sWindowManager.getTilingSlotTaskIds();
+            String[] prevPkgs = sWindowManager.getTilingSlotPkgs();
+            sWindowManager.clearTilingState();
+            synchronized (sSplitLock) {
+                clearSplitState();
+            }
+            for (int i = 0; i < prevTids.length; i++) {
+                int tid = prevTids[i] > 0 ? prevTids[i] : findTaskIdForPkg(prevPkgs[i]);
+                if (tid > 0) {
+                    detachFreeformAndEnsureFullscreen(tid, true);
+                }
+            }
+            if (prevPkgs.length > 0 && prevPkgs[0] != null && !prevPkgs[0].isEmpty()) {
+                int tid0 = prevTids[0] > 0 ? prevTids[0] : findTaskIdForPkg(prevPkgs[0]);
+                if (tid0 > 0 && sWindowManager.isAdaptiveSingleEnabled()) {
+                    WindowRect adaptive = sWindowManager.computeAdaptiveSingleBounds(
+                            sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), prevPkgs[0], 0, 0);
+                    if (adaptive.width() < sVirtW - 16) {
+                        ensureTaskResizeableAndMultiWindow(tid0, adaptive.toAndroidRect(), true);
+                        sWindowManager.putManagedWindow(tid0, prevPkgs[0], DesktopWindowManager.MODE_ADAPTIVE_SINGLE, adaptive, true, -1);
+                    }
+                }
+            }
+            ensureLauncherTaskFullscreenInBg();
+            notifyHelperSync();
+            pushRemoteDeviceState(true);
+            return true;
+        }
+
+        int slotCount = TilingLayoutEngine.slotCountForTopology(norm);
+        if (slotCount <= 0) return false;
+        int[] effRatios = (reqRatios != null && reqRatios.length > 0)
+                ? reqRatios
+                : TilingLayoutEngine.defaultRatiosForTopology(norm);
+        WindowRect[] slots = TilingLayoutEngine.computeSlots(
+                norm, sVirtW, sVirtH, computeCurrentDockInsetPx(), TilingLayoutEngine.DEFAULT_GAP_PX, effRatios);
+
+        ArrayList<String> chosenPkgs = new ArrayList<>(slotCount);
+        if (reqPkgs != null) {
+            for (String p : reqPkgs) {
+                if (chosenPkgs.size() >= slotCount) break;
+                if (isValidPackageName(p) && !isProtectedSystemTaskPkg(p) && !"com.extbridge.helper".equals(p)
+                        && !chosenPkgs.contains(p)) {
+                    chosenPkgs.add(p);
+                }
+            }
+        }
+        // Auto-fill remaining slots from live running tasks on sVdId, then all running/recent tasks
+        if (chosenPkgs.size() < slotCount) {
+            List<?> running = invokeTaskQuery("getTasks");
+            if (running != null) {
+                for (int pass = 0; pass < 2 && chosenPkgs.size() < slotCount; pass++) {
+                    boolean onlyExt = (pass == 0);
+                    for (Object t : running) {
+                        if (t == null) continue;
+                        int did = readIntField(t, "displayId", -1);
+                        if (onlyExt && did != sVdId) continue;
+                        String p = extractTaskPkg(t);
+                        if (!isValidPackageName(p) || isProtectedSystemTaskPkg(p) || "com.extbridge.helper".equals(p)) continue;
+                        if (!chosenPkgs.contains(p)) {
+                            chosenPkgs.add(p);
+                            if (chosenPkgs.size() >= slotCount) break;
+                        }
+                    }
+                }
+            }
+        }
+        if (chosenPkgs.size() < slotCount) {
+            List<?> recents = invokeTaskQuery("getRecentTasks");
+            if (recents != null) {
+                for (Object t : recents) {
+                    if (t == null) continue;
+                    String p = extractTaskPkg(t);
+                    if (!isValidPackageName(p) || isProtectedSystemTaskPkg(p) || "com.extbridge.helper".equals(p)) continue;
+                    if (!chosenPkgs.contains(p)) {
+                        chosenPkgs.add(p);
+                        if (chosenPkgs.size() >= slotCount) break;
+                    }
+                }
+            }
+        }
+        if (chosenPkgs.isEmpty()) return false;
+
+        int[] slotTids = new int[slotCount];
+        Arrays.fill(slotTids, -1);
+        for (int i = 0; i < chosenPkgs.size(); i++) {
+            slotTids[i] = findTaskIdForPkg(chosenPkgs.get(i));
+        }
+
+        sWindowManager.setTilingState(norm, chosenPkgs, slotTids, effRatios, slots);
+        synchronized (sSplitLock) {
+            sLastSplitActionMs = SystemClock.uptimeMillis();
+            if (slotCount == 2) {
+                sSplitActive = true;
+                sSplitSlot0Pkg = chosenPkgs.get(0);
+                sSplitSlot0TaskId = slotTids[0];
+                sSplitSlot1Pkg = (chosenPkgs.size() > 1) ? chosenPkgs.get(1) : "";
+                sSplitSlot1TaskId = (chosenPkgs.size() > 1) ? slotTids[1] : -1;
+                if (effRatios.length >= 1) {
+                    sSplitRatio = clampSplitRatio(effRatios[0] / 100f);
+                }
+            } else {
+                clearSplitState();
+            }
+        }
+
+        for (int i = 0; i < chosenPkgs.size(); i++) {
+            applyTilingSlot(i, chosenPkgs.get(i), slotTids[i], slots[i]);
+        }
+        notifyHelperSync();
+        pushRemoteDeviceState(true);
+        return true;
+    }
+
+    private static void applyTilingSlot(int slotIdx, String pkg, int knownTid, WindowRect bounds) {
+        if (sVdId <= 0 || pkg == null || pkg.isEmpty() || bounds == null) return;
+        applyAppModeCompat(pkg, 1, false);
+        Rect r = bounds.toAndroidRect();
+        int tid = knownTid > 0 ? knownTid : findTaskIdForPkg(pkg);
+        if (tid > 0) {
+            sWindowManager.updateTilingSlotTaskId(slotIdx, tid, pkg, bounds);
+            ensureTaskResizeableAndMultiWindow(tid, r, true);
+            if (bringSplitTaskFront(tid, r)) {
+                ensureTaskResizeableAndMultiWindow(tid, r, true);
+                return;
+            }
+        }
+        Intent intent = resolveSafeLaunchIntent(pkg, null);
+        if (intent == null || sMStartActivity == null) return;
+        try {
+            ActivityOptions opts = ActivityOptions.makeBasic();
+            opts.setLaunchDisplayId(sVdId);
+            opts.setLaunchBounds(r);
+            try {
+                ActivityOptions.class.getMethod("setLaunchWindowingMode", int.class).invoke(opts, 6);
+            } catch (Throwable ignored) {}
+            sMStartActivity.invoke(sAtm, null, "com.android.shell", null, intent, null, null, null, 0, 0, null, opts.toBundle());
+            if (sHandler != null) {
+                for (long delayMs : new long[]{240L, 700L}) {
+                    sHandler.postDelayed(() -> {
+                        if (!sWindowManager.isTilingActive() || sVdId <= 0) return;
+                        int t = findTaskIdForPkg(pkg);
+                        if (t > 0) {
+                            sWindowManager.updateTilingSlotTaskId(slotIdx, t, pkg, bounds);
+                            ensureTaskResizeableAndMultiWindow(t, r, true);
+                        }
+                    }, delayMs);
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean windowLifecycleAction(int taskId, String pkg, int action) {
+        if (sVdId <= 0 || sAtm == null) return false;
+        String safePkg = isValidPackageName(pkg) ? pkg : null;
+        int tid = (taskId > 0 && isTaskAllowedForExtControl(taskId, safePkg, false))
+                ? taskId
+                : (safePkg != null ? findTaskIdForPkg(safePkg) : -1);
+        if (safePkg == null && tid > 0) {
+            DesktopWindowManager.ManagedWindow mw = sWindowManager.getManagedWindow(tid);
+            if (mw != null && !mw.pkg.isEmpty()) safePkg = mw.pkg;
+        }
+        switch (action) {
+            case 1: { // focus
+                if (tid <= 0) return false;
+                DesktopWindowManager.ManagedWindow mw = sWindowManager.getManagedWindow(tid);
+                if (mw != null && !DesktopWindowManager.MODE_FULLSCREEN.equals(mw.mode) && mw.bounds != null) {
+                    Rect r = mw.bounds.toAndroidRect();
+                    ensureTaskResizeableAndMultiWindow(tid, r, false);
+                    bringSplitTaskFront(tid, r);
+                    sWindowManager.setFocusedTask(tid);
+                } else {
+                    switchToTaskOnVd(tid, safePkg);
+                }
+                notifyHelperSync();
+                pushRemoteDeviceState(true);
+                return true;
+            }
+            case 2: { // minimize
+                if (tid > 0) {
+                    sWindowManager.setMinimizedTask(tid, true);
+                }
+                boolean anyOtherVisible = false;
+                for (DesktopWindowManager.ManagedWindow mw : sWindowManager.getManagedWindowsSnapshot()) {
+                    if (!mw.minimized && mw.taskId != tid && DesktopWindowManager.MODE_FREEFORM.equals(mw.mode)) {
+                        anyOtherVisible = true;
+                        break;
+                    }
+                }
+                if (!anyOtherVisible) {
+                    minimizeToExtHome(tid, safePkg);
+                }
+                notifyHelperSync();
+                pushRemoteDeviceState(true);
+                return true;
+            }
+            case 3: { // close
+                if (tid <= 0) return false;
+                return removeTaskById(tid);
+            }
+            case 4: { // reload_dpi
+                if (safePkg == null) {
+                    String[] topApp = findTopUserAppOnDisplay(sVdId);
+                    safePkg = topApp[0];
+                }
+                if (safePkg == null || safePkg.isEmpty()) return false;
+                reloadAppDpiOnDisplay(safePkg, sVdId, -1);
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    private static void setAdaptiveSingleConfig(boolean enabled, int defaultWidthDp) {
+        sWindowManager.setAdaptiveSingleConfig(enabled, defaultWidthDp);
+        if (sVdId > 0 && sMirrorMode == 0 && !sWindowManager.isTilingActive() && !sSplitActive) {
+            String[] topApp = findTopUserAppOnDisplay(sVdId);
+            if (!topApp[0].isEmpty()) {
+                int tid = findTaskIdForPkg(topApp[0]);
+                if (tid > 0) {
+                    DesktopWindowManager.ManagedWindow cur = sWindowManager.getManagedWindow(tid);
+                    boolean isFreeform = (cur != null && DesktopWindowManager.MODE_FREEFORM.equals(cur.mode));
+                    if (!isFreeform) {
+                        if (enabled) {
+                            WindowRect bounds = sWindowManager.computeAdaptiveSingleBounds(
+                                    sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), topApp[0], 0, 0);
+                            if (bounds.width() < sVirtW - 16) {
+                                ensureTaskResizeableAndMultiWindow(tid, bounds.toAndroidRect(), true);
+                                sWindowManager.putManagedWindow(
+                                        tid, topApp[0], DesktopWindowManager.MODE_ADAPTIVE_SINGLE, bounds, true, -1);
+                            }
+                        } else {
+                            detachFreeformAndEnsureFullscreen(tid, true);
+                            sWindowManager.putManagedWindow(
+                                    tid, topApp[0], DesktopWindowManager.MODE_FULLSCREEN,
+                                    new WindowRect(0, 0, sVirtW, sVirtH), true, -1);
+                        }
+                    }
+                }
+            }
+        }
+        notifyHelperSync();
+        pushRemoteDeviceState(true);
+    }
+
+    private static void reloadAppDpiOnDisplay(String pkg, int targetDisplayId, int standaloneSessionId) {
+        if (!isValidPackageName(pkg) || isProtectedSystemTaskPkg(pkg) || "com.extbridge.helper".equals(pkg)) {
+            return;
+        }
+        sBgIoExec.execute(() -> {
+            try {
+                runCmdOut("am", "force-stop", pkg);
+                SystemClock.sleep(150L);
+                if (standaloneSessionId > 0) {
+                    StandaloneAppSession sas = sStandaloneSessions.get(standaloneSessionId);
+                    if (sas != null && !sas.closed && sas.appVdId > 0) {
+                        launchOrMoveAppToStandaloneDisplay(sas);
+                    }
+                } else if (sVdId > 0 && targetDisplayId == sVdId) {
+                    launchInWindowMode(pkg, "", DesktopWindowManager.INT_MODE_AUTO, 0, 0, 0, 0);
+                }
+            } catch (Throwable t) {
+                System.err.println("EXTBRIDGE_RELOAD_DPI_ERR pkg=" + pkg + ": " + t.getMessage());
+            }
+        });
+    }
+
+    private static boolean returnTaskToDesktop(String pkg, int taskId, StandaloneAppSession fromSession) {
+        if (sVdId <= 0 || sAtm == null) return false;
+        String safePkg = isValidPackageName(pkg) ? pkg : (fromSession != null ? fromSession.appPackage : "");
+        int tid = taskId > 0 ? taskId : (fromSession != null && fromSession.appTaskId > 0
+                ? fromSession.appTaskId : findTaskIdForPkg(safePkg));
+        if (tid <= 0 && !safePkg.isEmpty()) {
+            return launchInWindowMode(safePkg, "", DesktopWindowManager.INT_MODE_AUTO, 0, 0, 0, 0);
+        }
+        if (tid <= 0) return false;
+
+        moveTaskToDisplayRaw(tid, sVdId);
+        String resolvedMode = sWindowManager.resolveLaunchMode(safePkg, DesktopWindowManager.INT_MODE_AUTO);
+        if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(resolvedMode)) {
+            WindowRect bounds = sWindowManager.computeAdaptiveSingleBounds(
+                    sVirtW, sVirtH, sVirtDpi, computeCurrentDockInsetPx(), safePkg, 0, 0);
+            if (bounds.width() < sVirtW - 16) {
+                ensureTaskResizeableAndMultiWindow(tid, bounds.toAndroidRect(), true);
+                bringSplitTaskFront(tid, bounds.toAndroidRect());
+                sWindowManager.putManagedWindow(tid, safePkg, DesktopWindowManager.MODE_ADAPTIVE_SINGLE, bounds, true, -1);
+            } else {
+                detachFreeformAndEnsureFullscreen(tid, true);
+                sWindowManager.putManagedWindow(tid, safePkg, DesktopWindowManager.MODE_FULLSCREEN,
+                        new WindowRect(0, 0, sVirtW, sVirtH), true, -1);
+            }
+        } else {
+            detachFreeformAndEnsureFullscreen(tid, true);
+            sWindowManager.putManagedWindow(tid, safePkg, DesktopWindowManager.MODE_FULLSCREEN,
+                    new WindowRect(0, 0, sVirtW, sVirtH), true, -1);
+        }
+        notifyHelperSync();
+        pushRemoteDeviceState(true);
+        return true;
+    }
+
+    private static void relayoutManagedWindowsOnResize() {
+        if (sVdId <= 0 || sMirrorMode != 0) return;
+        if (sWindowManager.isTilingActive()) {
+            String topo = sWindowManager.getTilingTopology();
+            String[] pkgs = sWindowManager.getTilingSlotPkgs();
+            int[] tids = sWindowManager.getTilingSlotTaskIds();
+            int[] ratios = sWindowManager.getTilingRatios();
+            WindowRect[] slots = TilingLayoutEngine.computeSlots(
+                    topo, sVirtW, sVirtH, computeCurrentDockInsetPx(), TilingLayoutEngine.DEFAULT_GAP_PX, ratios);
+            for (int i = 0; i < slots.length && i < pkgs.length; i++) {
+                if (pkgs[i] == null || pkgs[i].isEmpty()) continue;
+                int tid = tids[i] > 0 ? tids[i] : findTaskIdForPkg(pkgs[i]);
+                if (tid > 0) {
+                    sWindowManager.updateTilingSlotTaskId(i, tid, pkgs[i], slots[i]);
+                    ensureTaskResizeableAndMultiWindow(tid, slots[i].toAndroidRect(), true);
+                }
+            }
+            return;
+        }
+        int dockPx = computeCurrentDockInsetPx();
+        int workBottom = Math.max(360, sVirtH - dockPx);
+        for (DesktopWindowManager.ManagedWindow mw : sWindowManager.getManagedWindowsSnapshot()) {
+            if (mw.minimized || mw.taskId <= 0) continue;
+            if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(mw.mode)) {
+                WindowRect next = sWindowManager.computeAdaptiveSingleBounds(
+                        sVirtW, sVirtH, sVirtDpi, dockPx, mw.pkg, 0, 0);
+                if (next.width() < sVirtW - 16) {
+                    ensureTaskResizeableAndMultiWindow(mw.taskId, next.toAndroidRect(), true);
+                    sWindowManager.putManagedWindow(mw.taskId, mw.pkg, DesktopWindowManager.MODE_ADAPTIVE_SINGLE, next, mw.focused, -1);
+                } else {
+                    detachFreeformAndEnsureFullscreen(mw.taskId, true);
+                    sWindowManager.putManagedWindow(mw.taskId, mw.pkg, DesktopWindowManager.MODE_FULLSCREEN,
+                            new WindowRect(0, 0, sVirtW, sVirtH), mw.focused, -1);
+                }
+            } else if (DesktopWindowManager.MODE_FREEFORM.equals(mw.mode) && mw.bounds != null) {
+                WindowRect clamped = DesktopWindowManager.clampBoundsToWorkArea(mw.bounds, sVirtW, workBottom);
+                ensureTaskResizeableAndMultiWindow(mw.taskId, clamped.toAndroidRect(), true);
+                sWindowManager.putManagedWindow(mw.taskId, mw.pkg, DesktopWindowManager.MODE_FREEFORM, clamped, mw.focused, -1);
+            }
+        }
+    }
+
+    private static void collectAndSendAppList(int sessionId) {
+        sBgIoExec.execute(() -> {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv == null || sCtx == null) return;
+            try {
+                HashMap<String, Integer> extRunning = new HashMap<>();
+                HashSet<Integer> extDisplayIds = new HashSet<>();
+                if (sVdId > 0) extDisplayIds.add(sVdId);
+                for (StandaloneAppSession sas : sStandaloneSessions.values()) {
+                    if (sas != null && !sas.closed && sas.appVdId > 0) {
+                        extDisplayIds.add(sas.appVdId);
+                    }
+                }
+                List<?> running = invokeTaskQuery("getTasks");
+                if (running != null) {
+                    for (Object t : running) {
+                        if (t == null) continue;
+                        int did = readIntField(t, "displayId", -1);
+                        if (!extDisplayIds.contains(did)) continue;
+                        String pkg = extractTaskPkg(t);
+                        if (pkg == null || pkg.isEmpty() || shouldSkipTaskPkg(pkg)) continue;
+                        int tid = readIntField(t, "taskId", readIntField(t, "id", -1));
+                        if (!extRunning.containsKey(pkg)) {
+                            extRunning.put(pkg, tid);
+                        }
+                    }
+                }
+
+                PackageManager pm = sCtx.getPackageManager();
+                Intent mainIntent = new Intent(Intent.ACTION_MAIN, null);
+                mainIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+                List<ResolveInfo> ris = pm.queryIntentActivities(mainIntent, 0);
+                LinkedHashMap<String, ExtCastProtocol.AppEntry> dedup = new LinkedHashMap<>();
+                if (ris != null) {
+                    for (ResolveInfo ri : ris) {
+                        if (ri == null || ri.activityInfo == null) continue;
+                        String pkg = ri.activityInfo.packageName;
+                        String cls = ri.activityInfo.name;
+                        if (pkg == null || pkg.isEmpty() || "com.extbridge.helper".equals(pkg)
+                                || isProtectedSystemTaskPkg(pkg)) continue;
+                        if (dedup.containsKey(pkg)) continue;
+                        String label = pkg;
+                        try {
+                            CharSequence cs = ri.loadLabel(pm);
+                            if (cs != null && cs.length() > 0) label = cs.toString().trim();
+                        } catch (Throwable ignored) {}
+                        if (sAppLabelCache.size() < 256) {
+                            sAppLabelCache.put(pkg, label);
+                        }
+                        Integer runningTid = extRunning.get(pkg);
+                        boolean onExt = (runningTid != null);
+                        dedup.put(pkg, new ExtCastProtocol.AppEntry(
+                                pkg, cls != null ? cls : "", label, onExt, onExt ? runningTid : -1));
+                    }
+                }
+                ArrayList<ExtCastProtocol.AppEntry> list = new ArrayList<>(dedup.values());
+                list.sort((a, b) -> {
+                    if (a.runningOnExt != b.runningOnExt) return a.runningOnExt ? -1 : 1;
+                    return a.label.compareToIgnoreCase(b.label);
+                });
+                srv.sendAppList(sessionId, new ExtCastProtocol.AppListMsg(list));
+            } catch (Throwable t) {
+                System.err.println("EXTBRIDGE_LIST_APPS_ERR: " + t.getMessage());
+            }
+        });
+    }
+
+    // ---- Dual-Path Remote Streaming & Concurrent Standalone Pop-Out App Sessions ----
+
+    private static final class StandaloneAppSession {
+        final int sessionId;
+        final int sinkType;
+        final String appPackage;
+        final String appActivity;
+        final Object sessionDisplayLock = new Object();
+
+        volatile VirtualDisplay appVd;
+        volatile int appVdId = -1;
+        volatile String appVdUniqueId;
+        volatile int width;
+        volatile int height;
+        volatile int createdVdW;
+        volatile int createdVdH;
+        volatile int dpi;
+        volatile float fps;
+        volatile int requestedBitrateKbps;
+        volatile int codecPref;
+        volatile int rotation = 0;
+        volatile RemoteStreamSink sink;
+        volatile RemoteInputBridge inputBridge;
+        volatile int appTaskId = -1;
+        volatile boolean closed = false;
+
+        StandaloneAppSession(int sessionId, int sinkType, String appPackage, String appActivity) {
+            this.sessionId = sessionId;
+            this.sinkType = sinkType;
+            this.appPackage = appPackage;
+            this.appActivity = (appActivity != null) ? appActivity : "";
+        }
+    }
+
+    private static void initRemoteStreaming() {
+        try {
+            sTrustStore = new TrustStoreManager();
+            sRemoteInputBridge = new RemoteInputBridge(new RemoteHostBridgeImpl());
+            sRemoteServer = new RemoteStreamServer(new RemoteSessionListenerImpl(), sTrustStore);
+            sRemoteServer.startUsbListener();
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_REMOTE_INIT_ERR: " + t);
+            t.printStackTrace();
+        }
+    }
+
+    private static void shutdownRemoteStreaming() {
+        try {
+            for (StandaloneAppSession sas : new ArrayList<>(sStandaloneSessions.values())) {
+                closeStandaloneSession(sas);
+            }
+            sStandaloneSessions.clear();
+        } catch (Throwable ignored) {}
+        try {
+            releaseAllUhidDevices();
+        } catch (Throwable ignored) {}
+        try {
+            if (sAudioCapturer != null) {
+                sAudioCapturer.stop();
+                sAudioCapturer = null;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (sRemoteInputBridge != null) {
+                sRemoteInputBridge.onSessionEnded();
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (sRemoteSink != null) {
+                sRemoteSink.stop();
+                sRemoteSink = null;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (sRemoteServer != null) {
+                sRemoteServer.shutdown();
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private static boolean isRemoteSessionActive() {
+        RemoteStreamServer srv = sRemoteServer;
+        RemoteStreamSink sink = sRemoteSink;
+        return srv != null && srv.hasDesktopSession() && sink != null && sink.isActive();
+    }
+
+    private static int getActiveSinkType() {
+        if (isRemoteSessionActive()) {
+            return sRemoteServer.getActiveSinkType();
+        }
+        RemoteStreamServer srv = sRemoteServer;
+        if (srv != null && srv.hasActiveSession()) {
+            return srv.getActiveSinkType();
+        }
+        if (sExtId >= 0 || findExternalDisplay() != null) {
+            return DisplaySink.SINK_PHYSICAL;
+        }
+        return sActiveSinkType;
+    }
+
+    private static int resolveEffectiveCodecPref(String helloPreferredCodec) {
+        if (sRemoteCodecPref == RemoteStreamSink.CODEC_PREF_H264) {
+            return RemoteStreamSink.CODEC_PREF_H264;
+        }
+        if (helloPreferredCodec != null) {
+            String lower = helloPreferredCodec.trim().toLowerCase(Locale.US);
+            if ("h264".equals(lower) || "avc".equals(lower)) {
+                return RemoteStreamSink.CODEC_PREF_H264;
+            }
+        }
+        return RemoteStreamSink.CODEC_PREF_AUTO_HEVC;
+    }
+
+    private static void attachRemoteDexDisplay() {
+        RemoteStreamSink sink = sRemoteSink;
+        if (sink == null || !sink.isActive()) return;
+        Surface codecSurf = sink.getInputSurface();
+        if (codecSurf == null) return;
+        sForceRebuild = false;
+        try {
+            if (sRemoteMirrorVd != null) {
+                try { sRemoteMirrorVd.release(); } catch (Throwable ignored) {}
+                sRemoteMirrorVd = null;
+            }
+            if (sVd != null) {
+                if (sVdId > 0) releaseUhidForDisplay(sVdId);
+                try { sVd.release(); } catch (Throwable ignored) {}
+                sVd = null;
+            }
+
+            int w = sink.getWidth();
+            int h = sink.getHeight();
+            int dpi = sink.getDpi();
+            float fps = sink.getFps();
+
+            Class<?> vdcBCls = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
+            Object vdcB = vdcBCls.getConstructor(String.class, int.class, int.class, int.class)
+                    .newInstance("ExtBridge-Remote", w, h, dpi);
+            int vdFlags = (sFullscreenPolicy == 1) ? VD_FLAGS_DEX_FIXED : VD_FLAGS_COMPAT;
+            vdcBCls.getMethod("setFlags", int.class).invoke(vdcB, vdFlags);
+            try { vdcBCls.getMethod("setHomeSupported", boolean.class).invoke(vdcB, false); } catch (Throwable ignored) {}
+            try { vdcBCls.getMethod("setRequestedRefreshRate", float.class).invoke(vdcB, fps); } catch (Throwable ignored) {}
+            vdcBCls.getMethod("setSurface", Surface.class).invoke(vdcB, codecSurf);
+            Object vdc = vdcBCls.getMethod("build").invoke(vdcB);
+
+            sVd = (VirtualDisplay) DisplayManager.class
+                    .getMethod("createVirtualDisplay", Class.forName("android.hardware.display.VirtualDisplayConfig"))
+                    .invoke(sDm, vdc);
+            if (sVd == null || sVd.getDisplay() == null) {
+                System.err.println("EXTBRIDGE_REMOTE_CREATE_VD_FAILED");
+                return;
+            }
+            Display vdDisp = sVd.getDisplay();
+            sVdId = vdDisp.getDisplayId();
+            sExtId = -1;
+            sVirtW = w;
+            sVirtH = h;
+            sVirtDpi = dpi;
+            sVirtFps = fps;
+            sCreatedVdW = w;
+            sCreatedVdH = h;
+            try {
+                sVdUniqueId = (String) Display.class.getMethod("getUniqueId").invoke(vdDisp);
+            } catch (Throwable ignored) {
+                sVdUniqueId = null;
+            }
+            sRenderMode = "REMOTE_DEX";
+            applyDisplayFullscreenPolicy(sVdId, sFullscreenPolicy == 1);
+
+            synchronized (sCursorLock) {
+                sCursorX = w * 0.5f;
+                sCursorY = h * 0.5f;
+            }
+            launchLauncher();
+            sBgIoExec.execute(() -> sanitizeSystemHomeTasks(false));
+            enqueuePushBinderToHelper(true);
+            startHelperService();
+            if (sSplitActive && sHandler != null) {
+                sHandler.postDelayed(() -> relayoutSplitTasks(false), 220L);
+            } else if (sHandler != null) {
+                sHandler.postDelayed(ExtBridge::ensureLauncherTaskFullscreenInBg, 220L);
+            }
+            notifyHelperSync();
+            pushRemoteDeviceState(true);
+            sink.requestKeyFrame();
+            System.out.println("EXTBRIDGE_REMOTE_DEX_ATTACHED vdId=" + sVdId
+                    + " size=" + w + "x" + h + "@" + dpi + "dpi fps=" + fps);
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_REMOTE_DEX_ATTACH_ERR: " + t);
+            t.printStackTrace();
+        }
+    }
+
+    private static void attachRemoteMirrorDisplay() {
+        RemoteStreamSink sink = sRemoteSink;
+        if (sink == null || !sink.isActive()) return;
+        Surface codecSurf = sink.getInputSurface();
+        if (codecSurf == null) return;
+        sForceRebuild = false;
+        try {
+            if (sVd != null) {
+                cleanupDisplayInternal(false, true);
+            }
+            if (sRemoteMirrorVd != null) {
+                try { sRemoteMirrorVd.release(); } catch (Throwable ignored) {}
+                sRemoteMirrorVd = null;
+            }
+
+            int w = sink.getWidth();
+            int h = sink.getHeight();
+            int dpi = sink.getDpi();
+            float fps = sink.getFps();
+
+            Class<?> vdcBCls = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
+            Method createVdM = DisplayManager.class.getMethod(
+                    "createVirtualDisplay", Class.forName("android.hardware.display.VirtualDisplayConfig"));
+
+            int[] candidateFlags = new int[]{
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC | DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
+            };
+            VirtualDisplay mirVd = null;
+            int chosenFlags = 0;
+            for (int flags : candidateFlags) {
+                try {
+                    Object vdcB = vdcBCls.getConstructor(String.class, int.class, int.class, int.class)
+                            .newInstance("ExtBridge-RemoteMirror", w, h, dpi);
+                    vdcBCls.getMethod("setFlags", int.class).invoke(vdcB, flags);
+                    try { vdcBCls.getMethod("setHomeSupported", boolean.class).invoke(vdcB, false); } catch (Throwable ignored) {}
+                    try { vdcBCls.getMethod("setRequestedRefreshRate", float.class).invoke(vdcB, fps); } catch (Throwable ignored) {}
+                    vdcBCls.getMethod("setSurface", Surface.class).invoke(vdcB, codecSurf);
+                    Object vdc = vdcBCls.getMethod("build").invoke(vdcB);
+                    mirVd = (VirtualDisplay) createVdM.invoke(sDm, vdc);
+                    if (mirVd != null) {
+                        chosenFlags = flags;
+                        break;
+                    }
+                } catch (Throwable ignored) {
+                    mirVd = null;
+                }
+            }
+            if (mirVd == null) {
+                System.err.println("EXTBRIDGE_REMOTE_MIRROR_CREATE_FAILED");
+                return;
+            }
+            sRemoteMirrorVd = mirVd;
+            sVdId = -1;
+            sExtId = -1;
+            sVirtW = w;
+            sVirtH = h;
+            sVirtDpi = dpi;
+            sVirtFps = fps;
+            sRenderMode = "REMOTE_MIRROR";
+
+            Point d0 = readDisplay0RealSize();
+            if (d0 != null && d0.x > 0 && d0.y > 0) {
+                sD0W = d0.x;
+                sD0H = d0.y;
+            }
+            enqueuePushBinderToHelper(true);
+            startHelperService();
+            notifyHelperSync();
+            pushRemoteDeviceState(true);
+            sink.requestKeyFrame();
+            System.out.println("EXTBRIDGE_REMOTE_MIRROR_ATTACHED flags=0x" + Integer.toHexString(chosenFlags)
+                    + " size=" + w + "x" + h + "@" + dpi + "dpi d0=" + sD0W + "x" + sD0H);
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_REMOTE_MIRROR_ATTACH_ERR: " + t);
+            t.printStackTrace();
+        }
+    }
+
+    // ---- Standalone Pop-Out App Session Lifecycle ----
+
+    private static boolean createStandaloneVirtualDisplay(StandaloneAppSession sas, Surface codecSurf) {
+        if (sas == null || codecSurf == null || sDm == null) return false;
+        try {
+            if (sas.appVd != null) {
+                if (sas.appVdId > 0) releaseUhidForDisplay(sas.appVdId);
+                try { sas.appVd.release(); } catch (Throwable ignored) {}
+                sas.appVd = null;
+                sas.appVdId = -1;
+                sas.appVdUniqueId = null;
+            }
+            Class<?> vdcBCls = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
+            String vdName = "ExtBridge-App-" + sas.appPackage;
+            Object vdcB = vdcBCls.getConstructor(String.class, int.class, int.class, int.class)
+                    .newInstance(vdName, sas.width, sas.height, sas.dpi);
+            vdcBCls.getMethod("setFlags", int.class).invoke(vdcB, VD_FLAGS_DEX_FIXED);
+            try { vdcBCls.getMethod("setHomeSupported", boolean.class).invoke(vdcB, false); } catch (Throwable ignored) {}
+            try { vdcBCls.getMethod("setRequestedRefreshRate", float.class).invoke(vdcB, sas.fps); } catch (Throwable ignored) {}
+            vdcBCls.getMethod("setSurface", Surface.class).invoke(vdcB, codecSurf);
+            Object vdc = vdcBCls.getMethod("build").invoke(vdcB);
+
+            VirtualDisplay vd = (VirtualDisplay) DisplayManager.class
+                    .getMethod("createVirtualDisplay", Class.forName("android.hardware.display.VirtualDisplayConfig"))
+                    .invoke(sDm, vdc);
+            if (vd == null || vd.getDisplay() == null) {
+                System.err.println("EXTBRIDGE_STANDALONE_CREATE_VD_FAILED pkg=" + sas.appPackage);
+                return false;
+            }
+            Display disp = vd.getDisplay();
+            sas.appVd = vd;
+            sas.appVdId = disp.getDisplayId();
+            sas.createdVdW = sas.width;
+            sas.createdVdH = sas.height;
+            try {
+                sas.appVdUniqueId = (String) Display.class.getMethod("getUniqueId").invoke(disp);
+            } catch (Throwable ignored) {
+                sas.appVdUniqueId = null;
+            }
+            // Native FULLSCREEN (1) container with system decors disabled (eliminates Xiaomi freeform top bar!)
+            applyDisplayFullscreenPolicy(sas.appVdId, true);
+            System.out.println("EXTBRIDGE_STANDALONE_VD_CREATED sid=" + sas.sessionId
+                    + " pkg=" + sas.appPackage + " appVdId=" + sas.appVdId
+                    + " size=" + sas.width + "x" + sas.height + "@" + sas.dpi + "dpi fps=" + sas.fps);
+            return true;
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_STANDALONE_VD_ERR pkg=" + sas.appPackage + ": " + t);
+            t.printStackTrace();
+            return false;
+        }
+    }
+
+    private static void launchOrMoveAppToStandaloneDisplay(StandaloneAppSession sas) {
+        if (sas == null || sas.closed || sas.appVdId <= 0 || sAtm == null) return;
+        String pkg = sas.appPackage;
+        sWindowManager.removeManagedWindowByPkg(pkg);
+        int runningTid = findRunningTaskIdForPkg(pkg);
+        if (runningTid > 0 && isTaskAllowedForExtControl(runningTid, pkg, false)) {
+            boolean moved = moveTaskToDisplayRaw(runningTid, sas.appVdId);
+            if (moved) {
+                detachFreeformAndEnsureFullscreenOnDisplay(runningTid, sas.width, sas.height);
+                sas.appTaskId = runningTid;
+                try {
+                    ActivityOptions opts = makeExtLaunchOptionsForMode(sas.appVdId, 0);
+                    Bundle b = opts.toBundle();
+                    for (Method m : sAtm.getClass().getMethods()) {
+                        if (m.getName().equals("startActivityFromRecents") && m.getParameterCount() == 2) {
+                            Object rc = m.invoke(sAtm, runningTid, b);
+                            if (!(rc instanceof Integer) || (Integer) rc >= 0) {
+                                scheduleStandalonePostLaunchVerify(sas);
+                                return;
+                            }
+                            break;
+                        }
+                    }
+                } catch (Throwable t) {
+                    System.err.println("EXTBRIDGE_STANDALONE_RECENTS_ERR pkg=" + pkg + ": " + t.getMessage());
+                }
+            }
+        }
+        Intent intent = resolveSafeLaunchIntent(pkg, sas.appActivity);
+        if (intent == null && sas.appActivity != null && !sas.appActivity.isEmpty()) {
+            intent = resolveSafeLaunchIntent(pkg, null);
+        }
+        if (intent == null || sMStartActivity == null) {
+            System.err.println("EXTBRIDGE_STANDALONE_NO_LAUNCH_INTENT pkg=" + pkg);
+            return;
+        }
+        try {
+            ActivityOptions opts = makeExtLaunchOptionsForMode(sas.appVdId, 0);
+            sMStartActivity.invoke(
+                    sAtm, null, "com.android.shell", null, intent, null, null, null, 0, 0, null, opts.toBundle());
+            scheduleStandalonePostLaunchVerify(sas);
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_STANDALONE_LAUNCH_ERR pkg=" + pkg + ": " + t.getMessage());
+        }
+    }
+
+    private static void scheduleStandalonePostLaunchVerify(StandaloneAppSession sas) {
+        if (sas == null || sHandler == null) return;
+        Runnable verify = () -> {
+            if (sas.closed || sas.appVdId <= 0) return;
+            int tid = findRunningTaskIdForPkg(sas.appPackage);
+            if (tid > 0) {
+                sas.appTaskId = tid;
+                if (getRunningTaskDisplayId(tid) != sas.appVdId) {
+                    moveTaskToDisplayRaw(tid, sas.appVdId);
+                }
+                int wm = getTaskWindowingMode(tid);
+                if (wm != 1 && wm != 0) {
+                    detachFreeformAndEnsureFullscreenOnDisplay(tid, sas.width, sas.height);
+                }
+            }
+            RemoteStreamSink sink = sas.sink;
+            if (sink != null && sink.isActive()) {
+                sink.requestKeyFrame();
+            }
+            pushStandaloneDeviceState(sas);
+        };
+        sHandler.postDelayed(verify, 260L);
+        sHandler.postDelayed(verify, 780L);
+    }
+
+    private static void applyStandaloneResize(StandaloneAppSession sas, ExtCastProtocol.ResizeConfig cfg) {
+        if (sas == null || sas.closed || cfg == null) return;
+        synchronized (sas.sessionDisplayLock) {
+            RemoteStreamSink sink = sas.sink;
+            if (sas.closed || sink == null || !sink.isActive()) return;
+
+            int rawW = (cfg.width > 0) ? cfg.width : sas.width;
+            int rawH = (cfg.height > 0) ? cfg.height : sas.height;
+            int[] aligned = DisplayGeometryUtil.alignForEncoder(rawW, rawH, 8);
+            int nextW = aligned[0];
+            int nextH = aligned[1];
+            int nextDpi = (cfg.dpi >= DisplayGeometryUtil.MIN_DPI && cfg.dpi <= DisplayGeometryUtil.MAX_DPI)
+                    ? cfg.dpi : DisplayGeometryUtil.computeAutoDpi(nextW, nextH);
+            float nextFps = (cfg.fpsX100 > 0)
+                    ? DisplayGeometryUtil.clampFps(cfg.fpsX100 / 100.0f, sas.fps) : sas.fps;
+            int nextBitrate = (cfg.bitrateKbps > 0)
+                    ? DisplayGeometryUtil.clampBitrateKbps(cfg.bitrateKbps, 1500, sRemoteMaxBitrateKbps)
+                    : Math.min(sas.requestedBitrateKbps, sRemoteMaxBitrateKbps);
+            int nextRot = (cfg.rotation >= 0 && cfg.rotation <= 3)
+                    ? DisplayGeometryUtil.normalizeRotation(cfg.rotation) : sas.rotation;
+            sas.requestedBitrateKbps = nextBitrate;
+
+            boolean geomChanged = (nextW != sink.getWidth() || nextH != sink.getHeight()
+                    || nextDpi != sink.getDpi() || Math.abs(nextFps - sink.getFps()) > 0.5f
+                    || nextRot != sink.getRotation());
+            if (!geomChanged) {
+                sink.updateBitrateKbps(nextBitrate);
+                pushStandaloneDeviceState(sas);
+                return;
+            }
+
+            boolean aspectFlipped = (sas.appVd != null && sas.createdVdW > 0 && sas.createdVdH > 0)
+                    && DisplayGeometryUtil.isOrientationAspectFlipped(sas.createdVdW, sas.createdVdH, nextW, nextH);
+
+            sas.width = nextW;
+            sas.height = nextH;
+            sas.dpi = nextDpi;
+            sas.fps = nextFps;
+            sas.rotation = nextRot;
+
+            if (sas.appVd != null && !aspectFlipped) {
+                boolean ok = sink.reconfigureAndSwap(
+                        nextW, nextH, nextDpi, nextFps, nextBitrate, sas.codecPref,
+                        ExtCastProtocol.DISPLAY_MODE_DEX, nextRot,
+                        (newSurface, actualW, actualH, actualDpi) -> {
+                            sas.width = actualW;
+                            sas.height = actualH;
+                            sas.dpi = actualDpi;
+                            sas.appVd.resize(actualW, actualH, actualDpi);
+                            sas.appVd.setSurface(newSurface);
+                        });
+                if (ok) {
+                    pushStandaloneDeviceState(sas);
+                    return;
+                }
+            }
+
+            // Aspect flipped (e.g. phone portrait dragged into tablet landscape): rebuild VD & migrate tasks!
+            ArrayList<Integer> prevTasks = (sas.appVdId > 0) ? collectExtUserTaskIds(sas.appVdId) : new ArrayList<>();
+            Surface nextSurf = sink.startOrReconfigure(
+                    nextW, nextH, nextDpi, nextFps, nextBitrate, sas.codecPref,
+                    ExtCastProtocol.DISPLAY_MODE_DEX, nextRot);
+            if (nextSurf != null) {
+                sas.width = sink.getWidth();
+                sas.height = sink.getHeight();
+                sas.dpi = sink.getDpi();
+                if (createStandaloneVirtualDisplay(sas, nextSurf)) {
+                    for (int tid : prevTasks) {
+                        moveTaskToDisplayRaw(tid, sas.appVdId);
+                        detachFreeformAndEnsureFullscreenOnDisplay(tid, sas.width, sas.height);
+                    }
+                    if (prevTasks.isEmpty()) {
+                        launchOrMoveAppToStandaloneDisplay(sas);
+                    }
+                }
+            }
+            pushStandaloneDeviceState(sas);
+        }
+    }
+
+    private static void closeStandaloneSession(StandaloneAppSession sas) {
+        if (sas == null) return;
+        synchronized (sas.sessionDisplayLock) {
+            if (sas.closed) return;
+            sas.closed = true;
+            if (sas.inputBridge != null) {
+                try { sas.inputBridge.onSessionEnded(); } catch (Throwable ignored) {}
+                sas.inputBridge = null;
+            }
+            if (sas.appVdId > 0) {
+                releaseUhidForDisplay(sas.appVdId);
+            }
+            if (sas.sink != null) {
+                try { sas.sink.stop(); } catch (Throwable ignored) {}
+                sas.sink = null;
+            }
+            if (sas.appVd != null) {
+                try { sas.appVd.release(); } catch (Throwable ignored) {}
+                sas.appVd = null;
+            }
+            sas.appVdId = -1;
+            sas.appVdUniqueId = null;
+        }
+    }
+
+    private static void applyRemoteResize(
+            int reqW, int reqH, int reqDpi, float reqFps,
+            int reqBitrateKbps, int reqDisplayMode, int reqRotation) {
+        synchronized (sDisplayLock) {
+            RemoteStreamSink sink = sRemoteSink;
+            if (!isRemoteSessionActive() || sink == null) return;
+
+            int nextMode = (reqDisplayMode == ExtCastProtocol.DISPLAY_MODE_DEX
+                    || reqDisplayMode == ExtCastProtocol.DISPLAY_MODE_MIRROR)
+                    ? reqDisplayMode : sMirrorMode;
+            int nextRot = (reqRotation >= 0 && reqRotation <= 3)
+                    ? DisplayGeometryUtil.normalizeRotation(reqRotation) : sVirtRot;
+            int rawW = (reqW > 0) ? reqW : sVirtW;
+            int rawH = (reqH > 0) ? reqH : sVirtH;
+            int[] aligned = DisplayGeometryUtil.alignForEncoder(rawW, rawH, 8);
+            int nextW = aligned[0];
+            int nextH = aligned[1];
+            int nextDpi = (reqDpi >= DisplayGeometryUtil.MIN_DPI && reqDpi <= DisplayGeometryUtil.MAX_DPI)
+                    ? reqDpi : DisplayGeometryUtil.computeAutoDpi(nextW, nextH);
+            float nextFps = (reqFps >= DisplayGeometryUtil.MIN_FPS)
+                    ? DisplayGeometryUtil.clampFps(reqFps, sVirtFps) : sVirtFps;
+            int nextBitrate = (reqBitrateKbps > 0)
+                    ? DisplayGeometryUtil.clampBitrateKbps(reqBitrateKbps, 1500, sRemoteMaxBitrateKbps)
+                    : Math.min(sRemoteRequestedBitrateKbps, sRemoteMaxBitrateKbps);
+            sRemoteRequestedBitrateKbps = nextBitrate;
+
+            boolean modeChanged = (nextMode != sink.getDisplayMode() || nextMode != sMirrorMode);
+            boolean geomChanged = (nextW != sink.getWidth() || nextH != sink.getHeight()
+                    || nextDpi != sink.getDpi()
+                    || Math.abs(nextFps - sink.getFps()) > 0.5f
+                    || nextRot != sink.getRotation());
+            boolean codecMismatch = (sSessionCodecPref == RemoteStreamSink.CODEC_PREF_H264
+                    && sink.getCodecId() != ExtCastProtocol.VIDEO_CODEC_H264)
+                    || (sSessionCodecPref == RemoteStreamSink.CODEC_PREF_AUTO_HEVC
+                    && sink.getCodecId() != ExtCastProtocol.VIDEO_CODEC_HEVC && sForceRebuild);
+
+            if (!modeChanged && !geomChanged && !codecMismatch && !sForceRebuild) {
+                sink.updateBitrateKbps(nextBitrate);
+                pushRemoteDeviceState(true);
+                notifyHelperSync();
+                return;
+            }
+            sForceRebuild = false;
+
+            if (modeChanged) {
+                synchronized (sSplitLock) {
+                    if (sSplitActive) exitSplitAndRestore(false);
+                }
+                sWindowManager.clearAllManagedWindows();
+            }
+            sMirrorMode = nextMode;
+            sVirtRot = nextRot;
+            sVirtW = nextW;
+            sVirtH = nextH;
+            sVirtDpi = nextDpi;
+            sVirtFps = nextFps;
+
+            if (nextMode == ExtCastProtocol.DISPLAY_MODE_MIRROR) {
+                if (sVd != null) {
+                    cleanupDisplayInternal(false, true);
+                }
+                boolean ok = sink.reconfigureAndSwap(
+                        nextW, nextH, nextDpi, nextFps, nextBitrate, sSessionCodecPref,
+                        ExtCastProtocol.DISPLAY_MODE_MIRROR, nextRot,
+                        (newSurface, actualW, actualH, actualDpi) -> {
+                            sVirtW = actualW;
+                            sVirtH = actualH;
+                            sVirtDpi = actualDpi;
+                            if (sRemoteMirrorVd != null) {
+                                try {
+                                    sRemoteMirrorVd.resize(actualW, actualH, actualDpi);
+                                    sRemoteMirrorVd.setSurface(newSurface);
+                                    return;
+                                } catch (Throwable ignored) {}
+                            }
+                            attachRemoteMirrorDisplay();
+                        });
+                if (!ok) {
+                    System.err.println("EXTBRIDGE_REMOTE_MIRROR_RECONFIG_FAILED");
+                }
+                notifyHelperSync();
+                pushRemoteDeviceState(true);
+                return;
+            }
+
+            if (sRemoteMirrorVd != null) {
+                try { sRemoteMirrorVd.release(); } catch (Throwable ignored) {}
+                sRemoteMirrorVd = null;
+            }
+
+            boolean aspectFlipped = (sVd != null && sCreatedVdW > 0 && sCreatedVdH > 0)
+                    && DisplayGeometryUtil.isOrientationAspectFlipped(sCreatedVdW, sCreatedVdH, nextW, nextH);
+
+            if (sVd != null && !aspectFlipped && !modeChanged) {
+                boolean ok = sink.reconfigureAndSwap(
+                        nextW, nextH, nextDpi, nextFps, nextBitrate, sSessionCodecPref,
+                        ExtCastProtocol.DISPLAY_MODE_DEX, nextRot,
+                        (newSurface, actualW, actualH, actualDpi) -> {
+                            sVirtW = actualW;
+                            sVirtH = actualH;
+                            sVirtDpi = actualDpi;
+                            sVd.resize(actualW, actualH, actualDpi);
+                            sVd.setSurface(newSurface);
+                        });
+                if (ok) {
+                    synchronized (sCursorLock) {
+                        sCursorX = Math.min(sCursorX, sVirtW - 1f);
+                        sCursorY = Math.min(sCursorY, sVirtH - 1f);
+                    }
+                    if (sHandler != null) {
+                        sHandler.postDelayed(() -> {
+                            if (sSplitActive && !sWindowManager.isTilingActive()) {
+                                relayoutSplitTasks(false);
+                            } else {
+                                relayoutManagedWindowsOnResize();
+                            }
+                        }, 300L);
+                    }
+                    notifyHelperSync();
+                    pushRemoteDeviceState(true);
+                    System.out.println("EXTBRIDGE_REMOTE_RESIZED " + sVirtW + "x" + sVirtH + "@" + sVirtDpi
+                            + "dpi fps=" + sVirtFps + " bitrate=" + nextBitrate + "kbps");
+                    return;
+                }
+            }
+
+            ArrayList<Integer> prevTasks = (sVdId > 0) ? collectExtUserTaskIds(sVdId) : new ArrayList<>();
+            Surface nextSurf = sink.startOrReconfigure(
+                    nextW, nextH, nextDpi, nextFps, nextBitrate, sSessionCodecPref,
+                    ExtCastProtocol.DISPLAY_MODE_DEX, nextRot);
+            if (nextSurf != null) {
+                attachRemoteDexDisplay();
+                if (sVdId > 0 && !prevTasks.isEmpty() && sAtm != null) {
+                    for (int tid : prevTasks) {
+                        moveTaskToDisplayRaw(tid, sVdId);
+                    }
+                    if (sHandler != null) {
+                        sHandler.postDelayed(ExtBridge::relayoutManagedWindowsOnResize, 280L);
+                    }
+                }
+            }
+            notifyHelperSync();
+            pushRemoteDeviceState(true);
+        }
+    }
+
+    private static void applyRemoteStreamPrefs(int codecPref, int maxBitrateKbps, boolean audioEnabled) {
+        int nextCodec = (codecPref == RemoteStreamSink.CODEC_PREF_H264)
+                ? RemoteStreamSink.CODEC_PREF_H264 : RemoteStreamSink.CODEC_PREF_AUTO_HEVC;
+        int nextMaxBr = DisplayGeometryUtil.clampBitrateKbps(maxBitrateKbps, 2000, 40_000);
+        boolean codecChanged = (nextCodec != sRemoteCodecPref);
+        sRemoteCodecPref = nextCodec;
+        sSessionCodecPref = nextCodec;
+        sRemoteMaxBitrateKbps = nextMaxBr;
+        sRemoteAudioPref = audioEnabled;
+
+        RemoteStreamSink sink = sRemoteSink;
+        if (sink != null && sink.isActive()) {
+            sink.setMaxBitrateKbps(nextMaxBr);
+            if (codecChanged) {
+                sForceRebuild = true;
+                applyRemoteResize(sVirtW, sVirtH, sVirtDpi, sVirtFps,
+                        Math.min(sRemoteRequestedBitrateKbps, nextMaxBr), sMirrorMode, sVirtRot);
+            }
+            setRemoteAudioActive(audioEnabled);
+            pushRemoteDeviceState(true);
+        }
+        notifyHelperSync();
+    }
+
+    private static void setRemoteAudioActive(boolean enable) {
+        if (!isRemoteSessionActive()) {
+            if (sAudioCapturer != null) {
+                sAudioCapturer.stop();
+                sAudioCapturer = null;
+            }
+            return;
+        }
+        if (enable) {
+            AudioStreamCapturer cap = sAudioCapturer;
+            if (cap == null) {
+                cap = new AudioStreamCapturer(sCtx, new AudioStreamCapturer.AudioListener() {
+                    @Override
+                    public void onAudioConfig(ExtCastProtocol.AudioConfig config, long timestampUs) {
+                        RemoteStreamServer srv = sRemoteServer;
+                        if (srv != null) srv.sendAudioConfig(config, timestampUs);
+                    }
+
+                    @Override
+                    public void onAudioFrame(byte[] aacAu, long timestampUs) {
+                        RemoteStreamServer srv = sRemoteServer;
+                        if (srv != null) srv.sendAudioFrame(aacAu, timestampUs);
+                    }
+
+                    @Override
+                    public void onAudioStateChanged(boolean active) {
+                        pushRemoteDeviceState(true);
+                    }
+                });
+                sAudioCapturer = cap;
+            }
+            cap.start();
+        } else {
+            if (sAudioCapturer != null) {
+                sAudioCapturer.stop();
+            }
+            pushRemoteDeviceState(true);
+        }
+    }
+
+    private static int readBatteryPct() {
+        try {
+            Intent bat = (sCtx != null)
+                    ? sCtx.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                    : null;
+            if (bat != null) {
+                int lvl = bat.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+                int scale = bat.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                if (lvl >= 0 && scale > 0) {
+                    return Math.max(0, Math.min(100, Math.round(lvl * 100f / scale)));
+                }
+            }
+        } catch (Throwable ignored) {}
+        return -1;
+    }
+
+    private static void pushRemoteDeviceState(boolean force) {
+        RemoteStreamServer srv = sRemoteServer;
+        if (srv == null || !srv.hasDesktopSession()) return;
+        long now = SystemClock.uptimeMillis();
+        if (!force && (now - sLastRemoteStatePushMs) < 4500L) return;
+        sLastRemoteStatePushMs = now;
+
+        RemoteStreamSink sink = sRemoteSink;
+        int w = (sink != null && sink.getWidth() > 0) ? sink.getWidth() : sVirtW;
+        int h = (sink != null && sink.getHeight() > 0) ? sink.getHeight() : sVirtH;
+        int dpi = (sink != null && sink.getDpi() > 0) ? sink.getDpi() : sVirtDpi;
+        double fps = (sink != null && sink.getActualFpsX100() > 0)
+                ? (sink.getActualFpsX100() / 100.0)
+                : ((sink != null && sink.getFps() > 0f) ? sink.getFps() : sVirtFps);
+        int bitrate = (sink != null && sink.isActive()) ? sink.getBitrateKbps() : sRemoteRequestedBitrateKbps;
+        boolean audioOn = (sAudioCapturer != null && sAudioCapturer.isActive());
+        String[] topApp = (sMirrorMode == 0 && sVdId > 0)
+                ? findTopUserAppOnDisplay(sVdId)
+                : new String[]{"", ""};
+
+        ExtCastProtocol.DeviceState state = new ExtCastProtocol.DeviceState(
+                srv.getDeviceName(),
+                srv.getActiveSinkType(),
+                sMirrorMode,
+                w, h, dpi, fps, sVirtRot,
+                bitrate,
+                readBatteryPct(),
+                sScreenDimmed,
+                audioOn,
+                sLastInjectStatus,
+                sWindowManager.isAdaptiveSingleEnabled(),
+                sWindowManager.getDefaultSingleWidthDp(),
+                sWindowManager.resolveActiveLayoutMode(),
+                topApp[0],
+                topApp[1]);
+        srv.sendDeviceState(state);
+    }
+
+    private static void pushStandaloneDeviceState(StandaloneAppSession sas) {
+        RemoteStreamServer srv = sRemoteServer;
+        if (srv == null || sas == null || sas.closed) return;
+        RemoteStreamSink sink = sas.sink;
+        int w = (sink != null && sink.getWidth() > 0) ? sink.getWidth() : sas.width;
+        int h = (sink != null && sink.getHeight() > 0) ? sink.getHeight() : sas.height;
+        int dpi = (sink != null && sink.getDpi() > 0) ? sink.getDpi() : sas.dpi;
+        double fps = (sink != null && sink.getActualFpsX100() > 0)
+                ? (sink.getActualFpsX100() / 100.0)
+                : ((sink != null && sink.getFps() > 0f) ? sink.getFps() : sas.fps);
+        int bitrate = (sink != null && sink.isActive()) ? sink.getBitrateKbps() : sas.requestedBitrateKbps;
+
+        ExtCastProtocol.DeviceState state = new ExtCastProtocol.DeviceState(
+                srv.getDeviceName(),
+                sas.sinkType,
+                ExtCastProtocol.DISPLAY_MODE_DEX,
+                w, h, dpi, fps, sas.rotation,
+                bitrate,
+                readBatteryPct(),
+                sScreenDimmed,
+                false,
+                sLastInjectStatus,
+                sWindowManager.isAdaptiveSingleEnabled(),
+                sWindowManager.getDefaultSingleWidthDp(),
+                DesktopWindowManager.MODE_STANDALONE_APP,
+                sas.appPackage,
+                resolveAppLabel(sas.appPackage));
+        srv.sendDeviceState(sas.sessionId, state);
+    }
+
+    private static void handleWindowActionFromRemote(int sessionId, ExtCastProtocol.WindowActionMsg msg) {
+        if (msg == null || msg.action.isEmpty()) return;
+        StandaloneAppSession sas = sStandaloneSessions.get(sessionId);
+        String action = msg.action.toLowerCase(Locale.US);
+        switch (action) {
+            case "set_adaptive_single": {
+                boolean enabled = msg.hasEnabled ? msg.enabled : sWindowManager.isAdaptiveSingleEnabled();
+                int widthDp = (msg.defaultWidthDp > 0) ? msg.defaultWidthDp : sWindowManager.getDefaultSingleWidthDp();
+                setAdaptiveSingleConfig(enabled, widthDp);
+                break;
+            }
+            case "set_single_width": {
+                setSingleWidthPct(msg.pkg, msg.widthPct, msg.remember);
+                break;
+            }
+            case "launch_app": {
+                if ("split".equalsIgnoreCase(msg.mode)) {
+                    int slot = (msg.slot == 1) ? 1 : 0;
+                    if (isValidPackageName(msg.pkg)) {
+                        handleSplitAction(slot == 0 ? 1 : 2, -1, msg.pkg, msg.cls);
+                    }
+                } else {
+                    int modeInt = DesktopWindowManager.parseModeString(msg.mode);
+                    launchInWindowMode(msg.pkg, msg.cls, modeInt,
+                            msg.hasBounds ? msg.left : 0,
+                            msg.hasBounds ? msg.top : 0,
+                            msg.hasBounds ? msg.right : 0,
+                            msg.hasBounds ? msg.bottom : 0);
+                }
+                break;
+            }
+            case "update_window": {
+                int modeInt = DesktopWindowManager.parseModeString(msg.mode);
+                if (modeInt == DesktopWindowManager.INT_MODE_AUTO) {
+                    modeInt = DesktopWindowManager.INT_MODE_FREEFORM;
+                }
+                updateWindowBounds(msg.taskId, msg.pkg, modeInt,
+                        msg.left, msg.top, msg.right, msg.bottom, msg.remember);
+                break;
+            }
+            case "focus_window": {
+                windowLifecycleAction(msg.taskId, msg.pkg, 1);
+                break;
+            }
+            case "minimize_window": {
+                windowLifecycleAction(msg.taskId, msg.pkg, 2);
+                break;
+            }
+            case "close_window": {
+                windowLifecycleAction(msg.taskId, msg.pkg, 3);
+                break;
+            }
+            case "set_tiling": {
+                int[] ratios = new int[msg.ratios.size()];
+                for (int i = 0; i < msg.ratios.size(); i++) {
+                    ratios[i] = msg.ratios.get(i);
+                }
+                setTilingLayout(msg.topology, msg.pkgs, ratios);
+                break;
+            }
+            case "reload_app_dpi": {
+                if (sas != null && !sas.closed) {
+                    String pkg = !msg.pkg.isEmpty() ? msg.pkg : sas.appPackage;
+                    reloadAppDpiOnDisplay(pkg, sas.appVdId, sas.sessionId);
+                } else {
+                    String pkg = msg.pkg;
+                    if (pkg.isEmpty() && sVdId > 0) {
+                        pkg = findTopUserAppOnDisplay(sVdId)[0];
+                    }
+                    if (!pkg.isEmpty()) {
+                        reloadAppDpiOnDisplay(pkg, sVdId, -1);
+                    }
+                }
+                break;
+            }
+            case "return_to_desktop": {
+                returnTaskToDesktop(msg.pkg, msg.taskId, sas);
+                break;
+            }
+            case "set_input_backend": {
+                String b = msg.backend.toLowerCase(Locale.US);
+                int mode = INPUT_BACKEND_AUTO;
+                if ("inject".equals(b) || "inject_events".equals(b)) mode = INPUT_BACKEND_INJECT;
+                else if ("uhid".equals(b)) mode = INPUT_BACKEND_UHID;
+                setInputBackendMode(mode);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+
+    private static final class RemoteSessionListenerImpl implements RemoteStreamServer.SessionListener {
+        @Override
+        public void onSessionConnected(
+                int sessionId, int sinkType, String clientId, String clientName, ExtCastProtocol.HelloMsg hello) {
+            if (hello != null && hello.isStandaloneApp()) {
+                connectStandaloneSession(sessionId, sinkType, clientName, hello);
+                return;
+            }
+            System.out.println("EXTBRIDGE_REMOTE_CONNECTED sid=" + sessionId + " sink=" + sinkType
+                    + " peer=" + clientName + " req=" + hello.width + "x" + hello.height
+                    + "@" + hello.dpi + "dpi fps=" + hello.fps + " br=" + hello.bitrateKbps + "kbps");
+            synchronized (sDisplayLock) {
+                if (sShuttingDown) return;
+                sDesktopSessionId = sessionId;
+                cleanupDisplayInternal(false, false);
+                if (sAudioCapturer != null) {
+                    sAudioCapturer.stop();
+                }
+                if (sRemoteSink != null) {
+                    sRemoteSink.stop();
+                    sRemoteSink = null;
+                }
+
+                sActiveSinkType = sinkType;
+                sMirrorMode = (hello.displayMode == ExtCastProtocol.DISPLAY_MODE_MIRROR)
+                        ? ExtCastProtocol.DISPLAY_MODE_MIRROR : ExtCastProtocol.DISPLAY_MODE_DEX;
+                int[] aligned = DisplayGeometryUtil.alignForEncoder(hello.width, hello.height, 8);
+                sVirtW = aligned[0];
+                sVirtH = aligned[1];
+                sVirtDpi = DisplayGeometryUtil.clampDpi(hello.dpi, sVirtW, sVirtH);
+                sVirtFps = DisplayGeometryUtil.clampFps(hello.fps, 60f);
+                sRemoteRequestedBitrateKbps = DisplayGeometryUtil.clampBitrateKbps(
+                        hello.bitrateKbps, 1500, sRemoteMaxBitrateKbps);
+                int codecPref = resolveEffectiveCodecPref(hello.preferredCodec);
+                sSessionCodecPref = codecPref;
+
+                final int boundSessionId = sessionId;
+                RemoteStreamSink sink = new RemoteStreamSink(sinkType, new RemoteStreamSink.FrameListener() {
+                    @Override
+                    public void onVideoConfig(ExtCastProtocol.VideoConfig config, long timestampUs) {
+                        RemoteStreamServer srv = sRemoteServer;
+                        if (srv != null) srv.sendVideoConfig(boundSessionId, config, timestampUs);
+                    }
+
+                    @Override
+                    public void onVideoFrame(byte[] annexBData, int flags, long timestampUs) {
+                        RemoteStreamServer srv = sRemoteServer;
+                        if (srv != null) srv.sendVideoFrame(boundSessionId, annexBData, flags, timestampUs);
+                    }
+
+                    @Override
+                    public void onEncoderError(String reason) {
+                        System.err.println("EXTBRIDGE_REMOTE_ENCODER_ERR sid=" + boundSessionId + ": " + reason);
+                        RemoteStreamServer srv = sRemoteServer;
+                        if (srv != null) srv.disconnectSession(boundSessionId, reason);
+                    }
+                });
+                sink.setMaxBitrateKbps(sRemoteMaxBitrateKbps);
+                Surface inputSurface = sink.startOrReconfigure(
+                        sVirtW, sVirtH, sVirtDpi, sVirtFps,
+                        sRemoteRequestedBitrateKbps, codecPref, sMirrorMode, sVirtRot);
+                if (inputSurface == null) {
+                    RemoteStreamServer srv = sRemoteServer;
+                    if (srv != null) srv.disconnectSession(boundSessionId, "Video encoder unavailable");
+                    return;
+                }
+                sRemoteSink = sink;
+                if (sMirrorMode == ExtCastProtocol.DISPLAY_MODE_MIRROR) {
+                    attachRemoteMirrorDisplay();
+                } else {
+                    attachRemoteDexDisplay();
+                }
+            }
+            if (sRemoteInputBridge != null) {
+                sRemoteInputBridge.onSessionStarted();
+            }
+            if (sRemoteAudioPref && hello.audioEnabled) {
+                setRemoteAudioActive(true);
+            }
+            pushRemoteDeviceState(true);
+            notifyHelperSync();
+        }
+
+        private void connectStandaloneSession(
+                int sessionId, int sinkType, String clientName, ExtCastProtocol.HelloMsg hello) {
+            String pkg = hello.appPackage;
+            if (!isValidPackageName(pkg) || isProtectedSystemTaskPkg(pkg) || "com.extbridge.helper".equals(pkg)) {
+                RemoteStreamServer srv = sRemoteServer;
+                if (srv != null) srv.disconnectSession(sessionId, "Invalid or protected appPackage: " + pkg);
+                return;
+            }
+            System.out.println("EXTBRIDGE_STANDALONE_CONNECTED sid=" + sessionId + " sink=" + sinkType
+                    + " peer=" + clientName + " pkg=" + pkg + " req=" + hello.width + "x" + hello.height
+                    + "@" + hello.dpi + "dpi fps=" + hello.fps);
+
+            StandaloneAppSession sas = new StandaloneAppSession(sessionId, sinkType, pkg, hello.appActivity);
+            int[] aligned = DisplayGeometryUtil.alignForEncoder(hello.width, hello.height, 8);
+            sas.width = aligned[0];
+            sas.height = aligned[1];
+            sas.dpi = DisplayGeometryUtil.clampDpi(hello.dpi, sas.width, sas.height);
+            sas.fps = DisplayGeometryUtil.clampFps(hello.fps, 60f);
+            sas.requestedBitrateKbps = DisplayGeometryUtil.clampBitrateKbps(
+                    hello.bitrateKbps, 1500, sRemoteMaxBitrateKbps);
+            sas.codecPref = resolveEffectiveCodecPref(hello.preferredCodec);
+
+            RemoteStreamSink sink = new RemoteStreamSink(sinkType, new RemoteStreamSink.FrameListener() {
+                @Override
+                public void onVideoConfig(ExtCastProtocol.VideoConfig config, long timestampUs) {
+                    RemoteStreamServer srv = sRemoteServer;
+                    if (srv != null) srv.sendVideoConfig(sessionId, config, timestampUs);
+                }
+
+                @Override
+                public void onVideoFrame(byte[] annexBData, int flags, long timestampUs) {
+                    RemoteStreamServer srv = sRemoteServer;
+                    if (srv != null) srv.sendVideoFrame(sessionId, annexBData, flags, timestampUs);
+                }
+
+                @Override
+                public void onEncoderError(String reason) {
+                    System.err.println("EXTBRIDGE_STANDALONE_ENCODER_ERR sid=" + sessionId + ": " + reason);
+                    RemoteStreamServer srv = sRemoteServer;
+                    if (srv != null) srv.disconnectSession(sessionId, reason);
+                }
+            });
+            sink.setMaxBitrateKbps(sRemoteMaxBitrateKbps);
+            Surface inputSurface = sink.startOrReconfigure(
+                    sas.width, sas.height, sas.dpi, sas.fps,
+                    sas.requestedBitrateKbps, sas.codecPref, ExtCastProtocol.DISPLAY_MODE_DEX, 0);
+            if (inputSurface == null) {
+                RemoteStreamServer srv = sRemoteServer;
+                if (srv != null) srv.disconnectSession(sessionId, "Standalone video encoder unavailable");
+                return;
+            }
+            sas.sink = sink;
+            sas.width = sink.getWidth();
+            sas.height = sink.getHeight();
+            sas.dpi = sink.getDpi();
+
+            if (!createStandaloneVirtualDisplay(sas, inputSurface)) {
+                sink.stop();
+                RemoteStreamServer srv = sRemoteServer;
+                if (srv != null) srv.disconnectSession(sessionId, "Standalone VirtualDisplay failed");
+                return;
+            }
+
+            sas.inputBridge = new RemoteInputBridge(
+                    new StandaloneHostBridgeImpl(sas),
+                    new File(RemoteInputBridge.DEFAULT_DOWNLOAD_DIR),
+                    false);
+            sas.inputBridge.onSessionStarted();
+            sStandaloneSessions.put(sessionId, sas);
+
+            launchOrMoveAppToStandaloneDisplay(sas);
+            pushStandaloneDeviceState(sas);
+            sink.requestKeyFrame();
+            notifyHelperSync();
+        }
+
+        @Override
+        public void onSessionDisconnected(int sessionId, int sinkType, String sessionRole, String reason) {
+            if (ExtCastProtocol.SESSION_ROLE_STANDALONE_APP.equalsIgnoreCase(sessionRole)) {
+                System.out.println("EXTBRIDGE_STANDALONE_DISCONNECTED sid=" + sessionId + " reason=" + reason);
+                StandaloneAppSession sas = sStandaloneSessions.remove(sessionId);
+                closeStandaloneSession(sas);
+                notifyHelperSync();
+                return;
+            }
+
+            System.out.println("EXTBRIDGE_REMOTE_DISCONNECTED sid=" + sessionId + " sink=" + sinkType + " reason=" + reason);
+            if (sessionId != sDesktopSessionId) {
+                return;
+            }
+            sDesktopSessionId = -1;
+            if (sRemoteInputBridge != null) {
+                sRemoteInputBridge.onSessionEnded();
+            }
+            if (sAudioCapturer != null) {
+                sAudioCapturer.stop();
+            }
+            synchronized (sDisplayLock) {
+                if (sRemoteSink != null) {
+                    sRemoteSink.stop();
+                    sRemoteSink = null;
+                }
+                cleanupDisplay(false);
+            }
+            notifyHelperSync();
+            if (!sShuttingDown && sHandler != null) {
+                sHandler.post(ExtBridge::tick);
+            }
+        }
+
+        @Override
+        public void onResizeConfig(int sessionId, ExtCastProtocol.ResizeConfig config) {
+            if (config == null) return;
+            StandaloneAppSession sas = sStandaloneSessions.get(sessionId);
+            if (sas != null) {
+                applyStandaloneResize(sas, config);
+                return;
+            }
+            if (sessionId != sDesktopSessionId) return;
+            float fps = (config.fpsX100 > 0) ? (config.fpsX100 / 100.0f) : sVirtFps;
+            applyRemoteResize(config.width, config.height, config.dpi, fps,
+                    config.bitrateKbps, config.displayMode, config.rotation);
+        }
+
+        @Override
+        public void onRequestIdr(int sessionId) {
+            StandaloneAppSession sas = sStandaloneSessions.get(sessionId);
+            if (sas != null) {
+                RemoteStreamSink s = sas.sink;
+                if (s != null) s.requestKeyFrame();
+                return;
+            }
+            RemoteStreamSink sink = sRemoteSink;
+            if (sink != null) sink.requestKeyFrame();
+        }
+
+        private RemoteInputBridge resolveInputBridge(int sessionId) {
+            StandaloneAppSession sas = sStandaloneSessions.get(sessionId);
+            if (sas != null) return sas.inputBridge;
+            return (sessionId == sDesktopSessionId) ? sRemoteInputBridge : null;
+        }
+
+        @Override
+        public void onMouseEvent(int sessionId, ExtCastProtocol.MouseEventMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleMouse(msg);
+        }
+
+        @Override
+        public void onTouchEvent(int sessionId, ExtCastProtocol.TouchEventMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleTouch(msg);
+        }
+
+        @Override
+        public void onKeyEvent(int sessionId, ExtCastProtocol.KeyEventMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleKey(msg);
+        }
+
+        @Override
+        public void onTextEvent(int sessionId, ExtCastProtocol.TextEventMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleText(msg);
+        }
+
+        @Override
+        public void onImageClipboardEvent(int sessionId, ExtCastProtocol.ImageClipboardEventMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleImageClipboard(msg);
+        }
+
+        @Override
+        public void onSystemAction(int sessionId, ExtCastProtocol.SystemActionMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleSystemAction(msg);
+        }
+
+        @Override
+        public void onFileTransferChunk(int sessionId, ExtCastProtocol.FileTransferChunkMsg msg) {
+            RemoteInputBridge b = resolveInputBridge(sessionId);
+            if (b != null) b.handleFileTransferChunk(msg);
+        }
+
+        @Override
+        public void onListApps(int sessionId) {
+            collectAndSendAppList(sessionId);
+        }
+
+        @Override
+        public void onWindowAction(int sessionId, ExtCastProtocol.WindowActionMsg msg) {
+            handleWindowActionFromRemote(sessionId, msg);
+        }
+
+        @Override
+        public void onWifiUpgradeEnabled() {
+            notifyHelperSync();
+        }
+
+        @Override
+        public void onVideoCongestion(int sessionId) {
+            StandaloneAppSession sas = sStandaloneSessions.get(sessionId);
+            RemoteStreamSink sink = (sas != null) ? sas.sink : sRemoteSink;
+            if (sink != null) sink.onNetworkCongestion();
+        }
+
+        @Override
+        public void onVideoQueueHealthy(int sessionId) {
+            StandaloneAppSession sas = sStandaloneSessions.get(sessionId);
+            RemoteStreamSink sink = (sas != null) ? sas.sink : sRemoteSink;
+            if (sink != null) sink.maybeRecoverBitrate();
+        }
+    }
+
+    private static final class StandaloneHostBridgeImpl implements RemoteInputBridge.HostBridge {
+        private final StandaloneAppSession sas;
+
+        StandaloneHostBridgeImpl(StandaloneAppSession sas) {
+            this.sas = sas;
+        }
+
+        @Override
+        public Context getContext() {
+            return sCtx;
+        }
+
+        @Override
+        public int getTargetDisplayId() {
+            return sas.closed ? -1 : sas.appVdId;
+        }
+
+        @Override
+        public boolean isMirrorMode() {
+            return false;
+        }
+
+        @Override
+        public int getStreamWidth() {
+            RemoteStreamSink s = sas.sink;
+            return (s != null && s.getWidth() > 0) ? s.getWidth() : sas.width;
+        }
+
+        @Override
+        public int getStreamHeight() {
+            RemoteStreamSink s = sas.sink;
+            return (s != null && s.getHeight() > 0) ? s.getHeight() : sas.height;
+        }
+
+        @Override
+        public int getTargetDisplayWidth() {
+            return sas.width;
+        }
+
+        @Override
+        public int getTargetDisplayHeight() {
+            return sas.height;
+        }
+
+        @Override
+        public boolean injectInputEvent(InputEvent ev, int targetDisplayId, int mode) {
+            return invokeInjectInputForDisplay(
+                    ev, targetDisplayId, mode, sas.appVdUniqueId, sas.width, sas.height);
+        }
+
+        @Override
+        public void focusDisplay(int displayId) {
+            focusDisplayForKey(displayId);
+        }
+
+        @Override
+        public void updateCursorPosition(float x, float y) {
+            // Standalone windows use Mac's own native pointer without moving main desktop cursor
+        }
+
+        @Override
+        public void performHome() {
+            if (!sas.closed && sas.appVdId > 0) {
+                long now = SystemClock.uptimeMillis();
+                KeyEvent kd = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0, 0,
+                        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+                KeyEvent ku = new KeyEvent(now, now + 5, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK, 0, 0,
+                        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+                injectInputEvent(kd, sas.appVdId, 2);
+                injectInputEvent(ku, sas.appVdId, 2);
+            }
+        }
+
+        @Override
+        public void toggleDisplayMode(int arg) {}
+
+        @Override
+        public void toggleBlackout(int arg) {
+            setMainScreenDim(arg < 0 ? -1 : (arg != 0 ? 1 : 0));
+        }
+
+        @Override
+        public void rotateDisplay(int arg) {}
+
+        @Override
+        public void setAudioEnabled(boolean enabled) {}
+
+        @Override
+        public void requestDisconnect() {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.disconnectSession(sas.sessionId, "Standalone client requested disconnect");
+        }
+
+        @Override
+        public void sendClipboardPush(long seq, String text) {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.sendClipboardPush(sas.sessionId, seq, text);
+        }
+
+        @Override
+        public void sendClipboardImagePush(long seq, byte[] pngData) {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.sendClipboardImagePush(sas.sessionId, seq, pngData);
+        }
+
+        @Override
+        public void sendFileTransferAck(int transferId, int status, String pathOrError) {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.sendFileTransferAck(sas.sessionId, transferId, status, pathOrError);
+        }
+    }
+
+    private static final class RemoteHostBridgeImpl implements RemoteInputBridge.HostBridge {
+        @Override
+        public Context getContext() {
+            return sCtx;
+        }
+
+        @Override
+        public int getTargetDisplayId() {
+            return (sMirrorMode == 1) ? 0 : sVdId;
+        }
+
+        @Override
+        public boolean isMirrorMode() {
+            return sMirrorMode == 1;
+        }
+
+        @Override
+        public int getStreamWidth() {
+            RemoteStreamSink sink = sRemoteSink;
+            return (sink != null && sink.getWidth() > 0) ? sink.getWidth() : sVirtW;
+        }
+
+        @Override
+        public int getStreamHeight() {
+            RemoteStreamSink sink = sRemoteSink;
+            return (sink != null && sink.getHeight() > 0) ? sink.getHeight() : sVirtH;
+        }
+
+        @Override
+        public int getTargetDisplayWidth() {
+            if (sMirrorMode == 1) {
+                if (sD0W <= 0) {
+                    Point p = readDisplay0RealSize();
+                    if (p != null && p.x > 0 && p.y > 0) {
+                        sD0W = p.x;
+                        sD0H = p.y;
+                    }
+                }
+                return sD0W > 0 ? sD0W : sVirtW;
+            }
+            return sVirtW;
+        }
+
+        @Override
+        public int getTargetDisplayHeight() {
+            if (sMirrorMode == 1) {
+                if (sD0H <= 0) {
+                    Point p = readDisplay0RealSize();
+                    if (p != null && p.x > 0 && p.y > 0) {
+                        sD0W = p.x;
+                        sD0H = p.y;
+                    }
+                }
+                return sD0H > 0 ? sD0H : sVirtH;
+            }
+            return sVirtH;
+        }
+
+        @Override
+        public boolean injectInputEvent(InputEvent ev, int targetDisplayId, int mode) {
+            return invokeInjectInputMode(ev, targetDisplayId, mode);
+        }
+
+        @Override
+        public void focusDisplay(int displayId) {
+            focusDisplayForKey(displayId);
+        }
+
+        @Override
+        public void updateCursorPosition(float x, float y) {
+            synchronized (sCursorLock) {
+                sCursorX = x;
+                sCursorY = y;
+            }
+        }
+
+        @Override
+        public void performHome() {
+            if (sMirrorMode == 1) {
+                injectKey(KeyEvent.KEYCODE_HOME, 0);
+            } else {
+                minimizeToExtHome(-1, null);
+            }
+        }
+
+        @Override
+        public void toggleDisplayMode(int arg) {
+            int nextMode = (arg == 0 || arg == 1) ? arg : (sMirrorMode == 0 ? 1 : 0);
+            applyRemoteResize(sVirtW, sVirtH, sVirtDpi, sVirtFps, sRemoteRequestedBitrateKbps, nextMode, sVirtRot);
+        }
+
+        @Override
+        public void toggleBlackout(int arg) {
+            setMainScreenDim(arg < 0 ? -1 : (arg != 0 ? 1 : 0));
+        }
+
+        @Override
+        public void rotateDisplay(int arg) {
+            setRotation(arg);
+        }
+
+        @Override
+        public void setAudioEnabled(boolean enabled) {
+            sRemoteAudioPref = enabled;
+            setRemoteAudioActive(enabled);
+        }
+
+        @Override
+        public void requestDisconnect() {
+            RemoteStreamServer srv = sRemoteServer;
+            int sid = sDesktopSessionId;
+            if (srv != null && sid > 0) {
+                srv.disconnectSession(sid, "Client requested disconnect");
+            }
+        }
+
+        @Override
+        public void sendClipboardPush(long seq, String text) {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.sendClipboardPush(seq, text);
+        }
+
+        @Override
+        public void sendClipboardImagePush(long seq, byte[] pngData) {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.sendClipboardImagePush(seq, pngData);
+        }
+
+        @Override
+        public void sendFileTransferAck(int transferId, int status, String pathOrError) {
+            RemoteStreamServer srv = sRemoteServer;
+            if (srv != null) srv.sendFileTransferAck(transferId, status, pathOrError);
+        }
     }
 }
