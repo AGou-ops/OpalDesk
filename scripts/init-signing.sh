@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KEYSTORE_PATH="$ROOT_DIR/exthelper.p12"
 ALIAS="extbridge"
+DEFAULT_PASSWORD="extbridge"
 FORCE=0
 PASSWORD="${EXTBRIDGE_KEYSTORE_PASS:-}"
 
@@ -25,7 +26,12 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -p|--password)
-      PASSWORD="${2:-}"
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "ERROR: $1 requires a non-empty password value." >&2
+        usage >&2
+        exit 1
+      fi
+      PASSWORD="$2"
       shift 2
       ;;
     -f|--force)
@@ -69,6 +75,16 @@ find_keytool() {
   return 1
 }
 
+sha256_stdin() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print tolower($1)}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print tolower($1)}'
+  else
+    openssl dgst -sha256 -r | awk '{print tolower($1)}'
+  fi
+}
+
 KEYTOOL="$(find_keytool || true)"
 if [[ -z "$KEYTOOL" ]]; then
   echo "ERROR: keytool not found. Install JDK 17/21 or Android Studio." >&2
@@ -82,10 +98,16 @@ fi
 
 if [[ -z "$PASSWORD" ]]; then
   if [[ -t 0 ]]; then
-    read -r -s -p "Enter keystore password (leave empty for default 'extbridge'): " PASSWORD
+    read -r -s -p "Enter keystore password (leave empty for default '${DEFAULT_PASSWORD}'): " PASSWORD
     echo ""
+    if [[ -z "$PASSWORD" ]]; then
+      echo "WARNING: Using default keystore password '${DEFAULT_PASSWORD}' (fine for local dev; use a strong password for release keys)." >&2
+      PASSWORD="$DEFAULT_PASSWORD"
+    fi
+  else
+    echo "WARNING: Non-interactive shell with no password provided (-p / EXTBRIDGE_KEYSTORE_PASS); defaulting to '${DEFAULT_PASSWORD}'." >&2
+    PASSWORD="$DEFAULT_PASSWORD"
   fi
-  PASSWORD="${PASSWORD:-extbridge}"
 fi
 
 if [[ ${#PASSWORD} -lt 6 ]]; then
@@ -97,8 +119,8 @@ if [[ -f "$KEYSTORE_PATH" ]]; then
   rm -f "$KEYSTORE_PATH"
 fi
 
-"$KEYTOOL" -genkeypair \
-  -v \
+# Pass keystore password via scoped environment variable so it never appears in process argv (ps).
+EXTBRIDGE_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -genkeypair \
   -storetype PKCS12 \
   -keystore "$KEYSTORE_PATH" \
   -alias "$ALIAS" \
@@ -107,24 +129,25 @@ fi
   -sigalg SHA256withRSA \
   -validity 36500 \
   -dname "CN=ExtBridge, OU=ExtBridge, O=ExtBridge, L=Local, ST=Local, C=US" \
-  -storepass "$PASSWORD" \
-  -keypass "$PASSWORD" >/dev/null
+  -storepass:env EXTBRIDGE_KEYTOOL_PASS \
+  -keypass:env EXTBRIDGE_KEYTOOL_PASS
 
 chmod 600 "$KEYSTORE_PATH"
 
-if command -v shasum >/dev/null 2>&1; then
-  CERT_SHA256="$("$KEYTOOL" -exportcert -keystore "$KEYSTORE_PATH" -storetype PKCS12 -alias "$ALIAS" -storepass "$PASSWORD" 2>/dev/null | shasum -a 256 | awk '{print tolower($1)}')"
-elif command -v sha256sum >/dev/null 2>&1; then
-  CERT_SHA256="$("$KEYTOOL" -exportcert -keystore "$KEYSTORE_PATH" -storetype PKCS12 -alias "$ALIAS" -storepass "$PASSWORD" 2>/dev/null | sha256sum | awk '{print tolower($1)}')"
-else
-  CERT_SHA256="$("$KEYTOOL" -exportcert -keystore "$KEYSTORE_PATH" -storetype PKCS12 -alias "$ALIAS" -storepass "$PASSWORD" 2>/dev/null | openssl dgst -sha256 -r | awk '{print tolower($1)}')"
+CERT_SHA256="$(
+  EXTBRIDGE_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -exportcert \
+    -keystore "$KEYSTORE_PATH" \
+    -storetype PKCS12 \
+    -alias "$ALIAS" \
+    -storepass:env EXTBRIDGE_KEYTOOL_PASS \
+    | sha256_stdin
+)"
+if [[ -z "$CERT_SHA256" ]]; then
+  echo "ERROR: Failed to compute SHA-256 fingerprint for generated certificate." >&2
+  exit 1
 fi
 
-if base64 --help 2>&1 | grep -q -- "-w"; then
-  KEYSTORE_B64="$(base64 -w 0 "$KEYSTORE_PATH")"
-else
-  KEYSTORE_B64="$(base64 < "$KEYSTORE_PATH" | tr -d '\r\n')"
-fi
+KEYSTORE_B64="$(base64 < "$KEYSTORE_PATH" | tr -d '\r\n')"
 
 cat <<EOF
 

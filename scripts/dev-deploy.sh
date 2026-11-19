@@ -28,7 +28,12 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -s|--serial)
-      SERIAL="${2:-}"
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "ERROR: $1 requires a device serial value." >&2
+        usage >&2
+        exit 1
+      fi
+      SERIAL="$2"
       shift 2
       ;;
     --release)
@@ -161,15 +166,22 @@ if [[ "$TAIL_LOGS" -eq 1 ]]; then
   echo "==> Tailing daemon log & logcat (press Ctrl+C to stop)..."
   PIDS=()
   cleanup() {
-    for pid in "${PIDS[@]:-}"; do
+    trap - INT TERM EXIT
+    local pid
+    for pid in ${PIDS[@]+"${PIDS[@]}"}; do
+      pkill -P "$pid" 2>/dev/null || true
       kill "$pid" 2>/dev/null || true
     done
+    wait 2>/dev/null || true
   }
-  trap cleanup INT TERM EXIT
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  trap cleanup EXIT
 
-  "${ADB_CMD[@]}" shell "tail -F /data/local/tmp/extbridge.log 2>/dev/null" | sed 's/^/[daemon] /' &
+  # Run each pipeline in a subshell so cleanup kills both adb and sed without leaving orphan processes.
+  ( "${ADB_CMD[@]}" shell "tail -F /data/local/tmp/extbridge.log 2>/dev/null" | sed 's/^/[daemon] /' ) &
   PIDS+=($!)
-  "${ADB_CMD[@]}" logcat -v time ExtBridge:V ExtBridgeHelper:V AndroidRuntime:E '*:S' | sed 's/^/[helper] /' &
+  ( "${ADB_CMD[@]}" logcat -v time ExtBridge:V ExtBridgeHelper:V AndroidRuntime:E '*:S' | sed 's/^/[helper] /' ) &
   PIDS+=($!)
 
   wait

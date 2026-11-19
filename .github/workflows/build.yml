@@ -217,7 +217,7 @@ jobs:
             cd macos/ExtBridgeMac
             swift test
             swift build -c release
-            ../../scripts/build-macos-app.sh
+            ../../scripts/build-macos-app.sh --skip-build
           )
 
           ARCHIVE_NAME="ExtBridgeMac_v${VER}-macos.zip"
@@ -235,10 +235,8 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ExtBridge-macOS_v${{ steps.package_macos.outputs.app_version }}
-          path: |
-            ${{ env.MACOS_ARCHIVE_PATH }}
-            build/out/*.dmg
-          if-no-files-found: ignore
+          path: ${{ env.MACOS_ARCHIVE_PATH }}
+          if-no-files-found: error
           retention-days: 90
 
   release:

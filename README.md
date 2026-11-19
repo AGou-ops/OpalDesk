@@ -82,25 +82,27 @@
 │       ├── MainActivity.kt                  # HyperOS 澎湃风格主控台（响应式双栏/底栏、Miuix 抽屉与分应用规则）
 │       ├── TouchpadActivity.kt              # HyperOS 风格大触摸板与远程输入法转发
 │       ├── ui/                              # ExtVectorIcons 线性图标库、ExtHyperTheme 与 Miuix 弹窗组件
-│       ├── HyperUi.java                     # 原生 View 浮层共享线性矢量图标与澎湃色彩引擎
-│       ├── StageTransitionView.java         # HyperOS 2.0 级窗口最小化/恢复与分屏舞台过渡动效引擎
-│       ├── LauncherActivity.java            # 外接屏独立桌面启动器（壁纸同步、拼音检索、分屏/兼容菜单）
-│       ├── BridgeService.java               # 核心前台服务（澎湃 Dock、控制中心浮窗、黑屏遮罩、镜像信息栏、光标）
-│       ├── SideControlActivity.java         # 主屏镜像「副屏直控」交互页面（无键鼠手指点选侧边栏）
-│       ├── SideMouseCaptureActivity.java    # 镜像边缘物理鼠标捕获与跨屏边界协同
-│       ├── BridgeClient.java                # Binder IPC 客户端封装、主题/预设/比例模型与自动重连
-│       ├── BridgeProvider.java              # 零延迟安全分发 Binder 句柄（UID 白名单鉴权）
-│       ├── ControlReceiver.java             # `goAsync()` 异步后台广播控制接收器（含发送方 UID 鉴权）
-│       ├── NavAssistService.java            # 无障碍辅助服务（高优先级黑屏遮罩、边缘叠加、手势穿透）
-│       ├── AdbBootstrap.java                # mDNS 自动发现、无线调试配对连接、守护进程拉起
-│       └── AdbPairingReceiver.java          # 通知栏 6 位配对码快捷响应
+│       ├── overlay/                         # 悬浮层组件（Dock、快捷浮窗、镜像边栏、光标与黑屏遮罩）
+│       ├── HyperUi.kt                       # 原生 View 浮层共享线性矢量图标与澎湃色彩引擎
+│       ├── StageTransitionView.kt           # HyperOS 2.0 级窗口最小化/恢复与分屏舞台过渡动效引擎
+│       ├── LauncherActivity.kt              # 外接屏独立桌面启动器（壁纸同步、拼音检索、分屏/兼容菜单）
+│       ├── BridgeService.kt                 # 核心前台服务（澎湃 Dock、控制中心浮窗、黑屏遮罩、镜像信息栏、光标）
+│       ├── SideControlActivity.kt           # 主屏镜像「副屏直控」交互页面（无键鼠手指点选侧边栏）
+│       ├── SideMouseCaptureActivity.kt      # 镜像边缘物理鼠标捕获与跨屏边界协同
+│       ├── BridgeClient.kt                  # Binder IPC 客户端封装、主题/预设/比例模型与自动重连
+│       ├── BridgeProvider.kt                # 零延迟安全分发 Binder 句柄（UID 白名单鉴权）
+│       ├── ControlReceiver.kt               # `goAsync()` 异步后台广播控制接收器（含发送方 UID 鉴权）
+│       ├── NavAssistService.kt              # 无障碍辅助服务（高优先级黑屏遮罩、边缘叠加、手势穿透）
+│       ├── AdbBootstrap.kt                  # mDNS 自动发现、无线调试配对连接、守护进程拉起
+│       └── AdbPairingReceiver.kt            # 通知栏 6 位配对码快捷响应
 ├── docs/
 │   ├── USER_GUIDE.md                        # 完整图文使用说明书
 │   ├── RELEASE_v3.5.3.md                    # v3.5.3 版本发布与更新说明
 │   └── images/                              # GitHub 文档实机截图素材
+├── scripts/                                 # 本地签名初始化、macOS 打包与 ADB 开发部署脚本
 ├── .github/workflows/build.yml              # GitHub Actions 云端自动编译打包与 Release 工作流（SHA 锁定与最小权限）
 ├── THIRD_PARTY_NOTICES.md                   # 第三方开源组件与内置 libadb.so 来源、哈希及许可证声明
-├── build_v3.ps1                             # Windows 一键全自动编译打包脚本（extbridge.jar + Gradle R8 Release）
+├── gradlew / gradlew.bat                    # Gradle 统一构建入口（自动构建 :bridge:dexBridgeJar 与 :helper Release APK）
 └── start_extbridge.sh                       # 手机/ADB 手动启动守护进程脚本
 ```
 
@@ -125,13 +127,19 @@
 
 ## 🛠️ 从源码编译
 
-Windows 下具备 **JDK 17+**（Gradle Toolchain 将自动拉取 JDK 21）与 **Android SDK (`build-tools/37.0.0` + `platforms/android-37.0`)** 即可一键编译：
+具备 **JDK 21**（或 JDK 17+，Gradle Toolchain 会自动匹配）与 **Android SDK (`build-tools/37.0.0` + `platforms/android-37.0`)** 后，直接使用 Gradle Wrapper 即可跨平台一键编译（会自动执行 `:bridge:dexBridgeJar` 并将 `extbridge.jar` 打入 APK）：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build_v3.ps1
+```bash
+# Linux / macOS
+./gradlew :helper:assembleRelease
 ```
 
-输出产物位于 `build\out\extbridge.jar` 与 `build\out\exthelper.apk`（Release 构建默认要求官方签名证书 `exthelper.p12` / `EXTBRIDGE_KEYSTORE`，绝不回退 Debug 签名；如需无密钥可复现构建校验，可设置 `$env:EXTBRIDGE_ALLOW_UNSIGNED_RELEASE="1"` 生成 `exthelper-unsigned.apk`）。完整版本更新历史请见 [CHANGELOG.md](CHANGELOG.md)。
+```powershell
+# Windows
+.\gradlew.bat :helper:assembleRelease
+```
+
+输出产物位于 `bridge/build/libs/extbridge.jar` 与 `helper/build/outputs/apk/release/`（Release 构建默认要求签名证书 `exthelper.p12` / `EXTBRIDGE_KEYSTORE`，可先运行 `./scripts/init-signing.sh` 生成，绝不回退 Debug 签名；如需无密钥可复现构建校验，可附加 `-PallowUnsignedRelease=true` 或设置 `EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1` 生成未签名 APK）。完整版本更新历史请见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 

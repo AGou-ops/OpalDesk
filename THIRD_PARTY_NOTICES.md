@@ -19,7 +19,7 @@ ExtBridge (`com.extbridge.helper` & `com.extbridge.daemon.ExtBridge`) is license
   - **Protocol Buffers (`libprotobuf` 21.5)**: **BSD-3-Clause License** (`Copyright 2008 Google Inc.`).
   - **Compression Libraries (`zstd`, `lz4`, `brotli`)**: **BSD-2-Clause / BSD-3-Clause / MIT Licenses**.
   - **`libusb` (`libusb.info`)**: **GNU Lesser General Public License v2.1 (LGPL-2.1-or-later)**.
-    - *LGPL-2.1 Compliance & Replacement Note*: `libadb.so` is a separate standalone command-line executable (`ProcessBuilder`), not linked into ExtBridge's Java/Kotlin application code (`classes.dex` or `extbridge.jar`). Full upstream build recipes and patches for `android-tools` (`34.0.0`) are publicly available at <https://github.com/termux/termux-packages/tree/master/packages/android-tools> and <https://github.com/nmeum/android-tools>. Users may freely replace `helper/jniLibs/arm64-v8a/libadb.so` with any compatible `arm64-v8a` `adb` binary rebuilt from modified `libusb` / `android-tools` sources and re-package the APK via `build_v3.ps1`.
+    - *LGPL-2.1 Compliance & Replacement Note*: `libadb.so` is a separate standalone command-line executable (`ProcessBuilder`), not linked into ExtBridge's Java/Kotlin application code (`classes.dex` or `extbridge.jar`). Full upstream build recipes and patches for `android-tools` (`34.0.0`) are publicly available at <https://github.com/termux/termux-packages/tree/master/packages/android-tools> and <https://github.com/nmeum/android-tools>. Users may freely replace `helper/jniLibs/arm64-v8a/libadb.so` with any compatible `arm64-v8a` `adb` binary rebuilt from modified `libusb` / `android-tools` sources and re-package the APK via `./gradlew :helper:assembleRelease` (`.\gradlew.bat :helper:assembleRelease` on Windows).
 
 ---
 
