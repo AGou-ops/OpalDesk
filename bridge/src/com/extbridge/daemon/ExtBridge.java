@@ -102,6 +102,11 @@ public class ExtBridge implements Runnable {
     private static final int VD_FLAGS_COMPAT = 0x44CB; // includes ROTATES_WITH_CONTENT (0x0080)
     private static final int VD_FLAGS_DEX_FIXED = 0x444B; // strips ROTATES_WITH_CONTENT -> lock landscape desktop!
     private static final Object sDisplayLock = new Object();
+    private static final ExecutorService sBinderPushExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ExtBinderPush");
+        t.setDaemon(true);
+        return t;
+    });
     private static final ExecutorService sBgIoExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "ExtBgIo");
         t.setDaemon(true);
@@ -356,6 +361,10 @@ public class ExtBridge implements Runnable {
                 System.exit(1);
                 return;
             }
+            // Best-effort SELinux dynamic transition to u:r:shell:s0 if launched without runcon
+            try (FileOutputStream attrOut = new FileOutputStream("/proc/thread-self/attr/current")) {
+                attrOut.write("u:r:shell:s0\0".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+            } catch (Throwable ignored) {}
             System.out.println("EXTBRIDGE_ROOT_DROPPED_TO_SHELL uid=2000 gid=2000");
         } catch (Throwable t) {
             System.err.println("EXTBRIDGE_FATAL_DROP_ROOT_FAILED: " + t);
@@ -492,11 +501,6 @@ public class ExtBridge implements Runnable {
                 sCtx = sysCtx;
             }
             sCtx = fixShellContext(sCtx);
-            if (getVerifiedHelperUid() > 0) {
-                try { runCmdOut("appops", "set", "com.extbridge.helper", "10021", "allow"); } catch (Throwable ignored) {}
-                try { runCmdOut("appops", "set", "com.extbridge.helper", "ACCESS_RESTRICTED_SETTINGS", "allow"); } catch (Throwable ignored) {}
-                try { runCmdOut("appops", "set", "com.extbridge.helper", "SYSTEM_ALERT_WINDOW", "allow"); } catch (Throwable ignored) {}
-            }
             sDm = (DisplayManager) sCtx.getSystemService(Context.DISPLAY_SERVICE);
             sIm = (InputManager) sCtx.getSystemService(Context.INPUT_SERVICE);
 
@@ -517,9 +521,19 @@ public class ExtBridge implements Runnable {
             unbindInput();
             restoreOrphanScreenDimBackup();
             loadConf();
-            sBgIoExec.execute(() -> sanitizeSystemHomeTasks(true));
 
             sCtlBinder = new BridgeBinder();
+            sHandler = new Handler(Looper.getMainLooper());
+            // Push Binder IMMEDIATELY on dedicated thread (<250ms) BEFORE queuing slow dumpsys/appops jobs!
+            enqueuePushBinderToHelper(true);
+            for (long retryDelayMs : new long[]{400L, 1100L, 2400L}) {
+                sHandler.postDelayed(() -> {
+                    if (!sShuttingDown && (sHelperProcToken == null || !sHelperProcToken.pingBinder())) {
+                        enqueuePushBinderToHelper(true);
+                    }
+                }, retryDelayMs);
+            }
+
             try {
                 IntentFilter flt = new IntentFilter();
                 flt.addAction("com.extbridge.daemon.NEED_BINDER");
@@ -532,15 +546,21 @@ public class ExtBridge implements Runnable {
                             if (!isTrustedCaller(senderUid)) return;
                         }
                         long now = SystemClock.uptimeMillis();
-                        if (now - sLastNeedBinderRxMs < 800L) return;
+                        if (now - sLastNeedBinderRxMs < 500L) return;
                         sLastNeedBinderRxMs = now;
                         enqueuePushBinderToHelper(false);
                     }
                 };
                 if (Build.VERSION.SDK_INT >= 33) {
                     sCtx.registerReceiver(needBinderRx, flt, Context.RECEIVER_EXPORTED);
+                    if (sysCtx != null && sysCtx != sCtx) {
+                        try { sysCtx.registerReceiver(needBinderRx, flt, Context.RECEIVER_EXPORTED); } catch (Throwable ignored) {}
+                    }
                 } else {
                     sCtx.registerReceiver(needBinderRx, flt);
+                    if (sysCtx != null && sysCtx != sCtx) {
+                        try { sysCtx.registerReceiver(needBinderRx, flt); } catch (Throwable ignored) {}
+                    }
                 }
             } catch (Throwable ignored) {}
 
@@ -552,10 +572,16 @@ public class ExtBridge implements Runnable {
             System.out.println("EXTBRIDGE_V3_DAEMON_STARTED cfg=" + sVirtW + "x" + sVirtH + "@" + sVirtDpi + "dpi," + sVirtFps + "fps");
             System.out.flush();
 
-            sHandler = new Handler(Looper.getMainLooper());
-            sBgIoExec.execute(() -> healStrayCompatOverrides(false));
-            grantAppWidgetBind();
-            enqueuePushBinderToHelper(true);
+            sBgIoExec.execute(() -> {
+                if (getVerifiedHelperUid() > 0) {
+                    try { runCmdOut("appops", "set", "com.extbridge.helper", "10021", "allow"); } catch (Throwable ignored) {}
+                    try { runCmdOut("appops", "set", "com.extbridge.helper", "ACCESS_RESTRICTED_SETTINGS", "allow"); } catch (Throwable ignored) {}
+                    try { runCmdOut("appops", "set", "com.extbridge.helper", "SYSTEM_ALERT_WINDOW", "allow"); } catch (Throwable ignored) {}
+                }
+                grantAppWidgetBind();
+                healStrayCompatOverrides(false);
+                sanitizeSystemHomeTasks(true);
+            });
             sHandler.post(new ExtBridge());
             Looper.loop();
         } catch (Throwable t) {
@@ -825,11 +851,13 @@ public class ExtBridge implements Runnable {
             }
         }
         if (firstConf || !new File(HEAL_MARKER_PATH).exists()) {
-            // Never overwrite user Developer Options (force_resizable_activities / enable_non_resizable_multi_window)
-            healStrayCompatOverrides(false);
-            try (FileWriter fw = new FileWriter(HEAL_MARKER_PATH, false)) {
-                fw.write("1\n");
-            } catch (Throwable ignored) {}
+            // Run stray compat healing asynchronously on sBgIoExec so first-boot startup never blocks Binder handshake
+            sBgIoExec.execute(() -> {
+                healStrayCompatOverrides(false);
+                try (FileWriter fw = new FileWriter(HEAL_MARKER_PATH, false)) {
+                    fw.write("1\n");
+                } catch (Throwable ignored) {}
+            });
         }
     }
 
@@ -3631,19 +3659,39 @@ public class ExtBridge implements Runnable {
 
     private static void enqueuePushBinderToHelper(boolean forceImmediate) {
         long now = SystemClock.uptimeMillis();
-        if (!forceImmediate && (now - sLastBinderPushAttemptMs) < 900L) return;
+        if (!forceImmediate && (now - sLastBinderPushAttemptMs) < 700L) return;
         sLastBinderPushAttemptMs = now;
-        sBgIoExec.execute(ExtBridge::pushBinderToHelper);
+        sBinderPushExec.execute(ExtBridge::pushBinderToHelper);
+    }
+
+    private static void sendBinderFallbackBroadcast(Bundle extras) {
+        if (sCtx == null || extras == null || getVerifiedHelperUid() <= 0) return;
+        try {
+            Intent bi = new Intent("com.extbridge.helper.BINDER_PUSH");
+            bi.setComponent(new ComponentName("com.extbridge.helper", "com.extbridge.helper.ControlReceiver"));
+            bi.addFlags(Intent.FLAG_RECEIVER_FOREGROUND | Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            bi.putExtras(extras);
+            if (Build.VERSION.SDK_INT >= 34) {
+                Bundle opts = android.app.BroadcastOptions.makeBasic()
+                        .setShareIdentityEnabled(true)
+                        .toBundle();
+                sCtx.sendBroadcast(bi, "android.permission.INJECT_EVENTS", opts);
+            } else {
+                sCtx.sendBroadcast(bi, "android.permission.INJECT_EVENTS");
+            }
+        } catch (Throwable ignored) {}
     }
 
     private static void pushBinderToHelper() {
         if (sCtx == null || sCtlBinder == null || sShuttingDown) return;
-        if (!isVerifiedHelperProviderOwner()) return;
+        if (getVerifiedHelperUid() <= 0) return;
+        boolean providerDelivered = false;
         try {
             Bundle b = new Bundle();
             b.putBinder("cb", sCtlBinder);
-            Bundle res = callHelperProvider("setBinder", b);
-            if (res != null) {
+            Bundle res = isVerifiedHelperProviderOwner() ? callHelperProvider("setBinder", b) : null;
+            if (res != null && res.getBoolean("ok", false)) {
+                providerDelivered = true;
                 final IBinder tok = res.getBinder("proc");
                 if (tok != null && tok != sHelperProcToken) {
                     sHelperProcToken = tok;
@@ -3656,6 +3704,10 @@ public class ExtBridge implements Runnable {
                         }, 0);
                     } catch (Throwable ignored) {}
                 }
+            }
+            if (!providerDelivered) {
+                // Fallback channel when OEM ROM hooks block shell->app ContentProvider calls under Root/su
+                sendBinderFallbackBroadcast(b);
             }
         } catch (Throwable t) {
             System.err.println("pushBinderToHelper failed: " + t);

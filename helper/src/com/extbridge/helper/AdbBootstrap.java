@@ -26,6 +26,7 @@ import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
 import java.security.MessageDigest;
+import java.security.SecureRandom;
 import java.util.ArrayDeque;
 import java.util.Enumeration;
 import java.util.HashMap;
@@ -626,7 +627,7 @@ public final class AdbBootstrap {
             try { runAdb(appCtx, 2500, "-s", target, "shell", "settings put global adb_wifi_enabled 0"); } catch (Throwable ignored) {}
         }
 
-        awaitDaemonBinderReady(appCtx, listener, "无线调试激活成功，ExtBridge 服务已就绪！");
+        awaitDaemonBinderReady(appCtx, false, listener, "无线调试激活成功，ExtBridge 服务已就绪！");
     }
 
     public static boolean isAutoCloseWifiAdbEnabled(Context ctx) {
@@ -708,25 +709,46 @@ public final class AdbBootstrap {
             }
             String qStage = staged[0].replace("'", "");
             String expSha = staged[1].toLowerCase(Locale.US);
-            // Root ONLY copies our 0600 private staged jar into an O_EXCL mktemp file with chown -h 2000:2000,
-            // then immediately transitions to uid 2000 (u:r:shell:s0) before operating in /data/local/tmp or running app_process!
-            String shellInner = buildShellSwapAndLaunchScript("\"$ROOT_TMP\"", expSha);
+            byte[] rnd = new byte[8];
+            new SecureRandom().nextBytes(rnd);
+            StringBuilder nonce = new StringBuilder(16);
+            for (byte b : rnd) {
+                nonce.append(String.format(Locale.US, "%02x", b & 0xff));
+            }
+            // Literal cryptographic-nonce path avoids environment variable wiping across `su 2000`
+            String rootTmp = "/data/local/tmp/extb_" + nonce + ".jar";
+            String shellInner = buildShellSwapAndLaunchScript("'" + rootTmp + "'", expSha);
             String qShellInner = shellInner.replace("'", "'\\''");
+            // Root ONLY populates an O_CREAT|O_EXCL (`set -C`) temp jar verified against expSha
+            // (with automatic `pm path` fallback when Magisk/KernelSU Mount Namespace is Isolated),
+            // chowns it 2000:2000, and transitions to uid 2000 (`u:r:shell:s0`) before running app_process!
             String script = "UID_NOW=$(id -u 2>/dev/null || echo -1); "
                     + "if [ \"$UID_NOW\" != \"0\" ]; then echo NO_ROOT:$UID_NOW; exit 12; fi; "
-                    + "if [ ! -f '" + qStage + "' ] || [ -L '" + qStage + "' ]; then echo ERR_STAGE_MISSING; exit 21; fi; "
-                    + "SRC_SHA=$(sha256sum '" + qStage + "' 2>/dev/null | cut -d' ' -f1); "
-                    + "if [ \"$SRC_SHA\" != '" + expSha + "' ]; then echo ERR_STAGE_HASH; exit 21; fi; "
-                    + "ROOT_TMP=$(mktemp /data/local/tmp/extbridge.XXXXXX 2>/dev/null); "
-                    + "if [ -z \"$ROOT_TMP\" ] || [ -L \"$ROOT_TMP\" ]; then echo ERR_MKTEMP; exit 21; fi; "
-                    + "cp '" + qStage + "' \"$ROOT_TMP\" && chmod 644 \"$ROOT_TMP\" && chown -h 2000:2000 \"$ROOT_TMP\" "
-                    + "|| { rm -f \"$ROOT_TMP\"; echo ERR_STAGE_COPY; exit 21; }; "
-                    + "export ROOT_TMP; "
-                    + "(runcon u:r:shell:s0 su 2000 -c '" + qShellInner + "' 2>/dev/null "
-                    + "|| su 2000 -c '" + qShellInner + "' 2>/dev/null "
-                    + "|| su shell -c '" + qShellInner + "')";
+                    + "if ! (umask 022; set -C; : > '" + rootTmp + "') 2>/dev/null || [ -L '" + rootTmp + "' ]; then "
+                    + "rm -f '" + rootTmp + "' 2>/dev/null; echo ERR_MKTEMP; exit 21; fi; "
+                    + "if [ -f '" + qStage + "' ] && [ ! -L '" + qStage + "' ] && [ -s '" + qStage + "' ]; then "
+                    + "cat '" + qStage + "' > '" + rootTmp + "' 2>/dev/null; fi; "
+                    + "SRC_SHA=$(sha256sum '" + rootTmp + "' 2>/dev/null | cut -d' ' -f1); "
+                    + "if [ \"$SRC_SHA\" != '" + expSha + "' ]; then "
+                    + "APK=$(pm path com.extbridge.helper 2>/dev/null | head -n1 | cut -d: -f2); "
+                    + "if [ -n \"$APK\" ] && [ -f \"$APK\" ] && [ ! -L \"$APK\" ]; then "
+                    + "unzip -p \"$APK\" assets/extbridge.jar > '" + rootTmp + "' 2>/dev/null; fi; "
+                    + "SRC_SHA=$(sha256sum '" + rootTmp + "' 2>/dev/null | cut -d' ' -f1); "
+                    + "fi; "
+                    + "if [ \"$SRC_SHA\" != '" + expSha + "' ] || ! unzip -tq '" + rootTmp + "' >/dev/null 2>&1; then "
+                    + "rm -f '" + rootTmp + "' 2>/dev/null; echo ERR_STAGE_HASH:$SRC_SHA; exit 21; fi; "
+                    + "chmod 644 '" + rootTmp + "' && chown -h 2000:2000 '" + rootTmp + "' "
+                    + "|| { rm -f '" + rootTmp + "' 2>/dev/null; echo ERR_STAGE_CHOWN; exit 21; }; "
+                    + "run_as_shell() { "
+                    + "su 2000 -c \"$1\" && return 0; rc=$?; [ \"$rc\" -ge 20 ] && [ \"$rc\" -le 29 ] && return \"$rc\"; "
+                    + "su shell -c \"$1\" 2>/dev/null && return 0; rc=$?; [ \"$rc\" -ge 20 ] && [ \"$rc\" -le 29 ] && return \"$rc\"; "
+                    + "su 2000 /system/bin/sh -c \"$1\" 2>/dev/null && return 0; rc=$?; [ \"$rc\" -ge 20 ] && [ \"$rc\" -le 29 ] && return \"$rc\"; "
+                    + "/system/bin/sh -c \"$1\"; "
+                    + "}; "
+                    + "run_as_shell '" + qShellInner + "'; RC=$?; "
+                    + "rm -f '" + rootTmp + "' 2>/dev/null; exit $RC";
 
-            CmdRes res = runSu(22000, script);
+            CmdRes res = runSu(25000, script);
             String out = res.output == null ? "" : res.output.trim();
             if (res.code != 0 || !out.contains("LAUNCH_DONE")) {
                 String hint = out.contains("NO_ROOT")
@@ -739,7 +761,7 @@ public final class AdbBootstrap {
             if (markAutoRoot) {
                 setAutoRootEnabled(appCtx, true);
             }
-            awaitDaemonBinderReady(appCtx, listener, "Root 一键激活成功，ExtBridge 服务已就绪！");
+            awaitDaemonBinderReady(appCtx, true, listener, "Root 一键激活成功，ExtBridge 服务已就绪！");
         });
     }
 
@@ -788,17 +810,20 @@ public final class AdbBootstrap {
                 + "rm -f " + tmpJarExpr + "; echo ERR_STAGE_JAR; exit 21; fi; "
                 + shaGuard
                 + "chmod 644 " + tmpJarExpr + " || { rm -f " + tmpJarExpr + "; echo ERR_CHMOD_JAR; exit 21; }; "
-                + "(CLASSPATH=" + tmpJarExpr + " app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true); "
-                + "if pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1; then "
-                + "(pkill -f '^app_process.*ExtBridge' 2>/dev/null || true); "
+                + "(CLASSPATH=" + tmpJarExpr + " /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true); "
+                + "if pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then "
+                + "(pkill -f '^(/.*/)?app_process.*ExtBridge' 2>/dev/null || true); "
                 + "sleep 1.0; "
-                + "(pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true); fi; "
+                + "(pkill -f -l KILL '^(/.*/)?app_process.*ExtBridge' 2>/dev/null || true); fi; "
                 + "rm -f /data/local/tmp/extbridge.jar; "
                 + "if ! mv -f " + tmpJarExpr + " /data/local/tmp/extbridge.jar || [ -L /data/local/tmp/extbridge.jar ] || [ ! -s /data/local/tmp/extbridge.jar ]; then "
                 + "rm -f " + tmpJarExpr + "; echo ERR_SWAP_JAR; exit 22; fi; "
                 + postSwapShaGuard
                 + "chown -h 2000:2000 /data/local/tmp/extbridge.jar 2>/dev/null; "
-                + "rm -f /data/local/tmp/extbridge.log; "
+                + "LOG_DST=/dev/null; "
+                + "rm -f /data/local/tmp/extbridge.log 2>/dev/null; "
+                + "if (umask 022; set -C; : > /data/local/tmp/extbridge.log) 2>/dev/null && [ -f /data/local/tmp/extbridge.log ] && [ ! -L /data/local/tmp/extbridge.log ]; then "
+                + "chown -h 2000:2000 /data/local/tmp/extbridge.log 2>/dev/null; LOG_DST=/data/local/tmp/extbridge.log; fi; "
                 + "appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow 2>/dev/null; "
                 + "appops set com.extbridge.helper POST_NOTIFICATION allow 2>/dev/null; "
                 + "appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow 2>/dev/null; "
@@ -806,9 +831,18 @@ public final class AdbBootstrap {
                 + "appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null; "
                 + "pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null; "
                 + "dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1; "
-                + "(CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >/data/local/tmp/extbridge.log 2>&1 &); "
-                + "sleep 0.6; "
-                + "if pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1; then echo LAUNCH_DONE; else echo ERR_DAEMON_DIED; cat /data/local/tmp/extbridge.log 2>/dev/null; exit 24; fi";
+                + "CUR_CTX=$(id -Z 2>/dev/null || echo ''); "
+                + "case \"$CUR_CTX\" in "
+                + "*:shell:*) "
+                + "(CLASSPATH=/data/local/tmp/extbridge.jar setsid /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>\"$LOG_DST\" 2>&1 &); sleep 0.5 ;; "
+                + "*) "
+                + "(CLASSPATH=/data/local/tmp/extbridge.jar setsid runcon u:r:shell:s0 /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>\"$LOG_DST\" 2>&1 &); sleep 0.5; "
+                + "if ! pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then "
+                + "(CLASSPATH=/data/local/tmp/extbridge.jar setsid /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>\"$LOG_DST\" 2>&1 &); sleep 0.5; fi ;; "
+                + "esac; "
+                + "if ! pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then "
+                + "(CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>\"$LOG_DST\" 2>&1 &); sleep 0.6; fi; "
+                + "if pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then echo LAUNCH_DONE; else echo ERR_DAEMON_DIED; [ \"$LOG_DST\" != \"/dev/null\" ] && cat \"$LOG_DST\" 2>/dev/null; exit 24; fi";
     }
 
     public static String buildDaemonBootstrapScript(String stagedJarPath) {
@@ -833,9 +867,9 @@ public final class AdbBootstrap {
                 + buildShellSwapAndLaunchScript("\"$TMP_JAR\"", expectedSha256);
     }
 
-    private static void awaitDaemonBinderReady(Context appCtx, ProgressListener listener, String successMsg) {
+    private static void awaitDaemonBinderReady(Context appCtx, boolean fromRoot, ProgressListener listener, String successMsg) {
         postStep(listener, "守护进程已拉起，正在验证 Binder 连接...");
-        long deadline = System.currentTimeMillis() + 7000;
+        long deadline = System.currentTimeMillis() + 12000;
         while (System.currentTimeMillis() < deadline) {
             BridgeClient.requestBinder(appCtx);
             if (BridgeClient.getStatus().connected) {
@@ -843,9 +877,16 @@ public final class AdbBootstrap {
                 postResult(listener, true, successMsg);
                 return;
             }
-            try { Thread.sleep(350); } catch (InterruptedException ignored) { break; }
+            try { Thread.sleep(250); } catch (InterruptedException ignored) { break; }
         }
-        postResult(listener, false, "守护进程命令已下发，但暂未收到 Binder 握手，请稍等几秒或查看 /data/local/tmp/extbridge.log");
+        String tailDiag = "";
+        if (fromRoot) {
+            CmdRes diag = runSu(3000, "tail -n 8 /data/local/tmp/extbridge.log 2>/dev/null");
+            if (diag.output != null && !diag.output.trim().isEmpty()) {
+                tailDiag = "\n日志摘要:\n" + diag.output.trim();
+            }
+        }
+        postResult(listener, false, "守护进程命令已下发，但暂未收到 Binder 握手，请稍等几秒或查看 /data/local/tmp/extbridge.log" + tailDiag);
     }
 
     private static CmdRes runSu(long timeoutMs, String shellCmd) {

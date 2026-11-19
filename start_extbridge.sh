@@ -13,8 +13,9 @@ if [ "$(id -u 2>/dev/null)" = "0" ]; then
         echo "ERR_INVALID_SCRIPT: script path must be a regular file" >&2
         exit 20
     fi
-    exec runcon u:r:shell:s0 su 2000 -c "/system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
-        || exec su 2000 -c "/system/bin/sh '$SCRIPT_REAL'"
+    exec su 2000 -c "/system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
+        || exec su shell -c "/system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
+        || exec su 2000 /system/bin/sh "$SCRIPT_REAL"
     echo "ERR_DROP_ROOT: failed to switch from root to shell uid 2000 before touching /data/local/tmp" >&2
     exit 20
 fi
@@ -55,11 +56,11 @@ if [ -n "$APK_PATH" ]; then
         exit 24
     fi
 
-    (timeout 8 env CLASSPATH="$TMP_JAR" app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true)
-    if pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1; then
-        (pkill -f '^app_process.*ExtBridge' 2>/dev/null || true)
+    (timeout 8 env CLASSPATH="$TMP_JAR" /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true)
+    if pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then
+        (pkill -f '^(/.*/)?app_process.*ExtBridge' 2>/dev/null || true)
         sleep 1.0
-        (pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true)
+        (pkill -f -l KILL '^(/.*/)?app_process.*ExtBridge' 2>/dev/null || true)
     fi
 
     rm -f /data/local/tmp/extbridge.jar 2>/dev/null
@@ -83,18 +84,40 @@ else
         echo "ERR_NO_JAR: com.extbridge.helper not installed and /data/local/tmp/extbridge.jar missing or invalid" >&2
         exit 23
     fi
-    (CLASSPATH=/data/local/tmp/extbridge.jar app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true)
-    if pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1; then
-        (pkill -f '^app_process.*ExtBridge' 2>/dev/null || true)
+    (CLASSPATH=/data/local/tmp/extbridge.jar /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true)
+    if pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then
+        (pkill -f '^(/.*/)?app_process.*ExtBridge' 2>/dev/null || true)
         sleep 1.0
-        (pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true)
+        (pkill -f -l KILL '^(/.*/)?app_process.*ExtBridge' 2>/dev/null || true)
     fi
 fi
 
-[ -L /data/local/tmp/extbridge.log ] && rm -f /data/local/tmp/extbridge.log 2>/dev/null
+LOG_DST=/dev/null
+rm -f /data/local/tmp/extbridge.log 2>/dev/null
+if (umask 022; set -C; : > /data/local/tmp/extbridge.log) 2>/dev/null && [ -f /data/local/tmp/extbridge.log ] && [ ! -L /data/local/tmp/extbridge.log ]; then
+    chown -h 2000:2000 /data/local/tmp/extbridge.log 2>/dev/null
+    LOG_DST=/data/local/tmp/extbridge.log
+fi
 chown -h 2000:2000 /data/local/tmp/extbridge.jar /data/local/tmp/extbridge.conf /data/local/tmp/extbridge_apps.conf /data/local/tmp/extbridge_healed_v2 2>/dev/null
 
 export CLASSPATH=/data/local/tmp/extbridge.jar
-nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &
-sleep 1.5
-cat /data/local/tmp/extbridge.log
+CUR_CTX=$(id -Z 2>/dev/null || echo "")
+case "$CUR_CTX" in
+    *:shell:*)
+        (setsid /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>"$LOG_DST" 2>&1 &)
+        sleep 0.5
+        ;;
+    *)
+        (setsid runcon u:r:shell:s0 /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>"$LOG_DST" 2>&1 &)
+        sleep 0.5
+        if ! pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then
+            (setsid /system/bin/app_process /data/local/tmp com.extbridge.daemon.ExtBridge </dev/null >>"$LOG_DST" 2>&1 &)
+            sleep 0.5
+        fi
+        ;;
+esac
+if ! pgrep -f '^(/.*/)?app_process.*ExtBridge' >/dev/null 2>&1; then
+    nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >>"$LOG_DST" 2>&1 </dev/null &
+fi
+sleep 1.0
+[ "$LOG_DST" != "/dev/null" ] && cat "$LOG_DST"

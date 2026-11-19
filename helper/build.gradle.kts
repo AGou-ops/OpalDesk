@@ -62,9 +62,12 @@ android {
         p12File.exists() -> p12File
         else -> null
     }
-    val envPass = System.getenv("EXTBRIDGE_KEYSTORE_PASS")?.takeIf { it.isNotBlank() }
+    val envPass = (
+        System.getenv("EXTBRIDGE_KEYSTORE_PASS")?.takeIf { it.isNotBlank() }
+            ?: System.getenv("EXTBRIDGE")?.takeIf { it.isNotBlank() }
+        )
     if (envKs != null && envPass == null) {
-        throw GradleException("EXTBRIDGE_KEYSTORE_PASS must be explicitly set when EXTBRIDGE_KEYSTORE is provided.")
+        throw GradleException("EXTBRIDGE_KEYSTORE_PASS (or EXTBRIDGE) must be explicitly set when EXTBRIDGE_KEYSTORE is provided.")
     }
     val activePass = envPass ?: "extbridge"
     val requireReleaseKey = (System.getenv("EXTBRIDGE_REQUIRE_RELEASE_KEY") == "1")
@@ -84,9 +87,30 @@ android {
         )
     }
 
+    var signingPass = activePass
     if (activeKs != null) {
-        val ks = KeyStore.getInstance("PKCS12")
-        activeKs.inputStream().use { stream -> ks.load(stream, activePass.toCharArray()) }
+        val candidatePasswords = listOfNotNull(envPass, "extbridge").distinct()
+        var loadedKs: KeyStore? = null
+        var unlockedPass: String? = null
+        var lastErr: Throwable? = null
+        for (cand in candidatePasswords) {
+            try {
+                val candKs = KeyStore.getInstance("PKCS12")
+                activeKs.inputStream().use { stream -> candKs.load(stream, cand.toCharArray()) }
+                if (candKs.getKey("extbridge", cand.toCharArray()) != null) {
+                    loadedKs = candKs
+                    unlockedPass = cand
+                    break
+                }
+            } catch (t: Throwable) {
+                lastErr = t
+            }
+        }
+        val ks = loadedKs ?: throw GradleException(
+            "Failed to unlock release keystore (${activeKs.name}) with configured keystore password secret.",
+            lastErr
+        )
+        signingPass = unlockedPass ?: activePass
         val cert = ks.getCertificate("extbridge")
             ?: throw GradleException("Alias 'extbridge' not found in release keystore: ${activeKs.absolutePath}")
         val actualSha256 = MessageDigest.getInstance("SHA-256")
@@ -104,9 +128,9 @@ android {
             create("extrelease") {
                 storeFile = activeKs
                 storeType = "PKCS12"
-                storePassword = activePass
+                storePassword = signingPass
                 keyAlias = "extbridge"
-                keyPassword = activePass
+                keyPassword = signingPass
                 enableV1Signing = false
                 enableV2Signing = true
                 enableV3Signing = true

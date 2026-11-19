@@ -113,6 +113,7 @@
             android:exported="true"
             android:permission="android.permission.INJECT_EVENTS">
             <intent-filter>
+                <action android:name="com.extbridge.helper.BINDER_PUSH" />
                 <action android:name="com.extbridge.helper.TOGGLE_INPUT" />
                 <action android:name="com.extbridge.helper.STATE_SYNC" />
                 <action android:name="com.extbridge.helper.REBUILD" />

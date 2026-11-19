@@ -76,6 +76,9 @@ Write-Host "=== 2. Building Helper APK with Gradle + Jetpack Compose + Miuix ===
 Push-Location $ROOT
 try {
     $gradleArgs = @(":helper:assembleRelease", "--console=plain")
+    if ($env:CI -eq "true") {
+        $gradleArgs += "--no-daemon"
+    }
     if ($env:EXTBRIDGE_ALLOW_UNSIGNED_RELEASE -eq "1") {
         $gradleArgs += "-PallowUnsignedRelease=true"
     }

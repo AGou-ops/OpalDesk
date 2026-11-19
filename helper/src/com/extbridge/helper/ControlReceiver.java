@@ -51,6 +51,26 @@ public class ControlReceiver extends BroadcastReceiver {
             return;
         }
 
+        if ("com.extbridge.helper.BINDER_PUSH".equals(act)) {
+            if (this instanceof Internal || BridgeService.sUserStopping) return;
+            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                int uid = getSentFromUid();
+                if (uid != android.os.Process.INVALID_UID && uid != 0 && uid != 1000 && uid != 2000) return;
+            }
+            android.os.Bundle extras = intent.getExtras();
+            android.os.IBinder cb = (extras != null) ? extras.getBinder("cb") : null;
+            if (cb != null && cb.pingBinder()) {
+                try {
+                    if (BridgeClient.BINDER_DESC.equals(cb.getInterfaceDescriptor())) {
+                        BridgeClient.setBinder(cb);
+                        BridgeService.ensureStarted(context);
+                        BridgeService.refreshFromReceiver(context);
+                    }
+                } catch (Throwable ignored) {}
+            }
+            return;
+        }
+
         if ("com.extbridge.helper.STATE_SYNC".equals(act)) {
             BridgeService.refreshFromReceiver(context);
             return;
