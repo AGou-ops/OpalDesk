@@ -23,13 +23,10 @@ import kotlin.math.sin
  * LauncherActivity desktop bar, and SideControlActivity).
  */
 object HyperUi {
-    // HyperOS 2.0 Signature Palette
+    // HyperOS 2.0 Signature Palette (aligned with ExtMiuixComponents)
     const val HYPER_BLUE: Int = 0xFF0D84FF.toInt()
-    const val HYPER_BLUE_SOFT: Int = 0x2E0D84FF
-    const val HYPER_BLUE_TEXT: Int = 0xFF5EAAFF.toInt()
-    const val HYPER_AMBER: Int = 0xFFFF9F0A.toInt()
-    const val HYPER_RED: Int = 0xFFFF453A.toInt()
-    const val HYPER_GREEN: Int = 0xFF30D158.toInt()
+    const val HYPER_RED: Int = 0xFFE94634.toInt()
+    const val HYPER_GREEN: Int = 0xFF28C76F.toInt()
 
     const val FLYOUT_BG: Int = 0xF2191B20.toInt()
     const val FLYOUT_STROKE: Int = 0x26FFFFFF
@@ -38,7 +35,7 @@ object HyperUi {
     const val TILE_INACTIVE: Int = 0xFF2A2D35.toInt()
     const val CHIP_INACTIVE: Int = 0xFF262931.toInt()
     const val CHIP_ACTIVE_BG: Int = 0x330D84FF
-    const val CHIP_ACTIVE_STROKE: Int = 0x770D84FF
+    private const val CHIP_ACTIVE_STROKE: Int = 0x770D84FF
 
     // Vector Icon Kinds
     const val ICON_DEX = 1
@@ -59,7 +56,6 @@ object HyperUi {
     const val ICON_WINDOW = 16
     const val ICON_TOUCHPAD = 17
     const val ICON_SIDEBAR = 18
-    const val ICON_KEYBOARD = 19
     const val ICON_MEDIA = 20
     const val ICON_CALENDAR = 21
     const val ICON_CPU = 22
@@ -71,15 +67,18 @@ object HyperUi {
     const val ICON_RATIO = 28
     const val ICON_CHEVRON_LEFT = 29
     const val ICON_CHEVRON_RIGHT = 30
-    const val ICON_VOLUME_MUTE = 31
-    const val ICON_PLUS = 32
     const val ICON_MINUS = 33
-    const val ICON_PLAY = 34
-    const val ICON_PAUSE = 35
-    const val ICON_PREV = 36
-    const val ICON_NEXT = 37
 
-    @JvmStatic
+    // System-tile & volume icons (unifying MiniIconView into HyperUi)
+    const val ICON_WIFI = 40
+    const val ICON_WIFI_OFF = 41
+    const val ICON_BLUETOOTH = 42
+    const val ICON_AIRPLANE = 43
+    const val ICON_BATTERY_SAVER = 44
+    const val ICON_VOLUME_OFF = 45
+    const val ICON_VOLUME_LOW = 46
+    const val ICON_VOLUME_HIGH = 47
+
     fun dp(ctx: Context, v: Float): Int = max(
         1,
         TypedValue.applyDimension(
@@ -89,27 +88,6 @@ object HyperUi {
         ).roundToInt(),
     )
 
-    /** Strips leading Emoji / symbol prefixes from legacy labels cleanly. */
-    @JvmStatic
-    fun cleanLabel(raw: String?): String {
-        if (raw.isNullOrEmpty()) return ""
-        var i = 0
-        val n = raw.length
-        while (i < n) {
-            val cp = raw.codePointAt(i)
-            val isAsciiOrCjk = (cp in '0'.code..'9'.code) ||
-                (cp in 'A'.code..'Z'.code) ||
-                (cp in 'a'.code..'z'.code) ||
-                (cp in 0x4E00..0x9FFF) ||
-                cp == '('.code || cp == '['.code || cp == '【'.code
-            if (isAsciiOrCjk) break
-            i += Character.charCount(cp)
-        }
-        val trimmed = raw.substring(i).trim()
-        return trimmed.ifEmpty { raw.trim() }
-    }
-
-    @JvmStatic
     fun icon(ctx: Context, kind: Int, color: Int, sizeDp: Float): Drawable {
         val px = dp(ctx, sizeDp)
         return VectorIconDrawable(kind, color, px).apply {
@@ -117,7 +95,12 @@ object HyperUi {
         }
     }
 
-    @JvmStatic
+    fun volumeIconKind(level: Int): Int = when {
+        level <= 0 -> ICON_VOLUME_OFF
+        level == 1 -> ICON_VOLUME_LOW
+        else -> ICON_VOLUME_HIGH
+    }
+
     fun setStartIcon(tv: TextView?, kind: Int, color: Int, sizeDp: Float, padDp: Float) {
         if (tv == null) return
         val ctx = tv.context
@@ -126,7 +109,6 @@ object HyperUi {
         tv.compoundDrawablePadding = dp(ctx, padDp)
     }
 
-    @JvmStatic
     fun styleHyperChip(tv: TextView?, active: Boolean) {
         if (tv == null) return
         val ctx = tv.context
@@ -314,15 +296,6 @@ object HyperUi {
                     c.drawRoundRect(rect, s * 0.13f, s * 0.13f, paint)
                     c.drawLine(w * 0.62f, h * 0.18f, w * 0.62f, h * 0.82f, paint)
                 }
-                ICON_KEYBOARD -> {
-                    rect.set(w * 0.10f, h * 0.24f, w * 0.90f, h * 0.76f)
-                    c.drawRoundRect(rect, s * 0.12f, s * 0.12f, paint)
-                    c.drawLine(w * 0.32f, h * 0.62f, w * 0.68f, h * 0.62f, paint)
-                    paint.style = Paint.Style.FILL
-                    c.drawCircle(w * 0.30f, h * 0.42f, sw * 0.65f, paint)
-                    c.drawCircle(cx, h * 0.42f, sw * 0.65f, paint)
-                    c.drawCircle(w * 0.70f, h * 0.42f, sw * 0.65f, paint)
-                }
                 ICON_MEDIA -> {
                     c.drawCircle(w * 0.34f, h * 0.72f, s * 0.12f, paint)
                     c.drawCircle(w * 0.72f, h * 0.64f, s * 0.12f, paint)
@@ -394,52 +367,75 @@ object HyperUi {
                     path.lineTo(w * 0.38f, h * 0.78f)
                     c.drawPath(path, paint)
                 }
-                ICON_VOLUME_MUTE -> {
-                    path.moveTo(w * 0.16f, h * 0.38f)
-                    path.lineTo(w * 0.32f, h * 0.38f)
-                    path.lineTo(w * 0.52f, h * 0.22f)
-                    path.lineTo(w * 0.52f, h * 0.78f)
-                    path.lineTo(w * 0.32f, h * 0.62f)
-                    path.lineTo(w * 0.16f, h * 0.62f)
-                    path.close()
-                    c.drawPath(path, paint)
-                    c.drawLine(w * 0.64f, h * 0.38f, w * 0.84f, h * 0.62f, paint)
-                    c.drawLine(w * 0.84f, h * 0.38f, w * 0.64f, h * 0.62f, paint)
-                }
-                ICON_PLUS -> {
-                    c.drawLine(w * 0.24f, cy, w * 0.76f, cy, paint)
-                    c.drawLine(cx, h * 0.24f, cx, h * 0.76f, paint)
-                }
                 ICON_MINUS -> {
                     c.drawLine(w * 0.24f, cy, w * 0.76f, cy, paint)
                 }
-                ICON_PLAY -> {
+                ICON_WIFI, ICON_WIFI_OFF -> {
+                    if (kind == ICON_WIFI_OFF) paint.color = color and 0x66FFFFFF
+                    paint.strokeWidth = max(1.8f, s * 0.11f)
+                    val oy = h * 0.80f
+                    rect.set(cx - s * 0.44f, oy - s * 0.62f, cx + s * 0.44f, oy + s * 0.26f)
+                    c.drawArc(rect, -135f, 90f, false, paint)
+                    rect.set(cx - s * 0.28f, oy - s * 0.40f, cx + s * 0.28f, oy + s * 0.16f)
+                    c.drawArc(rect, -135f, 90f, false, paint)
                     paint.style = Paint.Style.FILL
-                    path.moveTo(w * 0.30f, h * 0.22f)
-                    path.lineTo(w * 0.76f, cy)
-                    path.lineTo(w * 0.30f, h * 0.78f)
-                    path.close()
+                    c.drawCircle(cx, oy - s * 0.04f, max(1.5f, s * 0.09f), paint)
+                    if (kind == ICON_WIFI_OFF) {
+                        paint.color = color
+                        paint.style = Paint.Style.STROKE
+                        c.drawLine(w * 0.18f, h * 0.18f, w * 0.82f, h * 0.82f, paint)
+                    }
+                }
+                ICON_BLUETOOTH -> {
+                    paint.strokeWidth = max(1.7f, s * 0.10f)
+                    path.moveTo(cx - s * 0.16f, cy - s * 0.20f)
+                    path.lineTo(cx + s * 0.18f, cy + s * 0.16f)
+                    path.lineTo(cx, cy + s * 0.36f)
+                    path.lineTo(cx, cy - s * 0.36f)
+                    path.lineTo(cx + s * 0.18f, cy - s * 0.16f)
+                    path.lineTo(cx - s * 0.16f, cy + s * 0.20f)
                     c.drawPath(path, paint)
                 }
-                ICON_PAUSE -> {
-                    c.drawLine(w * 0.36f, h * 0.24f, w * 0.36f, h * 0.76f, paint)
-                    c.drawLine(w * 0.64f, h * 0.24f, w * 0.64f, h * 0.76f, paint)
+                ICON_AIRPLANE -> {
+                    paint.strokeWidth = max(1.8f, s * 0.10f)
+                    c.drawLine(w * 0.15f, cy, w * 0.85f, cy, paint)
+                    c.drawLine(w * 0.42f, h * 0.16f, w * 0.56f, cy, paint)
+                    c.drawLine(w * 0.42f, h * 0.84f, w * 0.56f, cy, paint)
+                    c.drawLine(w * 0.18f, h * 0.34f, w * 0.26f, cy, paint)
+                    c.drawLine(w * 0.18f, h * 0.66f, w * 0.26f, cy, paint)
                 }
-                ICON_PREV -> {
-                    c.drawLine(w * 0.26f, h * 0.26f, w * 0.26f, h * 0.74f, paint)
-                    path.moveTo(w * 0.74f, h * 0.24f)
-                    path.lineTo(w * 0.38f, cy)
-                    path.lineTo(w * 0.74f, h * 0.76f)
+                ICON_BATTERY_SAVER -> {
+                    paint.strokeWidth = max(1.7f, s * 0.10f)
+                    rect.set(w * 0.16f, h * 0.26f, w * 0.82f, h * 0.74f)
+                    c.drawRoundRect(rect, s * 0.1f, s * 0.1f, paint)
+                    c.drawLine(w * 0.85f, h * 0.40f, w * 0.85f, h * 0.60f, paint)
+                    c.drawLine(w * 0.38f, h * 0.50f, w * 0.60f, h * 0.50f, paint)
+                    c.drawLine(w * 0.49f, h * 0.38f, w * 0.49f, h * 0.62f, paint)
+                }
+                ICON_VOLUME_OFF, ICON_VOLUME_LOW, ICON_VOLUME_HIGH -> {
+                    paint.style = Paint.Style.FILL
+                    path.moveTo(w * 0.14f, h * 0.38f)
+                    path.lineTo(w * 0.32f, h * 0.38f)
+                    path.lineTo(w * 0.54f, h * 0.20f)
+                    path.lineTo(w * 0.54f, h * 0.80f)
+                    path.lineTo(w * 0.32f, h * 0.62f)
+                    path.lineTo(w * 0.14f, h * 0.62f)
                     path.close()
                     c.drawPath(path, paint)
-                }
-                ICON_NEXT -> {
-                    c.drawLine(w * 0.74f, h * 0.26f, w * 0.74f, h * 0.74f, paint)
-                    path.moveTo(w * 0.26f, h * 0.24f)
-                    path.lineTo(w * 0.62f, cy)
-                    path.lineTo(w * 0.26f, h * 0.76f)
-                    path.close()
-                    c.drawPath(path, paint)
+
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = max(1.6f, s * 0.10f)
+                    if (kind == ICON_VOLUME_OFF) {
+                        c.drawLine(w * 0.64f, h * 0.36f, w * 0.86f, h * 0.64f, paint)
+                        c.drawLine(w * 0.86f, h * 0.36f, w * 0.64f, h * 0.64f, paint)
+                    } else {
+                        rect.set(w * 0.50f, h * 0.32f, w * 0.72f, h * 0.68f)
+                        c.drawArc(rect, -50f, 100f, false, paint)
+                        if (kind == ICON_VOLUME_HIGH) {
+                            rect.set(w * 0.52f, h * 0.18f, w * 0.88f, h * 0.82f)
+                            c.drawArc(rect, -52f, 104f, false, paint)
+                        }
+                    }
                 }
             }
             c.restore()

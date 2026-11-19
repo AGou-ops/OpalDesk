@@ -24,37 +24,39 @@ class BridgeClientLogicTest {
         assertFalse(st.isUhidInputActive)
         assertFalse(st.isMultiTilingActive)
 
-        st.sinkType = BridgeClient.SINK_PHYSICAL
-        assertFalse(st.isRemoteSink)
-        assertFalse(st.isRemoteDisplayActive)
+        val stPhys = st.copy(sinkType = BridgeClient.SINK_PHYSICAL)
+        assertFalse(stPhys.isRemoteSink)
+        assertFalse(stPhys.isRemoteDisplayActive)
 
-        st.sinkType = BridgeClient.SINK_REMOTE_USB
-        assertTrue(st.isRemoteSink)
-        assertTrue(st.isRemoteDisplayActive)
+        val stUsb = st.copy(sinkType = BridgeClient.SINK_REMOTE_USB)
+        assertTrue(stUsb.isRemoteSink)
+        assertTrue(stUsb.isRemoteDisplayActive)
 
-        st.sinkType = BridgeClient.SINK_REMOTE_WIFI_ADB
+        val stWifiAdb = st.copy(sinkType = BridgeClient.SINK_REMOTE_WIFI_ADB)
         assertEquals(4, BridgeClient.SINK_REMOTE_WIFI_ADB)
-        assertTrue(st.isRemoteSink)
-        assertTrue(st.isRemoteDisplayActive)
+        assertTrue(stWifiAdb.isRemoteSink)
+        assertTrue(stWifiAdb.isRemoteDisplayActive)
         assertTrue(BridgeClient.isRemoteDisplayActive(BridgeClient.SINK_REMOTE_WIFI_ADB))
 
-        st.sinkType = BridgeClient.SINK_REMOTE_WIFI
-        st.wifiServerEnabled = 1
-        st.wifiServerPort = BridgeClient.DEFAULT_WIFI_REMOTE_PORT
-        st.streamFpsX100 = 5994
-        st.streamBitrateKbps = 16500
-        st.wifiCertFingerprint = "a1b2c3d4e5f6071899aabbccddeeff00112233445566778899aabbccddeeff00"
-        st.activePairingPin = "482910"
-        st.injectStatus = BridgeClient.INJECT_STATUS_UHID
-        st.activeLayoutMode = BridgeClient.LAYOUT_GRID_2X2
+        val stWifi = st.copy(
+            sinkType = BridgeClient.SINK_REMOTE_WIFI,
+            wifiServerEnabled = 1,
+            wifiServerPort = BridgeClient.DEFAULT_WIFI_REMOTE_PORT,
+            streamFpsX100 = 5994,
+            streamBitrateKbps = 16500,
+            wifiCertFingerprint = "a1b2c3d4e5f6071899aabbccddeeff00112233445566778899aabbccddeeff00",
+            activePairingPin = "482910",
+            injectStatus = BridgeClient.INJECT_STATUS_UHID,
+            activeLayoutMode = BridgeClient.LAYOUT_GRID_2X2,
+        )
 
-        assertTrue(st.isRemoteSink)
-        assertTrue(st.isRemoteDisplayActive)
-        assertTrue(st.isWifiServerEnabled)
-        assertTrue(st.isUhidInputActive)
-        assertTrue(st.isMultiTilingActive)
-        assertEquals(59.94f, st.streamFps, 0.001f)
-        assertEquals("A1B2-C3D4-E5F6-0718", st.shortCertFingerprint)
+        assertTrue(stWifi.isRemoteSink)
+        assertTrue(stWifi.isRemoteDisplayActive)
+        assertTrue(stWifi.isWifiServerEnabled)
+        assertTrue(stWifi.isUhidInputActive)
+        assertTrue(stWifi.isMultiTilingActive)
+        assertEquals(59.94f, stWifi.streamFps, 0.001f)
+        assertEquals("A1B2-C3D4-E5F6-0718", stWifi.shortCertFingerprint)
     }
 
     @Test

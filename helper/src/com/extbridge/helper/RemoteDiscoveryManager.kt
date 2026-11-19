@@ -125,7 +125,9 @@ class RemoteDiscoveryManager(context: Context) {
         multicastLock = null
         try {
             if (lock.isHeld) lock.release()
-        } catch (_: Throwable) {}
+        } catch (t: Throwable) {
+            Log.d(TAG, "MulticastLock release ignored: ${t.message}")
+        }
     }
 
     private fun registerInternal(
@@ -202,7 +204,9 @@ class RemoteDiscoveryManager(context: Context) {
         if (mgr != null && listener != null) {
             try {
                 mgr.unregisterService(listener)
-            } catch (_: Throwable) {}
+            } catch (t: Throwable) {
+                Log.d(TAG, "unregisterService ignored: ${t.message}")
+            }
         }
     }
 }

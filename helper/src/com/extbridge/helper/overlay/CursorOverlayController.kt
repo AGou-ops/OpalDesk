@@ -5,61 +5,68 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
-import android.graphics.PixelFormat
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
 import com.extbridge.helper.BridgeClient
-import kotlin.math.abs
 import kotlin.math.roundToInt
 
 /**
- * Manages the topmost software cursor overlay on the external VirtualDisplay.
- * Automatically suppresses and hides the Android software cursor whenever the active
- * sink is a remote Mac display (`SINK_REMOTE_USB` / `SINK_REMOTE_WIFI_ADB` / `SINK_REMOTE_WIFI`)
- * so the user never sees a double pointer alongside macOS's native cursor.
+ * Manages the topmost software cursor overlay via [OverlaySurfaceHost] ([OverlayLayer.CURSOR]).
+ * Suppresses itself when a remote Mac sink is active and forwards coordinates to `host.dock.onCursorMoved`.
  */
 class CursorOverlayController(private val host: OverlayHost) {
 
-    var cursorView: CursorView? = null
-        private set
-    var cursorLp: WindowManager.LayoutParams? = null
-        private set
-    var cursorVisible: Boolean = false
-        private set
+    companion object {
+        private const val TAG = "ExtCursorOverlay"
+        private const val SURFACE_KEY = "cursor"
+        private const val CURSOR_SIZE_PX = 44
+        private const val HOTSPOT_OFFSET_X = 6
+        private const val HOTSPOT_OFFSET_Y = 4
+        private const val AUTO_HIDE_TIMEOUT_MS = 7000L
+        private const val CURSOR_ELEVATION_DP = 48f
+    }
 
-    private var suppressedForRemoteSink: Boolean = false
-
+    private var cursorView: CursorView? = null
+    private var cursorLp: WindowManager.LayoutParams? = null
+    private var cursorVisible = false
+    private var suppressedForRemoteSink = false
     private val hideCursorTask = Runnable { setCursorVisible(false) }
 
     fun buildCursorOverlay(ctx: Context, st: BridgeClient.Status) {
         suppressedForRemoteSink = st.isRemoteSink
-        val view = CursorView(ctx)
-        view.elevation = OverlayUiUtils.dp(ctx, 48f).toFloat()
-        view.translationZ = OverlayUiUtils.dp(ctx, 48f).toFloat()
-        val lp = WindowManager.LayoutParams(
-            44,
-            44,
-            host.winType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT,
+        val view = CursorView(ctx).apply {
+            isClickable = false; isFocusable = false
+            elevation = ctx.dpF(CURSOR_ELEVATION_DP)
+            translationZ = ctx.dpF(CURSOR_ELEVATION_DP)
+            visibility = View.GONE
+        }
+        val lp = OverlayWindowParams.edgeStrip(
+            CURSOR_SIZE_PX, CURSOR_SIZE_PX, host.winType,
+            Gravity.TOP or Gravity.LEFT, st.cursorX - HOTSPOT_OFFSET_X, st.cursorY - HOTSPOT_OFFSET_Y, touchable = false,
         )
-        lp.gravity = Gravity.TOP or Gravity.LEFT
-        lp.x = st.cursorX - 6
-        lp.y = st.cursorY - 4
-        view.visibility = View.GONE
-        cursorView = view
-        cursorLp = lp
-        cursorVisible = false
+        cursorView = view; cursorLp = lp; cursorVisible = false
+
+        host.surfaceHost.register(
+            OverlaySurfaceHost.SurfaceEntry(
+                key = SURFACE_KEY,
+                layer = OverlayLayer.CURSOR,
+                view = view,
+                wmParams = lp,
+                launcherParamsProvider = { ctx.flp(CURSOR_SIZE_PX, CURSOR_SIZE_PX, Gravity.TOP or Gravity.LEFT) },
+                onAttachedToHost = { inLauncher ->
+                    view.translationX = if (inLauncher) lp.x.toFloat() else 0f
+                    view.translationY = if (inLauncher) lp.y.toFloat() else 0f
+                    if (inLauncher) view.bringToFront()
+                },
+            ),
+        )
     }
 
     fun updateRemoteSuppression(st: BridgeClient.Status) {
-        val shouldSuppress = st.isRemoteDisplayActive
-        suppressedForRemoteSink = shouldSuppress
-        if (shouldSuppress) {
+        suppressedForRemoteSink = st.isRemoteDisplayActive
+        if (suppressedForRemoteSink) {
             host.handler.removeCallbacks(hideCursorTask)
             setCursorVisible(false)
         }
@@ -68,12 +75,11 @@ class CursorOverlayController(private val host: OverlayHost) {
     fun bringCursorToFront() {
         val view = cursorView ?: return
         try {
-            if (host.inLauncherHost) {
-                view.bringToFront()
-            } else if (host.extWm != null && view.parent != null) {
-                view.elevation = OverlayUiUtils.dp(host.extCtx ?: host.serviceContext, 48f).toFloat()
-            }
-        } catch (_: Throwable) {}
+            if (host.inLauncherHost) view.bringToFront()
+            else host.surfaceHost.bringLayerToFront(OverlayLayer.CURSOR, inLauncher = false, wm = host.extWm)
+        } catch (t: Throwable) {
+            Log.w(TAG, "bringCursorToFront failed", t)
+        }
     }
 
     fun updateCursorOnExt(x: Float, y: Float, pressing: Boolean) {
@@ -82,51 +88,29 @@ class CursorOverlayController(private val host: OverlayHost) {
         if (suppressedForRemoteSink || host.lastStatus.isRemoteSink) {
             suppressedForRemoteSink = true
             host.handler.removeCallbacks(hideCursorTask)
-            if (cursorVisible || view.visibility == View.VISIBLE) {
-                setCursorVisible(false)
-            }
-            maybeWakeDockOnEdge(x, y)
+            if (cursorVisible || view.visibility == View.VISIBLE) setCursorVisible(false)
+            host.dock.onCursorMoved(x, y)
             return
         }
         try {
-            if (!cursorVisible) {
-                cursorVisible = true
-                view.visibility = View.VISIBLE
-            }
+            if (!cursorVisible) { cursorVisible = true; view.visibility = View.VISIBLE }
             view.setPressing(pressing)
-            lp.x = x.roundToInt() - 6
-            lp.y = y.roundToInt() - 4
+            lp.x = x.roundToInt() - HOTSPOT_OFFSET_X
+            lp.y = y.roundToInt() - HOTSPOT_OFFSET_Y
             if (host.inLauncherHost) {
-                view.translationX = lp.x.toFloat()
-                view.translationY = lp.y.toFloat()
-                view.bringToFront()
+                view.translationX = lp.x.toFloat(); view.translationY = lp.y.toFloat(); view.bringToFront()
             } else {
-                host.extWm?.updateViewLayout(view, lp)
+                host.surfaceHost.updateWindowLayout(view, lp, host.extWm)
             }
             host.handler.removeCallbacks(hideCursorTask)
-            host.handler.postDelayed(hideCursorTask, 7000L)
-            maybeWakeDockOnEdge(x, y)
-        } catch (_: Throwable) {}
-    }
-
-    private fun maybeWakeDockOnEdge(x: Float, y: Float) {
-        val ctx = host.extCtx ?: return
-        if (host.isDockAutoHide() && !host.isOnLauncherHome() && host.overlayH > 0) {
-            val edgeZone = OverlayUiUtils.dp(ctx, 18f)
-            val dockZone = OverlayUiUtils.dp(ctx, 82f)
-            if (host.isDockHidden() &&
-                y >= (host.overlayH - edgeZone) &&
-                abs(x - host.overlayW * 0.5f) <= OverlayUiUtils.dp(ctx, 190f)
-            ) {
-                host.wakeDockFromEdge()
-            } else if (!host.isDockHidden() && y >= (host.overlayH - dockZone)) {
-                host.cancelAutoHideTimer()
-                host.evaluateDockAutoHide(true)
-            }
+            host.handler.postDelayed(hideCursorTask, AUTO_HIDE_TIMEOUT_MS)
+            host.dock.onCursorMoved(x, y)
+        } catch (t: Throwable) {
+            Log.w(TAG, "updateCursorOnExt failed", t)
         }
     }
 
-    fun setCursorVisible(vis: Boolean) {
+    private fun setCursorVisible(vis: Boolean) {
         val effective = vis && !suppressedForRemoteSink
         cursorVisible = effective
         cursorView?.visibility = if (effective) View.VISIBLE else View.GONE
@@ -134,51 +118,28 @@ class CursorOverlayController(private val host: OverlayHost) {
 
     fun detach() {
         host.handler.removeCallbacks(hideCursorTask)
-        host.removeOverlayView(cursorView)
-        cursorView = null
-        cursorLp = null
-        cursorVisible = false
+        host.surfaceHost.unregister(SURFACE_KEY, host.extWm)
+        cursorView = null; cursorLp = null; cursorVisible = false
     }
 
     class CursorView(ctx: Context) : View(ctx) {
-        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFF0F172A.toInt()
-            style = Paint.Style.FILL
-        }
+        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF0F172A.toInt(); style = Paint.Style.FILL }
         private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.STROKE
-            strokeWidth = 2.6f
-            strokeJoin = Paint.Join.ROUND
+            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 2.6f; strokeJoin = Paint.Join.ROUND
         }
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x9938BDF8.toInt()
-            style = Paint.Style.STROKE
-            strokeWidth = 2.5f
+            color = 0x9938BDF8.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.5f
         }
         private val arrow = Path().apply {
-            moveTo(6f, 4f)
-            lineTo(6f, 34f)
-            lineTo(13.5f, 26.5f)
-            lineTo(19f, 38f)
-            lineTo(23.5f, 36f)
-            lineTo(18f, 24.5f)
-            lineTo(28f, 24.5f)
-            close()
+            moveTo(6f, 4f); lineTo(6f, 34f); lineTo(13.5f, 26.5f); lineTo(19f, 38f)
+            lineTo(23.5f, 36f); lineTo(18f, 24.5f); lineTo(28f, 24.5f); close()
         }
         private var pressing = false
 
-        fun setPressing(p: Boolean) {
-            if (pressing != p) {
-                pressing = p
-                invalidate()
-            }
-        }
+        fun setPressing(p: Boolean) { if (pressing != p) { pressing = p; invalidate() } }
 
         override fun onDraw(canvas: Canvas) {
-            if (pressing) {
-                canvas.drawCircle(6f, 6f, 10f, ring)
-            }
+            if (pressing) canvas.drawCircle(6f, 6f, 10f, ring)
             canvas.drawPath(arrow, fill)
             canvas.drawPath(arrow, stroke)
         }

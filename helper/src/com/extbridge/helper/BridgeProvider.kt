@@ -7,63 +7,69 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
-import android.os.Process
+import android.util.Log
+import com.extbridge.helper.protocol.BridgeProtocol.HelperActions
+import com.extbridge.helper.protocol.IpcTrustVerifier
 
 class BridgeProvider : ContentProvider() {
     companion object {
+        private const val TAG = "ExtBridgeProvider"
         private val sProcToken = Binder()
     }
 
     override fun onCreate(): Boolean = true
 
-    private fun isTrustedCaller(): Boolean {
-        val uid = Binder.getCallingUid()
-        if (uid == 0 || uid == 1000 || uid == 2000) return true
-        return uid == Process.myUid()
-    }
-
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle {
-        if (!isTrustedCaller()) {
+        val callerUid = Binder.getCallingUid()
+        if (!IpcTrustVerifier.isTrustedCallerUid(callerUid)) {
+            Log.w(TAG, "Rejected BridgeProvider.call($method) from untrusted uid=$callerUid")
             return Bundle().apply { putBoolean("ok", false) }
         }
-        if ("setBinder" == method && extras != null) {
-            if (BridgeService.sUserStopping) {
-                return Bundle().apply { putBoolean("ok", false) }
-            }
-            val b = extras.getBinder("cb")
-            var descOk = false
-            if (b != null && b.pingBinder()) {
-                try {
-                    descOk = BridgeClient.BINDER_DESC == b.interfaceDescriptor
-                } catch (_: Throwable) {}
-            }
-            if (descOk) {
-                BridgeClient.setBinder(b)
-                BridgeService.ensureStarted(context)
-                BridgeService.refreshFromReceiver(context)
-                return Bundle().apply {
-                    putBoolean("ok", true)
-                    putBinder("proc", sProcToken)
-                }
-            }
-        } else if ("syncState" == method) {
-            val ctx = context
-            if (ctx != null && !BridgeService.sUserStopping) {
-                BridgeService.refreshFromReceiver(ctx)
-                try {
-                    val syncIntent = Intent("com.extbridge.helper.STATE_SYNC").setPackage(ctx.packageName)
-                    ctx.sendBroadcast(syncIntent)
-                } catch (_: Throwable) {}
-            }
-            return Bundle().apply { putBoolean("ok", true) }
-        } else if ("mirEdgeCapture" == method && extras != null) {
-            if (!BridgeService.sUserStopping) {
-                val enter = extras.getBoolean("enter", true)
-                BridgeService.onEdgeCaptureFromDaemon(enter)
-            }
-            return Bundle().apply { putBoolean("ok", true) }
+        return when (method) {
+            HelperActions.PROVIDER_METHOD_SET_BINDER -> handleSetBinder(extras)
+            HelperActions.PROVIDER_METHOD_SYNC_STATE -> handleSyncState()
+            HelperActions.PROVIDER_METHOD_MIR_EDGE_CAPTURE -> handleMirrorEdgeCapture(extras)
+            else -> Bundle()
         }
-        return Bundle()
+    }
+
+    private fun handleSetBinder(extras: Bundle?): Bundle {
+        if (extras == null || BridgeService.sUserStopping) {
+            return Bundle().apply { putBoolean("ok", false) }
+        }
+        val cb = extras.getBinder(HelperActions.EXTRA_CALLBACK_BINDER)
+        if (!IpcTrustVerifier.isValidDaemonBinder(cb)) {
+            return Bundle()
+        }
+        BridgeClient.setBinder(cb)
+        BridgeService.ensureStarted(context)
+        BridgeService.refreshFromReceiver(context)
+        return Bundle().apply {
+            putBoolean("ok", true)
+            putBinder(HelperActions.EXTRA_PROC_TOKEN, sProcToken)
+        }
+    }
+
+    private fun handleSyncState(): Bundle {
+        val ctx = context
+        if (ctx != null && !BridgeService.sUserStopping) {
+            BridgeService.refreshFromReceiver(ctx)
+            try {
+                val syncIntent = Intent(HelperActions.STATE_SYNC).setPackage(ctx.packageName)
+                ctx.sendBroadcast(syncIntent)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to broadcast STATE_SYNC", t)
+            }
+        }
+        return Bundle().apply { putBoolean("ok", true) }
+    }
+
+    private fun handleMirrorEdgeCapture(extras: Bundle?): Bundle {
+        if (extras != null && !BridgeService.sUserStopping) {
+            val enter = extras.getBoolean(HelperActions.EXTRA_EDGE_ENTER, true)
+            BridgeService.onEdgeCaptureFromDaemon(enter)
+        }
+        return Bundle().apply { putBoolean("ok", true) }
     }
 
     override fun query(

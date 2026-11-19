@@ -1,7 +1,6 @@
 package com.extbridge.helper
 
 import android.app.Activity
-import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -10,6 +9,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -17,6 +17,8 @@ import android.view.View
 import android.view.WindowManager
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import com.extbridge.helper.protocol.BridgeProtocol.CapturedMouseAction
+import com.extbridge.helper.service.DisplayLaunchHelper
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -29,10 +31,11 @@ import java.util.concurrent.Executors
 class SideMouseCaptureActivity : Activity() {
 
     companion object {
+        private const val TAG = "ExtSideMouseCapture"
+
         @Volatile
         private var sActive: SideMouseCaptureActivity? = null
 
-        @JvmStatic
         fun finishActiveIfAny() {
             val act = sActive
             if (act != null && !act.mClosing) {
@@ -43,30 +46,16 @@ class SideMouseCaptureActivity : Activity() {
             }
         }
 
-        @JvmStatic
         fun launch(ctx: Context?) {
             if (ctx == null) return
-            try {
-                val i = Intent(ctx, SideMouseCaptureActivity::class.java).apply {
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
-                            Intent.FLAG_ACTIVITY_NO_ANIMATION,
-                    )
-                }
-                if (Build.VERSION.SDK_INT >= 26) {
-                    val ao = ActivityOptions.makeBasic()
-                    ao.setLaunchDisplayId(0)
-                    try {
-                        ActivityOptions::class.java
-                            .getMethod("setLaunchWindowingMode", Int::class.java)
-                            .invoke(ao, 1)
-                    } catch (_: Throwable) {}
-                    ctx.startActivity(i, ao.toBundle())
-                } else {
-                    ctx.startActivity(i)
-                }
-            } catch (_: Throwable) {}
+            val intent = Intent(ctx, SideMouseCaptureActivity::class.java).apply {
+                addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS or
+                        Intent.FLAG_ACTIVITY_NO_ANIMATION,
+                )
+            }
+            DisplayLaunchHelper.launchOnDisplay0(ctx, intent, windowingMode = 1)
         }
     }
 
@@ -76,12 +65,11 @@ class SideMouseCaptureActivity : Activity() {
 
     @Volatile
     private var mClosing = false
-    private var mBackCallback: Any? = null
+    private var mBackCallback: OnBackInvokedCallback? = null
 
     private val mCaptureWatchdog = Runnable {
         if (!mClosing && !isFinishing) {
-            val ok = Build.VERSION.SDK_INT >= 26 && mCaptureView?.hasPointerCapture() == true
-            if (!ok) {
+            if (mCaptureView?.hasPointerCapture() != true) {
                 exitDaemonCaptureAsync()
                 finishSilently()
             }
@@ -103,14 +91,12 @@ class SideMouseCaptureActivity : Activity() {
             setBackgroundColor(Color.TRANSPARENT)
             isFocusable = true
             isFocusableInTouchMode = true
-            if (Build.VERSION.SDK_INT >= 26) {
-                setOnCapturedPointerListener { _, ev ->
-                    BridgeService.handleCapturedPointerEventStatic(
-                        ev,
-                        mExec,
-                        Runnable { runOnUiThread { finishSilently() } },
-                    )
-                }
+            setOnCapturedPointerListener { _, ev ->
+                BridgeService.handleCapturedPointerEventStatic(
+                    ev,
+                    mExec,
+                    Runnable { runOnUiThread { finishSilently() } },
+                )
             }
         }
         mCaptureView = captureView
@@ -127,7 +113,9 @@ class SideMouseCaptureActivity : Activity() {
                     cb,
                 )
                 mBackCallback = cb
-            } catch (_: Throwable) {}
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to register OnBackInvokedCallback", t)
+            }
         }
         mUiHandler.postDelayed(mCaptureWatchdog, 600L)
     }
@@ -156,15 +144,15 @@ class SideMouseCaptureActivity : Activity() {
             mUiHandler.postDelayed(mCaptureWatchdog, 320L)
             return
         }
-        val captureView = mCaptureView
-        if (Build.VERSION.SDK_INT >= 26 && captureView != null) {
-            try {
-                captureView.requestFocus()
-                captureView.requestPointerCapture()
-            } catch (_: Throwable) {}
-            mUiHandler.removeCallbacks(mCaptureWatchdog)
-            mUiHandler.postDelayed(mCaptureWatchdog, 280L)
+        val captureView = mCaptureView ?: return
+        try {
+            captureView.requestFocus()
+            captureView.requestPointerCapture()
+        } catch (t: Throwable) {
+            Log.w(TAG, "requestPointerCapture failed on focus gain", t)
         }
+        mUiHandler.removeCallbacks(mCaptureWatchdog)
+        mUiHandler.postDelayed(mCaptureWatchdog, 280L)
     }
 
     override fun onPointerCaptureChanged(hasCapture: Boolean) {
@@ -173,11 +161,15 @@ class SideMouseCaptureActivity : Activity() {
             mUiHandler.removeCallbacks(mCaptureWatchdog)
         } else if (!mClosing && !isFinishing) {
             val captureView = mCaptureView
-            if (Build.VERSION.SDK_INT >= 26 && captureView != null && hasWindowFocus()) {
+            if (captureView != null && hasWindowFocus()) {
                 captureView.post {
                     val v = mCaptureView
                     if (!mClosing && v != null && hasWindowFocus()) {
-                        try { v.requestPointerCapture() } catch (_: Throwable) {}
+                        try {
+                            v.requestPointerCapture()
+                        } catch (t: Throwable) {
+                            Log.d(TAG, "Retry requestPointerCapture failed: ${t.message}")
+                        }
                     }
                 }
             }
@@ -206,11 +198,13 @@ class SideMouseCaptureActivity : Activity() {
         val exec = mExec
         if (exec != null && !exec.isShutdown) {
             try {
-                exec.execute { BridgeClient.sendCapturedMirrorMouse(5, 0f, 0f, 0f) }
+                exec.execute { BridgeClient.sendCapturedMirrorMouse(CapturedMouseAction.EXIT_CAPTURE, 0f, 0f, 0f) }
                 return
-            } catch (_: Throwable) {}
+            } catch (t: Throwable) {
+                Log.d(TAG, "FIFO executor unavailable for EXIT_CAPTURE; using fallback thread: ${t.message}")
+            }
         }
-        Thread { BridgeClient.sendCapturedMirrorMouse(5, 0f, 0f, 0f) }.start()
+        Thread { BridgeClient.sendCapturedMirrorMouse(CapturedMouseAction.EXIT_CAPTURE, 0f, 0f, 0f) }.start()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -227,29 +221,31 @@ class SideMouseCaptureActivity : Activity() {
         if (mClosing) return
         mClosing = true
         mUiHandler.removeCallbacksAndMessages(null)
-        if (Build.VERSION.SDK_INT >= 26) {
-            try { mCaptureView?.releasePointerCapture() } catch (_: Throwable) {}
+        try {
+            mCaptureView?.releasePointerCapture()
+        } catch (t: Throwable) {
+            Log.d(TAG, "releasePointerCapture failed during finish: ${t.message}")
         }
-        if (Build.VERSION.SDK_INT >= 21) {
-            finishAndRemoveTask()
-        } else {
-            finish()
-        }
+        finishAndRemoveTask()
         overridePendingTransition(0, 0)
     }
 
     override fun onDestroy() {
         if (sActive === this) sActive = null
         mUiHandler.removeCallbacksAndMessages(null)
-        if (Build.VERSION.SDK_INT >= 33 && mBackCallback is OnBackInvokedCallback) {
-            try {
-                onBackInvokedDispatcher.unregisterOnBackInvokedCallback(mBackCallback as OnBackInvokedCallback)
-            } catch (_: Throwable) {}
+        if (Build.VERSION.SDK_INT >= 33) {
+            mBackCallback?.let { cb ->
+                try {
+                    onBackInvokedDispatcher.unregisterOnBackInvokedCallback(cb)
+                } catch (t: Throwable) {
+                    Log.d(TAG, "unregisterOnBackInvokedCallback failed: ${t.message}")
+                }
+            }
             mBackCallback = null
         }
         if (!mClosing) {
             mClosing = true
-            Thread { BridgeClient.sendCapturedMirrorMouse(5, 0f, 0f, 0f) }.start()
+            Thread { BridgeClient.sendCapturedMirrorMouse(CapturedMouseAction.EXIT_CAPTURE, 0f, 0f, 0f) }.start()
         }
         mExec?.shutdownNow()
         mExec = null

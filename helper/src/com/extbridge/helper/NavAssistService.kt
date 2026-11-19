@@ -13,30 +13,16 @@ class NavAssistService : AccessibilityService() {
         @Volatile
         private var sOnStateChanged: Runnable? = null
 
-        @JvmStatic
         fun isRunning(): Boolean = sInstance != null
 
-        @JvmStatic
         fun getInstance(): NavAssistService? = sInstance
 
-        @JvmStatic
         fun setOnStateChanged(r: Runnable?) {
             sOnStateChanged = r
         }
 
-        @JvmStatic
-        fun performBack() {
-            sInstance?.performGlobalAction(GLOBAL_ACTION_BACK)
-        }
-
-        @JvmStatic
         fun performHome() {
             sInstance?.performGlobalAction(GLOBAL_ACTION_HOME)
-        }
-
-        @JvmStatic
-        fun performRecents() {
-            sInstance?.performGlobalAction(GLOBAL_ACTION_RECENTS)
         }
     }
 
