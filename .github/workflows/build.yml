@@ -81,11 +81,33 @@ jobs:
             }
           }
           if ($rawB64 -and -not [string]::IsNullOrWhiteSpace($rawB64) -and $env:HAS_KEYSTORE_PASS -eq '1') {
-            $ksPath = Join-Path $env:RUNNER_TEMP "exthelper.p12"
-            $cleanB64 = ($rawB64 -replace '\s+', '')
-            [IO.File]::WriteAllBytes($ksPath, [Convert]::FromBase64String($cleanB64))
-            "EXTBRIDGE_KEYSTORE=$ksPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-            Write-Host "Staged release keystore from GitHub Secrets."
+            $rawLen = $rawB64.Length
+            $miiMatch = [regex]::Match($rawB64, 'MII[A-Za-z0-9+/=\s\-_]{400,}')
+            $candidate = if ($miiMatch.Success) { $miiMatch.Value } else { $rawB64 }
+            $cleanB64 = (($candidate -replace '\s+', '') -replace '-', '+' -replace '_', '/').Trim('"', "'")
+            $rem = $cleanB64.Length % 4
+            if ($rem -eq 2) { $cleanB64 += '==' }
+            elseif ($rem -eq 3) { $cleanB64 += '=' }
+            $startsMii = $cleanB64.StartsWith('MII')
+            try {
+              $ksBytes = [Convert]::FromBase64String($cleanB64)
+              if ($ksBytes.Length -lt 500 -or $ksBytes[0] -ne 0x30) {
+                throw "Decoded bytes length=$($ksBytes.Length) is not a valid PKCS#12 ASN.1 archive (expected ~2534 bytes)."
+              }
+              $ksPath = Join-Path $env:RUNNER_TEMP "exthelper.p12"
+              [IO.File]::WriteAllBytes($ksPath, $ksBytes)
+              "EXTBRIDGE_KEYSTORE=$ksPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Write-Host "Staged release keystore from GitHub Secrets ($($ksBytes.Length) bytes)."
+            } catch {
+              $diag = "EXTBRIDGEBASE64 decode failed (rawLen=$rawLen, cleanLen=$($cleanB64.Length), startsWithMII=$startsMii): $($_.Exception.Message)"
+              if ($env:IS_RELEASE_PUBLISH -eq '1') {
+                Write-Host "::error title=Invalid EXTBRIDGEBASE64 Secret::$diag"
+                throw $diag
+              } else {
+                Write-Host "::warning title=Invalid EXTBRIDGEBASE64 Secret::$diag (falling back to unsigned CI verification build)"
+                "EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              }
+            }
           } else {
             "EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             Write-Host "No keystore secrets configured; non-release CI will produce unsigned verification APK only."
