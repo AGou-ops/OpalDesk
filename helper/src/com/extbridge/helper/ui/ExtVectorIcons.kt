@@ -287,4 +287,20 @@ object ExtVectorIcons {
             moveTo(6f, 11.5f); lineTo(18f, 11.5f)
         }
     }
+
+    val LaptopMac: ImageVector by lazy {
+        strokeIcon("LaptopMac") {
+            moveTo(4.5f, 5.5f); lineTo(19.5f, 5.5f); lineTo(19.5f, 16f); lineTo(4.5f, 16f); close()
+            moveTo(2.5f, 18.5f); lineTo(21.5f, 18.5f)
+        }
+    }
+
+    val UsbCable: ImageVector by lazy {
+        strokeIcon("UsbCable") {
+            moveTo(12f, 20f); lineTo(12f, 5f)
+            moveTo(9.5f, 7.5f); lineTo(12f, 4.5f); lineTo(14.5f, 7.5f)
+            moveTo(12f, 15f); lineTo(7.5f, 11.5f); lineTo(7.5f, 9f)
+            moveTo(12f, 13f); lineTo(16.5f, 10f); lineTo(16.5f, 8f)
+        }
+    }
 }

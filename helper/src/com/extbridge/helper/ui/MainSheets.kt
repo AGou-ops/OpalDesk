@@ -56,8 +56,10 @@ import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.overlay.OverlayBottomSheet
 import top.yukonga.miuix.kmp.overlay.OverlayDialog
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
+import top.yukonga.miuix.kmp.preference.SliderPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import kotlin.math.roundToInt
 
 data class WidgetCandidateItem(
     val info: AppWidgetProviderInfo,
@@ -71,6 +73,7 @@ fun DiagnosticsSheet(
     show: Boolean,
     status: BridgeClient.Status,
     onRebuild: () -> Unit,
+    onDisconnectRemote: () -> Unit = {},
     onDismiss: () -> Unit,
 ) {
     OverlayBottomSheet(
@@ -81,6 +84,7 @@ fun DiagnosticsSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .padding(bottom = 16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -89,14 +93,57 @@ fun DiagnosticsSheet(
             ) {
                 DiagRow("核心守护进程", if (status.connected) "在线 (Binder 已连接)" else "未激活")
                 DiagDivider()
+                DiagRow(
+                    "输出通道类型",
+                    if (status.connected) {
+                        val base = BridgeClient.sinkTypeLabel(status.sinkType)
+                        if (status.isRemoteSink && status.remotePeerName.isNotBlank()) {
+                            "$base · ${status.remotePeerName}"
+                        } else {
+                            base
+                        }
+                    } else {
+                        "--"
+                    },
+                )
+                DiagDivider()
                 DiagRow("当前输出模式", if (status.connected) BridgeClient.mirrorModeLabel(status.mirrorMode) else "--")
+                DiagDivider()
+                DiagRow(
+                    "当前窗口布局",
+                    if (status.connected) {
+                        val base = BridgeClient.layoutModeLabel(status.activeLayoutMode)
+                        if (status.isAdaptiveSingleEnabled) "$base · 黄金默认 ${status.defaultSingleWidthDp}dp" else base
+                    } else {
+                        "--"
+                    },
+                )
+                if (status.connected && status.isRemoteSink) {
+                    DiagDivider()
+                    DiagRow(
+                        "实时视频流指标",
+                        "${BridgeClient.formatStreamFps(status.streamFpsX100)} · ${BridgeClient.formatBitrateMbps(status.streamBitrateKbps)}",
+                        valueColor = HyperGreen,
+                    )
+                }
+                DiagDivider()
+                DiagRow(
+                    "无线大屏监听",
+                    if (!status.connected) {
+                        "--"
+                    } else if (status.isWifiServerEnabled) {
+                        "已开启 · 端口 ${status.wifiServerPort}"
+                    } else {
+                        "已关闭"
+                    },
+                )
                 DiagDivider()
                 DiagRow(
                     "物理外接显示器",
                     if (status.connected && status.extId > 0) {
                         "Display #${status.extId} · ${status.physW}×${status.physH} @ ${String.format("%.1f", status.physFps)}Hz"
                     } else {
-                        "未检测到外接显示器"
+                        "未检测到物理外接显示器"
                     },
                 )
                 DiagDivider()
@@ -123,11 +170,16 @@ fun DiagnosticsSheet(
                     },
                 )
                 DiagDivider()
-                val injectBlocked = status.connected && status.injectStatus == -1
+                val injectBlocked = status.connected && status.injectStatus == BridgeClient.INJECT_STATUS_BLOCKED
+                val injectText = if (!status.connected) "--" else BridgeClient.injectStatusLabel(status.injectStatus)
                 DiagRow(
-                    "输入注入权限",
-                    if (!status.connected) "--" else if (injectBlocked) "被系统拦截 (-1)" else "正常可用",
-                    valueColor = if (injectBlocked) HyperRed else if (status.connected) HyperGreen else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    "输入注入状态",
+                    injectText,
+                    valueColor = when {
+                        !status.connected -> MiuixTheme.colorScheme.onSurfaceVariantSummary
+                        injectBlocked -> HyperRed
+                        else -> HyperGreen
+                    },
                 )
             }
 
@@ -142,6 +194,21 @@ fun DiagnosticsSheet(
                         color = HyperRed,
                     )
                 }
+            }
+
+            if (status.connected && status.isRemoteSink) {
+                TextButton(
+                    text = "断开当前 Mac 远端连接",
+                    onClick = {
+                        onDisconnectRemote()
+                        onDismiss()
+                    },
+                    colors = ButtonDefaults.textButtonColors(
+                        color = HyperRed.copy(alpha = 0.14f),
+                        textColor = HyperRed,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                )
             }
 
             Row(
@@ -1190,6 +1257,534 @@ fun MirrorWidgetSlotSheet(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun RemoteMacDisplaySheet(
+    show: Boolean,
+    status: BridgeClient.Status,
+    localIpv4: String,
+    wifiBusy: Boolean,
+    codecPref: Int,
+    maxBitrateMbps: Int,
+    audioEnabled: Boolean,
+    trustedClients: List<BridgeClient.TrustedMacClient>,
+    trustedLoading: Boolean,
+    onToggleWifiServer: (Boolean) -> Unit,
+    onRegeneratePin: () -> Unit,
+    onCopyText: (String, String) -> Unit,
+    onDisconnectRemote: () -> Unit,
+    onCodecPrefChange: (Int) -> Unit,
+    onMaxBitrateChange: (Int) -> Unit,
+    onAudioEnabledChange: (Boolean) -> Unit,
+    onApplyStreamPrefs: () -> Unit,
+    onRefreshTrusted: () -> Unit,
+    onRevokeClient: (String) -> Unit,
+    onRevokeAllClients: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    OverlayBottomSheet(
+        show = show,
+        title = "Mac / 无线大屏",
+        onDismissRequest = onDismiss,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 580.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            if (!status.connected) {
+                Card(
+                    colors = CardDefaults.defaultColors(color = HyperAmber.copy(alpha = 0.14f)),
+                    insideMargin = PaddingValues(14.dp),
+                ) {
+                    Text(
+                        text = "请先激活 ExtBridge 核心守护进程后再启用无线大屏或管理已信任的 Mac 设备。",
+                        fontSize = 13.sp,
+                        color = HyperAmber,
+                    )
+                }
+            }
+
+            // Active remote Mac session banner
+            if (status.connected && status.isRemoteDisplayActive) {
+                val (channelBadge, accent) = when (status.sinkType) {
+                    BridgeClient.SINK_REMOTE_USB -> "USB 有线直连" to HyperGreen
+                    BridgeClient.SINK_REMOTE_WIFI_ADB -> "无线 ADB 隧道" to HyperBlue
+                    else -> "Wi-Fi 无线直连" to HyperPurple
+                }
+                val peerName = status.remotePeerName.ifBlank { "Mac 客户端" }
+                Card(
+                    colors = CardDefaults.defaultColors(color = accent.copy(alpha = 0.13f)),
+                    insideMargin = PaddingValues(14.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = peerName,
+                                fontSize = 15.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MiuixTheme.colorScheme.onSurfaceContainer,
+                            )
+                            Spacer(Modifier.height(2.dp))
+                            Text(
+                                text = "${status.virtW}×${status.virtH} · ${BridgeClient.formatStreamFps(status.streamFpsX100)} · ${BridgeClient.formatBitrateMbps(status.streamBitrateKbps)}",
+                                fontSize = 12.sp,
+                                fontFamily = FontFamily.Monospace,
+                                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                        StatusPillBadge(
+                            label = channelBadge,
+                            dotColor = accent,
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    TextButton(
+                        text = "断开当前 Mac 连接",
+                        onClick = onDisconnectRemote,
+                        colors = ButtonDefaults.textButtonColors(
+                            color = HyperRed.copy(alpha = 0.16f),
+                            textColor = HyperRed,
+                        ),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+
+            // 1. Wireless Remote Server & Pairing PIN
+            SmallTitle("无线大屏服务（TLS 1.3 + Bonjour）", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp))
+            Card {
+                SwitchPreference(
+                    title = "开启局域网无线大屏服务",
+                    summary = if (status.isWifiServerEnabled) {
+                        "已开启并广播 _extbridge._tcp.，同局域网 Mac 可自动发现"
+                    } else {
+                        "默认关闭以保护安全；有线 USB 连接 Mac 无需开启此开关"
+                    },
+                    checked = status.isWifiServerEnabled,
+                    enabled = status.connected && !wifiBusy,
+                    onCheckedChange = onToggleWifiServer,
+                )
+
+                if (status.connected && status.isWifiServerEnabled) {
+                    val port = if (status.wifiServerPort > 0) status.wifiServerPort else BridgeClient.DEFAULT_WIFI_REMOTE_PORT
+                    val endpoint = "$localIpv4:$port"
+                    val shortFp = status.shortCertFingerprint.ifBlank { "等待证书初始化…" }
+                    val rawPin = status.activePairingPin.trim()
+                    val formattedPin = if (rawPin.length == 6) {
+                        "${rawPin.substring(0, 3)}  ${rawPin.substring(3, 6)}"
+                    } else {
+                        rawPin.ifBlank { "------" }
+                    }
+
+                    DiagDivider()
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "局域网监听地址",
+                                    fontSize = 12.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                )
+                                Text(
+                                    text = endpoint,
+                                    fontSize = 14.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                            }
+                            TextButton(
+                                text = "复制地址",
+                                onClick = { onCopyText(endpoint, "已复制局域网地址 $endpoint") },
+                                insideMargin = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "TLS 证书指纹短码（首次配对核验）",
+                                    fontSize = 12.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                )
+                                Text(
+                                    text = shortFp,
+                                    fontSize = 13.5.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = MiuixTheme.colorScheme.primary,
+                                )
+                            }
+                            if (status.wifiCertFingerprint.isNotBlank()) {
+                                TextButton(
+                                    text = "复制指纹",
+                                    onClick = { onCopyText(status.wifiCertFingerprint, "已复制完整 SHA-256 证书指纹") },
+                                    insideMargin = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                )
+                            }
+                        }
+
+                        // Large 6-digit one-time Pairing PIN card
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(HyperBlue.copy(alpha = 0.11f))
+                                .border(1.dp, HyperBlue.copy(alpha = 0.30f), RoundedCornerShape(16.dp))
+                                .padding(horizontal = 16.dp, vertical = 14.dp),
+                        ) {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                Text(
+                                    text = "一次性 6 位配对 PIN 码",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MiuixTheme.colorScheme.primary,
+                                )
+                                Text(
+                                    text = formattedPin,
+                                    fontSize = 32.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    letterSpacing = 4.sp,
+                                    color = MiuixTheme.colorScheme.onSurfaceContainer,
+                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    TextButton(
+                                        text = if (wifiBusy) "刷新中…" else "刷新 PIN 码",
+                                        enabled = !wifiBusy,
+                                        onClick = onRegeneratePin,
+                                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    if (rawPin.isNotEmpty()) {
+                                        TextButton(
+                                            text = "复制 PIN",
+                                            onClick = { onCopyText(rawPin, "已复制配对 PIN 码") },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2. Streaming Codec, Bitrate & Audio Preferences
+            SmallTitle("视频编码与音频回传偏好", insideMargin = PaddingValues(horizontal = 4.dp, vertical = 2.dp))
+            Card {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "编码器偏好",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Medium,
+                    )
+                    TabRowWithContour(
+                        tabs = listOf("自动 HEVC (推荐)", "兼容 H.264"),
+                        selectedTabIndex = codecPref.coerceIn(0, 1),
+                        onTabSelected = onCodecPrefChange,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                DiagDivider()
+                SliderPreference(
+                    title = "视频流码率上限",
+                    summary = "建议 Wi-Fi 使用 12–20 Mbps，USB 有线可拉高至 24–32 Mbps",
+                    value = maxBitrateMbps.coerceIn(4, 32).toFloat(),
+                    valueRange = 4f..32f,
+                    valueText = "$maxBitrateMbps Mbps",
+                    showKeyPoints = true,
+                    keyPoints = listOf(4f, 8f, 16f, 24f, 32f),
+                    onValueChange = { v ->
+                        val stepped = ((v / 2f).roundToInt() * 2).coerceIn(4, 32)
+                        onMaxBitrateChange(stepped)
+                    },
+                )
+                DiagDivider()
+                SwitchPreference(
+                    title = "同步回传系统音频到 Mac",
+                    summary = "通过 48kHz AAC-LC 低延迟推送播放音频至 Mac 扬声器",
+                    checked = audioEnabled,
+                    onCheckedChange = onAudioEnabledChange,
+                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                ) {
+                    TextButton(
+                        text = "应用流媒体偏好",
+                        enabled = status.connected,
+                        onClick = onApplyStreamPrefs,
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
+
+            // 3. Trusted Mac Clients
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                SmallTitle(
+                    "已信任的 Mac 设备 (${trustedClients.size})",
+                    insideMargin = PaddingValues(vertical = 2.dp),
+                )
+                TextButton(
+                    text = if (trustedLoading) "读取中…" else "刷新列表",
+                    enabled = status.connected && !trustedLoading,
+                    onClick = onRefreshTrusted,
+                    insideMargin = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                )
+            }
+            Card(insideMargin = PaddingValues(14.dp)) {
+                if (trustedClients.isEmpty()) {
+                    Text(
+                        text = if (trustedLoading) {
+                            "正在读取守护进程信任列表…"
+                        } else {
+                            "暂无已信任的 Mac 设备。在 Mac 端使用上方 6 位 PIN 完成首次配对后，将自动保存信任令牌。"
+                        },
+                        fontSize = 12.5.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    )
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        trustedClients.forEachIndexed { idx, client ->
+                            if (idx > 0) DiagDivider()
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                                    Text(
+                                        text = client.clientName,
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        text = "ID: ${client.clientId.take(20)}",
+                                        fontSize = 11.5.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                                TextButton(
+                                    text = "撤销",
+                                    onClick = { onRevokeClient(client.clientId) },
+                                    colors = ButtonDefaults.textButtonColors(
+                                        color = HyperRed.copy(alpha = 0.14f),
+                                        textColor = HyperRed,
+                                    ),
+                                    insideMargin = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                        TextButton(
+                            text = "撤销全部已信任 Mac 设备",
+                            onClick = onRevokeAllClients,
+                            colors = ButtonDefaults.textButtonColors(
+                                color = HyperRed.copy(alpha = 0.14f),
+                                textColor = HyperRed,
+                            ),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun AdaptiveSingleSizeCard(
+    enabled: Boolean,
+    defaultWidthDp: Int,
+    daemonConnected: Boolean,
+    onEnabledChange: (Boolean) -> Unit,
+    onSelectPresetWidth: (Int) -> Unit,
+    onSliderWidthChange: (Int) -> Unit,
+) {
+    val clampedDp = defaultWidthDp.coerceIn(360, 1100)
+    val presets = remember {
+        listOf(
+            460 to "460dp 精致手机",
+            680 to "680dp 折叠屏",
+            900 to "900dp 平板双栏",
+        )
+    }
+
+    Card {
+        SwitchPreference(
+            title = "单应用默认黄金尺寸",
+            summary = "打开单个应用自动居中精致比例，拖动窗口左右边缘实时重排并分应用记忆宽度",
+            checked = enabled,
+            onCheckedChange = onEnabledChange,
+        )
+        DiagDivider()
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "黄金宽度快捷预设",
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MiuixTheme.colorScheme.onSurfaceContainer,
+                )
+                StatusPillBadge(
+                    label = if (enabled) BridgeClient.classifyWidthPresetLabel(clampedDp, false) else "已关闭 (默认全屏)",
+                    dotColor = if (enabled) HyperBlue else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                presets.forEach { (wDp, label) ->
+                    val active = enabled && kotlin.math.abs(clampedDp - wDp) <= 10
+                    TextButton(
+                        text = label,
+                        enabled = enabled,
+                        onClick = { onSelectPresetWidth(wDp) },
+                        colors = if (active) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
+                        insideMargin = PaddingValues(horizontal = 6.dp, vertical = 7.dp),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        }
+        DiagDivider()
+        SliderPreference(
+            title = "默认单应用宽度",
+            summary = if (daemonConnected) {
+                "拖动实时同步守护进程（360–1100dp，双击窗口边缘手柄可一键切换全屏）"
+            } else {
+                "本地已保存偏好，激活守护进程后自动应用"
+            },
+            value = clampedDp.toFloat(),
+            valueRange = 360f..1100f,
+            valueText = "${clampedDp} dp",
+            enabled = enabled,
+            showKeyPoints = true,
+            keyPoints = listOf(460f, 680f, 900f),
+            onValueChange = { raw ->
+                val stepped = ((raw / 10f).roundToInt() * 10).coerceIn(360, 1100)
+                onSliderWidthChange(stepped)
+            },
+        )
+    }
+}
+
+@Composable
+fun InputEngineCard(
+    selectedBackendMode: Int,
+    daemonConnected: Boolean,
+    injectStatus: Int,
+    onSelectBackendMode: (Int) -> Unit,
+) {
+    val options = remember {
+        listOf(
+            "自动 (优先系统/UHID 兜底)",
+            "强制 UHID 虚拟键鼠",
+            "仅系统注入",
+        )
+    }
+    val selectedIdx = when (selectedBackendMode) {
+        BridgeClient.INPUT_BACKEND_UHID -> 1
+        BridgeClient.INPUT_BACKEND_INJECT_EVENTS -> 2
+        else -> 0
+    }
+    val (statusLabel, statusColor) = when {
+        !daemonConnected -> "核心服务未连接" to MiuixTheme.colorScheme.onSurfaceVariantSummary
+        injectStatus == BridgeClient.INJECT_STATUS_UHID -> "UHID 硬件外设注入已激活" to HyperGreen
+        injectStatus == BridgeClient.INJECT_STATUS_BLOCKED -> "系统注入被拦截 · 建议切换 UHID" to HyperRed
+        else -> "系统事件注入正常" to HyperGreen
+    }
+
+    Card {
+        OverlayDropdownPreference(
+            title = "输入注入引擎",
+            summary = "HyperOS 3 拦截系统注入时，自动或手动切换 UHID 虚拟键鼠即可流畅操控大屏",
+            items = options,
+            selectedIndex = selectedIdx,
+            onSelectedIndexChange = { idx ->
+                val targetMode = when (idx) {
+                    1 -> BridgeClient.INPUT_BACKEND_UHID
+                    2 -> BridgeClient.INPUT_BACKEND_INJECT_EVENTS
+                    else -> BridgeClient.INPUT_BACKEND_AUTO
+                }
+                onSelectBackendMode(targetMode)
+            },
+        )
+        DiagDivider()
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 11.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "当前运行状态",
+                fontSize = 13.sp,
+                color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+            )
+            StatusPillBadge(label = statusLabel, dotColor = statusColor)
         }
     }
 }

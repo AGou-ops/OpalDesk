@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import com.extbridge.helper.ui.ActivationSheet
+import com.extbridge.helper.ui.AdaptiveSingleSizeCard
 import com.extbridge.helper.ui.CustomMirrorColorDialog
 import com.extbridge.helper.ui.CustomResolutionDialog
 import com.extbridge.helper.ui.DevOptionsGuideDialog
@@ -84,11 +85,13 @@ import com.extbridge.helper.ui.HyperBlue
 import com.extbridge.helper.ui.HyperGreen
 import com.extbridge.helper.ui.HyperPurple
 import com.extbridge.helper.ui.HyperRed
+import com.extbridge.helper.ui.InputEngineCard
 import com.extbridge.helper.ui.MirrorLayoutSelectorGrid
 import com.extbridge.helper.ui.MirrorMemoDialog
 import com.extbridge.helper.ui.MirrorPresetManagerSheet
 import com.extbridge.helper.ui.MirrorWidgetSlotSheet
 import com.extbridge.helper.ui.PermissionChecklistDialog
+import com.extbridge.helper.ui.RemoteMacDisplaySheet
 import com.extbridge.helper.ui.StatusPillBadge
 import com.extbridge.helper.ui.WidgetCandidateItem
 import com.extbridge.helper.ui.isEffectiveDark
@@ -157,6 +160,14 @@ class MainActivity : ComponentActivity() {
         private const val KEY_STARTUP_PERMS_DONE = "startup_perms_done"
         private const val KEY_NOTIF_ASKED = "notif_asked"
         private const val KEY_DEV_GUIDE_DONE = "dev_guide_done"
+
+        private const val PREF_REMOTE_STREAM = "extbridge_remote_stream_prefs"
+        private const val KEY_REMOTE_CODEC = "remote_codec_pref"
+        private const val KEY_REMOTE_BITRATE_MBPS = "remote_max_bitrate_mbps"
+        private const val KEY_REMOTE_AUDIO = "remote_audio_enabled"
+        private const val KEY_ADAPTIVE_SINGLE_ENABLED = "adaptive_single_enabled"
+        private const val KEY_DEFAULT_SINGLE_WIDTH_DP = "default_single_width_dp"
+        private const val KEY_INPUT_BACKEND_MODE = "input_backend_mode"
 
         private const val REQ_NOTIF_STARTUP = 3901
         private const val REQ_NOTIF_DEV_GATE = 3902
@@ -235,6 +246,22 @@ class MainActivity : ComponentActivity() {
     private var showCustomColorDialog by mutableStateOf(false)
     private var showWidgetSheet by mutableStateOf(false)
     private var activeWidgetSlot by mutableIntStateOf(0)
+    private var showRemoteMacSheet by mutableStateOf(false)
+
+    // Mac / Wireless remote display state
+    private var localLanIp by mutableStateOf("127.0.0.1")
+    private var wifiServerBusy by mutableStateOf(false)
+    private var remoteCodecPref by mutableIntStateOf(BridgeClient.CODEC_PREF_AUTO_HEVC)
+    private var remoteMaxBitrateMbps by mutableIntStateOf(16)
+    private var remoteAudioEnabled by mutableStateOf(true)
+    private val trustedMacClients = mutableStateListOf<BridgeClient.TrustedMacClient>()
+    private var trustedMacLoading by mutableStateOf(false)
+
+    // v4.1 Adaptive Single-App Golden Size & Input Backend state
+    private var adaptiveSingleEnabled by mutableStateOf(true)
+    private var defaultSingleWidthDp by mutableIntStateOf(BridgeClient.DEFAULT_SINGLE_WIDTH_DP)
+    private var inputBackendMode by mutableIntStateOf(BridgeClient.INPUT_BACKEND_AUTO)
+    private var pendingAdaptivePush: Runnable? = null
 
     // Activation sheet live state
     private var autoRootEnabled by mutableStateOf(false)
@@ -415,6 +442,14 @@ class MainActivity : ComponentActivity() {
         widgetSlot1Ratio = BridgeService.getMirrorWidgetRatio(this, 1)
         widgetSlot0Label = resolveBoundWidgetLabel(0)
         widgetSlot1Label = resolveBoundWidgetLabel(1)
+        val rSp = getSharedPreferences(PREF_REMOTE_STREAM, MODE_PRIVATE)
+        remoteCodecPref = rSp.getInt(KEY_REMOTE_CODEC, BridgeClient.CODEC_PREF_AUTO_HEVC).coerceIn(0, 1)
+        remoteMaxBitrateMbps = rSp.getInt(KEY_REMOTE_BITRATE_MBPS, 16).coerceIn(4, 32)
+        remoteAudioEnabled = rSp.getBoolean(KEY_REMOTE_AUDIO, true)
+        adaptiveSingleEnabled = rSp.getBoolean(KEY_ADAPTIVE_SINGLE_ENABLED, true)
+        defaultSingleWidthDp = rSp.getInt(KEY_DEFAULT_SINGLE_WIDTH_DP, BridgeClient.DEFAULT_SINGLE_WIDTH_DP).coerceIn(360, 1100)
+        inputBackendMode = rSp.getInt(KEY_INPUT_BACKEND_MODE, BridgeClient.INPUT_BACKEND_AUTO).coerceIn(0, 2)
+        localLanIp = AdbBootstrap.getLocalIpv4()
     }
 
     private fun resolveBoundWidgetLabel(slot: Int): String? {
@@ -474,6 +509,8 @@ class MainActivity : ComponentActivity() {
                     }
                     if (syncAllowed) {
                         mirrorSideMode = st.mirrorSideMode
+                        adaptiveSingleEnabled = st.isAdaptiveSingleEnabled
+                        defaultSingleWidthDp = st.defaultSingleWidthDp.coerceIn(360, 1100)
                     }
                     if (st.physW > 0 && st.physH > 0) {
                         lastPhysW = st.physW
@@ -616,8 +653,15 @@ class MainActivity : ComponentActivity() {
         val st = daemonStatus
         return when {
             !st.connected -> "v$versionName · 核心服务未激活"
+            st.sinkType == BridgeClient.SINK_REMOTE_USB ->
+                "v$versionName · Mac 有线大屏 (USB · ${st.remotePeerName.ifBlank { "Mac" }})"
+            st.sinkType == BridgeClient.SINK_REMOTE_WIFI_ADB ->
+                "v$versionName · Mac 无线 ADB 大屏 (${st.remotePeerName.ifBlank { "Mac" }})"
+            st.sinkType == BridgeClient.SINK_REMOTE_WIFI ->
+                "v$versionName · Mac 无线 Wi-Fi 大屏 (${st.remotePeerName.ifBlank { "Mac" }})"
             st.mirrorMode == 1 && st.extId > 0 -> "v$versionName · 原生镜像 Display #${st.extId}"
             st.vdId > 0 -> "v$versionName · 扩展桌面 ${st.virtW}×${st.virtH}"
+            st.isWifiServerEnabled -> "v$versionName · 无线大屏监听中 :${st.wifiServerPort}"
             else -> "v$versionName · 服务就绪，待接入显示器"
         }
     }
@@ -766,6 +810,24 @@ class MainActivity : ComponentActivity() {
                 "守护进程尚未运行",
                 "支持 Root 一键拉起、本机无线调试自激活或电脑单行 ADB 命令启动。",
             )
+            st.sinkType == BridgeClient.SINK_REMOTE_USB -> QuadHero(
+                "USB 有线",
+                HyperGreen,
+                "Mac 有线大屏 (USB) · ${st.remotePeerName.ifBlank { "Mac 客户端" }}",
+                "USB 有线直连 · ${BridgeClient.mirrorModeLabel(st.mirrorMode)} ${st.virtW}×${st.virtH} · ${BridgeClient.formatStreamFps(st.streamFpsX100)} · ${BridgeClient.formatBitrateMbps(st.streamBitrateKbps)}",
+            )
+            st.sinkType == BridgeClient.SINK_REMOTE_WIFI_ADB -> QuadHero(
+                "无线 ADB",
+                HyperBlue,
+                "Mac 无线 ADB 大屏 · ${st.remotePeerName.ifBlank { "Mac 客户端" }}",
+                "无线 ADB 调试隧道 · ${BridgeClient.mirrorModeLabel(st.mirrorMode)} ${st.virtW}×${st.virtH} · ${BridgeClient.formatStreamFps(st.streamFpsX100)} · ${BridgeClient.formatBitrateMbps(st.streamBitrateKbps)}",
+            )
+            st.sinkType == BridgeClient.SINK_REMOTE_WIFI -> QuadHero(
+                "Wi-Fi 直连",
+                HyperPurple,
+                "Mac 无线 Wi-Fi 大屏 · ${st.remotePeerName.ifBlank { "Mac 客户端" }}",
+                "Wi-Fi TLS 直连 · ${BridgeClient.mirrorModeLabel(st.mirrorMode)} ${st.virtW}×${st.virtH} · ${BridgeClient.formatStreamFps(st.streamFpsX100)} · ${BridgeClient.formatBitrateMbps(st.streamBitrateKbps)}",
+            )
             st.mirrorMode == 1 && st.extId > 0 -> QuadHero(
                 "镜像投屏",
                 HyperPurple,
@@ -778,11 +840,17 @@ class MainActivity : ComponentActivity() {
                 "DeX 扩展桌面 · Display #${st.vdId}",
                 "渲染 ${st.virtW}×${st.virtH} (${BridgeClient.rotationLabel(st.virtRot)}) @ ${st.virtDpi}dpi · 物理 ${st.physW}×${st.physH}@${st.physFps.roundToInt()}Hz",
             )
+            st.isWifiServerEnabled -> QuadHero(
+                "无线待机",
+                HyperBlue,
+                "核心服务在线 · 无线大屏监听中",
+                "局域网 $localLanIp:${if (st.wifiServerPort > 0) st.wifiServerPort else BridgeClient.DEFAULT_WIFI_REMOTE_PORT} · 亦可接入 USB / Type-C 显示器自动点亮",
+            )
             else -> QuadHero(
                 "待机就绪",
                 HyperBlue,
-                "核心服务在线 · 待插入显示器",
-                "已存预设 ${st.virtW}×${st.virtH} @ ${st.virtDpi}dpi · 接入 Type-C 外接屏自动点亮",
+                "核心服务在线 · 待接入显示器",
+                "已存预设 ${st.virtW}×${st.virtH} @ ${st.virtDpi}dpi · 支持 Type-C 外接屏或 Mac 有线/无线大屏",
             )
         }
 
@@ -822,19 +890,46 @@ class MainActivity : ComponentActivity() {
                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
             )
 
-            if (st.connected && st.injectStatus == -1) {
+            if (st.connected && st.injectStatus == BridgeClient.INJECT_STATUS_UHID) {
                 Spacer(Modifier.height(10.dp))
-                Box(
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(HyperGreen.copy(alpha = 0.13f))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "UHID 硬件外设注入已激活",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = HyperGreen,
+                    )
+                    StatusPillBadge("UHID 直通", HyperGreen)
+                }
+            } else if (st.connected && st.injectStatus == BridgeClient.INJECT_STATUS_BLOCKED) {
+                Spacer(Modifier.height(10.dp))
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(10.dp))
                         .background(HyperRed.copy(alpha = 0.14f))
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = "点击注入被拦截：请开启开发者选项「USB 调试（安全设置）」",
+                        text = "系统点击注入被拦截：可开启「USB 调试（安全设置）」或切换 UHID 虚拟键鼠兜底",
                         fontSize = 12.sp,
                         color = HyperRed,
+                    )
+                    TextButton(
+                        text = "一键切换 UHID 虚拟键鼠",
+                        onClick = { applyInputBackendMode(BridgeClient.INPUT_BACKEND_UHID) },
+                        colors = ButtonDefaults.textButtonColorsPrimary(),
+                        insideMargin = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                        modifier = Modifier.fillMaxWidth(),
                     )
                 }
             }
@@ -855,6 +950,17 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
+                    if (st.isRemoteSink) {
+                        TextButton(
+                            text = "断开 Mac",
+                            onClick = { disconnectRemoteMac() },
+                            colors = ButtonDefaults.textButtonColors(
+                                color = HyperRed.copy(alpha = 0.14f),
+                                textColor = HyperRed,
+                            ),
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
                     TextButton(
                         text = "连接诊断",
                         onClick = { showDiagSheet = true },
@@ -874,6 +980,75 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier.weight(1f),
                     )
                 }
+            }
+        }
+
+        // Mac / Wireless Remote Display Card
+        SmallTitle("Mac / 无线大屏", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
+        Card(
+            cornerRadius = 18.dp,
+            insideMargin = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+            pressFeedbackType = PressFeedbackType.Sink,
+            showIndication = true,
+            onClick = { openRemoteMacSheet() },
+        ) {
+            val (remoteBadge, remoteBadgeColor) = when {
+                !st.connected -> "需激活" to HyperAmber
+                st.sinkType == BridgeClient.SINK_REMOTE_USB -> "USB 有线" to HyperGreen
+                st.sinkType == BridgeClient.SINK_REMOTE_WIFI_ADB -> "无线 ADB" to HyperBlue
+                st.sinkType == BridgeClient.SINK_REMOTE_WIFI -> "Wi-Fi 直连" to HyperPurple
+                st.isWifiServerEnabled -> "监听中" to HyperBlue
+                else -> "未开启" to MiuixTheme.colorScheme.onSurfaceVariantSummary
+            }
+            val remoteSummary = when {
+                !st.connected -> "激活核心服务后支持 USB 2.0/3.0 与 Wi-Fi 无线连接 Mac 大屏"
+                st.isRemoteSink ->
+                    "${st.remotePeerName.ifBlank { "Mac" }} · ${BridgeClient.formatStreamFps(st.streamFpsX100)} · ${BridgeClient.formatBitrateMbps(st.streamBitrateKbps)} · 点击管理"
+                st.isWifiServerEnabled -> {
+                    val port = if (st.wifiServerPort > 0) st.wifiServerPort else BridgeClient.DEFAULT_WIFI_REMOTE_PORT
+                    val pinPreview = st.activePairingPin.ifBlank { "------" }
+                    "局域网 $localLanIp:$port · 配对 PIN $pinPreview · 点击查看指纹与管理设备"
+                }
+                else -> "开启无线大屏 TLS 服务、获取 6 位配对 PIN 码、调节编码码率与已信任 Mac"
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(HyperBlue.copy(alpha = 0.14f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(
+                        imageVector = ExtVectorIcons.LaptopMac,
+                        contentDescription = "Mac / 无线大屏",
+                        tint = HyperBlue,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                    Text(
+                        text = "Mac 有线 / 无线大屏中心",
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MiuixTheme.colorScheme.onSurfaceContainer,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = remoteSummary,
+                        fontSize = 12.sp,
+                        color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                StatusPillBadge(label = remoteBadge, dotColor = remoteBadgeColor)
             }
         }
 
@@ -1144,6 +1319,22 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+
+        SmallTitle("单应用默认黄金尺寸", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
+        AdaptiveSingleSizeCard(
+            enabled = adaptiveSingleEnabled,
+            defaultWidthDp = defaultSingleWidthDp,
+            daemonConnected = daemonStatus.connected,
+            onEnabledChange = { next ->
+                applyAdaptiveSingleConfig(enabled = next, widthDp = defaultSingleWidthDp, debounce = false, showToast = true)
+            },
+            onSelectPresetWidth = { wDp ->
+                applyAdaptiveSingleConfig(enabled = adaptiveSingleEnabled, widthDp = wDp, debounce = false, showToast = true)
+            },
+            onSliderWidthChange = { wDp ->
+                applyAdaptiveSingleConfig(enabled = adaptiveSingleEnabled, widthDp = wDp, debounce = true, showToast = false)
+            },
+        )
 
         SmallTitle("快捷预设与硬件信号", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
         Card {
@@ -1439,6 +1630,30 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
+            SmallTitle("单应用默认黄金尺寸", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
+            AdaptiveSingleSizeCard(
+                enabled = adaptiveSingleEnabled,
+                defaultWidthDp = defaultSingleWidthDp,
+                daemonConnected = daemonStatus.connected,
+                onEnabledChange = { next ->
+                    applyAdaptiveSingleConfig(enabled = next, widthDp = defaultSingleWidthDp, debounce = false, showToast = true)
+                },
+                onSelectPresetWidth = { wDp ->
+                    applyAdaptiveSingleConfig(enabled = adaptiveSingleEnabled, widthDp = wDp, debounce = false, showToast = true)
+                },
+                onSliderWidthChange = { wDp ->
+                    applyAdaptiveSingleConfig(enabled = adaptiveSingleEnabled, widthDp = wDp, debounce = true, showToast = false)
+                },
+            )
+
+            SmallTitle("输入注入引擎", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
+            InputEngineCard(
+                selectedBackendMode = inputBackendMode,
+                daemonConnected = daemonStatus.connected,
+                injectStatus = daemonStatus.injectStatus,
+                onSelectBackendMode = { mode -> applyInputBackendMode(mode) },
+            )
+
             SmallTitle("扩展桌面行为", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
             Card {
                 SwitchPreference(
@@ -1470,6 +1685,16 @@ class MainActivity : ComponentActivity() {
 
             SmallTitle("守护进程与权限健康", insideMargin = PaddingValues(horizontal = 6.dp, vertical = 2.dp))
             Card {
+                ArrowPreference(
+                    title = "Mac / 无线大屏与信任设备管理",
+                    summary = if (daemonStatus.isWifiServerEnabled) {
+                        "无线服务监听中 :${daemonStatus.wifiServerPort} · 点击管理 PIN 与已信任 Mac"
+                    } else {
+                        "配置无线大屏服务、6 位配对 PIN、编码码率与已信任 Mac 列表"
+                    },
+                    onClick = { openRemoteMacSheet() },
+                )
+                SectionLine()
                 ArrowPreference(
                     title = "激活 / 重连核心守护进程",
                     summary = if (daemonStatus.connected) "当前在线 · 点击查看 Root / 无线调试 / ADB 引导" else "当前未连接 · 点击立即激活",
@@ -1556,7 +1781,40 @@ class MainActivity : ComponentActivity() {
                 Thread { BridgeClient.rebuild() }.start()
                 Toast.makeText(this, "已发送渲染重建指令", Toast.LENGTH_SHORT).show()
             },
+            onDisconnectRemote = { disconnectRemoteMac() },
             onDismiss = { showDiagSheet = false },
+        )
+
+        RemoteMacDisplaySheet(
+            show = showRemoteMacSheet,
+            status = daemonStatus,
+            localIpv4 = localLanIp,
+            wifiBusy = wifiServerBusy,
+            codecPref = remoteCodecPref,
+            maxBitrateMbps = remoteMaxBitrateMbps,
+            audioEnabled = remoteAudioEnabled,
+            trustedClients = trustedMacClients.toList(),
+            trustedLoading = trustedMacLoading,
+            onToggleWifiServer = { enable -> toggleWifiRemoteServer(enable) },
+            onRegeneratePin = { regenerateWifiPairingPin() },
+            onCopyText = { text, toastMsg -> copyTextToClipboard(text, toastMsg) },
+            onDisconnectRemote = { disconnectRemoteMac() },
+            onCodecPrefChange = { pref ->
+                remoteCodecPref = pref
+                saveAndPushRemoteStreamPrefs(showToast = false)
+            },
+            onMaxBitrateChange = { mbps ->
+                remoteMaxBitrateMbps = mbps
+            },
+            onAudioEnabledChange = { en ->
+                remoteAudioEnabled = en
+                saveAndPushRemoteStreamPrefs(showToast = false)
+            },
+            onApplyStreamPrefs = { saveAndPushRemoteStreamPrefs(showToast = true) },
+            onRefreshTrusted = { loadTrustedMacClientsAsync() },
+            onRevokeClient = { id -> revokeTrustedMacClient(id) },
+            onRevokeAllClients = { revokeTrustedMacClient("*") },
+            onDismiss = { showRemoteMacSheet = false },
         )
 
         ActivationSheet(
@@ -1753,6 +2011,224 @@ class MainActivity : ComponentActivity() {
     }
 
     // --- Actions & Business Logic ---
+
+    private fun openRemoteMacSheet() {
+        localLanIp = AdbBootstrap.getLocalIpv4()
+        showRemoteMacSheet = true
+        refreshAllState(syncFromDaemon = false)
+        if (daemonStatus.connected) {
+            loadTrustedMacClientsAsync()
+        }
+    }
+
+    private fun toggleWifiRemoteServer(enable: Boolean) {
+        if (wifiServerBusy) return
+        wifiServerBusy = true
+        val port = if (daemonStatus.wifiServerPort > 0) daemonStatus.wifiServerPort else BridgeClient.DEFAULT_WIFI_REMOTE_PORT
+        Thread {
+            val res = BridgeClient.setWifiRemoteConfig(enable = enable, port = port, regeneratePin = enable)
+            runOnUiThread {
+                wifiServerBusy = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (res.ok) {
+                    Toast.makeText(
+                        this,
+                        if (res.enabled) "无线大屏服务已开启 (端口 ${res.port})" else "无线大屏服务已关闭",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                } else {
+                    Toast.makeText(this, "设置无线大屏服务失败，请确认守护进程已更新并在线", Toast.LENGTH_SHORT).show()
+                }
+                BridgeService.refreshFromReceiver(this)
+                refreshAllState(syncFromDaemon = false)
+                if (res.ok && res.enabled) {
+                    loadTrustedMacClientsAsync()
+                }
+            }
+        }.start()
+    }
+
+    private fun regenerateWifiPairingPin() {
+        if (wifiServerBusy) return
+        wifiServerBusy = true
+        val port = if (daemonStatus.wifiServerPort > 0) daemonStatus.wifiServerPort else BridgeClient.DEFAULT_WIFI_REMOTE_PORT
+        Thread {
+            val res = BridgeClient.setWifiRemoteConfig(enable = true, port = port, regeneratePin = true)
+            runOnUiThread {
+                wifiServerBusy = false
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (res.ok) {
+                    Toast.makeText(this, "已生成新的 6 位配对 PIN 码", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "刷新 PIN 码失败", Toast.LENGTH_SHORT).show()
+                }
+                BridgeService.refreshFromReceiver(this)
+                refreshAllState(syncFromDaemon = false)
+            }
+        }.start()
+    }
+
+    private fun applyAdaptiveSingleConfig(
+        enabled: Boolean,
+        widthDp: Int,
+        debounce: Boolean,
+        showToast: Boolean,
+    ) {
+        val clamped = widthDp.coerceIn(360, 1100)
+        adaptiveSingleEnabled = enabled
+        defaultSingleWidthDp = clamped
+        suppressDaemonSyncUntilMs = android.os.SystemClock.uptimeMillis() + 2500L
+        getSharedPreferences(PREF_REMOTE_STREAM, MODE_PRIVATE).edit()
+            .putBoolean(KEY_ADAPTIVE_SINGLE_ENABLED, enabled)
+            .putInt(KEY_DEFAULT_SINGLE_WIDTH_DP, clamped)
+            .apply()
+
+        pendingAdaptivePush?.let { handler.removeCallbacks(it) }
+        val pushTask = Runnable {
+            pendingAdaptivePush = null
+            if (!daemonStatus.connected) {
+                if (showToast) {
+                    Toast.makeText(this, "已保存本地偏好，激活服务后自动生效", Toast.LENGTH_SHORT).show()
+                }
+                return@Runnable
+            }
+            Thread {
+                val ok = BridgeClient.setAdaptiveSingleConfig(enabled, clamped)
+                runOnUiThread {
+                    if (isFinishing || isDestroyed) return@runOnUiThread
+                    if (showToast) {
+                        val msg = if (ok) {
+                            if (enabled) "单应用默认黄金尺寸：${clamped}dp" else "已关闭单应用默认居中（恢复全屏）"
+                        } else {
+                            "同步单应用默认尺寸失败"
+                        }
+                        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                    }
+                    BridgeService.refreshFromReceiver(this)
+                    refreshAllState(syncFromDaemon = false)
+                }
+            }.start()
+        }
+        if (debounce) {
+            pendingAdaptivePush = pushTask
+            handler.postDelayed(pushTask, 180L)
+        } else {
+            pushTask.run()
+        }
+    }
+
+    private fun applyInputBackendMode(mode: Int) {
+        val safeMode = mode.coerceIn(BridgeClient.INPUT_BACKEND_AUTO, BridgeClient.INPUT_BACKEND_UHID)
+        inputBackendMode = safeMode
+        getSharedPreferences(PREF_REMOTE_STREAM, MODE_PRIVATE).edit()
+            .putInt(KEY_INPUT_BACKEND_MODE, safeMode)
+            .apply()
+        if (!daemonStatus.connected) {
+            Toast.makeText(this, "已保存输入引擎偏好：${BridgeClient.inputBackendLabel(safeMode)}", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Thread {
+            val activeStatus = BridgeClient.setInputBackend(safeMode)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                val msg = when (activeStatus) {
+                    BridgeClient.INJECT_STATUS_UHID -> "UHID 硬件外设注入已激活"
+                    BridgeClient.INJECT_STATUS_SYSTEM -> "已切换：${BridgeClient.inputBackendLabel(safeMode)}（系统注入正常）"
+                    else -> "当前输入被系统拦截，建议选择「强制 UHID 虚拟键鼠」或开启 USB 安全调试"
+                }
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                BridgeService.refreshFromReceiver(this)
+                refreshAllState(syncFromDaemon = false)
+            }
+        }.start()
+    }
+
+    private fun saveAndPushRemoteStreamPrefs(showToast: Boolean) {
+        val codec = remoteCodecPref.coerceIn(0, 1)
+        val mbps = remoteMaxBitrateMbps.coerceIn(4, 32)
+        val audio = remoteAudioEnabled
+        getSharedPreferences(PREF_REMOTE_STREAM, MODE_PRIVATE).edit()
+            .putInt(KEY_REMOTE_CODEC, codec)
+            .putInt(KEY_REMOTE_BITRATE_MBPS, mbps)
+            .putBoolean(KEY_REMOTE_AUDIO, audio)
+            .apply()
+        if (!daemonStatus.connected) {
+            if (showToast) Toast.makeText(this, "已保存本地偏好，激活服务后生效", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Thread {
+            val ok = BridgeClient.setRemoteStreamPrefs(codec, mbps * 1000, audio)
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (showToast) {
+                    Toast.makeText(
+                        this,
+                        if (ok) "流媒体参数已同步：${if (codec == 0) "HEVC" else "H.264"} · ${mbps}Mbps · 音频${if (audio) "开" else "关"}"
+                        else "应用流媒体参数失败",
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                }
+                refreshAllState(syncFromDaemon = false)
+            }
+        }.start()
+    }
+
+    private fun disconnectRemoteMac() {
+        Thread {
+            val ok = BridgeClient.disconnectRemoteClient()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                Toast.makeText(
+                    this,
+                    if (ok) "已断开当前 Mac 大屏连接" else "当前无活跃的远端 Mac 连接",
+                    Toast.LENGTH_SHORT,
+                ).show()
+                BridgeService.refreshFromReceiver(this)
+                refreshAllState(syncFromDaemon = false)
+            }
+        }.start()
+    }
+
+    private fun loadTrustedMacClientsAsync() {
+        if (trustedMacLoading) return
+        trustedMacLoading = true
+        Thread {
+            val list = BridgeClient.listTrustedMacClients()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                trustedMacClients.clear()
+                trustedMacClients.addAll(list)
+                trustedMacLoading = false
+            }
+        }.start()
+    }
+
+    private fun revokeTrustedMacClient(clientId: String) {
+        Thread {
+            val ok = BridgeClient.revokeTrustedMacClient(clientId)
+            val updated = BridgeClient.listTrustedMacClients()
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                trustedMacClients.clear()
+                trustedMacClients.addAll(updated)
+                Toast.makeText(
+                    this,
+                    if (ok) {
+                        if (clientId == "*") "已撤销全部已信任 Mac 设备" else "已撤销该 Mac 设备的配对信任"
+                    } else {
+                        "撤销信任失败"
+                    },
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }.start()
+    }
+
+    private fun copyTextToClipboard(text: String, toastMsg: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText("extbridge_remote", text))
+        Toast.makeText(this, toastMsg, Toast.LENGTH_SHORT).show()
+    }
 
     private fun launchOnDisplay0(cls: Class<*>) {
         runCatching {
