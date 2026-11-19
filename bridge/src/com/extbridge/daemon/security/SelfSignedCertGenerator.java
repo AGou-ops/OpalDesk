@@ -1,17 +1,19 @@
 package com.extbridge.daemon.security;
 
+import com.extbridge.daemon.util.AtomicFiles;
+import com.extbridge.daemon.util.CryptoHex;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.IOException;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
-import java.security.MessageDigest;
 import java.security.PrivateKey;
 import java.security.SecureRandom;
 import java.security.Signature;
@@ -92,8 +94,11 @@ public final class SelfSignedCertGenerator {
                 if (loaded != null && isCertificateUsable(loaded.certificate)) {
                     return loaded;
                 }
-            } catch (Throwable ignored) {
-                // Corrupt or incompatible store: regenerate below.
+                System.err.println("EXTBRIDGE_TLS_STORE_ROTATE path=" + storeFile.getAbsolutePath()
+                        + " reason=certificate expired or missing entry");
+            } catch (Throwable t) {
+                System.err.println("EXTBRIDGE_TLS_STORE_LOAD_ERR path=" + storeFile.getAbsolutePath()
+                        + " regenerating: " + t.getMessage());
             }
         }
         ServerIdentity fresh = generate(commonName, pass, null);
@@ -153,14 +158,8 @@ public final class SelfSignedCertGenerator {
         return ctx;
     }
 
-    public static String sha256Hex(byte[] data) throws Exception {
-        byte[] digest = MessageDigest.getInstance("SHA-256").digest(data);
-        StringBuilder sb = new StringBuilder(64);
-        for (byte b : digest) {
-            sb.append(Character.forDigit((b >> 4) & 0x0F, 16));
-            sb.append(Character.forDigit(b & 0x0F, 16));
-        }
-        return sb.toString();
+    public static String sha256Hex(byte[] data) {
+        return CryptoHex.sha256Hex(data);
     }
 
     private static ServerIdentity loadFromFile(File storeFile, char[] password) throws Exception {
@@ -189,32 +188,13 @@ public final class SelfSignedCertGenerator {
     }
 
     private static void saveAtomic(KeyStore ks, File target, char[] password) {
-        File parent = target.getParentFile();
-        if (parent != null && !parent.exists()) {
-            parent.mkdirs();
-        }
-        File tmp = new File(target.getAbsolutePath() + ".tmp");
         try {
-            if (tmp.exists()) {
-                tmp.delete();
-            }
-            try (FileOutputStream fos = new FileOutputStream(tmp, false)) {
-                ks.store(fos, password);
-                fos.flush();
-                fos.getFD().sync();
-            }
-            tmp.setReadable(false, false);
-            tmp.setReadable(true, true);
-            tmp.setWritable(false, false);
-            tmp.setWritable(true, true);
-            if (!tmp.renameTo(target)) {
-                if (target.exists()) {
-                    target.delete();
-                }
-                tmp.renameTo(target);
-            }
-        } catch (Throwable ignored) {
-            try { tmp.delete(); } catch (Throwable ignored2) {}
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(4096);
+            ks.store(baos, password);
+            AtomicFiles.writeAtomic(target, baos.toByteArray(), AtomicFiles.MODE_OWNER_RW);
+        } catch (Exception e) {
+            System.err.println("EXTBRIDGE_TLS_STORE_SAVE_ERR path=" + target.getAbsolutePath()
+                    + ": " + e.getMessage());
         }
     }
 
@@ -283,7 +263,9 @@ public final class SelfSignedCertGenerator {
                 try {
                     byte[] rawIp = InetAddress.getByName(ip.trim()).getAddress();
                     sanEntries.add(derPrimitiveContextTag(7, rawIp));
-                } catch (Throwable ignored) {}
+                } catch (IOException | SecurityException e) {
+                    System.err.println("EXTBRIDGE_TLS_SAN_SKIP ip=" + ip + ": " + e.getMessage());
+                }
             }
         }
         byte[] extSan = derExtension(OID_SUBJECT_ALT_NAME, false, derSequenceList(sanEntries));

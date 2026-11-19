@@ -1,12 +1,13 @@
 package com.extbridge.daemon.window;
 
 import com.extbridge.daemon.stream.SimpleJson;
+import com.extbridge.daemon.util.AtomicFiles;
 import com.extbridge.daemon.window.TilingLayoutEngine.WindowRect;
 
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -36,7 +37,6 @@ public final class DesktopWindowManager {
     public static final int MAX_SINGLE_WIDTH_DP = 1200;
     public static final int MIN_WIDTH_PCT = 28;
     public static final int MAX_WIDTH_PCT = 100;
-    public static final int MAX_FREEFORM_WINDOWS = 4;
     public static final int MAX_SAVED_APP_PREFS = 256;
 
     // 5-tier width snapping presets (% of display width)
@@ -74,6 +74,18 @@ public final class DesktopWindowManager {
                 boolean focused,
                 boolean minimized,
                 int slotIndex) {
+            this(taskId, pkg, mode, bounds, focused, minimized, slotIndex, System.currentTimeMillis());
+        }
+
+        private ManagedWindow(
+                int taskId,
+                String pkg,
+                String mode,
+                WindowRect bounds,
+                boolean focused,
+                boolean minimized,
+                int slotIndex,
+                long updatedAtMs) {
             this.taskId = taskId;
             this.pkg = (pkg != null) ? pkg : "";
             this.mode = (mode != null && !mode.isEmpty()) ? mode : MODE_ADAPTIVE_SINGLE;
@@ -81,7 +93,11 @@ public final class DesktopWindowManager {
             this.focused = focused;
             this.minimized = minimized;
             this.slotIndex = slotIndex;
-            this.updatedAtMs = System.currentTimeMillis();
+            this.updatedAtMs = updatedAtMs;
+        }
+
+        public ManagedWindow copy() {
+            return new ManagedWindow(taskId, pkg, mode, bounds, focused, minimized, slotIndex, updatedAtMs);
         }
     }
 
@@ -177,19 +193,6 @@ public final class DesktopWindowManager {
             }
         }
         return best;
-    }
-
-    public static String intModeToString(int intMode) {
-        switch (intMode) {
-            case INT_MODE_FULLSCREEN:
-                return MODE_FULLSCREEN;
-            case INT_MODE_ADAPTIVE_SINGLE:
-                return MODE_ADAPTIVE_SINGLE;
-            case INT_MODE_FREEFORM:
-                return MODE_FREEFORM;
-            default:
-                return "";
-        }
     }
 
     public static int parseModeString(String modeStr) {
@@ -452,25 +455,14 @@ public final class DesktopWindowManager {
                 mw.updatedAtMs = System.currentTimeMillis();
             }
             managedWindows.put(taskId, mw);
-            // Bound total freeform windows softly by marking oldest non-focused if > MAX_FREEFORM_WINDOWS
-            return mw;
+            return mw.copy();
         }
     }
 
     public ManagedWindow getManagedWindow(int taskId) {
         synchronized (lock) {
-            return managedWindows.get(taskId);
-        }
-    }
-
-    public ManagedWindow findManagedWindowByPkg(String pkg) {
-        if (pkg == null || pkg.isEmpty()) return null;
-        synchronized (lock) {
-            ManagedWindow found = null;
-            for (ManagedWindow mw : managedWindows.values()) {
-                if (pkg.equals(mw.pkg)) found = mw;
-            }
-            return found;
+            ManagedWindow mw = managedWindows.get(taskId);
+            return (mw != null) ? mw.copy() : null;
         }
     }
 
@@ -624,6 +616,72 @@ public final class DesktopWindowManager {
 
     // ---- Tiling State ----
 
+    /**
+     * Immutable snapshot of the 2-slot split view derived from active {@code SPLIT_2_H}/{@code SPLIT_2_V}
+     * tiling state, guaranteeing atomic non-torn reads for Binder codes 15 & 35.
+     */
+    public static final class TwoSlotSplitSnapshot {
+        public final boolean active;
+        public final String topology;
+        public final int ratioPct;
+        public final String slot0Pkg;
+        public final String slot1Pkg;
+        public final int slot0TaskId;
+        public final int slot1TaskId;
+
+        TwoSlotSplitSnapshot(
+                boolean active, String topology, int ratioPct,
+                String slot0Pkg, String slot1Pkg, int slot0TaskId, int slot1TaskId) {
+            this.active = active;
+            this.topology = topology;
+            this.ratioPct = ratioPct;
+            this.slot0Pkg = slot0Pkg;
+            this.slot1Pkg = slot1Pkg;
+            this.slot0TaskId = slot0TaskId;
+            this.slot1TaskId = slot1TaskId;
+        }
+
+        public int emptySlotIndex() {
+            if (!active) return -1;
+            boolean has0 = slot0Pkg != null && !slot0Pkg.isEmpty();
+            boolean has1 = slot1Pkg != null && !slot1Pkg.isEmpty();
+            if (has0 && !has1) return 1;
+            if (!has0 && has1) return 0;
+            return -1;
+        }
+    }
+
+    public TwoSlotSplitSnapshot getTwoSlotSplitSnapshot(int fallbackRatioPct) {
+        int clampedFallback = Math.max(25, Math.min(75, fallbackRatioPct));
+        synchronized (lock) {
+            boolean twoSlot = TilingLayoutEngine.TOPOLOGY_SPLIT_2_H.equals(tilingTopology)
+                    || TilingLayoutEngine.TOPOLOGY_SPLIT_2_V.equals(tilingTopology);
+            if (!twoSlot) {
+                return new TwoSlotSplitSnapshot(
+                        false, TilingLayoutEngine.TOPOLOGY_NONE, clampedFallback, "", "", -1, -1);
+            }
+            int ratio = (tilingRatios != null && tilingRatios.length > 0)
+                    ? Math.max(25, Math.min(75, tilingRatios[0]))
+                    : clampedFallback;
+            return new TwoSlotSplitSnapshot(
+                    true, tilingTopology, ratio,
+                    tilingSlotPkgs[0] != null ? tilingSlotPkgs[0] : "",
+                    tilingSlotPkgs[1] != null ? tilingSlotPkgs[1] : "",
+                    tilingSlotTaskIds[0], tilingSlotTaskIds[1]);
+        }
+    }
+
+    public boolean isPkgInActiveTiling(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        synchronized (lock) {
+            if (!isTilingActiveLocked()) return false;
+            for (String p : tilingSlotPkgs) {
+                if (pkg.equals(p)) return true;
+            }
+            return false;
+        }
+    }
+
     public boolean isTilingActive() {
         synchronized (lock) {
             return isTilingActiveLocked();
@@ -759,8 +817,7 @@ public final class DesktopWindowManager {
         synchronized (lock) {
             List<ManagedWindow> list = new ArrayList<>(managedWindows.size());
             for (ManagedWindow mw : managedWindows.values()) {
-                list.add(new ManagedWindow(
-                        mw.taskId, mw.pkg, mw.mode, mw.bounds, mw.focused, mw.minimized, mw.slotIndex));
+                list.add(mw.copy());
             }
             return Collections.unmodifiableList(list);
         }
@@ -819,7 +876,9 @@ public final class DesktopWindowManager {
                             adaptiveSingleEnabled = !"0".equals(p[1].trim());
                             try {
                                 defaultSingleWidthDp = clampWidthDp(Integer.parseInt(p[2].trim()));
-                            } catch (Throwable ignored) {}
+                            } catch (NumberFormatException nfe) {
+                                System.err.println("EXTBRIDGE_WIN_PREFS_BAD_WIDTH raw=" + p[2].trim());
+                            }
                         }
                         continue;
                     }
@@ -845,50 +904,36 @@ public final class DesktopWindowManager {
                         appPrefs.put(pkg, new AppWindowPref(pkg, mode, wPct, wDp, ff));
                     }
                 }
-            } catch (Throwable ignored) {}
+            } catch (IOException | RuntimeException e) {
+                System.err.println("EXTBRIDGE_WIN_PREFS_LOAD_ERR path=" + prefsFile.getAbsolutePath()
+                        + ": " + e.getMessage());
+            }
         }
     }
 
     private void savePrefsLocked() {
         if (prefsFile == null) return;
-        File parent = prefsFile.getParentFile();
-        if (parent != null && !parent.exists()) {
-            parent.mkdirs();
+        StringBuilder sb = new StringBuilder(256);
+        sb.append("GLOBAL\t").append(adaptiveSingleEnabled ? 1 : 0)
+          .append('\t').append(defaultSingleWidthDp).append('\n');
+        for (AppWindowPref p : appPrefs.values()) {
+            sb.append(p.pkg).append('\t')
+              .append(p.mode).append('\t')
+              .append(p.widthPct).append('\t')
+              .append(p.widthDp);
+            if (p.freeformBounds != null) {
+                sb.append('\t').append(p.freeformBounds.left)
+                  .append('\t').append(p.freeformBounds.top)
+                  .append('\t').append(p.freeformBounds.right)
+                  .append('\t').append(p.freeformBounds.bottom);
+            }
+            sb.append('\n');
         }
-        File tmp = new File(prefsFile.getAbsolutePath() + ".tmp");
         try {
-            if (tmp.exists()) tmp.delete();
-            StringBuilder sb = new StringBuilder(256);
-            sb.append("GLOBAL\t").append(adaptiveSingleEnabled ? 1 : 0)
-              .append('\t').append(defaultSingleWidthDp).append('\n');
-            for (AppWindowPref p : appPrefs.values()) {
-                sb.append(p.pkg).append('\t')
-                  .append(p.mode).append('\t')
-                  .append(p.widthPct).append('\t')
-                  .append(p.widthDp);
-                if (p.freeformBounds != null) {
-                    sb.append('\t').append(p.freeformBounds.left)
-                      .append('\t').append(p.freeformBounds.top)
-                      .append('\t').append(p.freeformBounds.right)
-                      .append('\t').append(p.freeformBounds.bottom);
-                }
-                sb.append('\n');
-            }
-            try (FileOutputStream fos = new FileOutputStream(tmp, false)) {
-                fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-                fos.flush();
-                fos.getFD().sync();
-            }
-            tmp.setReadable(false, false);
-            tmp.setReadable(true, true);
-            tmp.setWritable(false, false);
-            tmp.setWritable(true, true);
-            if (!tmp.renameTo(prefsFile)) {
-                if (prefsFile.exists()) prefsFile.delete();
-                tmp.renameTo(prefsFile);
-            }
-        } catch (Throwable ignored) {
-            try { tmp.delete(); } catch (Throwable ignored2) {}
+            AtomicFiles.writeAtomicUtf8(prefsFile, sb.toString(), AtomicFiles.MODE_OWNER_RW);
+        } catch (IOException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_WIN_PREFS_SAVE_ERR path=" + prefsFile.getAbsolutePath()
+                    + ": " + e.getMessage());
         }
     }
 
@@ -896,7 +941,7 @@ public final class DesktopWindowManager {
         if (s == null) return def;
         try {
             return Integer.parseInt(s.trim());
-        } catch (Throwable ignored) {
+        } catch (NumberFormatException ignored) {
             return def;
         }
     }

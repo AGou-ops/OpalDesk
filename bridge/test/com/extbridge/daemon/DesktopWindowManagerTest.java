@@ -181,5 +181,15 @@ public class DesktopWindowManagerTest {
         wm.minimizeAllSingleWindows();
         assertTrue(wm.getManagedWindow(8113).minimized);
         assertFalse(wm.getManagedWindow(8113).focused);
+
+        // Mutating a returned ManagedWindow must NOT leak into DesktopWindowManager internal state
+        DesktopWindowManager.ManagedWindow copy = wm.getManagedWindow(8113);
+        copy.minimized = false;
+        copy.focused = true;
+        copy.mode = DesktopWindowManager.MODE_FREEFORM;
+        DesktopWindowManager.ManagedWindow fresh = wm.getManagedWindow(8113);
+        assertTrue("Internal minimized state must be protected by defensive copy", fresh.minimized);
+        assertFalse("Internal focused state must be protected by defensive copy", fresh.focused);
+        assertEquals(DesktopWindowManager.MODE_ADAPTIVE_SINGLE, fresh.mode);
     }
 }

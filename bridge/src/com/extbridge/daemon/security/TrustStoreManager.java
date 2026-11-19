@@ -1,17 +1,18 @@
 package com.extbridge.daemon.security;
 
+import com.extbridge.daemon.util.AtomicFiles;
+import com.extbridge.daemon.util.CryptoHex;
+
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
-import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -150,7 +151,7 @@ public final class TrustStoreManager {
             if (providedToken != null && !providedToken.isEmpty()) {
                 TrustedPeer existing = peers.get(clientId);
                 if (existing != null) {
-                    String providedHash = sha256Hex(providedToken);
+                    String providedHash = CryptoHex.sha256Hex(providedToken);
                     if (constantTimeEquals(existing.tokenSha256, providedHash)) {
                         clearFailuresLocked(bucketKey);
                         if (!existing.clientName.equals(clientName)) {
@@ -195,7 +196,7 @@ public final class TrustStoreManager {
             // 4. PIN accepted: issue fresh 32-byte random hex token, persist, and rotate one-time PIN!
             clearFailuresLocked(bucketKey);
             String newToken = generateRandomTokenHex(32);
-            String tokenHash = sha256Hex(newToken);
+            String tokenHash = CryptoHex.sha256Hex(newToken);
             if (!peers.containsKey(clientId) && peers.size() >= MAX_TRUSTED_CLIENTS) {
                 // Evict oldest trusted client to keep store bounded.
                 String oldestKey = peers.keySet().iterator().next();
@@ -221,7 +222,7 @@ public final class TrustStoreManager {
         synchronized (lock) {
             long now = clock.nowMs();
             String newToken = generateRandomTokenHex(32);
-            String tokenHash = sha256Hex(newToken);
+            String tokenHash = CryptoHex.sha256Hex(newToken);
             if (!peers.containsKey(clientId) && peers.size() >= MAX_TRUSTED_CLIENTS) {
                 String oldestKey = peers.keySet().iterator().next();
                 peers.remove(oldestKey);
@@ -243,12 +244,6 @@ public final class TrustStoreManager {
     public int getTrustedCount() {
         synchronized (lock) {
             return peers.size();
-        }
-    }
-
-    public List<TrustedPeer> listTrustedPeers() {
-        synchronized (lock) {
-            return new ArrayList<>(peers.values());
         }
     }
 
@@ -352,25 +347,7 @@ public final class TrustStoreManager {
     private String generateRandomTokenHex(int numBytes) {
         byte[] buf = new byte[numBytes];
         rng.nextBytes(buf);
-        return toHex(buf);
-    }
-
-    private static String sha256Hex(String input) {
-        try {
-            byte[] d = MessageDigest.getInstance("SHA-256").digest(input.getBytes(StandardCharsets.UTF_8));
-            return toHex(d);
-        } catch (Throwable t) {
-            throw new IllegalStateException("SHA-256 unavailable", t);
-        }
-    }
-
-    private static String toHex(byte[] bytes) {
-        StringBuilder sb = new StringBuilder(bytes.length * 2);
-        for (byte b : bytes) {
-            sb.append(Character.forDigit((b >> 4) & 0x0F, 16));
-            sb.append(Character.forDigit(b & 0x0F, 16));
-        }
-        return sb.toString();
+        return CryptoHex.toHex(buf);
     }
 
     private long checkLockoutLocked(String bucketKey, long now) {
@@ -432,47 +409,38 @@ public final class TrustStoreManager {
                     String tokenHash = parts[2].trim().toLowerCase(Locale.US);
                     long created = 0L;
                     if (parts.length >= 4) {
-                        try { created = Long.parseLong(parts[3].trim()); } catch (Throwable ignored) {}
+                        try {
+                            created = Long.parseLong(parts[3].trim());
+                        } catch (NumberFormatException nfe) {
+                            System.err.println("EXTBRIDGE_TRUSTSTORE_BAD_TS clientId=" + cid
+                                    + " raw=" + parts[3].trim());
+                        }
                     }
                     if (!cid.isEmpty() && tokenHash.length() == 64 && peers.size() < MAX_TRUSTED_CLIENTS) {
                         peers.put(cid, new TrustedPeer(cid, name, tokenHash, created));
                     }
                 }
-            } catch (Throwable ignored) {}
+            } catch (IOException | RuntimeException e) {
+                System.err.println("EXTBRIDGE_TRUSTSTORE_LOAD_ERR path=" + storeFile.getAbsolutePath()
+                        + ": " + e.getMessage());
+            }
         }
     }
 
     private void saveToDiskLocked() {
         if (storeFile == null) return;
-        File parent = storeFile.getParentFile();
-        if (parent != null && !parent.exists()) {
-            parent.mkdirs();
+        StringBuilder sb = new StringBuilder();
+        for (TrustedPeer p : peers.values()) {
+            sb.append(p.clientId).append('\t')
+              .append(p.clientName).append('\t')
+              .append(p.tokenSha256).append('\t')
+              .append(p.createdAtMs).append('\n');
         }
-        File tmp = new File(storeFile.getAbsolutePath() + ".tmp");
         try {
-            if (tmp.exists()) tmp.delete();
-            StringBuilder sb = new StringBuilder();
-            for (TrustedPeer p : peers.values()) {
-                sb.append(p.clientId).append('\t')
-                  .append(p.clientName).append('\t')
-                  .append(p.tokenSha256).append('\t')
-                  .append(p.createdAtMs).append('\n');
-            }
-            try (FileOutputStream fos = new FileOutputStream(tmp, false)) {
-                fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-                fos.flush();
-                fos.getFD().sync();
-            }
-            tmp.setReadable(false, false);
-            tmp.setReadable(true, true);
-            tmp.setWritable(false, false);
-            tmp.setWritable(true, true);
-            if (!tmp.renameTo(storeFile)) {
-                if (storeFile.exists()) storeFile.delete();
-                tmp.renameTo(storeFile);
-            }
-        } catch (Throwable ignored) {
-            try { tmp.delete(); } catch (Throwable ignored2) {}
+            AtomicFiles.writeAtomicUtf8(storeFile, sb.toString(), AtomicFiles.MODE_OWNER_RW);
+        } catch (IOException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_TRUSTSTORE_SAVE_ERR path=" + storeFile.getAbsolutePath()
+                    + ": " + e.getMessage());
         }
     }
 }

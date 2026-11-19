@@ -150,29 +150,53 @@ public final class SimpleJson {
             return def;
         }
 
+        /**
+         * Returns the integer value for {@code key}, coercing numeric strings and falling back to
+         * {@code def} when absent or non-numeric.
+         */
         public int getInt(String key, int def) {
             Object v = fields.get(key);
             if (v instanceof Number) return ((Number) v).intValue();
             if (v instanceof String) {
-                try { return Integer.parseInt(((String) v).trim()); } catch (Throwable ignored) {}
+                try {
+                    return Integer.parseInt(((String) v).trim());
+                } catch (NumberFormatException ignored) {
+                    // Non-numeric string value falls back to caller's default.
+                }
             }
             return def;
         }
 
+        /**
+         * Returns the long value for {@code key}, coercing numeric strings and falling back to
+         * {@code def} when absent or non-numeric.
+         */
         public long getLong(String key, long def) {
             Object v = fields.get(key);
             if (v instanceof Number) return ((Number) v).longValue();
             if (v instanceof String) {
-                try { return Long.parseLong(((String) v).trim()); } catch (Throwable ignored) {}
+                try {
+                    return Long.parseLong(((String) v).trim());
+                } catch (NumberFormatException ignored) {
+                    // Non-numeric string value falls back to caller's default.
+                }
             }
             return def;
         }
 
+        /**
+         * Returns the double value for {@code key}, coercing numeric strings and falling back to
+         * {@code def} when absent or non-numeric.
+         */
         public double getDouble(String key, double def) {
             Object v = fields.get(key);
             if (v instanceof Number) return ((Number) v).doubleValue();
             if (v instanceof String) {
-                try { return Double.parseDouble(((String) v).trim()); } catch (Throwable ignored) {}
+                try {
+                    return Double.parseDouble(((String) v).trim());
+                } catch (NumberFormatException ignored) {
+                    // Non-numeric string value falls back to caller's default.
+                }
             }
             return def;
         }
@@ -187,12 +211,6 @@ public final class SimpleJson {
                 if ("false".equals(s) || "0".equals(s)) return false;
             }
             return def;
-        }
-
-        public JsonObjectView getObject(String key) {
-            Object v = fields.get(key);
-            if (v instanceof JsonObjectView) return (JsonObjectView) v;
-            return null;
         }
 
         public List<String> getStringList(String key) {
@@ -210,6 +228,9 @@ public final class SimpleJson {
             return out;
         }
 
+        /**
+         * Returns parsed integers from array {@code key}, skipping any non-numeric elements.
+         */
         public List<Integer> getIntList(String key) {
             Object v = fields.get(key);
             if (!(v instanceof List<?>)) return Collections.emptyList();
@@ -219,7 +240,11 @@ public final class SimpleJson {
                 if (item instanceof Number) {
                     out.add(((Number) item).intValue());
                 } else if (item instanceof String) {
-                    try { out.add(Integer.parseInt(((String) item).trim())); } catch (Throwable ignored) {}
+                    try {
+                        out.add(Integer.parseInt(((String) item).trim()));
+                    } catch (NumberFormatException ignored) {
+                        // Skip malformed integer token in array.
+                    }
                 }
             }
             return out;

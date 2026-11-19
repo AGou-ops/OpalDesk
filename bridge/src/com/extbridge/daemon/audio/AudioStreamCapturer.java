@@ -66,7 +66,9 @@ public final class AudioStreamCapturer {
                 rec = createAudioRecord();
                 if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
                     if (rec != null) {
-                        try { rec.release(); } catch (Throwable ignored) {}
+                        try { rec.release(); } catch (RuntimeException e) {
+                            System.err.println("EXTBRIDGE_AUDIO_REC_RELEASE_WARN: " + e.getMessage());
+                        }
                     }
                     System.out.println("EXTBRIDGE_AUDIO_UNAVAILABLE AudioRecord not initialized; degrading gracefully");
                     notifyState(false);
@@ -105,9 +107,17 @@ public final class AudioStreamCapturer {
                 notifyState(true);
                 return true;
             } catch (Throwable t) {
-                System.out.println("EXTBRIDGE_AUDIO_FALLBACK_OFF: " + t.getMessage());
-                try { if (enc != null) enc.release(); } catch (Throwable ignored) {}
-                try { if (rec != null) rec.release(); } catch (Throwable ignored) {}
+                System.err.println("EXTBRIDGE_AUDIO_FALLBACK_OFF: " + t.getMessage());
+                if (enc != null) {
+                    try { enc.release(); } catch (RuntimeException e) {
+                        System.err.println("EXTBRIDGE_AUDIO_ENC_CLEANUP_WARN: " + e.getMessage());
+                    }
+                }
+                if (rec != null) {
+                    try { rec.release(); } catch (RuntimeException e) {
+                        System.err.println("EXTBRIDGE_AUDIO_REC_CLEANUP_WARN: " + e.getMessage());
+                    }
+                }
                 this.audioRecord = null;
                 this.encoder = null;
                 this.running = false;
@@ -135,22 +145,26 @@ public final class AudioStreamCapturer {
         this.encoder = null;
 
         if (rec != null) {
-            try { rec.stop(); } catch (Throwable ignored) {}
-            try { rec.release(); } catch (Throwable ignored) {}
+            try { rec.stop(); } catch (RuntimeException ignored) {}
+            try { rec.release(); } catch (RuntimeException e) {
+                System.err.println("EXTBRIDGE_AUDIO_REC_RELEASE_WARN: " + e.getMessage());
+            }
         }
         Thread ct = this.captureThread;
         this.captureThread = null;
         if (ct != null && ct != Thread.currentThread()) {
-            try { ct.join(250L); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            try { ct.join(250L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
         if (enc != null) {
-            try { enc.stop(); } catch (Throwable ignored) {}
-            try { enc.release(); } catch (Throwable ignored) {}
+            try { enc.stop(); } catch (RuntimeException ignored) {}
+            try { enc.release(); } catch (RuntimeException e) {
+                System.err.println("EXTBRIDGE_AUDIO_ENC_RELEASE_WARN: " + e.getMessage());
+            }
         }
         Thread dt = this.drainThread;
         this.drainThread = null;
         if (dt != null && dt != Thread.currentThread()) {
-            try { dt.join(250L); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            try { dt.join(250L); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
         }
         if (notifyIfWasActive && wasActive) {
             notifyState(false);
@@ -170,61 +184,64 @@ public final class AudioStreamCapturer {
                 .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
                 .build();
 
-        // Attempt 1: AudioRecord.Builder with internal capture preset REMOTE_SUBMIX + shell Context
+        // Attempt 1: internal capture preset REMOTE_SUBMIX + shell Context;
+        // Attempt 2: standard AudioRecord.Builder with REMOTE_SUBMIX + shell Context.
+        AudioRecord rec = tryBuildAudioRecord(af, bufSize, true);
+        if (rec != null) return rec;
+        return tryBuildAudioRecord(af, bufSize, false);
+    }
+
+    private AudioRecord tryBuildAudioRecord(AudioFormat af, int bufSize, boolean useInternalPreset) {
         try {
-            AudioAttributes.Builder attrB = new AudioAttributes.Builder();
-            Method setInternal = null;
-            try {
-                setInternal = AudioAttributes.Builder.class.getMethod("setInternalCapturePreset", int.class);
-            } catch (Throwable ignored) {}
-            if (setInternal != null) {
+            AudioRecord.Builder recB = new AudioRecord.Builder()
+                    .setAudioFormat(af)
+                    .setBufferSizeInBytes(bufSize);
+
+            if (useInternalPreset) {
+                Method setInternal;
+                try {
+                    setInternal = AudioAttributes.Builder.class.getMethod("setInternalCapturePreset", int.class);
+                } catch (NoSuchMethodException ignored) {
+                    return null;
+                }
+                AudioAttributes.Builder attrB = new AudioAttributes.Builder();
                 setInternal.invoke(attrB, MediaRecorder.AudioSource.REMOTE_SUBMIX);
-                AudioRecord.Builder recB = new AudioRecord.Builder()
-                        .setAudioFormat(af)
-                        .setBufferSizeInBytes(bufSize);
                 try {
                     AudioRecord.Builder.class.getMethod("setAudioAttributes", AudioAttributes.class)
                             .invoke(recB, attrB.build());
-                } catch (Throwable ignored) {
+                } catch (NoSuchMethodException ignored) {
                     recB.setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX);
                 }
-                if (ctx != null && Build.VERSION.SDK_INT >= 31) {
-                    try {
-                        AudioRecord.Builder.class.getMethod("setContext", Context.class).invoke(recB, ctx);
-                    } catch (Throwable ignored) {}
+                if (Build.VERSION.SDK_INT >= 30) {
+                    recB.setPrivacySensitive(false);
                 }
-                try {
-                    if (Build.VERSION.SDK_INT >= 30) {
-                        recB.setPrivacySensitive(false);
-                    }
-                } catch (Throwable ignored) {}
-                AudioRecord r = recB.build();
-                if (r.getState() == AudioRecord.STATE_INITIALIZED) {
-                    return r;
-                }
-                r.release();
+            } else {
+                recB.setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX);
             }
-        } catch (Throwable ignored) {}
 
-        // Attempt 2: Standard AudioRecord.Builder with REMOTE_SUBMIX
-        try {
-            AudioRecord.Builder recB = new AudioRecord.Builder()
-                    .setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX)
-                    .setAudioFormat(af)
-                    .setBufferSizeInBytes(bufSize);
-            if (ctx != null && Build.VERSION.SDK_INT >= 31) {
-                try {
-                    AudioRecord.Builder.class.getMethod("setContext", Context.class).invoke(recB, ctx);
-                } catch (Throwable ignored) {}
-            }
+            applyShellContext(recB);
+
             AudioRecord r = recB.build();
             if (r.getState() == AudioRecord.STATE_INITIALIZED) {
                 return r;
             }
             r.release();
-        } catch (Throwable ignored) {}
-
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_AUDIO_RECORD_ATTEMPT_WARN internalPreset="
+                    + useInternalPreset + ": " + t.getMessage());
+        }
         return null;
+    }
+
+    private void applyShellContext(AudioRecord.Builder recB) {
+        if (ctx == null || Build.VERSION.SDK_INT < 31) return;
+        try {
+            AudioRecord.Builder.class.getMethod("setContext", Context.class).invoke(recB, ctx);
+        } catch (NoSuchMethodException ignored) {
+            // Optional hidden API.
+        } catch (ReflectiveOperationException e) {
+            System.err.println("EXTBRIDGE_AUDIO_SET_CTX_WARN: " + e.getMessage());
+        }
     }
 
     private void captureLoop(AudioRecord rec, MediaCodec enc) {
@@ -239,7 +256,7 @@ public final class AudioStreamCapturer {
                 if (read < 0) {
                     consecutiveErrors++;
                     if (consecutiveErrors >= 5) {
-                        System.out.println("EXTBRIDGE_AUDIO_READ_FAILED err=" + read + "; disabling audio");
+                        System.err.println("EXTBRIDGE_AUDIO_READ_FAILED err=" + read + "; disabling audio");
                         failAndDisableAsync();
                         return;
                     }
@@ -262,12 +279,13 @@ public final class AudioStreamCapturer {
                 }
             } catch (IllegalStateException ise) {
                 if (running) {
+                    System.err.println("EXTBRIDGE_AUDIO_CAPTURE_STATE_ERR: " + ise.getMessage());
                     failAndDisableAsync();
                 }
                 return;
             } catch (Throwable t) {
                 if (running) {
-                    System.out.println("EXTBRIDGE_AUDIO_CAPTURE_ERR: " + t.getMessage());
+                    System.err.println("EXTBRIDGE_AUDIO_CAPTURE_ERR: " + t.getMessage());
                     failAndDisableAsync();
                 }
                 return;
@@ -321,11 +339,24 @@ public final class AudioStreamCapturer {
                 } finally {
                     enc.releaseOutputBuffer(outIdx, false);
                 }
+
+                if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    if (running) {
+                        System.err.println("EXTBRIDGE_AUDIO_DRAIN_UNEXPECTED_EOS; disabling audio");
+                        failAndDisableAsync();
+                    }
+                    break;
+                }
             } catch (IllegalStateException ise) {
+                if (running) {
+                    System.err.println("EXTBRIDGE_AUDIO_DRAIN_STATE_ERR: " + ise.getMessage());
+                    failAndDisableAsync();
+                }
                 break;
             } catch (Throwable t) {
                 if (running) {
-                    System.out.println("EXTBRIDGE_AUDIO_DRAIN_ERR: " + t.getMessage());
+                    System.err.println("EXTBRIDGE_AUDIO_DRAIN_ERR: " + t);
+                    failAndDisableAsync();
                 }
                 break;
             }
@@ -356,6 +387,7 @@ public final class AudioStreamCapturer {
     }
 
     private void failAndDisableAsync() {
+        this.running = false;
         Thread t = new Thread(this::stop, "ExtAudioStop");
         t.setDaemon(true);
         t.start();
@@ -365,7 +397,9 @@ public final class AudioStreamCapturer {
         if (listener != null) {
             try {
                 listener.onAudioStateChanged(isActive);
-            } catch (Throwable ignored) {}
+            } catch (Throwable t) {
+                System.err.println("EXTBRIDGE_AUDIO_STATE_CALLBACK_ERR: " + t.getMessage());
+            }
         }
     }
 }

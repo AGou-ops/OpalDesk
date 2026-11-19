@@ -1,0 +1,160 @@
+package com.extbridge.daemon.ipc;
+
+/**
+ * Single source of truth for the ExtBridge daemon Binder IPC wire protocol,
+ * LocalSocket control channel, Helper IPC contracts, Android windowing modes,
+ * and action constants.
+ *
+ * <p>Must remain ABI-aligned with {@code com.extbridge.helper.protocol.BridgeProtocol}.
+ */
+public final class BridgeProtocol {
+    // ---- Binder, LocalSocket & Helper IPC identifiers ----
+    public static final String BINDER_DESC = "com.extbridge.daemon.IBridgeControl";
+    public static final String CTL_SOCKET_NAME = "com.extbridge.daemon.ctl";
+    public static final String ACTION_NEED_BINDER = "com.extbridge.daemon.NEED_BINDER";
+
+    public static final String HELPER_PROVIDER_AUTHORITY = "com.extbridge.helper.provider";
+    public static final String HELPER_ACTION_BINDER_PUSH = "com.extbridge.helper.BINDER_PUSH";
+    public static final String HELPER_LAUNCHER_CLASS = "com.extbridge.helper.LauncherActivity";
+    public static final String HELPER_SERVICE_CLASS = "com.extbridge.helper.BridgeService";
+    public static final String HELPER_CONTROL_RECEIVER_CLASS = "com.extbridge.helper.ControlReceiver";
+
+    public static final String PROVIDER_METHOD_SET_BINDER = "setBinder";
+    public static final String PROVIDER_METHOD_SYNC_STATE = "syncState";
+    public static final String PROVIDER_METHOD_MIR_EDGE_CAPTURE = "mirEdgeCapture";
+
+    public static final String CTL_CMD_SHUTDOWN = "SHUTDOWN";
+    public static final String CTL_CMD_NEED_BINDER = "NEED_BINDER";
+    public static final String CTL_REPLY_DONE = "DONE";
+    public static final String CTL_REPLY_OK = "OK";
+
+    // ---- Binder Transaction Codes (active ABI; obsolete codes 13, 14, 19, 36 removed) ----
+    public static final int TX_TOGGLE_INPUT = 10;
+    public static final int TX_SEND_BACK = 11;
+    public static final int TX_RELAUNCH_LAUNCHER = 12;
+    public static final int TX_GET_STATUS = 15;
+    public static final int TX_APPLY_CONFIG = 16;
+    public static final int TX_SEND_MOUSE = 17;
+    public static final int TX_SEND_KEY = 18;
+    public static final int TX_LAUNCH_COMPONENT = 20;
+    public static final int TX_REBUILD = 21;
+    public static final int TX_GET_WALLPAPER = 22;
+    public static final int TX_GET_TASKS = 23;
+    public static final int TX_SWITCH_TO_TASK = 24;
+    public static final int TX_REMOVE_TASK = 25;
+    public static final int TX_GET_SYS_STATUS = 26;
+    public static final int TX_EXEC_SYS_ACTION = 27;
+    public static final int TX_SET_MIRROR_MODE = 28;
+    public static final int TX_SET_FULLSCREEN_POLICY = 29;
+    public static final int TX_PREPARE_APP_LAUNCH = 30;
+    public static final int TX_GET_ALL_APP_MODES = 31;
+    public static final int TX_SET_APP_MODE = 32;
+    public static final int TX_RESET_ALL_APP_MODES = 33;
+    public static final int TX_SET_ROTATION = 34;
+    public static final int TX_SPLIT_ACTION = 35;
+    public static final int TX_MINIMIZE_TO_EXT_HOME = 37;
+    public static final int TX_SET_MIRROR_SIDE_MODE = 38;
+    public static final int TX_GET_MIRROR_TELEMETRY = 39;
+    public static final int TX_ENSURE_APPWIDGET_PERMISSION = 40;
+    public static final int TX_SEND_SIDE_TOUCH = 41;
+    public static final int TX_SEND_CAPTURED_MIRROR_MOUSE = 42;
+    public static final int TX_NOTIFY_MIRROR_EDGE_HOVER = 43;
+    public static final int TX_CAPTURE_TASK_SNAPSHOT = 44;
+    public static final int TX_SET_WIFI_REMOTE_CONFIG = 45;
+    public static final int TX_LIST_TRUSTED_MAC_CLIENTS = 46;
+    public static final int TX_REVOKE_TRUSTED_MAC_CLIENT = 47;
+    public static final int TX_DISCONNECT_REMOTE_CLIENT = 48;
+    public static final int TX_SET_REMOTE_STREAM_PREFS = 49;
+    public static final int TX_GET_MANAGED_WINDOWS = 50;
+    public static final int TX_LAUNCH_IN_WINDOW_MODE = 51;
+    public static final int TX_UPDATE_WINDOW_BOUNDS = 52;
+    public static final int TX_SET_TILING_LAYOUT = 53;
+    public static final int TX_WINDOW_LIFECYCLE_ACTION = 54;
+    public static final int TX_SET_ADAPTIVE_SINGLE_CONFIG = 55;
+    public static final int TX_SET_INPUT_BACKEND = 56;
+    public static final int TX_SHUTDOWN = 99;
+
+    // ---- Android WindowConfiguration Windowing Modes ----
+    public static final int WINDOWING_MODE_UNDEFINED = 0;
+    public static final int WINDOWING_MODE_FULLSCREEN = 1;
+    public static final int WINDOWING_MODE_FREEFORM = 5;
+    public static final int WINDOWING_MODE_MULTI_WINDOW = 6;
+
+    // ---- VirtualDisplay Flag Bitmasks ----
+    /** Includes ROTATES_WITH_CONTENT (0x0080) for compatibility mode. */
+    public static final int VD_FLAGS_COMPAT = 0x44CB;
+    /** Strips ROTATES_WITH_CONTENT so DeX desktop remains locked landscape. */
+    public static final int VD_FLAGS_DEX_FIXED = 0x444B;
+
+    // ---- Mirror Modes & Side Modes ----
+    public static final int MIRROR_MODE_DEX = 0;
+    public static final int MIRROR_MODE_MIRROR = 1;
+
+    public static final int MIRROR_SIDE_OFF = 0;
+    public static final int MIRROR_SIDE_ALIGN_LEFT = 1;
+    public static final int MIRROR_SIDE_ALIGN_RIGHT = 2;
+    public static final int MIRROR_SIDE_CENTER_DUAL = 3;
+
+    // ---- Per-App Compat Modes ----
+    public static final int APP_MODE_DEFAULT = 0;
+    public static final int APP_MODE_LAND_FULL = 1;
+    public static final int APP_MODE_PORT_COMPAT = 2;
+
+    // ---- Input Backend & Inject Status ----
+    public static final int INPUT_BACKEND_AUTO = 0;
+    public static final int INPUT_BACKEND_INJECT = 1;
+    public static final int INPUT_BACKEND_UHID = 2;
+
+    public static final int INJECT_STATUS_SYSTEM = 1;
+    public static final int INJECT_STATUS_UHID = 2;
+    public static final int INJECT_STATUS_BLOCKED = -1;
+    public static final int INJECT_STATUS_FAILED = -2;
+
+    // ---- Binder Code 17 Mouse Actions ----
+    public static final int MOUSE_MOVE_REL = 0;
+    public static final int MOUSE_LEFT_CLICK = 1;
+    public static final int MOUSE_RIGHT_CLICK = 2;
+    public static final int MOUSE_LEFT_DOWN = 3;
+    public static final int MOUSE_LEFT_UP = 4;
+    public static final int MOUSE_SCROLL = 5;
+    public static final int MOUSE_MOVE_ABS = 7;
+
+    // ---- Binder Code 18 Key Sub-Actions ----
+    public static final int KEY_ACTION_EVENT = 0;
+    public static final int KEY_ACTION_ASCII = 1;
+    public static final int KEY_ACTION_PASTE = 2;
+
+    // ---- Binder Code 42 Captured Mirror Mouse Actions ----
+    public static final int CAPTURED_MOVE_REL = 0;
+    public static final int CAPTURED_LEFT_DOWN = 1;
+    public static final int CAPTURED_LEFT_UP = 2;
+    public static final int CAPTURED_SCROLL = 4;
+    public static final int CAPTURED_EXIT = 5;
+    public static final int CAPTURED_EXTRA_BTN_DOWN = 6;
+    public static final int CAPTURED_EXTRA_BTN_UP = 7;
+    public static final int CAPTURED_REASSERT_D0_FOCUS = 9;
+
+    // ---- Binder Code 35 Legacy 2-Slot Split Actions ----
+    public static final int SPLIT_ASSIGN_LEFT_TOP = 1;
+    public static final int SPLIT_ASSIGN_RIGHT_BOTTOM = 2;
+    public static final int SPLIT_TOGGLE_QUICK = 3;
+    public static final int SPLIT_SET_RATIO = 4;
+    public static final int SPLIT_SWAP = 5;
+    public static final int SPLIT_EXIT = 6;
+
+    // ---- Binder Code 27 System Actions ----
+    public static final int SYS_ACTION_WIFI = 1;
+    public static final int SYS_ACTION_BT = 2;
+    public static final int SYS_ACTION_AIRPLANE = 3;
+    public static final int SYS_ACTION_POWER_SAVE = 4;
+    public static final int SYS_ACTION_OPEN_SETTINGS = 5;
+    public static final int SYS_ACTION_SCREEN_DIM = 6;
+
+    // ---- Binder Code 54 Window Lifecycle Actions ----
+    public static final int WIN_ACTION_FOCUS = 1;
+    public static final int WIN_ACTION_MINIMIZE = 2;
+    public static final int WIN_ACTION_CLOSE = 3;
+    public static final int WIN_ACTION_RELOAD_DPI = 4;
+
+    private BridgeProtocol() {}
+}

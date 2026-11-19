@@ -26,6 +26,20 @@ import java.util.LinkedHashSet;
  */
 public final class UhidInputDevice implements Closeable {
     public static final String UHID_DEVICE_PATH = "/dev/uhid";
+    private static final int HID_KEY_V = 0x19;
+
+    // Cached reflection bindings for port-to-display association across InputManager / IInputManager
+    private static final Object ASSOC_CACHE_LOCK = new Object();
+    private static volatile boolean sAssocMethodsResolved;
+    private static volatile Method sImAddPort;
+    private static volatile Method sImAddLegacy;
+    private static volatile Method sImRemPort;
+    private static volatile Method sImRemLegacy;
+    private static volatile Class<?> sIImCachedClass;
+    private static volatile Method sIImAddPort;
+    private static volatile Method sIImAddLegacy;
+    private static volatile Method sIImRemPort;
+    private static volatile Method sIImRemLegacy;
 
     private final Object ioLock = new Object();
     private final int displayId;
@@ -83,6 +97,7 @@ public final class UhidInputDevice implements Closeable {
     private void init() throws Exception {
         synchronized (ioLock) {
             if (vdUniqueId != null && !vdUniqueId.isEmpty()) {
+                // Pre-register before UHID_CREATE2 so EventHub binds the display during initial HID probe.
                 bindPortAssociation(ptrPhys, vdUniqueId);
                 bindPortAssociation(kbdPhys, vdUniqueId);
                 portAssociated = true;
@@ -115,6 +130,7 @@ public final class UhidInputDevice implements Closeable {
             writeAll(kbdFd, createKbd);
 
             if (vdUniqueId != null && !vdUniqueId.isEmpty()) {
+                // Re-apply after UHID_CREATE2 for ROMs whose InputReader only attaches associations to live ports.
                 bindPortAssociation(ptrPhys, vdUniqueId);
                 bindPortAssociation(kbdPhys, vdUniqueId);
             }
@@ -210,7 +226,7 @@ public final class UhidInputDevice implements Closeable {
 
             if (androidKeyCode == KeyEvent.KEYCODE_PASTE) {
                 int mods = isDown ? UhidProtocol.MOD_LEFT_CTRL : 0;
-                int[] keys = isDown ? new int[]{0x19} : new int[0]; // Ctrl+V
+                int[] keys = isDown ? new int[]{HID_KEY_V} : new int[0]; // Ctrl+V
                 try {
                     writeAll(kbdFd, UhidProtocol.buildInput2Event(UhidProtocol.buildKeyboardReport(mods, keys)));
                     return true;
@@ -267,7 +283,9 @@ public final class UhidInputDevice implements Closeable {
                         writeAll(ptrFd, UhidProtocol.buildInput2Event(
                                 UhidProtocol.buildPointerReport(0, Math.max(0, lastAbsX), Math.max(0, lastAbsY), 0, 0)));
                     }
-                } catch (Throwable ignored) {}
+                } catch (Exception e) {
+                    System.err.println("EXTBRIDGE_UHID_PTR_RELEASE_WARN: " + e.getMessage());
+                }
                 destroyAndCloseFd(ptrFd);
                 ptrFd = null;
             }
@@ -276,7 +294,9 @@ public final class UhidInputDevice implements Closeable {
                     if (activeModifiers != 0 || !pressedHidKeys.isEmpty()) {
                         writeAll(kbdFd, UhidProtocol.buildInput2Event(UhidProtocol.buildKeyboardReport(0, null)));
                     }
-                } catch (Throwable ignored) {}
+                } catch (Exception e) {
+                    System.err.println("EXTBRIDGE_UHID_KBD_RELEASE_WARN: " + e.getMessage());
+                }
                 destroyAndCloseFd(kbdFd);
                 kbdFd = null;
             }
@@ -327,46 +347,71 @@ public final class UhidInputDevice implements Closeable {
         if (fd == null) return;
         try {
             writeAll(fd, UhidProtocol.buildDestroyEvent());
-        } catch (Throwable ignored) {
+        } catch (Exception e) {
+            System.err.println("EXTBRIDGE_UHID_DESTROY_WARN: " + e.getMessage());
         } finally {
-            try { Os.close(fd); } catch (Throwable ignored) {}
+            try {
+                Os.close(fd);
+            } catch (ErrnoException e) {
+                System.err.println("EXTBRIDGE_UHID_CLOSE_WARN: " + e.getMessage());
+            }
+        }
+    }
+
+    private void ensureAssocMethodsCached() {
+        Class<?> iimCls = (iInputManager != null) ? iInputManager.getClass() : null;
+        if (sAssocMethodsResolved && (iimCls == null || iimCls == sIImCachedClass)) return;
+        synchronized (ASSOC_CACHE_LOCK) {
+            if (!sAssocMethodsResolved) {
+                sImAddPort = findMethodOrNull(InputManager.class, "addUniqueIdAssociationByPort", String.class, String.class);
+                sImAddLegacy = findMethodOrNull(InputManager.class, "addUniqueIdAssociation", String.class, String.class);
+                sImRemPort = findMethodOrNull(InputManager.class, "removeUniqueIdAssociationByPort", String.class);
+                sImRemLegacy = findMethodOrNull(InputManager.class, "removeUniqueIdAssociation", String.class);
+                sAssocMethodsResolved = true;
+            }
+            if (iimCls != null && iimCls != sIImCachedClass) {
+                sIImAddPort = findMethodOrNull(iimCls, "addUniqueIdAssociationByPort", String.class, String.class);
+                sIImAddLegacy = findMethodOrNull(iimCls, "addUniqueIdAssociation", String.class, String.class);
+                sIImRemPort = findMethodOrNull(iimCls, "removeUniqueIdAssociationByPort", String.class);
+                sIImRemLegacy = findMethodOrNull(iimCls, "removeUniqueIdAssociation", String.class);
+                sIImCachedClass = iimCls;
+            }
+        }
+    }
+
+    private static Method findMethodOrNull(Class<?> cls, String name, Class<?>... params) {
+        try {
+            return cls.getMethod(name, params);
+        } catch (NoSuchMethodException ignored) {
+            return null;
         }
     }
 
     private void bindPortAssociation(String phys, String uniqueId) {
         if (phys == null || uniqueId == null || uniqueId.isEmpty()) return;
-        if (invokeAssocMethod(inputManager, "addUniqueIdAssociationByPort", phys, uniqueId)) return;
-        if (invokeAssocMethod(inputManager, "addUniqueIdAssociation", phys, uniqueId)) return;
-        if (invokeAssocMethod(iInputManager, "addUniqueIdAssociationByPort", phys, uniqueId)) return;
-        invokeAssocMethod(iInputManager, "addUniqueIdAssociation", phys, uniqueId);
+        ensureAssocMethodsCached();
+        if (invokeCached(inputManager, sImAddPort, phys, uniqueId)) return;
+        if (invokeCached(inputManager, sImAddLegacy, phys, uniqueId)) return;
+        if (invokeCached(iInputManager, sIImAddPort, phys, uniqueId)) return;
+        invokeCached(iInputManager, sIImAddLegacy, phys, uniqueId);
     }
 
     private void unbindPortAssociation(String phys) {
         if (phys == null) return;
-        if (invokeUnbindMethod(inputManager, "removeUniqueIdAssociationByPort", phys)) return;
-        if (invokeUnbindMethod(inputManager, "removeUniqueIdAssociation", phys)) return;
-        if (invokeUnbindMethod(iInputManager, "removeUniqueIdAssociationByPort", phys)) return;
-        invokeUnbindMethod(iInputManager, "removeUniqueIdAssociation", phys);
+        ensureAssocMethodsCached();
+        if (invokeCached(inputManager, sImRemPort, phys)) return;
+        if (invokeCached(inputManager, sImRemLegacy, phys)) return;
+        if (invokeCached(iInputManager, sIImRemPort, phys)) return;
+        invokeCached(iInputManager, sIImRemLegacy, phys);
     }
 
-    private static boolean invokeAssocMethod(Object target, String name, String port, String uniqueId) {
-        if (target == null) return false;
+    private static boolean invokeCached(Object target, Method method, Object... args) {
+        if (target == null || method == null) return false;
         try {
-            Method m = target.getClass().getMethod(name, String.class, String.class);
-            m.invoke(target, port, uniqueId);
+            method.invoke(target, args);
             return true;
-        } catch (Throwable ignored) {
-            return false;
-        }
-    }
-
-    private static boolean invokeUnbindMethod(Object target, String name, String port) {
-        if (target == null) return false;
-        try {
-            Method m = target.getClass().getMethod(name, String.class);
-            m.invoke(target, port);
-            return true;
-        } catch (Throwable ignored) {
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_UHID_ASSOC_WARN method=" + method.getName() + ": " + e.getMessage());
             return false;
         }
     }

@@ -1,5 +1,7 @@
 package com.extbridge.daemon.stream;
 
+import com.extbridge.daemon.BridgeBuildConfig;
+
 import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -12,11 +14,13 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * ExtCast v1.1 binary framing and payload codecs (Big-Endian network byte order).
- * Byte-for-byte compatible with ExtBridgeMac (Swift ExtCastFrame).
+ * ExtCast v1.1 server-side binary framing and payload codecs (Big-Endian network byte order).
+ * Byte-for-byte compatible with ExtBridgeMac (Swift ExtCastFrame):
+ * - Encodes downlink frames (Android -> Mac)
+ * - Decodes uplink frames (Mac -> Android)
  */
 public final class ExtCastProtocol {
-    public static final int PROTOCOL_VERSION = 1;
+    public static final int PROTOCOL_VERSION = BridgeBuildConfig.EXTCAST_PROTOCOL_VERSION;
     public static final int HEADER_SIZE = 18;
     public static final int MAGIC = 0x45584231; // "EXB1"
     public static final byte MAGIC_0 = 0x45; // 'E'
@@ -75,14 +79,11 @@ public final class ExtCastProtocol {
 
     // Audio codec IDs
     public static final int AUDIO_CODEC_AAC_LC = 1;
-    public static final int AUDIO_CODEC_OPUS = 2;
-    public static final int AUDIO_CODEC_PCM_16 = 3;
 
     // Display modes
     public static final int DISPLAY_MODE_DEX = 0;
     public static final int DISPLAY_MODE_MIRROR = 1;
     public static final int DISPLAY_MODE_UNCHANGED = 0xFF;
-    public static final int ROTATION_UNCHANGED = 0xFF;
 
     // Mouse actions
     public static final int MOUSE_MOVE_ABS = 0;
@@ -133,7 +134,7 @@ public final class ExtCastProtocol {
     public static final int FILE_ACK_ERR = 1;
 
     public static final byte[] EMPTY_BYTES = new byte[0];
-    private static final byte[] PNG_MAGIC = new byte[]{
+    static final byte[] PNG_MAGIC = new byte[]{
             (byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A
     };
 
@@ -150,6 +151,10 @@ public final class ExtCastProtocol {
     public static final class ProtocolException extends IOException {
         public ProtocolException(String message) {
             super(message);
+        }
+
+        public ProtocolException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -168,10 +173,6 @@ public final class ExtCastProtocol {
     }
 
     // ---- Low-level 18-byte BE frame I/O ----
-
-    public static void writeFrame(OutputStream out, Frame frame) throws IOException {
-        writeFrame(out, frame.type, frame.flags, frame.timestampUs, frame.payload, 0, frame.payload.length);
-    }
 
     public static void writeFrame(
             OutputStream out,
@@ -279,7 +280,7 @@ public final class ExtCastProtocol {
         }
     }
 
-    // ---- Downlink payload structures & encoders/decoders ----
+    // ---- Downlink payload structures & encoders (Android -> Mac) ----
 
     public static final class VideoConfig {
         public final int codec;
@@ -319,23 +320,6 @@ public final class ExtCastProtocol {
         return bb.array();
     }
 
-    public static VideoConfig decodeVideoConfig(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 11) {
-            throw new ProtocolException("VIDEO_CONFIG payload too short");
-        }
-        ByteBuffer bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
-        int codec = bb.get() & 0xFF;
-        int width = bb.getShort() & 0xFFFF;
-        int height = bb.getShort() & 0xFFFF;
-        int dpi = bb.getShort() & 0xFFFF;
-        int rotation = bb.get() & 0xFF;
-        int fpsX100 = bb.getShort() & 0xFFFF;
-        int displayMode = bb.get() & 0xFF;
-        byte[] csd = new byte[bb.remaining()];
-        bb.get(csd);
-        return new VideoConfig(codec, width, height, dpi, rotation, fpsX100, displayMode, csd);
-    }
-
     public static final class AudioConfig {
         public final int codec;
         public final int sampleRate;
@@ -358,19 +342,6 @@ public final class ExtCastProtocol {
         bb.put((byte) (cfg.channels & 0xFF));
         if (asc.length > 0) bb.put(asc);
         return bb.array();
-    }
-
-    public static AudioConfig decodeAudioConfig(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 6) {
-            throw new ProtocolException("AUDIO_CONFIG payload too short");
-        }
-        ByteBuffer bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
-        int codec = bb.get() & 0xFF;
-        int sampleRate = bb.getInt();
-        int channels = bb.get() & 0xFF;
-        byte[] asc = new byte[bb.remaining()];
-        bb.get(asc);
-        return new AudioConfig(codec, sampleRate, channels, asc);
     }
 
     public static final class DeviceState {
@@ -455,69 +426,12 @@ public final class ExtCastProtocol {
         return json.getBytes(StandardCharsets.UTF_8);
     }
 
-    public static DeviceState decodeDeviceState(byte[] payload) throws ProtocolException {
-        try {
-            SimpleJson.JsonObjectView obj = SimpleJson.parseObject(new String(payload, StandardCharsets.UTF_8));
-            return new DeviceState(
-                    obj.getString("deviceName", "Android"),
-                    obj.getInt("sinkType", 0),
-                    obj.getInt("displayMode", 0),
-                    obj.getInt("width", 1920),
-                    obj.getInt("height", 1080),
-                    obj.getInt("dpi", 240),
-                    obj.getDouble("fps", 60.0),
-                    obj.getInt("rotation", 0),
-                    obj.getInt("bitrateKbps", 12000),
-                    obj.getInt("batteryPct", -1),
-                    obj.getBoolean("blackout", false),
-                    obj.getBoolean("audioEnabled", false),
-                    obj.getInt("injectStatus", 1),
-                    obj.getBoolean("adaptiveSingleEnabled", true),
-                    obj.getInt("defaultSingleWidthDp", 460),
-                    obj.getString("activeLayoutMode", "FULLSCREEN"),
-                    obj.getString("topAppPackage", ""),
-                    obj.getString("topAppLabel", ""));
-        } catch (Throwable t) {
-            throw new ProtocolException("Invalid DEVICE_STATE JSON: " + t.getMessage());
-        }
-    }
-
-    public static final class ClipboardPush {
-        public final long seq;
-        public final String text;
-
-        public ClipboardPush(long seq, String text) {
-            this.seq = seq;
-            this.text = (text != null) ? text : "";
-        }
-    }
-
     public static byte[] encodeClipboardPush(long seq, String text) {
         byte[] utf8 = (text != null ? text : "").getBytes(StandardCharsets.UTF_8);
         ByteBuffer bb = ByteBuffer.allocate(8 + utf8.length).order(ByteOrder.BIG_ENDIAN);
         bb.putLong(seq);
         bb.put(utf8);
         return bb.array();
-    }
-
-    public static ClipboardPush decodeClipboardPush(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 8) {
-            throw new ProtocolException("CLIPBOARD_PUSH payload too short");
-        }
-        ByteBuffer bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
-        long seq = bb.getLong();
-        String text = new String(payload, 8, payload.length - 8, StandardCharsets.UTF_8);
-        return new ClipboardPush(seq, text);
-    }
-
-    public static final class ClipboardImagePush {
-        public final long seq;
-        public final byte[] pngData;
-
-        public ClipboardImagePush(long seq, byte[] pngData) {
-            this.seq = seq;
-            this.pngData = (pngData != null) ? pngData : EMPTY_BYTES;
-        }
     }
 
     public static byte[] encodeClipboardImagePush(long seq, byte[] pngData) throws ProtocolException {
@@ -529,23 +443,6 @@ public final class ExtCastProtocol {
         bb.putLong(seq);
         if (data.length > 0) bb.put(data);
         return bb.array();
-    }
-
-    public static ClipboardImagePush decodeClipboardImagePush(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 8) {
-            throw new ProtocolException("CLIPBOARD_PUSH image payload too short");
-        }
-        int imgLen = payload.length - 8;
-        if (imgLen > MAX_CLIPBOARD_IMAGE_BYTES) {
-            throw new ProtocolException("Clipboard PNG exceeds 8 MiB limit: " + imgLen);
-        }
-        ByteBuffer bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
-        long seq = bb.getLong();
-        byte[] data = new byte[imgLen];
-        if (imgLen > 0) {
-            bb.get(data);
-        }
-        return new ClipboardImagePush(seq, data);
     }
 
     public static final class AuthResultMsg {
@@ -579,37 +476,6 @@ public final class ExtCastProtocol {
         return out;
     }
 
-    public static AuthResultMsg decodeAuthResult(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 3) {
-            throw new ProtocolException("AUTH_RESULT payload too short");
-        }
-        boolean okByte = (payload[0] & 0xFF) != 0;
-        try {
-            String json = new String(payload, 1, payload.length - 1, StandardCharsets.UTF_8);
-            SimpleJson.JsonObjectView obj = SimpleJson.parseObject(json);
-            return new AuthResultMsg(
-                    okByte && obj.getBoolean("ok", okByte),
-                    obj.getString("authToken", ""),
-                    obj.getString("message", ""),
-                    obj.getString("deviceName", ""),
-                    obj.getString("certFingerprint", ""));
-        } catch (Throwable t) {
-            throw new ProtocolException("Invalid AUTH_RESULT JSON: " + t.getMessage());
-        }
-    }
-
-    public static final class FileTransferAck {
-        public final int transferId;
-        public final int status; // 0=ok, 1=err
-        public final String pathOrError;
-
-        public FileTransferAck(int transferId, int status, String pathOrError) {
-            this.transferId = transferId;
-            this.status = status;
-            this.pathOrError = (pathOrError != null) ? pathOrError : "";
-        }
-    }
-
     public static byte[] encodeFileTransferAck(int transferId, int status, String pathOrError) {
         byte[] utf8 = (pathOrError != null ? pathOrError : "").getBytes(StandardCharsets.UTF_8);
         ByteBuffer bb = ByteBuffer.allocate(5 + utf8.length).order(ByteOrder.BIG_ENDIAN);
@@ -619,15 +485,82 @@ public final class ExtCastProtocol {
         return bb.array();
     }
 
-    public static FileTransferAck decodeFileTransferAck(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 5) {
-            throw new ProtocolException("FILE_TRANSFER_ACK payload too short");
+    public static final class WifiUpgradeReadyMsg {
+        public final boolean ok;
+        public final String host;
+        public final int port;
+        public final String certFingerprint;
+        public final String authToken;
+        public final String message;
+
+        public WifiUpgradeReadyMsg(
+                boolean ok, String host, int port,
+                String certFingerprint, String authToken, String message) {
+            this.ok = ok;
+            this.host = (host != null) ? host : "";
+            this.port = port;
+            this.certFingerprint = (certFingerprint != null) ? certFingerprint : "";
+            this.authToken = (authToken != null) ? authToken : "";
+            this.message = (message != null) ? message : "";
         }
-        ByteBuffer bb = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN);
-        int transferId = bb.getInt();
-        int status = bb.get() & 0xFF;
-        String pathOrErr = new String(payload, 5, payload.length - 5, StandardCharsets.UTF_8);
-        return new FileTransferAck(transferId, status, pathOrErr);
+    }
+
+    public static byte[] encodeWifiUpgradeReady(WifiUpgradeReadyMsg msg) {
+        String json = new SimpleJson.ObjectBuilder()
+                .put("ok", msg.ok)
+                .put("host", msg.host)
+                .put("port", msg.port)
+                .put("certFingerprint", msg.certFingerprint)
+                .put("authToken", msg.authToken)
+                .put("message", msg.message)
+                .build();
+        return json.getBytes(StandardCharsets.UTF_8);
+    }
+
+    public static final class AppEntry {
+        public final String pkg;
+        public final String cls;
+        public final String label;
+        public final boolean runningOnExt;
+        public final int taskId;
+
+        public AppEntry(String pkg, String cls, String label, boolean runningOnExt, int taskId) {
+            this.pkg = (pkg != null) ? pkg : "";
+            this.cls = (cls != null) ? cls : "";
+            this.label = (label != null) ? label : "";
+            this.runningOnExt = runningOnExt;
+            this.taskId = taskId;
+        }
+    }
+
+    public static final class AppListMsg {
+        public final List<AppEntry> apps;
+
+        public AppListMsg(List<AppEntry> apps) {
+            this.apps = (apps != null)
+                    ? Collections.unmodifiableList(new ArrayList<>(apps))
+                    : Collections.emptyList();
+        }
+    }
+
+    public static byte[] encodeAppList(AppListMsg msg) {
+        SimpleJson.ArrayBuilder arr = new SimpleJson.ArrayBuilder();
+        if (msg != null && msg.apps != null) {
+            for (AppEntry e : msg.apps) {
+                if (e == null) continue;
+                arr.addRaw(new SimpleJson.ObjectBuilder()
+                        .put("pkg", e.pkg)
+                        .put("cls", e.cls)
+                        .put("label", e.label)
+                        .put("runningOnExt", e.runningOnExt)
+                        .put("taskId", e.taskId)
+                        .build());
+            }
+        }
+        String json = new SimpleJson.ObjectBuilder()
+                .putRaw("apps", arr.build())
+                .build();
+        return json.getBytes(StandardCharsets.UTF_8);
     }
 
     public static byte[] encodePingPong(long pingId) {
@@ -643,7 +576,7 @@ public final class ExtCastProtocol {
         return ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN).getLong();
     }
 
-    // ---- Uplink payload structures & encoders/decoders ----
+    // ---- Uplink payload structures & decoders (Mac -> Android) ----
 
     public static final class HelloMsg {
         public final int protocolVersion;
@@ -704,29 +637,6 @@ public final class ExtCastProtocol {
         }
     }
 
-    public static byte[] encodeHello(HelloMsg msg) {
-        String json = new SimpleJson.ObjectBuilder()
-                .put("protocolVersion", msg.protocolVersion)
-                .put("clientName", msg.clientName)
-                .put("clientId", msg.clientId)
-                .put("preferredCodec", msg.preferredCodec)
-                .put("width", msg.width)
-                .put("height", msg.height)
-                .put("dpi", msg.dpi)
-                .put("fps", msg.fps)
-                .put("bitrateKbps", msg.bitrateKbps)
-                .put("displayMode", msg.displayMode)
-                .put("audioEnabled", msg.audioEnabled)
-                .put("authToken", msg.authToken)
-                .put("pinCode", msg.pinCode)
-                .put("transportHint", msg.transportHint)
-                .put("sessionRole", msg.sessionRole)
-                .put("appPackage", msg.appPackage)
-                .put("appActivity", msg.appActivity)
-                .build();
-        return json.getBytes(StandardCharsets.UTF_8);
-    }
-
     public static HelloMsg decodeHello(byte[] payload) throws ProtocolException {
         if (payload == null || payload.length < 2) {
             throw new ProtocolException("HELLO payload empty");
@@ -751,8 +661,8 @@ public final class ExtCastProtocol {
                     obj.getString("sessionRole", SESSION_ROLE_DESKTOP),
                     obj.getString("appPackage", ""),
                     obj.getString("appActivity", ""));
-        } catch (Throwable t) {
-            throw new ProtocolException("Invalid HELLO JSON: " + t.getMessage());
+        } catch (RuntimeException t) {
+            throw new ProtocolException("Invalid HELLO JSON: " + t.getMessage(), t);
         }
     }
 
@@ -776,18 +686,6 @@ public final class ExtCastProtocol {
             this.displayMode = displayMode & 0xFF;
             this.rotation = rotation & 0xFF;
         }
-    }
-
-    public static byte[] encodeResizeConfig(ResizeConfig cfg) {
-        ByteBuffer bb = ByteBuffer.allocate(14).order(ByteOrder.BIG_ENDIAN);
-        bb.putShort((short) (cfg.width & 0xFFFF));
-        bb.putShort((short) (cfg.height & 0xFFFF));
-        bb.putShort((short) (cfg.dpi & 0xFFFF));
-        bb.putShort((short) (cfg.fpsX100 & 0xFFFF));
-        bb.putInt(cfg.bitrateKbps);
-        bb.put((byte) (cfg.displayMode & 0xFF));
-        bb.put((byte) (cfg.rotation & 0xFF));
-        return bb.array();
     }
 
     public static ResizeConfig decodeResizeConfig(byte[] payload) throws ProtocolException {
@@ -825,18 +723,6 @@ public final class ExtCastProtocol {
             this.hScroll = hScroll;
             this.vScroll = vScroll;
         }
-    }
-
-    public static byte[] encodeMouseEvent(MouseEventMsg msg) {
-        ByteBuffer bb = ByteBuffer.allocate(25).order(ByteOrder.BIG_ENDIAN);
-        bb.put((byte) (msg.action & 0xFF));
-        bb.putFloat(msg.x);
-        bb.putFloat(msg.y);
-        bb.putInt(msg.buttons);
-        bb.putInt(msg.actionButton);
-        bb.putFloat(msg.hScroll);
-        bb.putFloat(msg.vScroll);
-        return bb.array();
     }
 
     public static MouseEventMsg decodeMouseEvent(byte[] payload) throws ProtocolException {
@@ -880,25 +766,6 @@ public final class ExtCastProtocol {
         }
     }
 
-    public static byte[] encodeTouchEvent(TouchEventMsg msg) throws ProtocolException {
-        int count = (msg.pointers != null) ? msg.pointers.length : 0;
-        if (count > MAX_TOUCH_POINTERS) {
-            throw new ProtocolException("Too many touch pointers: " + count);
-        }
-        ByteBuffer bb = ByteBuffer.allocate(3 + count * 16).order(ByteOrder.BIG_ENDIAN);
-        bb.put((byte) (msg.action & 0xFF));
-        bb.put((byte) (msg.actionIndex & 0xFF));
-        bb.put((byte) (count & 0xFF));
-        for (int i = 0; i < count; i++) {
-            TouchPointer p = msg.pointers[i];
-            bb.putInt(p.pointerId);
-            bb.putFloat(p.x);
-            bb.putFloat(p.y);
-            bb.putFloat(p.pressure);
-        }
-        return bb.array();
-    }
-
     public static TouchEventMsg decodeTouchEvent(byte[] payload) throws ProtocolException {
         if (payload == null || payload.length < 3) {
             throw new ProtocolException("INPUT_TOUCH payload too short");
@@ -938,15 +805,6 @@ public final class ExtCastProtocol {
         }
     }
 
-    public static byte[] encodeKeyEvent(KeyEventMsg msg) {
-        ByteBuffer bb = ByteBuffer.allocate(13).order(ByteOrder.BIG_ENDIAN);
-        bb.put((byte) (msg.action & 0xFF));
-        bb.putInt(msg.androidKeyCode);
-        bb.putInt(msg.metaState);
-        bb.putInt(msg.repeatCount);
-        return bb.array();
-    }
-
     public static KeyEventMsg decodeKeyEvent(byte[] payload) throws ProtocolException {
         if (payload == null || payload.length < 13) {
             throw new ProtocolException("INPUT_KEY payload must be 13 bytes");
@@ -969,15 +827,6 @@ public final class ExtCastProtocol {
             this.seq = seq;
             this.text = (text != null) ? text : "";
         }
-    }
-
-    public static byte[] encodeTextEvent(TextEventMsg msg) {
-        byte[] utf8 = (msg.text != null ? msg.text : "").getBytes(StandardCharsets.UTF_8);
-        ByteBuffer bb = ByteBuffer.allocate(9 + utf8.length).order(ByteOrder.BIG_ENDIAN);
-        bb.put((byte) (msg.mode & 0xFF));
-        bb.putLong(msg.seq);
-        bb.put(utf8);
-        return bb.array();
     }
 
     public static TextEventMsg decodeTextEvent(byte[] payload) throws ProtocolException {
@@ -1003,18 +852,6 @@ public final class ExtCastProtocol {
         }
     }
 
-    public static byte[] encodeImageClipboardEvent(ImageClipboardEventMsg msg) throws ProtocolException {
-        byte[] data = (msg != null && msg.pngData != null) ? msg.pngData : EMPTY_BYTES;
-        if (data.length > MAX_CLIPBOARD_IMAGE_BYTES) {
-            throw new ProtocolException("Image clipboard payload exceeds 8 MiB limit: " + data.length);
-        }
-        ByteBuffer bb = ByteBuffer.allocate(9 + data.length).order(ByteOrder.BIG_ENDIAN);
-        bb.put((byte) ((msg != null ? msg.mode : TEXT_MODE_SET_CLIPBOARD_ONLY) & 0xFF));
-        bb.putLong(msg != null ? msg.seq : 0L);
-        if (data.length > 0) bb.put(data);
-        return bb.array();
-    }
-
     public static ImageClipboardEventMsg decodeImageClipboardEvent(byte[] payload) throws ProtocolException {
         if (payload == null || payload.length < 9) {
             throw new ProtocolException("INPUT_TEXT image payload too short");
@@ -1032,128 +869,6 @@ public final class ExtCastProtocol {
         }
         return new ImageClipboardEventMsg(mode, seq, data);
     }
-
-    // ---- ExtCast v1.1 Downlink: WIFI_UPGRADE_READY (0x14) & APP_LIST (0x15) ----
-
-    public static final class WifiUpgradeReadyMsg {
-        public final boolean ok;
-        public final String host;
-        public final int port;
-        public final String certFingerprint;
-        public final String authToken;
-        public final String message;
-
-        public WifiUpgradeReadyMsg(
-                boolean ok, String host, int port,
-                String certFingerprint, String authToken, String message) {
-            this.ok = ok;
-            this.host = (host != null) ? host : "";
-            this.port = port;
-            this.certFingerprint = (certFingerprint != null) ? certFingerprint : "";
-            this.authToken = (authToken != null) ? authToken : "";
-            this.message = (message != null) ? message : "";
-        }
-    }
-
-    public static byte[] encodeWifiUpgradeReady(WifiUpgradeReadyMsg msg) {
-        String json = new SimpleJson.ObjectBuilder()
-                .put("ok", msg.ok)
-                .put("host", msg.host)
-                .put("port", msg.port)
-                .put("certFingerprint", msg.certFingerprint)
-                .put("authToken", msg.authToken)
-                .put("message", msg.message)
-                .build();
-        return json.getBytes(StandardCharsets.UTF_8);
-    }
-
-    public static WifiUpgradeReadyMsg decodeWifiUpgradeReady(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 2) {
-            throw new ProtocolException("WIFI_UPGRADE_READY payload empty");
-        }
-        try {
-            SimpleJson.JsonObjectView obj = SimpleJson.parseObject(new String(payload, StandardCharsets.UTF_8));
-            return new WifiUpgradeReadyMsg(
-                    obj.getBoolean("ok", false),
-                    obj.getString("host", ""),
-                    obj.getInt("port", 0),
-                    obj.getString("certFingerprint", ""),
-                    obj.getString("authToken", ""),
-                    obj.getString("message", ""));
-        } catch (Throwable t) {
-            throw new ProtocolException("Invalid WIFI_UPGRADE_READY JSON: " + t.getMessage());
-        }
-    }
-
-    public static final class AppEntry {
-        public final String pkg;
-        public final String cls;
-        public final String label;
-        public final boolean runningOnExt;
-        public final int taskId;
-
-        public AppEntry(String pkg, String cls, String label, boolean runningOnExt, int taskId) {
-            this.pkg = (pkg != null) ? pkg : "";
-            this.cls = (cls != null) ? cls : "";
-            this.label = (label != null) ? label : "";
-            this.runningOnExt = runningOnExt;
-            this.taskId = taskId;
-        }
-    }
-
-    public static final class AppListMsg {
-        public final List<AppEntry> apps;
-
-        public AppListMsg(List<AppEntry> apps) {
-            this.apps = (apps != null)
-                    ? Collections.unmodifiableList(new ArrayList<>(apps))
-                    : Collections.emptyList();
-        }
-    }
-
-    public static byte[] encodeAppList(AppListMsg msg) {
-        SimpleJson.ArrayBuilder arr = new SimpleJson.ArrayBuilder();
-        if (msg != null && msg.apps != null) {
-            for (AppEntry e : msg.apps) {
-                if (e == null) continue;
-                arr.addRaw(new SimpleJson.ObjectBuilder()
-                        .put("pkg", e.pkg)
-                        .put("cls", e.cls)
-                        .put("label", e.label)
-                        .put("runningOnExt", e.runningOnExt)
-                        .put("taskId", e.taskId)
-                        .build());
-            }
-        }
-        String json = new SimpleJson.ObjectBuilder()
-                .putRaw("apps", arr.build())
-                .build();
-        return json.getBytes(StandardCharsets.UTF_8);
-    }
-
-    public static AppListMsg decodeAppList(byte[] payload) throws ProtocolException {
-        if (payload == null || payload.length < 2) {
-            throw new ProtocolException("APP_LIST payload empty");
-        }
-        try {
-            SimpleJson.JsonObjectView obj = SimpleJson.parseObject(new String(payload, StandardCharsets.UTF_8));
-            List<SimpleJson.JsonObjectView> items = obj.getObjectList("apps");
-            List<AppEntry> entries = new ArrayList<>(items.size());
-            for (SimpleJson.JsonObjectView item : items) {
-                entries.add(new AppEntry(
-                        item.getString("pkg", ""),
-                        item.getString("cls", ""),
-                        item.getString("label", ""),
-                        item.getBoolean("runningOnExt", false),
-                        item.getInt("taskId", -1)));
-            }
-            return new AppListMsg(entries);
-        } catch (Throwable t) {
-            throw new ProtocolException("Invalid APP_LIST JSON: " + t.getMessage());
-        }
-    }
-
-    // ---- ExtCast v1.1 Uplink: WINDOW_ACTION (0x2B) ----
 
     public static final class WindowActionMsg {
         public final String action;
@@ -1225,61 +940,6 @@ public final class ExtCastProtocol {
         }
     }
 
-    public static byte[] encodeWindowAction(WindowActionMsg msg) {
-        SimpleJson.ObjectBuilder ob = new SimpleJson.ObjectBuilder()
-                .put("action", msg.action);
-        if (msg.hasEnabled) {
-            ob.put("enabled", msg.enabled);
-        }
-        if (msg.defaultWidthDp > 0) {
-            ob.put("defaultWidthDp", msg.defaultWidthDp);
-        }
-        if (!msg.pkg.isEmpty()) {
-            ob.put("pkg", msg.pkg);
-        }
-        if (!msg.cls.isEmpty()) {
-            ob.put("cls", msg.cls);
-        }
-        if (!msg.mode.isEmpty()) {
-            ob.put("mode", msg.mode);
-        }
-        if (msg.widthPct > 0) {
-            ob.put("widthPct", msg.widthPct);
-        }
-        if (msg.remember) {
-            ob.put("remember", true);
-        }
-        if (msg.slot >= 0) {
-            ob.put("slot", msg.slot);
-        }
-        if (msg.taskId > 0) {
-            ob.put("taskId", msg.taskId);
-        }
-        if (msg.hasBounds) {
-            ob.put("left", msg.left)
-              .put("top", msg.top)
-              .put("right", msg.right)
-              .put("bottom", msg.bottom);
-        }
-        if (!msg.topology.isEmpty()) {
-            ob.put("topology", msg.topology);
-        }
-        if (!msg.pkgs.isEmpty()) {
-            SimpleJson.ArrayBuilder pa = new SimpleJson.ArrayBuilder();
-            for (String p : msg.pkgs) pa.add(p);
-            ob.putRaw("pkgs", pa.build());
-        }
-        if (!msg.ratios.isEmpty()) {
-            SimpleJson.ArrayBuilder ra = new SimpleJson.ArrayBuilder();
-            for (Integer r : msg.ratios) ra.add(r != null ? r : 0);
-            ob.putRaw("ratios", ra.build());
-        }
-        if (!msg.backend.isEmpty()) {
-            ob.put("backend", msg.backend);
-        }
-        return ob.build().getBytes(StandardCharsets.UTF_8);
-    }
-
     public static WindowActionMsg decodeWindowAction(byte[] payload) throws ProtocolException {
         if (payload == null || payload.length < 2) {
             throw new ProtocolException("WINDOW_ACTION payload empty");
@@ -1314,8 +974,8 @@ public final class ExtCastProtocol {
                     obj.getString("backend", ""));
         } catch (ProtocolException pe) {
             throw pe;
-        } catch (Throwable t) {
-            throw new ProtocolException("Invalid WINDOW_ACTION JSON: " + t.getMessage());
+        } catch (RuntimeException t) {
+            throw new ProtocolException("Invalid WINDOW_ACTION JSON: " + t.getMessage(), t);
         }
     }
 
@@ -1327,13 +987,6 @@ public final class ExtCastProtocol {
             this.action = action;
             this.arg = arg;
         }
-    }
-
-    public static byte[] encodeSystemAction(int action, int arg) {
-        ByteBuffer bb = ByteBuffer.allocate(5).order(ByteOrder.BIG_ENDIAN);
-        bb.put((byte) (action & 0xFF));
-        bb.putInt(arg);
-        return bb.array();
     }
 
     public static SystemActionMsg decodeSystemAction(byte[] payload) throws ProtocolException {
@@ -1361,37 +1014,6 @@ public final class ExtCastProtocol {
             this.totalSize = totalSize;
             this.data = (data != null) ? data : EMPTY_BYTES;
         }
-    }
-
-    public static byte[] encodeFileTransferStart(int transferId, String fileName, long totalSize) throws ProtocolException {
-        byte[] nameBytes = (fileName != null ? fileName : "").getBytes(StandardCharsets.UTF_8);
-        if (nameBytes.length > 0xFFFF) {
-            throw new ProtocolException("File name exceeds uint16 length");
-        }
-        ByteBuffer bb = ByteBuffer.allocate(5 + 2 + nameBytes.length + 8).order(ByteOrder.BIG_ENDIAN);
-        bb.putInt(transferId);
-        bb.put((byte) FILE_FLAG_START);
-        bb.putShort((short) nameBytes.length);
-        bb.put(nameBytes);
-        bb.putLong(totalSize);
-        return bb.array();
-    }
-
-    public static byte[] encodeFileTransferData(int transferId, byte[] data, boolean isEnd) {
-        byte[] bytes = (data != null) ? data : EMPTY_BYTES;
-        int flags = FILE_FLAG_DATA | (isEnd ? FILE_FLAG_END : 0);
-        ByteBuffer bb = ByteBuffer.allocate(5 + bytes.length).order(ByteOrder.BIG_ENDIAN);
-        bb.putInt(transferId);
-        bb.put((byte) flags);
-        if (bytes.length > 0) bb.put(bytes);
-        return bb.array();
-    }
-
-    public static byte[] encodeFileTransferControl(int transferId, int chunkFlags) {
-        ByteBuffer bb = ByteBuffer.allocate(5).order(ByteOrder.BIG_ENDIAN);
-        bb.putInt(transferId);
-        bb.put((byte) (chunkFlags & 0xFF));
-        return bb.array();
     }
 
     public static FileTransferChunkMsg decodeFileTransferChunk(byte[] payload) throws ProtocolException {

@@ -22,15 +22,16 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.Socket;
-import java.util.ArrayDeque;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Enumeration;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
@@ -52,9 +53,6 @@ public final class RemoteStreamServer {
     public static final int MAX_STANDALONE_SESSIONS = 3;
 
     private static final int HANDSHAKE_TIMEOUT_MS = 10_000;
-    private static final int MAX_QUEUED_VIDEO_FRAMES = 10;
-    private static final int MAX_QUEUED_AUDIO_FRAMES = 12;
-    private static final int MAX_TOTAL_QUEUED_FRAMES = 64;
     private static final int SOCKET_IO_BUFFER_BYTES = 131_072;
     private static final int SOCKET_SEND_BUF_BYTES = 512 * 1024;
 
@@ -100,24 +98,8 @@ public final class RemoteStreamServer {
         }
     }
 
-    private static final class QueuedFrame {
-        final int type;
-        final int flags;
-        final long timestampUs;
-        final byte[] payload;
-        final boolean isVideo;
-        final boolean isAudio;
-        final boolean isKeyFrame;
-
-        QueuedFrame(int type, int flags, long timestampUs, byte[] payload) {
-            this.type = type;
-            this.flags = flags;
-            this.timestampUs = timestampUs;
-            this.payload = (payload != null) ? payload : ExtCastProtocol.EMPTY_BYTES;
-            this.isVideo = (type == ExtCastProtocol.TYPE_VIDEO_FRAME);
-            this.isAudio = (type == ExtCastProtocol.TYPE_AUDIO_FRAME);
-            this.isKeyFrame = this.isVideo && ((flags & ExtCastProtocol.FLAG_VIDEO_KEYFRAME) != 0);
-        }
+    private interface TimeoutClearer {
+        void clear() throws IOException;
     }
 
     private final SessionListener listener;
@@ -161,10 +143,6 @@ public final class RemoteStreamServer {
         this.deviceName = (deviceName != null && !deviceName.trim().isEmpty()) ? deviceName.trim() : "Android";
     }
 
-    public TrustStoreManager getTrustStore() {
-        return trustStore;
-    }
-
     public String getDeviceName() {
         return deviceName;
     }
@@ -188,25 +166,14 @@ public final class RemoteStreamServer {
 
     public boolean hasDesktopSession() {
         ClientSession s = desktopSession;
-        return s != null && !s.closed;
-    }
-
-    public int getDesktopSessionId() {
-        ClientSession s = desktopSession;
-        return (s != null && !s.closed) ? s.sessionId : -1;
-    }
-
-    public int getStandaloneSessionCount() {
-        synchronized (sessionLock) {
-            return standaloneSessions.size();
-        }
+        return s != null && !s.isClosed();
     }
 
     public boolean hasActiveSession() {
         if (hasDesktopSession()) return true;
         synchronized (sessionLock) {
             for (ClientSession s : standaloneSessions.values()) {
-                if (s != null && !s.closed) return true;
+                if (s != null && !s.isClosed()) return true;
             }
         }
         return false;
@@ -214,12 +181,12 @@ public final class RemoteStreamServer {
 
     public int getActiveSinkType() {
         ClientSession d = desktopSession;
-        if (d != null && !d.closed) {
+        if (d != null && !d.isClosed()) {
             return d.sinkType;
         }
         synchronized (sessionLock) {
             for (ClientSession s : standaloneSessions.values()) {
-                if (s != null && !s.closed) return s.sinkType;
+                if (s != null && !s.isClosed()) return s.sinkType;
             }
         }
         return DisplaySink.SINK_NONE;
@@ -227,25 +194,12 @@ public final class RemoteStreamServer {
 
     public String getActivePeerName() {
         ClientSession d = desktopSession;
-        if (d != null && !d.closed && d.clientName != null) {
+        if (d != null && !d.isClosed() && d.clientName != null) {
             return d.clientName;
         }
         synchronized (sessionLock) {
             for (ClientSession s : standaloneSessions.values()) {
-                if (s != null && !s.closed && s.clientName != null) return s.clientName;
-            }
-        }
-        return "";
-    }
-
-    public String getActiveClientId() {
-        ClientSession d = desktopSession;
-        if (d != null && !d.closed && d.clientId != null) {
-            return d.clientId;
-        }
-        synchronized (sessionLock) {
-            for (ClientSession s : standaloneSessions.values()) {
-                if (s != null && !s.closed && s.clientId != null) return s.clientId;
+                if (s != null && !s.isClosed() && s.clientName != null) return s.clientName;
             }
         }
         return "";
@@ -306,7 +260,7 @@ public final class RemoteStreamServer {
                 SSLServerSocket ss = (SSLServerSocket) sslCtx.getServerSocketFactory().createServerSocket();
                 ss.setReuseAddress(true);
                 ss.bind(new InetSocketAddress(wifiPort), 8);
-                configureSecureTlsProtocols(ss);
+                applySecureTlsProtocols(ss.getSupportedProtocols(), ss::setEnabledProtocols);
 
                 wifiServerSocket = ss;
                 wifiEnabled = true;
@@ -350,18 +304,14 @@ public final class RemoteStreamServer {
         }
     }
 
-    private interface SessionPredicate {
-        boolean matches(ClientSession session);
-    }
-
-    private void disconnectMatchingSessions(SessionPredicate pred, String reason) {
+    private void disconnectMatchingSessions(Predicate<ClientSession> pred, String reason) {
         List<ClientSession> toClose = new ArrayList<>();
         synchronized (sessionLock) {
-            if (desktopSession != null && pred.matches(desktopSession)) {
+            if (desktopSession != null && pred.test(desktopSession)) {
                 toClose.add(desktopSession);
             }
             for (ClientSession s : standaloneSessions.values()) {
-                if (s != null && pred.matches(s)) {
+                if (s != null && pred.test(s)) {
                     toClose.add(s);
                 }
             }
@@ -376,7 +326,7 @@ public final class RemoteStreamServer {
             stopped = true;
             stopWifiListenerLocked();
             if (usbServerSocket != null) {
-                try { usbServerSocket.close(); } catch (Throwable ignored) {}
+                ClientSession.closeTransportQuietly(usbServerSocket);
                 usbServerSocket = null;
             }
         }
@@ -387,35 +337,35 @@ public final class RemoteStreamServer {
 
     public void sendVideoConfig(int sessionId, ExtCastProtocol.VideoConfig config, long timestampUs) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed && config != null) {
+        if (s != null && !s.isClosed() && config != null) {
             s.enqueue(ExtCastProtocol.TYPE_VIDEO_CONFIG, 0, timestampUs, ExtCastProtocol.encodeVideoConfig(config));
         }
     }
 
     public void sendVideoFrame(int sessionId, byte[] annexB, int flags, long timestampUs) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed) {
+        if (s != null && !s.isClosed()) {
             s.enqueue(ExtCastProtocol.TYPE_VIDEO_FRAME, flags, timestampUs, annexB);
         }
     }
 
     public void sendAudioConfig(int sessionId, ExtCastProtocol.AudioConfig config, long timestampUs) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed && config != null) {
+        if (s != null && !s.isClosed() && config != null) {
             s.enqueue(ExtCastProtocol.TYPE_AUDIO_CONFIG, 0, timestampUs, ExtCastProtocol.encodeAudioConfig(config));
         }
     }
 
     public void sendAudioFrame(int sessionId, byte[] aacAu, long timestampUs) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed) {
+        if (s != null && !s.isClosed()) {
             s.enqueue(ExtCastProtocol.TYPE_AUDIO_FRAME, 0, timestampUs, aacAu);
         }
     }
 
     public void sendDeviceState(int sessionId, ExtCastProtocol.DeviceState state) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed && state != null) {
+        if (s != null && !s.isClosed() && state != null) {
             long ts = SystemClock.elapsedRealtimeNanos() / 1000L;
             s.enqueue(ExtCastProtocol.TYPE_DEVICE_STATE, 0, ts, ExtCastProtocol.encodeDeviceState(state));
         }
@@ -423,7 +373,7 @@ public final class RemoteStreamServer {
 
     public void sendClipboardPush(int sessionId, long seq, String text) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed) {
+        if (s != null && !s.isClosed()) {
             long ts = SystemClock.elapsedRealtimeNanos() / 1000L;
             s.enqueue(ExtCastProtocol.TYPE_CLIPBOARD_PUSH, 0, ts, ExtCastProtocol.encodeClipboardPush(seq, text));
         }
@@ -431,7 +381,7 @@ public final class RemoteStreamServer {
 
     public void sendClipboardImagePush(int sessionId, long seq, byte[] pngData) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed) {
+        if (s != null && !s.isClosed()) {
             try {
                 byte[] payload = ExtCastProtocol.encodeClipboardImagePush(seq, pngData);
                 long ts = SystemClock.elapsedRealtimeNanos() / 1000L;
@@ -444,7 +394,7 @@ public final class RemoteStreamServer {
 
     public void sendFileTransferAck(int sessionId, int transferId, int status, String pathOrError) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed) {
+        if (s != null && !s.isClosed()) {
             long ts = SystemClock.elapsedRealtimeNanos() / 1000L;
             s.enqueue(ExtCastProtocol.TYPE_FILE_TRANSFER_ACK, 0, ts,
                     ExtCastProtocol.encodeFileTransferAck(transferId, status, pathOrError));
@@ -453,23 +403,13 @@ public final class RemoteStreamServer {
 
     public void sendAppList(int sessionId, ExtCastProtocol.AppListMsg appList) {
         ClientSession s = allSessions.get(sessionId);
-        if (s != null && !s.closed && appList != null) {
+        if (s != null && !s.isClosed() && appList != null) {
             long ts = SystemClock.elapsedRealtimeNanos() / 1000L;
             s.enqueue(ExtCastProtocol.TYPE_APP_LIST, 0, ts, ExtCastProtocol.encodeAppList(appList));
         }
     }
 
     // ---- Desktop-session convenience senders ----
-
-    public void sendVideoConfig(ExtCastProtocol.VideoConfig config, long timestampUs) {
-        ClientSession s = desktopSession;
-        if (s != null) sendVideoConfig(s.sessionId, config, timestampUs);
-    }
-
-    public void sendVideoFrame(byte[] annexB, int flags, long timestampUs) {
-        ClientSession s = desktopSession;
-        if (s != null) sendVideoFrame(s.sessionId, annexB, flags, timestampUs);
-    }
 
     public void sendAudioConfig(ExtCastProtocol.AudioConfig config, long timestampUs) {
         ClientSession s = desktopSession;
@@ -510,17 +450,19 @@ public final class RemoteStreamServer {
             try {
                 LocalSocket client = srv.accept();
                 if (stopped) {
-                    closeQuietly(client);
+                    ClientSession.closeTransportQuietly(client);
                     break;
                 }
                 Credentials cred = null;
                 try {
                     cred = client.getPeerCredentials();
-                } catch (Throwable ignored) {}
+                } catch (IOException e) {
+                    System.err.println("EXTBRIDGE_USB_CRED_ERR: " + e.getMessage());
+                }
                 int peerUid = (cred != null) ? cred.getUid() : -1;
                 if (peerUid != 0 && peerUid != 2000) {
                     System.err.println("EXTBRIDGE_USB_STREAM_REJECT_UID uid=" + peerUid);
-                    closeQuietly(client);
+                    ClientSession.closeTransportQuietly(client);
                     continue;
                 }
                 Thread handler = new Thread(() -> handleUsbClient(client), "ExtUsbClient");
@@ -540,7 +482,7 @@ public final class RemoteStreamServer {
             try {
                 Socket raw = serverSock.accept();
                 if (stopped || !wifiEnabled || !(raw instanceof SSLSocket)) {
-                    closeQuietly(raw);
+                    ClientSession.closeTransportQuietly(raw);
                     continue;
                 }
                 SSLSocket ssl = (SSLSocket) raw;
@@ -560,34 +502,22 @@ public final class RemoteStreamServer {
         wifiEnabled = false;
         SSLServerSocket ss = wifiServerSocket;
         wifiServerSocket = null;
-        if (ss != null) {
-            try { ss.close(); } catch (Throwable ignored) {}
-        }
+        ClientSession.closeTransportQuietly(ss);
     }
+
+    // ---- Shared Handshake & Transport Handlers ----
 
     private void handleUsbClient(LocalSocket sock) {
         try {
-            try { sock.setSendBufferSize(SOCKET_SEND_BUF_BYTES); } catch (Throwable ignored) {}
-            try { sock.setReceiveBufferSize(SOCKET_IO_BUFFER_BYTES); } catch (Throwable ignored) {}
+            try { sock.setSendBufferSize(SOCKET_SEND_BUF_BYTES); } catch (IOException ignored) {}
+            try { sock.setReceiveBufferSize(SOCKET_IO_BUFFER_BYTES); } catch (IOException ignored) {}
             sock.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
+
             InputStream in = new BufferedInputStream(sock.getInputStream(), SOCKET_IO_BUFFER_BYTES);
             OutputStream out = new BufferedOutputStream(sock.getOutputStream(), SOCKET_IO_BUFFER_BYTES);
 
-            ExtCastProtocol.Frame first = ExtCastProtocol.readFrame(in);
-            if (first == null || first.type != ExtCastProtocol.TYPE_HELLO) {
-                sendAuthFailureAndClose(out, sock, "Expected HELLO frame");
-                return;
-            }
-            ExtCastProtocol.HelloMsg hello = ExtCastProtocol.decodeHello(first.payload);
-            if (hello.protocolVersion != ExtCastProtocol.PROTOCOL_VERSION) {
-                sendAuthFailureAndClose(out, sock, "Unsupported protocolVersion: " + hello.protocolVersion);
-                return;
-            }
-
-            if (hello.isStandaloneApp() && hello.appPackage.isEmpty()) {
-                sendAuthFailureAndClose(out, sock, "Missing appPackage for standalone_app session");
-                return;
-            }
+            ExtCastProtocol.HelloMsg hello = readAndValidateHello(in, out, sock);
+            if (hello == null) return;
 
             int sinkType = ExtCastProtocol.TRANSPORT_HINT_WIFI_ADB.equalsIgnoreCase(hello.transportHint)
                     ? DisplaySink.SINK_REMOTE_WIFI_ADB
@@ -596,24 +526,16 @@ public final class RemoteStreamServer {
             if (clientId.isEmpty()) clientId = "usb-peer";
             String defaultName = (sinkType == DisplaySink.SINK_REMOTE_WIFI_ADB) ? "Mac (Wi-Fi ADB)" : "Mac (USB)";
             String clientName = TrustStoreManager.sanitizeClientName(hello.clientName, defaultName);
-
-            if (!hasCapacityForSession(hello)) {
-                sendAuthFailureAndClose(out, sock, "Maximum " + MAX_STANDALONE_SESSIONS + " standalone app sessions active");
-                return;
-            }
-
             String authMsg = (sinkType == DisplaySink.SINK_REMOTE_WIFI_ADB)
                     ? "Wireless ADB channel authenticated"
                     : "USB ADB channel authenticated";
-            ExtCastProtocol.AuthResultMsg okMsg = new ExtCastProtocol.AuthResultMsg(
-                    true, "", authMsg, deviceName, getCertFingerprint());
-            writeAuthResultImmediate(out, okMsg);
 
-            sock.setSoTimeout(0);
-            runAuthenticatedSession(sinkType, true, clientId, clientName, hello, sock, in, out);
+            completeHandshakeAndRun(
+                    sinkType, true, clientId, clientName, "", authMsg,
+                    hello, sock, () -> sock.setSoTimeout(0), in, out);
         } catch (Throwable t) {
             System.err.println("EXTBRIDGE_USB_CLIENT_ERR: " + t.getMessage());
-            closeQuietly(sock);
+            ClientSession.closeTransportQuietly(sock);
         }
     }
 
@@ -621,30 +543,18 @@ public final class RemoteStreamServer {
         try {
             sock.setTcpNoDelay(true);
             sock.setKeepAlive(true);
-            try { sock.setSendBufferSize(SOCKET_SEND_BUF_BYTES); } catch (Throwable ignored) {}
-            try { sock.setReceiveBufferSize(SOCKET_IO_BUFFER_BYTES); } catch (Throwable ignored) {}
+            try { sock.setSendBufferSize(SOCKET_SEND_BUF_BYTES); } catch (SocketException ignored) {}
+            try { sock.setReceiveBufferSize(SOCKET_IO_BUFFER_BYTES); } catch (SocketException ignored) {}
             sock.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
-            configureSecureTlsProtocols(sock);
+            applySecureTlsProtocols(sock.getSupportedProtocols(), sock::setEnabledProtocols);
             sock.startHandshake();
 
             String peerIp = (sock.getInetAddress() != null) ? sock.getInetAddress().getHostAddress() : "unknown";
             InputStream in = new BufferedInputStream(sock.getInputStream(), SOCKET_IO_BUFFER_BYTES);
             OutputStream out = new BufferedOutputStream(sock.getOutputStream(), SOCKET_IO_BUFFER_BYTES);
 
-            ExtCastProtocol.Frame first = ExtCastProtocol.readFrame(in);
-            if (first == null || first.type != ExtCastProtocol.TYPE_HELLO) {
-                sendAuthFailureAndClose(out, sock, "Expected HELLO frame");
-                return;
-            }
-            ExtCastProtocol.HelloMsg hello = ExtCastProtocol.decodeHello(first.payload);
-            if (hello.protocolVersion != ExtCastProtocol.PROTOCOL_VERSION) {
-                sendAuthFailureAndClose(out, sock, "Unsupported protocolVersion: " + hello.protocolVersion);
-                return;
-            }
-            if (hello.isStandaloneApp() && hello.appPackage.isEmpty()) {
-                sendAuthFailureAndClose(out, sock, "Missing appPackage for standalone_app session");
-                return;
-            }
+            ExtCastProtocol.HelloMsg hello = readAndValidateHello(in, out, sock);
+            if (hello == null) return;
 
             TrustStoreManager.AuthResult auth = trustStore.authenticate(
                     hello.clientId, hello.clientName, hello.authToken, hello.pinCode, peerIp);
@@ -653,30 +563,68 @@ public final class RemoteStreamServer {
                 return;
             }
 
-            if (!hasCapacityForSession(hello)) {
-                sendAuthFailureAndClose(out, sock, "Maximum " + MAX_STANDALONE_SESSIONS + " standalone app sessions active");
-                return;
-            }
-
             String clientId = TrustStoreManager.sanitizeClientId(hello.clientId);
             String clientName = TrustStoreManager.sanitizeClientName(hello.clientName, "Mac (Wi-Fi)");
-            ExtCastProtocol.AuthResultMsg okMsg = new ExtCastProtocol.AuthResultMsg(
-                    true, auth.issuedToken, auth.message, deviceName, getCertFingerprint());
-            writeAuthResultImmediate(out, okMsg);
 
-            sock.setSoTimeout(0);
-            runAuthenticatedSession(DisplaySink.SINK_REMOTE_WIFI, false, clientId, clientName, hello, sock, in, out);
+            completeHandshakeAndRun(
+                    DisplaySink.SINK_REMOTE_WIFI, false, clientId, clientName,
+                    auth.issuedToken, auth.message,
+                    hello, sock, () -> sock.setSoTimeout(0), in, out);
         } catch (Throwable t) {
             System.err.println("EXTBRIDGE_WIFI_CLIENT_ERR: " + t.getMessage());
-            closeQuietly(sock);
+            ClientSession.closeTransportQuietly(sock);
         }
+    }
+
+    private ExtCastProtocol.HelloMsg readAndValidateHello(InputStream in, OutputStream out, Closeable sock)
+            throws IOException {
+        ExtCastProtocol.Frame first = ExtCastProtocol.readFrame(in);
+        if (first == null || first.type != ExtCastProtocol.TYPE_HELLO) {
+            sendAuthFailureAndClose(out, sock, "Expected HELLO frame");
+            return null;
+        }
+        ExtCastProtocol.HelloMsg hello = ExtCastProtocol.decodeHello(first.payload);
+        if (hello.protocolVersion != ExtCastProtocol.PROTOCOL_VERSION) {
+            sendAuthFailureAndClose(out, sock, "Unsupported protocolVersion: " + hello.protocolVersion);
+            return null;
+        }
+        if (hello.isStandaloneApp() && hello.appPackage.isEmpty()) {
+            sendAuthFailureAndClose(out, sock, "Missing appPackage for standalone_app session");
+            return null;
+        }
+        return hello;
+    }
+
+    private void completeHandshakeAndRun(
+            int sinkType,
+            boolean isAdbLocalSocket,
+            String clientId,
+            String clientName,
+            String issuedToken,
+            String authMsg,
+            ExtCastProtocol.HelloMsg hello,
+            Closeable sock,
+            TimeoutClearer clearTimeout,
+            InputStream in,
+            OutputStream out) throws IOException {
+        if (!hasCapacityForSession(hello)) {
+            sendAuthFailureAndClose(out, sock,
+                    "Maximum " + MAX_STANDALONE_SESSIONS + " standalone app sessions active");
+            return;
+        }
+
+        ExtCastProtocol.AuthResultMsg okMsg = new ExtCastProtocol.AuthResultMsg(
+                true, issuedToken, authMsg, deviceName, getCertFingerprint());
+        writeAuthResultImmediate(out, okMsg);
+        clearTimeout.clear();
+        runAuthenticatedSession(sinkType, isAdbLocalSocket, clientId, clientName, hello, sock, in, out);
     }
 
     private boolean hasCapacityForSession(ExtCastProtocol.HelloMsg hello) {
         if (!hello.isStandaloneApp()) return true;
         synchronized (sessionLock) {
             for (ClientSession existing : standaloneSessions.values()) {
-                if (existing != null && !existing.closed && hello.appPackage.equals(existing.appPackage)) {
+                if (existing != null && !existing.isClosed() && hello.appPackage.equals(existing.appPackage)) {
                     return true; // Replacing existing standalone window for the same app
                 }
             }
@@ -697,12 +645,12 @@ public final class RemoteStreamServer {
         boolean isStandalone = hello.isStandaloneApp();
         ClientSession current = new ClientSession(
                 sessionId, sinkType, isAdbLocalSocket, hello.sessionRole, hello.appPackage,
-                clientId, clientName, transport, out);
+                clientId, clientName, transport, out, listener);
 
         ClientSession replaced = null;
+        boolean capacityExceeded = false;
         synchronized (sessionLock) {
             if (isStandalone) {
-                // Replace same-package standalone session if one already exists
                 for (ClientSession existing : standaloneSessions.values()) {
                     if (existing != null && hello.appPackage.equals(existing.appPackage)) {
                         replaced = existing;
@@ -712,15 +660,21 @@ public final class RemoteStreamServer {
                 if (replaced != null) {
                     standaloneSessions.remove(replaced.sessionId);
                 } else if (standaloneSessions.size() >= MAX_STANDALONE_SESSIONS) {
-                    current.close("Maximum standalone app sessions reached");
-                    return;
+                    capacityExceeded = true;
                 }
-                standaloneSessions.put(sessionId, current);
+                if (!capacityExceeded) {
+                    standaloneSessions.put(sessionId, current);
+                    allSessions.put(sessionId, current);
+                }
             } else {
                 replaced = desktopSession;
                 desktopSession = current;
+                allSessions.put(sessionId, current);
             }
-            allSessions.put(sessionId, current);
+        }
+        if (capacityExceeded) {
+            current.close("Maximum standalone app sessions reached");
+            return;
         }
         if (replaced != null) {
             replaced.close("Replaced by new session");
@@ -733,7 +687,7 @@ public final class RemoteStreamServer {
                 listener.onSessionConnected(sessionId, sinkType, clientId, clientName, hello);
                 notifiedConnect = true;
             }
-            while (!stopped && !current.closed) {
+            while (!stopped && !current.isClosed()) {
                 ExtCastProtocol.Frame frame = ExtCastProtocol.readFrame(in);
                 if (frame == null) {
                     break;
@@ -741,7 +695,7 @@ public final class RemoteStreamServer {
                 dispatchUplinkFrame(current, frame);
             }
         } catch (Throwable t) {
-            if (!current.closed) {
+            if (!current.isClosed()) {
                 System.out.println("EXTBRIDGE_REMOTE_SESSION_END id=" + sessionId
                         + " role=" + current.sessionRole + " peer=" + clientName + " reason=" + t.getMessage());
             }
@@ -753,10 +707,8 @@ public final class RemoteStreamServer {
                     if (standaloneSessions.get(sessionId) == current) {
                         standaloneSessions.remove(sessionId);
                     }
-                } else {
-                    if (desktopSession == current) {
-                        desktopSession = null;
-                    }
+                } else if (desktopSession == current) {
+                    desktopSession = null;
                 }
             }
             if (notifiedConnect && listener != null) {
@@ -906,14 +858,15 @@ public final class RemoteStreamServer {
                 if (nic == null) continue;
                 try {
                     if (!nic.isUp() || nic.isLoopback()) continue;
-                } catch (Throwable ignored) {
+                } catch (SocketException ignored) {
                     continue;
                 }
                 String name = (nic.getName() != null) ? nic.getName().toLowerCase(Locale.US) : "";
                 if (name.startsWith("dummy") || name.startsWith("lo")) continue;
 
                 boolean isWlan = name.startsWith("wlan") || name.startsWith("swlan") || name.startsWith("ap");
-                boolean isEth = name.startsWith("eth") || name.startsWith("en") || name.startsWith("rndis") || name.startsWith("usb");
+                boolean isEth = name.startsWith("eth") || name.startsWith("en")
+                        || name.startsWith("rndis") || name.startsWith("usb");
                 boolean isTunnelOrCell = name.startsWith("rmnet") || name.startsWith("ccmni")
                         || name.startsWith("tun") || name.startsWith("tap") || name.startsWith("ppp");
 
@@ -936,7 +889,9 @@ public final class RemoteStreamServer {
                     }
                 }
             }
-        } catch (Throwable ignored) {}
+        } catch (SocketException e) {
+            System.err.println("EXTBRIDGE_LAN_IP_DETECT_ERR: " + e.getMessage());
+        }
 
         if (!bestWlan.isEmpty()) return bestWlan;
         if (!bestEth.isEmpty()) return bestEth;
@@ -949,9 +904,10 @@ public final class RemoteStreamServer {
             ExtCastProtocol.AuthResultMsg fail = new ExtCastProtocol.AuthResultMsg(
                     false, "", msg, deviceName, getCertFingerprint());
             writeAuthResultImmediate(out, fail);
-        } catch (Throwable ignored) {
+        } catch (IOException e) {
+            System.err.println("EXTBRIDGE_AUTH_FAIL_SEND_WARN: " + e.getMessage());
         } finally {
-            closeQuietly(sock);
+            ClientSession.closeTransportQuietly(sock);
         }
     }
 
@@ -962,23 +918,7 @@ public final class RemoteStreamServer {
         out.flush();
     }
 
-    private static void configureSecureTlsProtocols(SSLServerSocket ss) {
-        String[] supported = ss.getSupportedProtocols();
-        String[] chosen = filterTls12And13(supported);
-        if (chosen.length > 0) {
-            ss.setEnabledProtocols(chosen);
-        }
-    }
-
-    private static void configureSecureTlsProtocols(SSLSocket s) {
-        String[] supported = s.getSupportedProtocols();
-        String[] chosen = filterTls12And13(supported);
-        if (chosen.length > 0) {
-            s.setEnabledProtocols(chosen);
-        }
-    }
-
-    private static String[] filterTls12And13(String[] supported) {
+    private static void applySecureTlsProtocols(String[] supported, Consumer<String[]> setter) {
         List<String> list = new ArrayList<>();
         if (supported != null) {
             for (String p : supported) {
@@ -987,7 +927,9 @@ public final class RemoteStreamServer {
                 }
             }
         }
-        return list.toArray(new String[0]);
+        if (!list.isEmpty()) {
+            setter.accept(list.toArray(new String[0]));
+        }
     }
 
     private static String resolveDeviceName() {
@@ -998,209 +940,5 @@ public final class RemoteStreamServer {
             }
         } catch (Throwable ignored) {}
         return "Android";
-    }
-
-    private static void closeQuietly(Closeable c) {
-        if (c == null) return;
-        try { c.close(); } catch (Throwable ignored) {}
-    }
-
-    // ---- Dedicated outbound sender session with bounded queue & congestion drop ----
-
-    private final class ClientSession {
-        final int sessionId;
-        final int sinkType;
-        final boolean isAdbLocalSocket;
-        final String sessionRole;
-        final String appPackage;
-        final String clientId;
-        final String clientName;
-        final Closeable transport;
-        final OutputStream out;
-
-        final Object queueLock = new Object();
-        final ArrayDeque<QueuedFrame> queue = new ArrayDeque<>();
-        int queuedVideoFrames = 0;
-        int queuedAudioFrames = 0;
-        boolean awaitingKeyFrame = false;
-        long lastHealthyNotifyMs = 0L;
-
-        volatile boolean closed = false;
-        volatile String closeReason = "";
-        Thread senderThread;
-
-        ClientSession(
-                int sessionId,
-                int sinkType,
-                boolean isAdbLocalSocket,
-                String sessionRole,
-                String appPackage,
-                String clientId,
-                String clientName,
-                Closeable transport,
-                OutputStream out) {
-            this.sessionId = sessionId;
-            this.sinkType = sinkType;
-            this.isAdbLocalSocket = isAdbLocalSocket;
-            this.sessionRole = (sessionRole != null && !sessionRole.isEmpty())
-                    ? sessionRole : ExtCastProtocol.SESSION_ROLE_DESKTOP;
-            this.appPackage = (appPackage != null) ? appPackage : "";
-            this.clientId = clientId;
-            this.clientName = clientName;
-            this.transport = transport;
-            this.out = out;
-        }
-
-        void startSenderThread() {
-            senderThread = new Thread(this::sendLoop, "ExtStreamSender-" + sessionId);
-            senderThread.setDaemon(true);
-            senderThread.start();
-        }
-
-        void enqueue(int type, int flags, long timestampUs, byte[] payload) {
-            if (closed) return;
-            QueuedFrame qf = new QueuedFrame(type, flags, timestampUs, payload);
-            boolean triggerCongestion = false;
-            boolean triggerHealthy = false;
-
-            synchronized (queueLock) {
-                if (closed) return;
-
-                if (type == ExtCastProtocol.TYPE_VIDEO_CONFIG) {
-                    dropAllQueuedVideoLocked(false);
-                    awaitingKeyFrame = false;
-                    queue.addLast(qf);
-                    queueLock.notifyAll();
-                    return;
-                }
-
-                if (qf.isVideo) {
-                    if (qf.isKeyFrame) {
-                        if (queuedVideoFrames >= MAX_QUEUED_VIDEO_FRAMES / 2) {
-                            dropAllQueuedVideoLocked(false);
-                        }
-                        awaitingKeyFrame = false;
-                        queue.addLast(qf);
-                        queuedVideoFrames++;
-                        queueLock.notifyAll();
-                        return;
-                    }
-                    if (awaitingKeyFrame) {
-                        return;
-                    }
-                    if (queuedVideoFrames >= MAX_QUEUED_VIDEO_FRAMES) {
-                        dropAllQueuedVideoLocked(true);
-                        awaitingKeyFrame = true;
-                        triggerCongestion = true;
-                    } else {
-                        queue.addLast(qf);
-                        queuedVideoFrames++;
-                        if (queuedVideoFrames <= 1) {
-                            long now = SystemClock.uptimeMillis();
-                            if (now - lastHealthyNotifyMs >= 2000L) {
-                                lastHealthyNotifyMs = now;
-                                triggerHealthy = true;
-                            }
-                        }
-                        queueLock.notifyAll();
-                    }
-                } else if (qf.isAudio) {
-                    if (queuedAudioFrames >= MAX_QUEUED_AUDIO_FRAMES) {
-                        dropOldestAudioLocked();
-                    }
-                    queue.addLast(qf);
-                    queuedAudioFrames++;
-                    queueLock.notifyAll();
-                } else {
-                    if (queue.size() >= MAX_TOTAL_QUEUED_FRAMES) {
-                        dropAllQueuedVideoLocked(false);
-                        awaitingKeyFrame = true;
-                        triggerCongestion = true;
-                    }
-                    if (queue.size() >= MAX_TOTAL_QUEUED_FRAMES) {
-                        close("Outbound queue overflow (unresponsive peer)");
-                        return;
-                    }
-                    queue.addLast(qf);
-                    queueLock.notifyAll();
-                }
-            }
-
-            if (triggerCongestion && listener != null) {
-                listener.onVideoCongestion(sessionId);
-            } else if (triggerHealthy && listener != null) {
-                listener.onVideoQueueHealthy(sessionId);
-            }
-        }
-
-        private void dropAllQueuedVideoLocked(boolean keepKeyFrames) {
-            Iterator<QueuedFrame> it = queue.iterator();
-            while (it.hasNext()) {
-                QueuedFrame item = it.next();
-                if (item.isVideo && (!keepKeyFrames || !item.isKeyFrame)) {
-                    it.remove();
-                    queuedVideoFrames = Math.max(0, queuedVideoFrames - 1);
-                }
-            }
-        }
-
-        private void dropOldestAudioLocked() {
-            Iterator<QueuedFrame> it = queue.iterator();
-            while (it.hasNext()) {
-                QueuedFrame item = it.next();
-                if (item.isAudio) {
-                    it.remove();
-                    queuedAudioFrames = Math.max(0, queuedAudioFrames - 1);
-                    return;
-                }
-            }
-        }
-
-        private void sendLoop() {
-            try {
-                while (!closed) {
-                    QueuedFrame next;
-                    boolean shouldFlush;
-                    synchronized (queueLock) {
-                        while (!closed && queue.isEmpty()) {
-                            queueLock.wait(250L);
-                        }
-                        if (closed) break;
-                        next = queue.pollFirst();
-                        if (next == null) continue;
-                        if (next.isVideo) queuedVideoFrames = Math.max(0, queuedVideoFrames - 1);
-                        if (next.isAudio) queuedAudioFrames = Math.max(0, queuedAudioFrames - 1);
-                        shouldFlush = queue.isEmpty() || next.isVideo
-                                || next.type == ExtCastProtocol.TYPE_VIDEO_CONFIG
-                                || next.type == ExtCastProtocol.TYPE_WIFI_UPGRADE_READY
-                                || next.type == ExtCastProtocol.TYPE_APP_LIST
-                                || next.type == ExtCastProtocol.TYPE_PONG;
-                    }
-                    ExtCastProtocol.writeFrame(
-                            out, next.type, next.flags, next.timestampUs,
-                            next.payload, 0, next.payload.length);
-                    if (shouldFlush) {
-                        out.flush();
-                    }
-                }
-            } catch (Throwable t) {
-                if (!closed) {
-                    close("Send error: " + t.getMessage());
-                }
-            }
-        }
-
-        void close(String reason) {
-            if (closed) return;
-            closed = true;
-            closeReason = (reason != null) ? reason : "";
-            synchronized (queueLock) {
-                queue.clear();
-                queuedVideoFrames = 0;
-                queuedAudioFrames = 0;
-                queueLock.notifyAll();
-            }
-            closeQuietly(transport);
-        }
     }
 }

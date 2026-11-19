@@ -57,10 +57,6 @@ public final class TilingLayoutEngine {
             return left + width() / 2;
         }
 
-        public int centerY() {
-            return top + height() / 2;
-        }
-
         public boolean isEmpty() {
             return left >= right || top >= bottom;
         }
@@ -176,7 +172,9 @@ public final class TilingLayoutEngine {
             if (t.isEmpty()) continue;
             try {
                 vals.add(Integer.parseInt(t));
-            } catch (Throwable ignored) {}
+            } catch (NumberFormatException ignored) {
+                // Skip non-numeric CSV tokens.
+            }
         }
         int[] out = new int[vals.size()];
         for (int i = 0; i < vals.size(); i++) out[i] = vals.get(i);
@@ -287,39 +285,18 @@ public final class TilingLayoutEngine {
     }
 
     private static WindowRect[] computeSplit3Cols(int sw, int workBottom, int gap, int[] ratios) {
-        float f0 = 1f / 3f;
-        float f1 = 1f / 3f;
-        float f2 = 1f / 3f;
+        float[] fracs = new float[]{1f / 3f, 1f / 3f, 1f / 3f};
         if (ratios != null && ratios.length >= 3) {
-            int r0 = Math.max(1, ratios[0]);
-            int r1 = Math.max(1, ratios[1]);
-            int r2 = Math.max(1, ratios[2]);
-            float sum = r0 + r1 + r2;
-            f0 = Math.max(MIN_COL3_RATIO, r0 / sum);
-            f1 = Math.max(MIN_COL3_RATIO, r1 / sum);
-            f2 = Math.max(MIN_COL3_RATIO, r2 / sum);
-            float nSum = f0 + f1 + f2;
-            f0 /= nSum;
-            f1 /= nSum;
-            f2 = 1f - f0 - f1;
-        } else if (ratios != null && ratios.length == 2 && ratios[0] > 0 && ratios[1] > 0 && ratios[0] + ratios[1] < 95) {
-            int r0 = ratios[0];
-            int r1 = ratios[1];
-            int r2 = 100 - r0 - r1;
-            float sum = r0 + r1 + r2;
-            f0 = Math.max(MIN_COL3_RATIO, r0 / sum);
-            f1 = Math.max(MIN_COL3_RATIO, r1 / sum);
-            f2 = Math.max(MIN_COL3_RATIO, r2 / sum);
-            float nSum = f0 + f1 + f2;
-            f0 /= nSum;
-            f1 /= nSum;
-            f2 = 1f - f0 - f1;
+            fracs = normalizeThreeColRatios(Math.max(1, ratios[0]), Math.max(1, ratios[1]), Math.max(1, ratios[2]));
+        } else if (ratios != null && ratios.length == 2
+                && ratios[0] > 0 && ratios[1] > 0 && ratios[0] + ratios[1] < 95) {
+            fracs = normalizeThreeColRatios(ratios[0], ratios[1], 100 - ratios[0] - ratios[1]);
         }
 
         int availW = Math.max(3, sw - 2 * gap);
         int minColW = Math.min(MIN_SLOT_SIZE_PX, availW / 4);
-        int w0 = clampInt(Math.round(availW * f0), minColW, availW - 2 * minColW);
-        int w1 = clampInt(Math.round(availW * f1), minColW, availW - w0 - minColW);
+        int w0 = clampInt(Math.round(availW * fracs[0]), minColW, availW - 2 * minColW);
+        int w1 = clampInt(Math.round(availW * fracs[1]), minColW, availW - w0 - minColW);
         int x1 = w0 + gap;
         int x2 = x1 + w1 + gap;
         return new WindowRect[]{
@@ -327,6 +304,17 @@ public final class TilingLayoutEngine {
                 new WindowRect(x1, 0, x1 + w1, workBottom),
                 new WindowRect(x2, 0, sw, workBottom)
         };
+    }
+
+    private static float[] normalizeThreeColRatios(int r0, int r1, int r2) {
+        float sum = r0 + r1 + r2;
+        float f0 = Math.max(MIN_COL3_RATIO, r0 / sum);
+        float f1 = Math.max(MIN_COL3_RATIO, r1 / sum);
+        float f2 = Math.max(MIN_COL3_RATIO, r2 / sum);
+        float nSum = f0 + f1 + f2;
+        f0 /= nSum;
+        f1 /= nSum;
+        return new float[]{f0, f1, 1f - f0 - f1};
     }
 
     private static WindowRect[] computeGrid2x2(int sw, int workBottom, int gap, int[] ratios) {

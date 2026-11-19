@@ -14,11 +14,12 @@ import com.extbridge.daemon.stream.ExtCastProtocol;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Locale;
 
 /**
  * Zero-copy MediaCodec hardware video encoder sink feeding ExtCast v1 VIDEO_CONFIG & VIDEO_FRAME.
- * Prefers HEVC (video/hevc) with graceful fallback to H.264 (video/avc), enforces 8/16 even
- * encoder alignment, ultra-low-latency flags, dynamic ABR bitrate, and on-demand IDR keyframes.
+ * Prefers HEVC (video/hevc) with graceful fallback to H.264 (video/avc), enforces encoder alignment
+ * queried from the selected codec, ultra-low-latency flags, dynamic ABR bitrate, and on-demand IDR.
  */
 public final class RemoteStreamSink implements DisplaySink {
     public static final int CODEC_PREF_AUTO_HEVC = 0;
@@ -28,6 +29,7 @@ public final class RemoteStreamSink implements DisplaySink {
     private static final String MIME_AVC = "video/avc";
     private static final int MIN_BITRATE_KBPS = 1500;
     private static final int MAX_BITRATE_KBPS = 40_000;
+    private static final int DEFAULT_ALIGNMENT = 8;
     private static final long DEQUEUE_TIMEOUT_US = 10_000L;
     private static final long ABR_CONGESTION_COOLDOWN_MS = 1800L;
     private static final long ABR_RECOVERY_INTERVAL_MS = 4000L;
@@ -38,11 +40,30 @@ public final class RemoteStreamSink implements DisplaySink {
         void onEncoderError(String reason);
     }
 
+    /**
+     * Callback invoked with the new Surface BEFORE tearing down the old encoder session,
+     * ensuring seamless zero-flicker VirtualDisplay surface handover.
+     */
+    public interface SurfaceSwapper {
+        void onNewSurfaceReady(Surface newSurface, int alignedW, int alignedH, int dpi);
+    }
+
+    private static final class SelectedEncoder {
+        final String codecName; // nullable -> fallback to MediaCodec.createEncoderByType
+        final int alignW;
+        final int alignH;
+
+        SelectedEncoder(String codecName, int alignW, int alignH) {
+            this.codecName = codecName;
+            this.alignW = alignW;
+            this.alignH = alignH;
+        }
+    }
+
     private static final class EncoderSession {
         final MediaCodec codec;
         final Surface inputSurface;
         final int codecId;
-        final String mime;
         final int width;
         final int height;
         final int dpi;
@@ -54,12 +75,11 @@ public final class RemoteStreamSink implements DisplaySink {
         byte[] lastCsd;
 
         EncoderSession(
-                MediaCodec codec, Surface inputSurface, int codecId, String mime,
+                MediaCodec codec, Surface inputSurface, int codecId,
                 int width, int height, int dpi, float fps, int displayMode, int rotation) {
             this.codec = codec;
             this.inputSurface = inputSurface;
             this.codecId = codecId;
-            this.mime = mime;
             this.width = width;
             this.height = height;
             this.dpi = dpi;
@@ -71,7 +91,7 @@ public final class RemoteStreamSink implements DisplaySink {
 
     private final Object lock = new Object();
     private final FrameListener listener;
-    private volatile int sinkType;
+    private final int sinkType;
     private volatile EncoderSession session;
     private volatile int currentBitrateKbps = 12_000;
     private volatile int targetBitrateKbps = 12_000;
@@ -85,10 +105,6 @@ public final class RemoteStreamSink implements DisplaySink {
         this.listener = listener;
     }
 
-    public void setSinkType(int sinkType) {
-        this.sinkType = sinkType;
-    }
-
     public void setMaxBitrateKbps(int maxKbps) {
         int clamped = DisplayGeometryUtil.clampBitrateKbps(maxKbps, MIN_BITRATE_KBPS, MAX_BITRATE_KBPS);
         this.maxBitrateKbps = clamped;
@@ -99,8 +115,6 @@ public final class RemoteStreamSink implements DisplaySink {
 
     /**
      * Starts or reconfigures the hardware encoder and returns the active input {@link Surface}.
-     * Caller should attach this Surface to {@code VirtualDisplay} before invoking {@link #releaseOldSession}
-     * (handled cleanly inside when swapping, or atomically with fallback if encoder slots are scarce).
      */
     public Surface startOrReconfigure(
             int reqWidth,
@@ -112,59 +126,18 @@ public final class RemoteStreamSink implements DisplaySink {
             int displayMode,
             int rotation) {
         synchronized (lock) {
-            int clampedTarget = DisplayGeometryUtil.clampBitrateKbps(
-                    reqBitrateKbps, MIN_BITRATE_KBPS, Math.max(MIN_BITRATE_KBPS, maxBitrateKbps));
-            float clampedFps = DisplayGeometryUtil.clampFps(reqFps, 60f);
-            int clampedRot = DisplayGeometryUtil.normalizeRotation(rotation);
-
-            EncoderSession oldSession = this.session;
-            EncoderSession nextSession = null;
-            try {
-                nextSession = createAndStartEncoder(
-                        reqWidth, reqHeight, reqDpi, clampedFps, clampedTarget, codecPref, displayMode, clampedRot);
-            } catch (Throwable firstErr) {
-                // Some SoCs limit concurrent HW encoders: tear down old session first and retry once.
-                if (oldSession != null) {
-                    stopSessionQuietly(oldSession);
-                    this.session = null;
-                    oldSession = null;
-                }
-                try {
-                    nextSession = createAndStartEncoder(
-                            reqWidth, reqHeight, reqDpi, clampedFps, clampedTarget, codecPref, displayMode, clampedRot);
-                } catch (Throwable secondErr) {
-                    System.err.println("EXTBRIDGE_ENCODER_START_FAILED: " + secondErr);
-                    secondErr.printStackTrace();
-                    if (listener != null) {
-                        listener.onEncoderError("Failed to start video encoder: " + secondErr.getMessage());
-                    }
-                    return null;
-                }
-            }
-
-            this.targetBitrateKbps = clampedTarget;
-            this.currentBitrateKbps = clampedTarget;
-            this.session = nextSession;
-            startDrainThread(nextSession);
-
-            // Stop previous encoder session after new one is ready (caller will swap VD surface right away).
-            if (oldSession != null) {
-                final EncoderSession toStop = oldSession;
-                // Delay brief teardown slightly or stop immediately? Stop its drain loop now; release surface/codec cleanly.
-                stopSessionQuietly(toStop);
-            }
-            return nextSession.inputSurface;
+            EncoderSession next = activateSessionLocked(
+                    reqWidth, reqHeight, reqDpi, reqFps, reqBitrateKbps,
+                    codecPref, displayMode, rotation, null, false,
+                    "EXTBRIDGE_ENCODER_START_FAILED", "Failed to start video encoder: ");
+            return (next != null) ? next.inputSurface : null;
         }
     }
 
     /**
-     * Reconfigures and invokes {@code surfaceConsumer} with the new Surface BEFORE tearing down
+     * Reconfigures and invokes {@code swapper} with the new Surface BEFORE tearing down
      * the old Surface, ensuring seamless zero-flicker VirtualDisplay surface handover.
      */
-    public interface SurfaceSwapper {
-        void onNewSurfaceReady(Surface newSurface, int alignedW, int alignedH, int dpi);
-    }
-
     public boolean reconfigureAndSwap(
             int reqWidth,
             int reqHeight,
@@ -176,49 +149,73 @@ public final class RemoteStreamSink implements DisplaySink {
             int rotation,
             SurfaceSwapper swapper) {
         synchronized (lock) {
-            int clampedTarget = DisplayGeometryUtil.clampBitrateKbps(
-                    reqBitrateKbps, MIN_BITRATE_KBPS, Math.max(MIN_BITRATE_KBPS, maxBitrateKbps));
-            float clampedFps = DisplayGeometryUtil.clampFps(reqFps, 60f);
-            int clampedRot = DisplayGeometryUtil.normalizeRotation(rotation);
+            EncoderSession next = activateSessionLocked(
+                    reqWidth, reqHeight, reqDpi, reqFps, reqBitrateKbps,
+                    codecPref, displayMode, rotation, swapper, true,
+                    "EXTBRIDGE_ENCODER_RECONFIG_FAILED", "Encoder reconfigure failed: ");
+            return next != null;
+        }
+    }
 
-            EncoderSession oldSession = this.session;
-            EncoderSession nextSession;
+    private EncoderSession activateSessionLocked(
+            int reqWidth,
+            int reqHeight,
+            int reqDpi,
+            float reqFps,
+            int reqBitrateKbps,
+            int codecPref,
+            int displayMode,
+            int rotation,
+            SurfaceSwapper swapper,
+            boolean requestIdrAfterSwap,
+            String failLogTag,
+            String failReasonPrefix) {
+        int clampedTarget = DisplayGeometryUtil.clampBitrateKbps(
+                reqBitrateKbps, MIN_BITRATE_KBPS, Math.max(MIN_BITRATE_KBPS, maxBitrateKbps));
+        float clampedFps = DisplayGeometryUtil.clampFps(reqFps, 60f);
+        int clampedRot = DisplayGeometryUtil.normalizeRotation(rotation);
+
+        EncoderSession oldSession = this.session;
+        EncoderSession nextSession;
+        try {
+            nextSession = createAndStartEncoder(
+                    reqWidth, reqHeight, reqDpi, clampedFps, clampedTarget, codecPref, displayMode, clampedRot);
+        } catch (Throwable firstErr) {
+            // Some SoCs limit concurrent HW encoders: tear down old session first and retry once.
+            if (oldSession != null) {
+                stopSessionQuietly(oldSession);
+                this.session = null;
+                oldSession = null;
+            }
             try {
                 nextSession = createAndStartEncoder(
                         reqWidth, reqHeight, reqDpi, clampedFps, clampedTarget, codecPref, displayMode, clampedRot);
-            } catch (Throwable firstErr) {
-                if (oldSession != null) {
-                    stopSessionQuietly(oldSession);
-                    this.session = null;
-                    oldSession = null;
+            } catch (Throwable secondErr) {
+                System.err.println(failLogTag + ": " + secondErr);
+                secondErr.printStackTrace();
+                if (listener != null) {
+                    listener.onEncoderError(failReasonPrefix + secondErr.getMessage());
                 }
-                try {
-                    nextSession = createAndStartEncoder(
-                            reqWidth, reqHeight, reqDpi, clampedFps, clampedTarget, codecPref, displayMode, clampedRot);
-                } catch (Throwable secondErr) {
-                    System.err.println("EXTBRIDGE_ENCODER_RECONFIG_FAILED: " + secondErr);
-                    if (listener != null) {
-                        listener.onEncoderError("Encoder reconfigure failed: " + secondErr.getMessage());
-                    }
-                    return false;
-                }
+                return null;
             }
-
-            this.targetBitrateKbps = clampedTarget;
-            this.currentBitrateKbps = clampedTarget;
-            this.session = nextSession;
-            startDrainThread(nextSession);
-
-            if (swapper != null) {
-                swapper.onNewSurfaceReady(
-                        nextSession.inputSurface, nextSession.width, nextSession.height, nextSession.dpi);
-            }
-            if (oldSession != null) {
-                stopSessionQuietly(oldSession);
-            }
-            requestKeyFrame();
-            return true;
         }
+
+        this.targetBitrateKbps = clampedTarget;
+        this.currentBitrateKbps = clampedTarget;
+        this.session = nextSession;
+        startDrainThread(nextSession);
+
+        if (swapper != null) {
+            swapper.onNewSurfaceReady(
+                    nextSession.inputSurface, nextSession.width, nextSession.height, nextSession.dpi);
+        }
+        if (oldSession != null) {
+            stopSessionQuietly(oldSession);
+        }
+        if (requestIdrAfterSwap) {
+            requestKeyFrame();
+        }
+        return nextSession;
     }
 
     @Override
@@ -295,7 +292,9 @@ public final class RemoteStreamSink implements DisplaySink {
             Bundle params = new Bundle();
             params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
             s.codec.setParameters(params);
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_ENCODER_IDR_ERR: " + t.getMessage());
+        }
     }
 
     @Override
@@ -350,7 +349,9 @@ public final class RemoteStreamSink implements DisplaySink {
             Bundle params = new Bundle();
             params.putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, kbps * 1000);
             s.codec.setParameters(params);
-        } catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_ENCODER_BITRATE_ERR kbps=" + kbps + ": " + t.getMessage());
+        }
     }
 
     @Override
@@ -377,8 +378,8 @@ public final class RemoteStreamSink implements DisplaySink {
             int codecId = MIME_HEVC.equals(mime)
                     ? ExtCastProtocol.VIDEO_CODEC_HEVC
                     : ExtCastProtocol.VIDEO_CODEC_H264;
-            int[] capAlign = queryEncoderAlignment(mime);
-            int[][] dimCandidates = buildDimensionCandidates(reqW, reqH, capAlign[0], capAlign[1]);
+            SelectedEncoder selected = selectPreferredEncoder(mime);
+            int[][] dimCandidates = buildDimensionCandidates(reqW, reqH, selected.alignW, selected.alignH);
 
             for (int[] dims : dimCandidates) {
                 int w = dims[0];
@@ -389,27 +390,36 @@ public final class RemoteStreamSink implements DisplaySink {
                     MediaCodec codec = null;
                     Surface surf = null;
                     try {
-                        codec = createPreferredHardwareEncoder(mime);
+                        codec = (selected.codecName != null)
+                                ? MediaCodec.createByCodecName(selected.codecName)
+                                : MediaCodec.createEncoderByType(mime);
                         MediaFormat fmt = buildVideoFormat(mime, w, h, fps, bitrateKbps, lowLatency);
                         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                         surf = codec.createInputSurface();
                         if (surf != null && Build.VERSION.SDK_INT >= 30) {
                             try {
                                 surf.setFrameRate(fps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
-                            } catch (Throwable ignored) {}
+                            } catch (RuntimeException e) {
+                                System.err.println("EXTBRIDGE_ENCODER_FPS_HINT_WARN: " + e.getMessage());
+                            }
                         }
                         codec.start();
                         System.out.println("EXTBRIDGE_ENCODER_STARTED mime=" + mime
+                                + " codec=" + (selected.codecName != null ? selected.codecName : "default")
                                 + " size=" + w + "x" + h + "@" + dpi + "dpi fps=" + fps
                                 + " bitrate=" + bitrateKbps + "kbps lowLatency=" + lowLatency);
-                        return new EncoderSession(codec, surf, codecId, mime, w, h, dpi, fps, displayMode, rotation);
+                        return new EncoderSession(codec, surf, codecId, w, h, dpi, fps, displayMode, rotation);
                     } catch (Throwable t) {
                         lastErr = t;
                         if (surf != null) {
-                            try { surf.release(); } catch (Throwable ignored) {}
+                            try { surf.release(); } catch (RuntimeException e) {
+                                System.err.println("EXTBRIDGE_ENCODER_SURF_CLEANUP_WARN: " + e.getMessage());
+                            }
                         }
                         if (codec != null) {
-                            try { codec.release(); } catch (Throwable ignored) {}
+                            try { codec.release(); } catch (RuntimeException e) {
+                                System.err.println("EXTBRIDGE_ENCODER_CODEC_CLEANUP_WARN: " + e.getMessage());
+                            }
                         }
                     }
                 }
@@ -421,64 +431,72 @@ public final class RemoteStreamSink implements DisplaySink {
         throw new RuntimeException("Unable to configure video encoder", lastErr);
     }
 
-    private static MediaCodec createPreferredHardwareEncoder(String mime) throws Exception {
+    /**
+     * Performs a single {@link MediaCodecList} scan to pick the preferred hardware encoder for
+     * {@code mime} (falling back to software if no HW codec matches) and extracts alignment from
+     * that exact selected encoder.
+     */
+    private static SelectedEncoder selectPreferredEncoder(String mime) {
         try {
             MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
-            String fallbackName = null;
+            MediaCodecInfo swFallback = null;
+            String swMatchedType = null;
             for (MediaCodecInfo info : list.getCodecInfos()) {
                 if (!info.isEncoder()) continue;
-                boolean matches = false;
-                for (String type : info.getSupportedTypes()) {
-                    if (mime.equalsIgnoreCase(type)) {
-                        matches = true;
-                        break;
-                    }
+                String matchedType = matchSupportedType(info, mime);
+                if (matchedType == null) continue;
+                if (!isSoftwareCodec(info, info.getName())) {
+                    int[] align = extractAlignment(info, matchedType);
+                    return new SelectedEncoder(info.getName(), align[0], align[1]);
                 }
-                if (!matches) continue;
-                String name = info.getName();
-                boolean isSw = isSoftwareCodec(info, name);
-                if (!isSw) {
-                    return MediaCodec.createByCodecName(name);
-                }
-                if (fallbackName == null) {
-                    fallbackName = name;
+                if (swFallback == null) {
+                    swFallback = info;
+                    swMatchedType = matchedType;
                 }
             }
-            if (fallbackName != null) {
-                return MediaCodec.createByCodecName(fallbackName);
+            if (swFallback != null) {
+                int[] align = extractAlignment(swFallback, swMatchedType);
+                return new SelectedEncoder(swFallback.getName(), align[0], align[1]);
             }
-        } catch (Throwable ignored) {}
-        return MediaCodec.createEncoderByType(mime);
+        } catch (Throwable t) {
+            System.err.println("EXTBRIDGE_ENCODER_SCAN_WARN mime=" + mime + ": " + t.getMessage());
+        }
+        return new SelectedEncoder(null, DEFAULT_ALIGNMENT, DEFAULT_ALIGNMENT);
+    }
+
+    private static String matchSupportedType(MediaCodecInfo info, String mime) {
+        for (String type : info.getSupportedTypes()) {
+            if (mime.equalsIgnoreCase(type)) {
+                return type;
+            }
+        }
+        return null;
+    }
+
+    private static int[] extractAlignment(MediaCodecInfo info, String matchedType) {
+        try {
+            MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(matchedType);
+            if (caps != null && caps.getVideoCapabilities() != null) {
+                int wa = Math.max(DEFAULT_ALIGNMENT, caps.getVideoCapabilities().getWidthAlignment());
+                int ha = Math.max(DEFAULT_ALIGNMENT, caps.getVideoCapabilities().getHeightAlignment());
+                return new int[]{wa, ha};
+            }
+        } catch (RuntimeException e) {
+            System.err.println("EXTBRIDGE_ENCODER_ALIGN_WARN codec=" + info.getName() + ": " + e.getMessage());
+        }
+        return new int[]{DEFAULT_ALIGNMENT, DEFAULT_ALIGNMENT};
     }
 
     private static boolean isSoftwareCodec(MediaCodecInfo info, String name) {
         if (Build.VERSION.SDK_INT >= 29) {
             try {
                 return info.isSoftwareOnly();
-            } catch (Throwable ignored) {}
-        }
-        String lower = (name != null) ? name.toLowerCase(java.util.Locale.US) : "";
-        return lower.startsWith("omx.google.") || lower.startsWith("c2.android.");
-    }
-
-    private static int[] queryEncoderAlignment(String mime) {
-        try {
-            MediaCodecList list = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
-            for (MediaCodecInfo info : list.getCodecInfos()) {
-                if (!info.isEncoder()) continue;
-                for (String type : info.getSupportedTypes()) {
-                    if (mime.equalsIgnoreCase(type)) {
-                        MediaCodecInfo.CodecCapabilities caps = info.getCapabilitiesForType(type);
-                        if (caps != null && caps.getVideoCapabilities() != null) {
-                            int wa = Math.max(8, caps.getVideoCapabilities().getWidthAlignment());
-                            int ha = Math.max(8, caps.getVideoCapabilities().getHeightAlignment());
-                            return new int[]{wa, ha};
-                        }
-                    }
-                }
+            } catch (NoSuchMethodError ignored) {
+                // Fallback to name heuristic below.
             }
-        } catch (Throwable ignored) {}
-        return new int[]{8, 8};
+        }
+        String lower = (name != null) ? name.toLowerCase(Locale.US) : "";
+        return lower.startsWith("omx.google.") || lower.startsWith("c2.android.");
     }
 
     private static int[][] buildDimensionCandidates(int reqW, int reqH, int capAlignW, int capAlignH) {
@@ -503,21 +521,15 @@ public final class RemoteStreamSink implements DisplaySink {
         // Keepalive repeat at 2Hz on static desktop to save Wi-Fi/USB bandwidth.
         fmt.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 500_000L);
         if (lowLatency) {
-            try { fmt.setInteger(MediaFormat.KEY_PRIORITY, 0); } catch (Throwable ignored) {}
-            try { fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, Math.max(60, targetFps)); } catch (Throwable ignored) {}
-            try {
-                if (Build.VERSION.SDK_INT >= 26) {
-                    fmt.setInteger(MediaFormat.KEY_LATENCY, 0);
-                }
-            } catch (Throwable ignored) {}
-            try {
-                if (Build.VERSION.SDK_INT >= 29) {
-                    fmt.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
-                }
-            } catch (Throwable ignored) {}
-            try {
-                fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
-            } catch (Throwable ignored) {}
+            fmt.setInteger(MediaFormat.KEY_PRIORITY, 0);
+            fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, Math.max(60, targetFps));
+            if (Build.VERSION.SDK_INT >= 26) {
+                fmt.setInteger(MediaFormat.KEY_LATENCY, 0);
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                fmt.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
+            }
+            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
         }
         return fmt;
     }
@@ -543,7 +555,7 @@ public final class RemoteStreamSink implements DisplaySink {
                 if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                     MediaFormat outFmt = s.codec.getOutputFormat();
                     byte[] csd = extractCsdAnnexB(outFmt);
-                    if (csd != null && csd.length > 0) {
+                    if (csd.length > 0) {
                         s.lastCsd = csd;
                         emitVideoConfig(s, csd, SystemClock.elapsedRealtimeNanos() / 1000L);
                     }
@@ -598,18 +610,28 @@ public final class RemoteStreamSink implements DisplaySink {
                 }
 
                 if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                    s.running = false;
                     break;
                 }
             } catch (IllegalStateException ise) {
-                if (s.running && this.session == s) {
-                    System.err.println("EXTBRIDGE_ENCODER_DRAIN_STATE_ERR: " + ise.getMessage());
-                }
+                handleDrainFailure(s, "EXTBRIDGE_ENCODER_DRAIN_STATE_ERR",
+                        "Video encoder illegal state: " + ise.getMessage(), ise);
                 break;
             } catch (Throwable t) {
-                if (s.running && this.session == s) {
-                    System.err.println("EXTBRIDGE_ENCODER_DRAIN_ERR: " + t);
-                }
+                handleDrainFailure(s, "EXTBRIDGE_ENCODER_DRAIN_ERR",
+                        "Video encoder drain failure: " + t.getMessage(), t);
                 break;
+            }
+        }
+    }
+
+    private void handleDrainFailure(EncoderSession s, String tag, String reason, Throwable err) {
+        boolean wasActive = s.running && this.session == s;
+        s.running = false;
+        if (wasActive) {
+            System.err.println(tag + ": " + err);
+            if (listener != null) {
+                listener.onEncoderError(reason);
             }
         }
     }
@@ -649,7 +671,7 @@ public final class RemoteStreamSink implements DisplaySink {
 
     private static boolean hasInlineParameterSets(int codecId, byte[] annexB) {
         if (annexB == null || annexB.length < 5) return false;
-        int offset = 0;
+        int offset;
         if (annexB[0] == 0 && annexB[1] == 0 && annexB[2] == 0 && annexB[3] == 1) {
             offset = 4;
         } else if (annexB[0] == 0 && annexB[1] == 0 && annexB[2] == 1) {
@@ -661,22 +683,43 @@ public final class RemoteStreamSink implements DisplaySink {
         if (codecId == ExtCastProtocol.VIDEO_CODEC_HEVC) {
             int nalType = (nalByte >> 1) & 0x3F;
             return nalType == 32 || nalType == 33 || nalType == 34; // VPS, SPS, PPS
-        } else {
-            int nalType = nalByte & 0x1F;
-            return nalType == 7 || nalType == 8; // SPS, PPS
         }
+        int nalType = nalByte & 0x1F;
+        return nalType == 7 || nalType == 8; // SPS, PPS
     }
 
     private static void stopSessionQuietly(EncoderSession s) {
         if (s == null) return;
         s.running = false;
-        try { s.codec.signalEndOfInputStream(); } catch (Throwable ignored) {}
+        try {
+            s.codec.signalEndOfInputStream();
+        } catch (RuntimeException e) {
+            // Expected if codec was already stopped or in error state.
+        }
         Thread t = s.drainThread;
         if (t != null && t != Thread.currentThread()) {
-            try { t.join(350L); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+            try {
+                t.join(350L);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
         }
-        try { s.codec.stop(); } catch (Throwable ignored) {}
-        try { s.codec.release(); } catch (Throwable ignored) {}
-        try { if (s.inputSurface != null) s.inputSurface.release(); } catch (Throwable ignored) {}
+        try {
+            s.codec.stop();
+        } catch (RuntimeException e) {
+            System.err.println("EXTBRIDGE_ENCODER_STOP_WARN: " + e.getMessage());
+        }
+        try {
+            s.codec.release();
+        } catch (RuntimeException e) {
+            System.err.println("EXTBRIDGE_ENCODER_RELEASE_WARN: " + e.getMessage());
+        }
+        if (s.inputSurface != null) {
+            try {
+                s.inputSurface.release();
+            } catch (RuntimeException e) {
+                System.err.println("EXTBRIDGE_ENCODER_SURF_RELEASE_WARN: " + e.getMessage());
+            }
+        }
     }
 }
