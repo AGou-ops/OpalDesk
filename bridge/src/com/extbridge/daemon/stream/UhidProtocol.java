@@ -1,0 +1,442 @@
+package com.extbridge.daemon.stream;
+
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Pure-Java Linux 64-bit /dev/uhid binary struct encoder, USB HID report descriptors,
+ * HID input report builders, and Android KeyEvent.KEYCODE_* -> USB HID Usage ID mapping.
+ * Has zero android.* runtime dependencies so it executes identically on Android ART and JVM tests.
+ *
+ * Exact Linux 64-bit struct uhid_event layout (include/uapi/linux/uhid.h):
+ *   sizeof(struct uhid_event) == 4380 bytes (little-endian):
+ *   - offset 0..3:       __u32 type (UHID_DESTROY=1, UHID_CREATE2=11, UHID_INPUT2=12)
+ *   - offset 4..4375:    union u (largest packed member uhid_create2_req = 4372 bytes)
+ *   - offset 4376..4379: 4-byte trailing union alignment padding (from uhid_start_req __u64)
+ */
+public final class UhidProtocol {
+    public static final int UHID_EVENT_SIZE = 4380;
+    public static final int HID_MAX_DESCRIPTOR_SIZE = 4096;
+    public static final int UHID_DESTROY = 1;
+    public static final int UHID_CREATE2 = 11;
+    public static final int UHID_INPUT2 = 12;
+    public static final int BUS_VIRTUAL = 0x06;
+
+    // Exact byte offsets inside 64-bit little-endian struct uhid_event
+    public static final int OFFSET_TYPE = 0;
+    public static final int OFFSET_CREATE2_NAME = 4;       // 128 bytes
+    public static final int OFFSET_CREATE2_PHYS = 132;     // 64 bytes
+    public static final int OFFSET_CREATE2_UNIQ = 196;     // 64 bytes
+    public static final int OFFSET_CREATE2_RD_SIZE = 260;  // uint16 LE
+    public static final int OFFSET_CREATE2_BUS = 262;      // uint16 LE
+    public static final int OFFSET_CREATE2_VENDOR = 264;   // uint32 LE
+    public static final int OFFSET_CREATE2_PRODUCT = 268;  // uint32 LE
+    public static final int OFFSET_CREATE2_VERSION = 272;  // uint32 LE
+    public static final int OFFSET_CREATE2_COUNTRY = 276;  // uint32 LE
+    public static final int OFFSET_CREATE2_RD_DATA = 280;  // 4096 bytes
+
+    public static final int OFFSET_INPUT2_SIZE = 4;        // uint16 LE
+    public static final int OFFSET_INPUT2_DATA = 6;        // up to 4096 bytes
+
+    public static final int REPORT_ID_POINTER = 1;
+    public static final int REPORT_ID_KEYBOARD = 2;
+    public static final int POINTER_REPORT_SIZE = 8;
+    public static final int KEYBOARD_REPORT_SIZE = 9;
+    public static final int ABS_MAX = 32767;
+
+    public static final int VENDOR_ID = 0x18D1;
+    public static final int PRODUCT_ID_POINTER = 0xEB01;
+    public static final int PRODUCT_ID_KEYBOARD = 0xEB02;
+    public static final int DEVICE_VERSION = 0x0001;
+
+    // USB HID Modifier bits (Report ID 2, byte 1)
+    public static final int MOD_LEFT_CTRL = 0x01;
+    public static final int MOD_LEFT_SHIFT = 0x02;
+    public static final int MOD_LEFT_ALT = 0x04;
+    public static final int MOD_LEFT_GUI = 0x08;
+    public static final int MOD_RIGHT_CTRL = 0x10;
+    public static final int MOD_RIGHT_SHIFT = 0x20;
+    public static final int MOD_RIGHT_ALT = 0x40;
+    public static final int MOD_RIGHT_GUI = 0x80;
+
+    // Android KeyEvent numeric constants (matches android.view.KeyEvent 1:1 without runtime stub dependency)
+    private static final int KC_BACK = 4;
+    private static final int KC_0 = 7;
+    private static final int KC_1 = 8;
+    private static final int KC_DPAD_UP = 19;
+    private static final int KC_DPAD_DOWN = 20;
+    private static final int KC_DPAD_LEFT = 21;
+    private static final int KC_DPAD_RIGHT = 22;
+    private static final int KC_VOLUME_UP = 24;
+    private static final int KC_VOLUME_DOWN = 25;
+    private static final int KC_A = 29;
+    private static final int KC_COMMA = 55;
+    private static final int KC_PERIOD = 56;
+    private static final int KC_ALT_LEFT = 57;
+    private static final int KC_ALT_RIGHT = 58;
+    private static final int KC_SHIFT_LEFT = 59;
+    private static final int KC_SHIFT_RIGHT = 60;
+    private static final int KC_TAB = 61;
+    private static final int KC_SPACE = 62;
+    private static final int KC_ENTER = 66;
+    private static final int KC_DEL = 67;
+    private static final int KC_GRAVE = 68;
+    private static final int KC_MINUS = 69;
+    private static final int KC_EQUALS = 70;
+    private static final int KC_LEFT_BRACKET = 71;
+    private static final int KC_RIGHT_BRACKET = 72;
+    private static final int KC_BACKSLASH = 73;
+    private static final int KC_SEMICOLON = 74;
+    private static final int KC_APOSTROPHE = 75;
+    private static final int KC_SLASH = 76;
+    private static final int KC_MENU = 82;
+    private static final int KC_PAGE_UP = 92;
+    private static final int KC_PAGE_DOWN = 93;
+    private static final int KC_ESCAPE = 111;
+    private static final int KC_FORWARD_DEL = 112;
+    private static final int KC_CTRL_LEFT = 113;
+    private static final int KC_CTRL_RIGHT = 114;
+    private static final int KC_CAPS_LOCK = 115;
+    private static final int KC_SCROLL_LOCK = 116;
+    private static final int KC_META_LEFT = 117;
+    private static final int KC_META_RIGHT = 118;
+    private static final int KC_SYSRQ = 120;
+    private static final int KC_BREAK = 121;
+    private static final int KC_MOVE_HOME = 122;
+    private static final int KC_MOVE_END = 123;
+    private static final int KC_INSERT = 124;
+    private static final int KC_F1 = 131;
+    private static final int KC_NUM_LOCK = 143;
+    private static final int KC_NUMPAD_0 = 144;
+    private static final int KC_NUMPAD_1 = 145;
+    private static final int KC_NUMPAD_DIVIDE = 154;
+    private static final int KC_NUMPAD_MULTIPLY = 155;
+    private static final int KC_NUMPAD_SUBTRACT = 156;
+    private static final int KC_NUMPAD_ADD = 157;
+    private static final int KC_NUMPAD_DOT = 158;
+    private static final int KC_NUMPAD_COMMA = 159;
+    private static final int KC_NUMPAD_ENTER = 160;
+    private static final int KC_NUMPAD_EQUALS = 161;
+    private static final int KC_VOLUME_MUTE = 164;
+    private static final int KC_CUT = 277;
+    private static final int KC_COPY = 278;
+    private static final int KC_PASTE = 279;
+
+    private static final int META_SHIFT_ON = 1;
+    private static final int META_ALT_ON = 2;
+    private static final int META_ALT_LEFT_ON = 16;
+    private static final int META_ALT_RIGHT_ON = 32;
+    private static final int META_SHIFT_LEFT_ON = 64;
+    private static final int META_SHIFT_RIGHT_ON = 128;
+    private static final int META_CTRL_ON = 4096;
+    private static final int META_CTRL_LEFT_ON = 8192;
+    private static final int META_CTRL_RIGHT_ON = 16384;
+    private static final int META_META_ON = 65536;
+    private static final int META_META_LEFT_ON = 131072;
+    private static final int META_META_RIGHT_ON = 262144;
+
+    private static final byte[] POINTER_REPORT_DESCRIPTOR = new byte[]{
+            0x05, 0x01,               // Usage Page (Generic Desktop)
+            0x09, 0x02,               // Usage (Mouse)
+            (byte) 0xA1, 0x01,        // Collection (Application)
+            (byte) 0x85, REPORT_ID_POINTER, // Report ID (1)
+            0x09, 0x01,               //   Usage (Pointer)
+            (byte) 0xA1, 0x00,        //   Collection (Physical)
+            // 5 buttons
+            0x05, 0x09,               //     Usage Page (Button)
+            0x19, 0x01,               //     Usage Minimum (Button 1)
+            0x29, 0x05,               //     Usage Maximum (Button 5)
+            0x15, 0x00,               //     Logical Minimum (0)
+            0x25, 0x01,               //     Logical Maximum (1)
+            (byte) 0x95, 0x05,        //     Report Count (5)
+            0x75, 0x01,               //     Report Size (1)
+            (byte) 0x81, 0x02,        //     Input (Data, Variable, Absolute)
+            // 3 bits padding
+            (byte) 0x95, 0x01,        //     Report Count (1)
+            0x75, 0x03,               //     Report Size (3)
+            (byte) 0x81, 0x03,        //     Input (Constant, Variable, Absolute)
+            // Absolute X, Y (0..32767)
+            0x05, 0x01,               //     Usage Page (Generic Desktop)
+            0x09, 0x30,               //     Usage (X)
+            0x09, 0x31,               //     Usage (Y)
+            0x15, 0x00,               //     Logical Minimum (0)
+            0x26, (byte) 0xFF, 0x7F,  //     Logical Maximum (32767)
+            0x75, 0x10,               //     Report Size (16)
+            (byte) 0x95, 0x02,        //     Report Count (2)
+            (byte) 0x81, 0x02,        //     Input (Data, Variable, Absolute)
+            // Vertical wheel (-127..127)
+            0x09, 0x38,               //     Usage (Wheel)
+            0x15, (byte) 0x81,        //     Logical Minimum (-127)
+            0x25, 0x7F,               //     Logical Maximum (127)
+            0x75, 0x08,               //     Report Size (8)
+            (byte) 0x95, 0x01,        //     Report Count (1)
+            (byte) 0x81, 0x06,        //     Input (Data, Variable, Relative)
+            // Horizontal AC Pan (-127..127)
+            0x05, 0x0C,               //     Usage Page (Consumer)
+            0x0A, 0x38, 0x02,         //     Usage (AC Pan = 0x0238)
+            0x15, (byte) 0x81,        //     Logical Minimum (-127)
+            0x25, 0x7F,               //     Logical Maximum (127)
+            0x75, 0x08,               //     Report Size (8)
+            (byte) 0x95, 0x01,        //     Report Count (1)
+            (byte) 0x81, 0x06,        //     Input (Data, Variable, Relative)
+            (byte) 0xC0,              //   End Collection (Physical)
+            (byte) 0xC0               // End Collection (Application)
+    };
+
+    private static final byte[] KEYBOARD_REPORT_DESCRIPTOR = new byte[]{
+            0x05, 0x01,               // Usage Page (Generic Desktop)
+            0x09, 0x06,               // Usage (Keyboard)
+            (byte) 0xA1, 0x01,        // Collection (Application)
+            (byte) 0x85, REPORT_ID_KEYBOARD, // Report ID (2)
+            // 8 modifier bits
+            0x05, 0x07,               //   Usage Page (Keyboard/Keypad)
+            0x19, (byte) 0xE0,        //   Usage Minimum (Left Control)
+            0x29, (byte) 0xE7,        //   Usage Maximum (Right GUI)
+            0x15, 0x00,               //   Logical Minimum (0)
+            0x25, 0x01,               //   Logical Maximum (1)
+            0x75, 0x01,               //   Report Size (1)
+            (byte) 0x95, 0x08,        //   Report Count (8)
+            (byte) 0x81, 0x02,        //   Input (Data, Variable, Absolute)
+            // 1 reserved byte
+            (byte) 0x95, 0x01,        //   Report Count (1)
+            0x75, 0x08,               //   Report Size (8)
+            (byte) 0x81, 0x01,        //   Input (Constant)
+            // 6 keycode array
+            (byte) 0x95, 0x06,        //   Report Count (6)
+            0x75, 0x08,               //   Report Size (8)
+            0x15, 0x00,               //   Logical Minimum (0)
+            0x26, (byte) 0xFF, 0x00,  //   Logical Maximum (255)
+            0x05, 0x07,               //   Usage Page (Keyboard/Keypad)
+            0x19, 0x00,               //   Usage Minimum (0)
+            0x2A, (byte) 0xFF, 0x00,  //   Usage Maximum (255)
+            (byte) 0x81, 0x00,        //   Input (Data, Array)
+            (byte) 0xC0               // End Collection (Application)
+    };
+
+    private static final Map<Integer, Integer> KEYCODE_TO_HID = buildKeycodeMap();
+
+    private UhidProtocol() {}
+
+    private static Map<Integer, Integer> buildKeycodeMap() {
+        Map<Integer, Integer> m = new HashMap<>(128);
+        for (int i = 0; i < 26; i++) m.put(KC_A + i, 0x04 + i);
+        for (int i = 0; i < 9; i++) m.put(KC_1 + i, 0x1E + i);
+        m.put(KC_0, 0x27);
+        m.put(KC_ENTER, 0x28);
+        m.put(KC_ESCAPE, 0x29);
+        m.put(KC_BACK, 0x29);
+        m.put(KC_DEL, 0x2A);
+        m.put(KC_TAB, 0x2B);
+        m.put(KC_SPACE, 0x2C);
+        m.put(KC_MINUS, 0x2D);
+        m.put(KC_EQUALS, 0x2E);
+        m.put(KC_LEFT_BRACKET, 0x2F);
+        m.put(KC_RIGHT_BRACKET, 0x30);
+        m.put(KC_BACKSLASH, 0x31);
+        m.put(KC_SEMICOLON, 0x33);
+        m.put(KC_APOSTROPHE, 0x34);
+        m.put(KC_GRAVE, 0x35);
+        m.put(KC_COMMA, 0x36);
+        m.put(KC_PERIOD, 0x37);
+        m.put(KC_SLASH, 0x38);
+        m.put(KC_CAPS_LOCK, 0x39);
+        for (int i = 0; i < 12; i++) m.put(KC_F1 + i, 0x3A + i);
+        m.put(KC_SYSRQ, 0x46);
+        m.put(KC_SCROLL_LOCK, 0x47);
+        m.put(KC_BREAK, 0x48);
+        m.put(KC_INSERT, 0x49);
+        m.put(KC_MOVE_HOME, 0x4A);
+        m.put(KC_PAGE_UP, 0x4B);
+        m.put(KC_FORWARD_DEL, 0x4C);
+        m.put(KC_MOVE_END, 0x4D);
+        m.put(KC_PAGE_DOWN, 0x4E);
+        m.put(KC_DPAD_RIGHT, 0x4F);
+        m.put(KC_DPAD_LEFT, 0x50);
+        m.put(KC_DPAD_DOWN, 0x51);
+        m.put(KC_DPAD_UP, 0x52);
+        m.put(KC_NUM_LOCK, 0x53);
+        m.put(KC_NUMPAD_DIVIDE, 0x54);
+        m.put(KC_NUMPAD_MULTIPLY, 0x55);
+        m.put(KC_NUMPAD_SUBTRACT, 0x56);
+        m.put(KC_NUMPAD_ADD, 0x57);
+        m.put(KC_NUMPAD_ENTER, 0x58);
+        for (int i = 0; i < 9; i++) m.put(KC_NUMPAD_1 + i, 0x59 + i);
+        m.put(KC_NUMPAD_0, 0x62);
+        m.put(KC_NUMPAD_DOT, 0x63);
+        m.put(KC_MENU, 0x65);
+        m.put(KC_NUMPAD_EQUALS, 0x67);
+        m.put(KC_NUMPAD_COMMA, 0x85);
+        m.put(KC_CUT, 0x7B);
+        m.put(KC_COPY, 0x7C);
+        m.put(KC_PASTE, 0x7D);
+        m.put(KC_VOLUME_MUTE, 0x7F);
+        m.put(KC_VOLUME_UP, 0x80);
+        m.put(KC_VOLUME_DOWN, 0x81);
+        return m;
+    }
+
+    public static byte[] getPointerReportDescriptor() {
+        return POINTER_REPORT_DESCRIPTOR.clone();
+    }
+
+    public static byte[] getKeyboardReportDescriptor() {
+        return KEYBOARD_REPORT_DESCRIPTOR.clone();
+    }
+
+    public static String pointerPhysForDisplay(int displayId) {
+        return "extbridge-uhid-ptr-" + displayId;
+    }
+
+    public static String keyboardPhysForDisplay(int displayId) {
+        return "extbridge-uhid-kbd-" + displayId;
+    }
+
+    public static byte[] buildCreate2Event(
+            String name,
+            String phys,
+            String uniq,
+            int bus,
+            int vendor,
+            int product,
+            int version,
+            int country,
+            byte[] reportDescriptor) {
+        if (reportDescriptor == null || reportDescriptor.length == 0
+                || reportDescriptor.length > HID_MAX_DESCRIPTOR_SIZE) {
+            throw new IllegalArgumentException("Invalid HID report descriptor length");
+        }
+        byte[] buf = new byte[UHID_EVENT_SIZE];
+        ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+        bb.putInt(OFFSET_TYPE, UHID_CREATE2);
+        writeCString(buf, OFFSET_CREATE2_NAME, 128, name);
+        writeCString(buf, OFFSET_CREATE2_PHYS, 64, phys);
+        writeCString(buf, OFFSET_CREATE2_UNIQ, 64, uniq);
+        bb.putShort(OFFSET_CREATE2_RD_SIZE, (short) (reportDescriptor.length & 0xFFFF));
+        bb.putShort(OFFSET_CREATE2_BUS, (short) (bus & 0xFFFF));
+        bb.putInt(OFFSET_CREATE2_VENDOR, vendor);
+        bb.putInt(OFFSET_CREATE2_PRODUCT, product);
+        bb.putInt(OFFSET_CREATE2_VERSION, version);
+        bb.putInt(OFFSET_CREATE2_COUNTRY, country);
+        System.arraycopy(reportDescriptor, 0, buf, OFFSET_CREATE2_RD_DATA, reportDescriptor.length);
+        return buf;
+    }
+
+    public static byte[] buildInput2Event(byte[] reportData) {
+        if (reportData == null || reportData.length == 0 || reportData.length > HID_MAX_DESCRIPTOR_SIZE) {
+            throw new IllegalArgumentException("Invalid UHID_INPUT2 report length");
+        }
+        byte[] buf = new byte[UHID_EVENT_SIZE];
+        ByteBuffer bb = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+        bb.putInt(OFFSET_TYPE, UHID_INPUT2);
+        bb.putShort(OFFSET_INPUT2_SIZE, (short) (reportData.length & 0xFFFF));
+        System.arraycopy(reportData, 0, buf, OFFSET_INPUT2_DATA, reportData.length);
+        return buf;
+    }
+
+    public static byte[] buildDestroyEvent() {
+        byte[] buf = new byte[UHID_EVENT_SIZE];
+        ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).putInt(OFFSET_TYPE, UHID_DESTROY);
+        return buf;
+    }
+
+    public static int toAbsoluteAxis(float coord, int displaySize) {
+        if (!Float.isFinite(coord) || displaySize <= 1) return 0;
+        double norm = coord / (double) (displaySize - 1);
+        int val = (int) Math.round(norm * ABS_MAX);
+        return Math.max(0, Math.min(ABS_MAX, val));
+    }
+
+    public static byte clampWheelDelta(float delta) {
+        if (!Float.isFinite(delta) || delta == 0f) return 0;
+        int rounded = Math.round(delta);
+        if (rounded == 0) {
+            rounded = (delta > 0f) ? 1 : -1;
+        }
+        return (byte) Math.max(-127, Math.min(127, rounded));
+    }
+
+    public static byte[] buildPointerReport(
+            int buttonsMask, int absX, int absY, int vWheel, int hWheel) {
+        int clampedX = Math.max(0, Math.min(ABS_MAX, absX));
+        int clampedY = Math.max(0, Math.min(ABS_MAX, absY));
+        byte[] report = new byte[POINTER_REPORT_SIZE];
+        report[0] = REPORT_ID_POINTER;
+        report[1] = (byte) (buttonsMask & 0x1F);
+        report[2] = (byte) (clampedX & 0xFF);
+        report[3] = (byte) ((clampedX >>> 8) & 0xFF);
+        report[4] = (byte) (clampedY & 0xFF);
+        report[5] = (byte) ((clampedY >>> 8) & 0xFF);
+        report[6] = (byte) Math.max(-127, Math.min(127, vWheel));
+        report[7] = (byte) Math.max(-127, Math.min(127, hWheel));
+        return report;
+    }
+
+    public static byte[] buildKeyboardReport(int modifiersMask, int[] activeHidUsages) {
+        byte[] report = new byte[KEYBOARD_REPORT_SIZE];
+        report[0] = REPORT_ID_KEYBOARD;
+        report[1] = (byte) (modifiersMask & 0xFF);
+        report[2] = 0;
+        if (activeHidUsages != null) {
+            int count = Math.min(6, activeHidUsages.length);
+            for (int i = 0; i < count; i++) {
+                report[3 + i] = (byte) (activeHidUsages[i] & 0xFF);
+            }
+        }
+        return report;
+    }
+
+    public static int androidKeyCodeToHidUsage(int androidKeyCode) {
+        Integer usage = KEYCODE_TO_HID.get(androidKeyCode);
+        return (usage != null) ? usage : 0;
+    }
+
+    public static int androidModifierKeyToBit(int androidKeyCode) {
+        switch (androidKeyCode) {
+            case KC_CTRL_LEFT:   return MOD_LEFT_CTRL;
+            case KC_SHIFT_LEFT:  return MOD_LEFT_SHIFT;
+            case KC_ALT_LEFT:    return MOD_LEFT_ALT;
+            case KC_META_LEFT:   return MOD_LEFT_GUI;
+            case KC_CTRL_RIGHT:  return MOD_RIGHT_CTRL;
+            case KC_SHIFT_RIGHT: return MOD_RIGHT_SHIFT;
+            case KC_ALT_RIGHT:   return MOD_RIGHT_ALT;
+            case KC_META_RIGHT:  return MOD_RIGHT_GUI;
+            default: return 0;
+        }
+    }
+
+    public static int androidMetaToHidModifiers(int metaState) {
+        int mods = 0;
+        if ((metaState & META_CTRL_LEFT_ON) != 0) mods |= MOD_LEFT_CTRL;
+        if ((metaState & META_CTRL_RIGHT_ON) != 0) mods |= MOD_RIGHT_CTRL;
+        if ((metaState & META_CTRL_ON) != 0 && (mods & (MOD_LEFT_CTRL | MOD_RIGHT_CTRL)) == 0) {
+            mods |= MOD_LEFT_CTRL;
+        }
+        if ((metaState & META_SHIFT_LEFT_ON) != 0) mods |= MOD_LEFT_SHIFT;
+        if ((metaState & META_SHIFT_RIGHT_ON) != 0) mods |= MOD_RIGHT_SHIFT;
+        if ((metaState & META_SHIFT_ON) != 0 && (mods & (MOD_LEFT_SHIFT | MOD_RIGHT_SHIFT)) == 0) {
+            mods |= MOD_LEFT_SHIFT;
+        }
+        if ((metaState & META_ALT_LEFT_ON) != 0) mods |= MOD_LEFT_ALT;
+        if ((metaState & META_ALT_RIGHT_ON) != 0) mods |= MOD_RIGHT_ALT;
+        if ((metaState & META_ALT_ON) != 0 && (mods & (MOD_LEFT_ALT | MOD_RIGHT_ALT)) == 0) {
+            mods |= MOD_LEFT_ALT;
+        }
+        if ((metaState & META_META_LEFT_ON) != 0) mods |= MOD_LEFT_GUI;
+        if ((metaState & META_META_RIGHT_ON) != 0) mods |= MOD_RIGHT_GUI;
+        if ((metaState & META_META_ON) != 0 && (mods & (MOD_LEFT_GUI | MOD_RIGHT_GUI)) == 0) {
+            mods |= MOD_LEFT_GUI;
+        }
+        return mods;
+    }
+
+    private static void writeCString(byte[] dst, int offset, int maxBytes, String text) {
+        if (text == null || text.isEmpty() || maxBytes <= 1) return;
+        byte[] utf8 = text.getBytes(StandardCharsets.UTF_8);
+        int len = Math.min(utf8.length, maxBytes - 1);
+        System.arraycopy(utf8, 0, dst, offset, len);
+        dst[offset + len] = 0;
+    }
+}
