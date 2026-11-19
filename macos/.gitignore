@@ -1,0 +1,6 @@
+# SwiftPM build artifacts inside macos/
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
