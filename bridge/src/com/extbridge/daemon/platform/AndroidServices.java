@@ -17,6 +17,7 @@ import android.view.MotionEvent;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.List;
 
@@ -169,8 +170,8 @@ public final class AndroidServices {
         if (m == null) return null;
         try {
             return (IBinder) m.invoke(null, name);
-        } catch (ReflectiveOperationException e) {
-            System.err.println("EXTBRIDGE_SVC_LOOKUP_ERR name=" + name + ": " + e);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_SVC_LOOKUP_ERR name=" + name + ": " + unwrapMessage(e));
             return null;
         }
     }
@@ -181,8 +182,8 @@ public final class AndroidServices {
         try {
             Class<?> stubCls = Class.forName(stubClassName);
             return stubCls.getMethod("asInterface", IBinder.class).invoke(null, binder);
-        } catch (ReflectiveOperationException e) {
-            System.err.println("EXTBRIDGE_SVC_STUB_ERR name=" + serviceName + " stub=" + stubClassName + ": " + e);
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_SVC_STUB_ERR name=" + serviceName + " stub=" + stubClassName + ": " + unwrapMessage(e));
             return null;
         }
     }
@@ -204,8 +205,8 @@ public final class AndroidServices {
             }
         } catch (NoSuchFieldException ignored) {
             // Field only exists on Android 12+ ContextImpl.
-        } catch (ReflectiveOperationException e) {
-            System.err.println("EXTBRIDGE_SHELL_ATTR_WARN: " + e.getMessage());
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_SHELL_ATTR_WARN: " + unwrapMessage(e));
         }
         return base;
     }
@@ -223,19 +224,28 @@ public final class AndroidServices {
         if (m == null) return;
         try {
             m.invoke(ev, actionButton);
-        } catch (ReflectiveOperationException e) {
-            System.err.println("EXTBRIDGE_SET_ACTION_BTN_ERR: " + e.getMessage());
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_SET_ACTION_BTN_ERR: " + unwrapMessage(e));
         }
     }
 
     public static void disableLocalDisplayInfoCaches() {
         try {
             Class<?> dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal");
-            dmgCls.getMethod("disableLocalDisplayInfoCaches").invoke(null);
+            Method m = dmgCls.getMethod("disableLocalDisplayInfoCaches");
+            if (Modifier.isStatic(m.getModifiers())) {
+                m.invoke(null);
+            } else {
+                // Newer Android / HyperOS exposes disableLocalDisplayInfoCaches() as an instance method.
+                Object dmg = dmgCls.getMethod("getInstance").invoke(null);
+                if (dmg != null) {
+                    m.invoke(dmg);
+                }
+            }
         } catch (ClassNotFoundException | NoSuchMethodException ignored) {
             // Not present on all API levels.
-        } catch (ReflectiveOperationException e) {
-            System.err.println("EXTBRIDGE_DMG_CACHE_WARN: " + e.getMessage());
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_DMG_CACHE_WARN: " + unwrapMessage(e));
         }
     }
 
@@ -619,7 +629,7 @@ public final class AndroidServices {
                 m = findMethodOrNull(dmgCls, "setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
                 if (m != null) return new PreferredModeBinding(m, dmg, 3);
             }
-        } catch (ReflectiveOperationException ignored) { /* Fall through to IDisplayManager. */ }
+        } catch (ReflectiveOperationException | RuntimeException ignored) { /* Fall through to IDisplayManager. */ }
         if (idm != null) {
             m = findMethodOrNull(idm.getClass(), "setUserPreferredDisplayMode", int.class, Display.Mode.class);
             if (m != null) return new PreferredModeBinding(m, idm, 2);
