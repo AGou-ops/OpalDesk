@@ -31,4 +31,5 @@ Thumbs.db
 .vscode/
 *.iml
 .gradle/
+.kotlin/
 local.properties

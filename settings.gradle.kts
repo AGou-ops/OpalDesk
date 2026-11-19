@@ -25,4 +25,4 @@ plugins {
 }
 
 rootProject.name = "ExtBridge"
-include(":helper")
+include(":bridge", ":helper")

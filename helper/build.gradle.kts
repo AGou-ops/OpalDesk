@@ -1,6 +1,3 @@
-import java.security.KeyStore
-import java.security.MessageDigest
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -45,31 +42,27 @@ android {
             assets.directories.clear()
             assets.directories.add("assets")
         }
+        named("test") {
+            java.directories.clear()
+            java.directories.add("test")
+            kotlin.directories.clear()
+            kotlin.directories.add("test")
+        }
     }
 
     buildFeatures {
         compose = true
     }
 
-    val expectedReleaseCertSha256 = "e4f67b3012a16633006c64bfc9d5a95c7bdda10826bd729777c2a3066f49117c"
-    val p12File = rootProject.file("exthelper.p12")
-    val envKs = System.getenv("EXTBRIDGE_KEYSTORE")?.takeIf { it.isNotBlank() }?.let { file(it) }
-    if (envKs != null && !envKs.exists()) {
-        throw GradleException("EXTBRIDGE_KEYSTORE points to non-existent file: ${envKs.absolutePath}")
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
-    val activeKs = when {
-        envKs != null -> envKs
-        p12File.exists() -> p12File
-        else -> null
-    }
-    val envPass = (
-        System.getenv("EXTBRIDGE_KEYSTORE_PASS")?.takeIf { it.isNotBlank() }
-            ?: System.getenv("EXTBRIDGE")?.takeIf { it.isNotBlank() }
-        )
-    if (envKs != null && envPass == null) {
-        throw GradleException("EXTBRIDGE_KEYSTORE_PASS (or EXTBRIDGE) must be explicitly set when EXTBRIDGE_KEYSTORE is provided.")
-    }
-    val activePass = envPass ?: "extbridge"
+
+    val activeKsPath = (rootProject.extra["extBridgeSigningKeystorePath"] as? String).orEmpty()
+    val activeKs = activeKsPath.takeIf { it.isNotBlank() }?.let { file(it) }
+    val signingPass = (rootProject.extra["extBridgeSigningPassword"] as? String).orEmpty()
+    val signingAlias = (rootProject.extra["extBridgeSigningAlias"] as? String).orEmpty().ifBlank { "extbridge" }
+
     val requireReleaseKey = (System.getenv("EXTBRIDGE_REQUIRE_RELEASE_KEY") == "1")
         || (project.findProperty("requireReleaseKey")?.toString()?.equals("true", ignoreCase = true) == true)
         || (System.getenv("GITHUB_REF")?.startsWith("refs/tags/v") == true)
@@ -77,50 +70,14 @@ android {
         (System.getenv("EXTBRIDGE_ALLOW_UNSIGNED_RELEASE") == "1")
             || (project.findProperty("allowUnsignedRelease")?.toString()?.equals("true", ignoreCase = true) == true)
         )
-    val allowCustomCert = project.findProperty("allowCustomReleaseCert")?.toString()?.equals("true", ignoreCase = true) == true
     val isReleaseTaskRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
 
     if ((requireReleaseKey || (isReleaseTaskRequested && !allowUnsignedRelease)) && activeKs == null) {
         throw GradleException(
-            "Release build requires EXTBRIDGE_KEYSTORE (or local exthelper.p12) matching SHA-256 $expectedReleaseCertSha256. " +
-                "Never falls back to debug signing. For keyless reproducible-build verification only, pass -PallowUnsignedRelease=true (or EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1)."
+            "Release build requires EXTBRIDGE_KEYSTORE (or local exthelper.p12). " +
+                "Run ./scripts/init-signing.sh to generate a local signing certificate, or for keyless CI verification " +
+                "pass -PallowUnsignedRelease=true (or EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1)."
         )
-    }
-
-    var signingPass = activePass
-    if (activeKs != null) {
-        val candidatePasswords = listOfNotNull(envPass, "extbridge").distinct()
-        var loadedKs: KeyStore? = null
-        var unlockedPass: String? = null
-        var lastErr: Throwable? = null
-        for (cand in candidatePasswords) {
-            try {
-                val candKs = KeyStore.getInstance("PKCS12")
-                activeKs.inputStream().use { stream -> candKs.load(stream, cand.toCharArray()) }
-                if (candKs.getKey("extbridge", cand.toCharArray()) != null) {
-                    loadedKs = candKs
-                    unlockedPass = cand
-                    break
-                }
-            } catch (t: Throwable) {
-                lastErr = t
-            }
-        }
-        val ks = loadedKs ?: throw GradleException(
-            "Failed to unlock release keystore (${activeKs.name}) with configured keystore password secret.",
-            lastErr
-        )
-        signingPass = unlockedPass ?: activePass
-        val cert = ks.getCertificate("extbridge")
-            ?: throw GradleException("Alias 'extbridge' not found in release keystore: ${activeKs.absolutePath}")
-        val actualSha256 = MessageDigest.getInstance("SHA-256")
-            .digest(cert.encoded)
-            .joinToString("") { b -> "%02x".format(b) }
-        if (!allowCustomCert && !actualSha256.equals(expectedReleaseCertSha256, ignoreCase = true)) {
-            throw GradleException(
-                "Release keystore certificate SHA-256 mismatch! Expected $expectedReleaseCertSha256, got $actualSha256"
-            )
-        }
     }
 
     signingConfigs {
@@ -129,7 +86,7 @@ android {
                 storeFile = activeKs
                 storeType = "PKCS12"
                 storePassword = signingPass
-                keyAlias = "extbridge"
+                keyAlias = signingAlias
                 keyPassword = signingPass
                 enableV1Signing = false
                 enableV2Signing = true
@@ -147,7 +104,7 @@ android {
                 "proguard-rules.pro",
             )
             // Never fall back to debug keystore for release builds: if no release keystore is configured
-            // (e.g. third-party reproducible-build verification), emit an unsigned APK instead of a debug-signed APK.
+            // (e.g. keyless CI verification), emit an unsigned APK instead of a debug-signed APK.
             signingConfig = if (activeKs != null) {
                 signingConfigs.getByName("extrelease")
             } else {
@@ -155,6 +112,8 @@ android {
             }
         }
         debug {
+            // If a release keystore is configured, sign debug with it too so upgrade/daemon trust stays unified.
+            // Otherwise AGP uses standard ~/.android/debug.keystore, which :bridge:generateBridgeBuildConfig auto-matches.
             if (activeKs != null) {
                 signingConfig = signingConfigs.getByName("extrelease")
             }
@@ -185,20 +144,39 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("org.jetbrains.compose.foundation:foundation:1.12.0")
     implementation("org.jetbrains.compose.ui:ui:1.12.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-icons:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-squircle:0.9.4")
+
+    testImplementation("junit:junit:4.13.2")
 }
 
+val syncBridgeDaemonAsset = tasks.register<Copy>("syncBridgeDaemonAsset") {
+    group = "build"
+    description = "Builds :bridge:dexBridgeJar and copies extbridge.jar into helper/assets/."
+    val dexTask = project(":bridge").tasks.named("dexBridgeJar")
+    dependsOn(dexTask)
+    from(project(":bridge").layout.buildDirectory.file("libs/extbridge.jar"))
+    into(layout.projectDirectory.dir("assets"))
+    rename { "extbridge.jar" }
+}
+
+val helperAssetsJar = layout.projectDirectory.file("assets/extbridge.jar")
+
 tasks.named("preBuild") {
+    dependsOn(syncBridgeDaemonAsset)
     doFirst {
-        val jar = file("assets/extbridge.jar")
+        val jar = helperAssetsJar.asFile
         if (!jar.exists() || jar.length() < 4096L) {
             throw GradleException(
-                "Missing or empty helper/assets/extbridge.jar! Run build_v3.ps1 (or compile the bridge daemon first) " +
-                    "so the APK never ships without assets/extbridge.jar."
+                "Missing or empty helper/assets/extbridge.jar after :helper:syncBridgeDaemonAsset!"
             )
         }
     }
+}
+
+tasks.matching { it.name.startsWith("merge") && it.name.endsWith("Assets") }.configureEach {
+    dependsOn(syncBridgeDaemonAsset)
 }
