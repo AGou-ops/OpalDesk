@@ -75,11 +75,19 @@ class DockOverlayController(private val host: OverlayHost) {
     fun repositionTaskBubbleIfOpen() { if (taskBubble.isOpen) taskBubble.reposition() }
     fun clearTaskSignature() { lastTaskSig = "" }
 
-    fun onCursorMoved(x: Float, y: Float) = autoHide.onCursorMoved(x, y)
+    fun onCursorMoved(x: Float, y: Float) {
+        if (!host.lastStatus.isRemoteStreaming) autoHide.onCursorMoved(x, y)
+    }
     fun cancelAutoHideTimer() = autoHide.cancelTimer()
-    fun evaluateDockAutoHide(forceDelay: Boolean) = autoHide.evaluate(forceDelay)
-    fun applyDockHidden(hidden: Boolean) = autoHide.applyHidden(hidden)
-    fun applyDockHiddenAnimated(hidden: Boolean) = autoHide.applyHiddenAnimated(hidden)
+    fun evaluateDockAutoHide(forceDelay: Boolean) {
+        if (host.lastStatus.isRemoteStreaming) {
+            autoHide.applyHidden(true)
+            return
+        }
+        autoHide.evaluate(forceDelay)
+    }
+    fun applyDockHidden(hidden: Boolean) = autoHide.applyHidden(if (host.lastStatus.isRemoteStreaming) true else hidden)
+    fun applyDockHiddenAnimated(hidden: Boolean) = autoHide.applyHiddenAnimated(if (host.lastStatus.isRemoteStreaming) true else hidden)
     fun syncDockEdgeVisibility() = autoHide.syncEdgeVisibility()
 
     fun resetClosedVisualsBeforeHostSwap() {
@@ -88,6 +96,7 @@ class DockOverlayController(private val host: OverlayHost) {
     }
 
     fun buildDockOverlays(ctx: Context, st: BridgeClient.Status) {
+        if (st.isRemoteStreaming) return
         autoHide.buildEdgeTrigger(ctx)
         buildDockBar(ctx, st)
         taskBubble.build(ctx)

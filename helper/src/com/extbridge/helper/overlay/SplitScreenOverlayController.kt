@@ -5,15 +5,15 @@ import android.content.Context
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
-import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.OvershootInterpolator
 import android.view.animation.PathInterpolator
 import android.widget.FrameLayout
-import android.widget.TextView
 import com.extbridge.helper.BridgeClient
+import com.extbridge.helper.HyperUi
 import com.extbridge.helper.StageTransitionView
 import com.extbridge.helper.ipc.DaemonStateStore
 import kotlin.math.abs
@@ -29,9 +29,33 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
     companion object {
         private const val SURFACE_KEY_PRIMARY = "split_div_primary"
         private const val SURFACE_KEY_SECONDARY = "split_div_secondary"
+        private const val DIVIDER_HIT_THICKNESS_DP = 24f
+        private const val DIVIDER_HIT_LENGTH_DP = 76f
+        private const val CAPSULE_THICKNESS_DP = 5f
+        private const val CAPSULE_LENGTH_DP = 48f
+        private const val CAPSULE_IDLE_ALPHA = 0.62f
+        private const val CAPSULE_ACTIVE_ALPHA = 1f
+        private const val CAPSULE_HOVER_THICK_SCALE = 1.35f
+        private const val CAPSULE_HOVER_LONG_SCALE = 1.08f
+        private const val CAPSULE_DRAG_THICK_SCALE = 1.55f
+        private const val CAPSULE_DRAG_LONG_SCALE = 1.14f
+        private const val CAPSULE_ANIM_MS = 100L
+        private const val HANDLE_STATE_IDLE = 0
+        private const val HANDLE_STATE_HOVER = 1
+        private const val HANDLE_STATE_DRAG = 2
     }
 
-    private data class DividerHandle(val key: String, val root: FrameLayout, val pill: TextView, val lp: WindowManager.LayoutParams)
+    private class DividerHandle(
+        val key: String,
+        val root: FrameLayout,
+        val capsule: View,
+        val capsuleBg: GradientDrawable,
+        val lp: WindowManager.LayoutParams,
+        var isVertical: Boolean,
+        var hovered: Boolean = false,
+        var dragging: Boolean = false,
+        var lastVisualState: Int = -1,
+    )
 
     private val state = SplitDividerState()
     private var primaryHandle: DividerHandle? = null
@@ -57,16 +81,19 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
     fun repositionSplitMenu() = menuView.reposition()
 
     fun buildSplitOverlays(ctx: Context) {
+        if (host.lastStatus.isRemoteStreaming) return
         val portrait = host.overlayH > host.overlayW
+        val hitThick = ctx.dp(DIVIDER_HIT_THICKNESS_DP)
+        val hitLen = ctx.dp(DIVIDER_HIT_LENGTH_DP)
         primaryHandle = createDividerHandle(
             ctx, SURFACE_KEY_PRIMARY, DividerAxis.PRIMARY,
-            ctx.dp(if (portrait) 76f else 24f), ctx.dp(if (portrait) 24f else 76f),
-            max(0, host.overlayW / 2 - ctx.dp(12f)), max(0, host.overlayH / 2 - ctx.dp(38f)),
+            if (portrait) hitLen else hitThick, if (portrait) hitThick else hitLen,
+            max(0, host.overlayW / 2 - hitThick / 2), max(0, host.overlayH / 2 - hitLen / 2),
         )
         secondaryHandle = createDividerHandle(
             ctx, SURFACE_KEY_SECONDARY, DividerAxis.SECONDARY,
-            ctx.dp(76f), ctx.dp(24f),
-            max(0, host.overlayW / 2 - ctx.dp(38f)), max(0, host.overlayH / 2 - ctx.dp(12f)),
+            hitLen, hitThick,
+            max(0, host.overlayW / 2 - hitLen / 2), max(0, host.overlayH / 2 - hitThick / 2),
         )
         menuView.build(ctx)
     }
@@ -74,28 +101,101 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
     private fun createDividerHandle(
         ctx: Context, key: String, axis: DividerAxis, initW: Int, initH: Int, initX: Int, initY: Int,
     ): DividerHandle {
+        val isVertical = initH >= initW
         val root = FrameLayout(ctx).apply { visibility = View.GONE }
-        val pill = TextView(ctx).apply {
-            setTextColor(0xFFF8FAFC.toInt()); setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
-            paint.isFakeBoldText = true; gravity = Gravity.CENTER; elevation = ctx.dpF(12f)
-            background = roundedBg(0xE00F172A.toInt(), ctx.dpF(12f), ctx.dp(1f), 0x8838BDF8.toInt())
+        val capsuleBg = roundedBg(0xC8F8FAFC.toInt(), ctx.dpF(CAPSULE_THICKNESS_DP * 0.5f), ctx.dp(1f), 0x440B0E14)
+        val capsule = View(ctx).apply {
+            background = capsuleBg
+            alpha = CAPSULE_IDLE_ALPHA
+            elevation = ctx.dpF(4f)
         }
-        root.addView(pill, ctx.flp(MATCH, MATCH))
+        val capW = ctx.dp(if (isVertical) CAPSULE_THICKNESS_DP else CAPSULE_LENGTH_DP)
+        val capH = ctx.dp(if (isVertical) CAPSULE_LENGTH_DP else CAPSULE_THICKNESS_DP)
+        root.addView(capsule, ctx.flp(capW, capH, Gravity.CENTER))
+
+        val lp = OverlayWindowParams.floating(initW, initH, host.winType, initX, initY, touchModal = true)
+        val handle = DividerHandle(key, root, capsule, capsuleBg, lp, isVertical)
+        updateHandleVisual(handle, ctx, animate = false)
+
+        root.setOnHoverListener { _, ev ->
+            when (ev?.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER -> {
+                    handle.hovered = true
+                    updateHandleVisual(handle, ctx, animate = true)
+                }
+                MotionEvent.ACTION_HOVER_EXIT -> {
+                    handle.hovered = false
+                    updateHandleVisual(handle, ctx, animate = true)
+                }
+            }
+            false
+        }
         SplitTopologyLayout.attachDividerDragListener(
             root, axis, ctx.dp(6f), state, { host.overlayW to host.overlayH },
-            onDragStateChanged = { a, d -> if (a == DividerAxis.PRIMARY) draggingPrimary = d else draggingSecondary = d },
+            onDragStateChanged = { a, d ->
+                if (a == DividerAxis.PRIMARY) draggingPrimary = d else draggingSecondary = d
+                handle.dragging = d
+                updateHandleVisual(handle, ctx, animate = true)
+            },
             onLiveUpdate = { positionAllDividers() },
             onTap = { menuView.toggle() },
             onDragCommit = { commitCurrentDividerRatios(fromDragRelease = true) },
         )
-        val lp = OverlayWindowParams.floating(initW, initH, host.winType, initX, initY, touchModal = true)
         host.surfaceHost.register(
             OverlaySurfaceHost.SurfaceEntry(
                 key, OverlayLayer.SPLIT_DIVIDER, root, lp,
                 launcherParamsProvider = { ctx.flp(lp.width, lp.height, Gravity.TOP or Gravity.LEFT) },
             ),
         )
-        return DividerHandle(key, root, pill, lp)
+        return handle
+    }
+
+    private fun updateHandleVisual(handle: DividerHandle, ctx: Context, animate: Boolean) {
+        val nextState = when {
+            handle.dragging -> HANDLE_STATE_DRAG
+            handle.hovered -> HANDLE_STATE_HOVER
+            else -> HANDLE_STATE_IDLE
+        }
+        if (handle.lastVisualState == nextState) return
+        handle.lastVisualState = nextState
+
+        when (nextState) {
+            HANDLE_STATE_DRAG -> {
+                handle.capsuleBg.setColor(HyperUi.HYPER_BLUE)
+                handle.capsuleBg.setStroke(ctx.dp(1f), 0xCCFFFFFF.toInt())
+            }
+            HANDLE_STATE_HOVER -> {
+                handle.capsuleBg.setColor(0xF2FFFFFF.toInt())
+                handle.capsuleBg.setStroke(ctx.dp(1f), 0x5538BDF8)
+            }
+            else -> {
+                handle.capsuleBg.setColor(0xC8F8FAFC.toInt())
+                handle.capsuleBg.setStroke(ctx.dp(1f), 0x440B0E14)
+            }
+        }
+
+        val targetAlpha = if (nextState == HANDLE_STATE_IDLE) CAPSULE_IDLE_ALPHA else CAPSULE_ACTIVE_ALPHA
+        val thickScale = when (nextState) {
+            HANDLE_STATE_DRAG -> CAPSULE_DRAG_THICK_SCALE
+            HANDLE_STATE_HOVER -> CAPSULE_HOVER_THICK_SCALE
+            else -> 1f
+        }
+        val longScale = when (nextState) {
+            HANDLE_STATE_DRAG -> CAPSULE_DRAG_LONG_SCALE
+            HANDLE_STATE_HOVER -> CAPSULE_HOVER_LONG_SCALE
+            else -> 1f
+        }
+        val sx = if (handle.isVertical) thickScale else longScale
+        val sy = if (handle.isVertical) longScale else thickScale
+
+        handle.capsule.animate().cancel()
+        if (animate) {
+            handle.capsule.animate().alpha(targetAlpha).scaleX(sx).scaleY(sy).setDuration(CAPSULE_ANIM_MS).start()
+        } else {
+            handle.capsule.alpha = targetAlpha
+            handle.capsule.scaleX = sx
+            handle.capsule.scaleY = sy
+        }
     }
 
     fun triggerQuickSplitOrMenu() {
@@ -110,7 +210,7 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
     fun updateSplitUi(st: BridgeClient.Status) {
         val snap = host.lastWindowSnapshot
         state.topology = SplitTopologyLayout.resolveActiveTopology(st, snap, host.overlayH > host.overlayW)
-        val active = st.connected && st.vdId > 0 && st.mirrorMode != 1 &&
+        val active = st.connected && st.vdId > 0 && st.mirrorMode != 1 && !st.isRemoteStreaming &&
             (st.splitActive == 1 || BridgeClient.isTilingTopology(state.topology))
 
         host.syncOverlayHostSurface(false)
@@ -132,8 +232,10 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
 
     private fun positionAllDividers() {
         val ctx = host.extCtx ?: return
+        val hitThick = ctx.dp(DIVIDER_HIT_THICKNESS_DP)
+        val hitLen = ctx.dp(DIVIDER_HIT_LENGTH_DP)
         val (primary, secondary) = SplitTopologyLayout.computePlacements(
-            state, host.surfaceWidth, host.surfaceHeight, ctx.dp(26f), ctx.dp(80f), ctx.dp(80f), ctx.dp(26f),
+            state, host.surfaceWidth, host.surfaceHeight, hitThick, hitLen, hitLen, hitThick,
         )
         applyPlacement(primaryHandle, ctx, primary, draggingPrimary)
         if (secondary != null) applyPlacement(secondaryHandle, ctx, secondary, draggingSecondary)
@@ -141,11 +243,19 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
 
     private fun applyPlacement(handle: DividerHandle?, ctx: Context, p: DividerPlacement, dragging: Boolean) {
         if (handle == null) return
-        if (handle.pill.text?.toString() != p.label) handle.pill.text = p.label
-        (handle.pill.background as? GradientDrawable)?.apply {
-            setStroke(ctx.dp(if (dragging) 2f else 1f), if (dragging) 0xFF38BDF8.toInt() else 0x8838BDF8.toInt())
-            setColor(if (dragging) 0xF50284C7.toInt() else 0xE00F172A.toInt())
+        handle.root.contentDescription = p.label
+        val vertical = p.height >= p.width
+        if (handle.isVertical != vertical) {
+            handle.isVertical = vertical
+            (handle.capsule.layoutParams as? FrameLayout.LayoutParams)?.let { flp ->
+                flp.width = ctx.dp(if (vertical) CAPSULE_THICKNESS_DP else CAPSULE_LENGTH_DP)
+                flp.height = ctx.dp(if (vertical) CAPSULE_LENGTH_DP else CAPSULE_THICKNESS_DP)
+                handle.capsule.layoutParams = flp
+            }
+            handle.lastVisualState = -1
         }
+        handle.dragging = dragging
+        updateHandleVisual(handle, ctx, animate = false)
         host.surfaceHost.updatePosition(handle.root, handle.lp, host.inLauncherHost, host.extWm, p.x, p.y, p.width, p.height, Gravity.TOP or Gravity.LEFT)
     }
 
@@ -378,10 +488,10 @@ class SplitScreenOverlayController(private val host: OverlayHost) {
         val r0 = OverlayUiUtils.computeLocalSplitRect(host.overlayW, host.overlayH, 0, state.primaryRatio)
         val r1 = OverlayUiUtils.computeLocalSplitRect(host.overlayW, host.overlayH, 1, state.primaryRatio)
 
-        primaryHandle?.pill?.let { pill ->
-            pill.animate().cancel()
-            pill.animate().scaleX(1.16f).scaleY(1.16f).setDuration(130L).withEndAction {
-                primaryHandle?.pill?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(170L)?.setInterpolator(OvershootInterpolator(1.6f))?.start()
+        primaryHandle?.capsule?.let { capsule ->
+            capsule.animate().cancel()
+            capsule.animate().scaleX(1.22f).scaleY(1.22f).setDuration(130L).withEndAction {
+                primaryHandle?.capsule?.animate()?.scaleX(1f)?.scaleY(1f)?.setDuration(170L)?.setInterpolator(OvershootInterpolator(1.6f))?.start()
             }.start()
         }
         host.stageChoreographer.runTransition(

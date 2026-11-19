@@ -15,6 +15,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -191,5 +192,94 @@ public class DesktopWindowManagerTest {
         assertTrue("Internal minimized state must be protected by defensive copy", fresh.minimized);
         assertFalse("Internal focused state must be protected by defensive copy", fresh.focused);
         assertEquals(DesktopWindowManager.MODE_ADAPTIVE_SINGLE, fresh.mode);
+    }
+
+    @Test
+    public void testAdaptiveSingleVerticalBreathingMarginsWhenDockIsZero() throws Exception {
+        File prefs = new File(tmpDir.newFolder(), "extbridge_win_prefs.conf");
+        DesktopWindowManager wm = new DesktopWindowManager(prefs);
+
+        // 240dpi -> 16dp = 24px symmetrical top/bottom breathing margin
+        WindowRect r240 = wm.computeAdaptiveSingleBounds(2560, 1440, 240, 0, "com.tencent.mm", 0, 0);
+        assertTrue(r240.left > 0 && r240.right < 2560);
+        assertEquals(24, r240.top);
+        assertEquals(1440 - 24, r240.bottom);
+
+        // 160dpi -> 16px breathing margin
+        WindowRect r160 = wm.computeAdaptiveSingleBounds(1920, 1080, 160, 0, "com.tencent.mm", 55, 0);
+        assertEquals(16, r160.top);
+        assertEquals(1080 - 16, r160.bottom);
+
+        // 120dpi -> clamped to 12px floor
+        WindowRect r120 = wm.computeAdaptiveSingleBounds(1920, 1080, 120, 0, "com.tencent.mm", 42, 0);
+        assertEquals(12, r120.top);
+        assertEquals(1080 - 12, r120.bottom);
+
+        // 480dpi -> clamped to 32px ceiling
+        WindowRect r480 = wm.computeAdaptiveSingleBounds(2560, 1440, 480, 0, "com.tencent.mm", 55, 0);
+        assertEquals(32, r480.top);
+        assertEquals(1440 - 32, r480.bottom);
+
+        // Fullscreen width (100%) keeps exact 0..screenH without vertical margin
+        WindowRect rFull = wm.computeAdaptiveSingleBounds(2560, 1440, 240, 0, "com.tencent.mm", 100, 0);
+        assertEquals(0, rFull.left);
+        assertEquals(0, rFull.top);
+        assertEquals(2560, rFull.right);
+        assertEquals(1440, rFull.bottom);
+    }
+
+    @Test
+    public void testTilingRatiosAndLockConsistentSnapshot() throws Exception {
+        File prefs = new File(tmpDir.newFolder(), "extbridge_win_prefs.conf");
+        DesktopWindowManager wm = new DesktopWindowManager(prefs);
+
+        // Inactive tiling returns empty snapshot lists
+        DesktopWindowManager.TilingSnapshot idle = wm.getTilingSnapshot();
+        assertFalse(idle.active);
+        assertEquals(TilingLayoutEngine.TOPOLOGY_NONE, idle.topology);
+        assertTrue(idle.slots.isEmpty());
+        assertTrue(idle.ratios.isEmpty());
+
+        // Active 2-slot tiling exposes exact 2 slots & ratios, with defensive clone on getTilingRatios()
+        WindowRect[] slots2 = TilingLayoutEngine.computeSlots(
+                TilingLayoutEngine.TOPOLOGY_SPLIT_2_H, 2560, 1440, 0, new int[]{62, 38});
+        wm.setTilingState(
+                TilingLayoutEngine.TOPOLOGY_SPLIT_2_H,
+                Arrays.asList("com.tencent.mm", "com.quark.browser"),
+                new int[]{101, 102},
+                new int[]{62, 38},
+                slots2);
+        int[] ratios = wm.getTilingRatios();
+        assertArrayEquals(new int[]{62, 38}, ratios);
+        ratios[0] = 99;
+        assertArrayEquals("Mutating returned ratio array must not affect internal state",
+                new int[]{62, 38}, wm.getTilingRatios());
+
+        DesktopWindowManager.TilingSnapshot snap2 = wm.getTilingSnapshot();
+        assertTrue(snap2.active);
+        assertEquals(TilingLayoutEngine.TOPOLOGY_SPLIT_2_H, snap2.topology);
+        assertEquals(Arrays.asList("com.tencent.mm", "com.quark.browser"), snap2.slots);
+        assertEquals(Arrays.asList(62, 38), snap2.ratios);
+
+        // Active 3-slot tiling slices slots to exact topology slotCount (3)
+        WindowRect[] slots3 = TilingLayoutEngine.computeSlots(
+                TilingLayoutEngine.TOPOLOGY_SPLIT_3_MASTER, 2560, 1440, 0, new int[]{55, 45});
+        wm.setTilingState(
+                TilingLayoutEngine.TOPOLOGY_SPLIT_3_MASTER,
+                Arrays.asList("com.a.one", "com.b.two", "com.c.three"),
+                new int[]{21, 22, 23},
+                new int[]{55, 45},
+                slots3);
+        DesktopWindowManager.TilingSnapshot snap3 = wm.getTilingSnapshot();
+        assertTrue(snap3.active);
+        assertEquals(3, snap3.slots.size());
+        assertEquals(Arrays.asList("com.a.one", "com.b.two", "com.c.three"), snap3.slots);
+        assertEquals(Arrays.asList(55, 45), snap3.ratios);
+
+        wm.clearTilingState();
+        DesktopWindowManager.TilingSnapshot cleared = wm.getTilingSnapshot();
+        assertFalse(cleared.active);
+        assertTrue(cleared.slots.isEmpty());
+        assertTrue(cleared.ratios.isEmpty());
     }
 }

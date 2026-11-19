@@ -25,29 +25,54 @@ struct ExtBridgeMacApp: App {
     @State private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup("ExtBridgeMac", id: WindowID.main) {
+        WindowGroup("ExtBridge", id: WindowID.main) {
             Group {
                 if model.isShowingDisplayCanvas {
                     DisplayWindowView(model: model)
                         .navigationTitle(windowTitle)
                 } else {
                     DeviceHubView(model: model)
-                        .navigationTitle("ExtBridgeMac")
+                        .navigationTitle("ExtBridge")
                 }
             }
-            .frame(minWidth: 760, minHeight: 500)
+            .frame(minWidth: 680, minHeight: 480)
             .onAppear(perform: registerTerminationHandler)
         }
-        .defaultSize(width: 1120, height: 700)
+        .defaultSize(width: 1180, height: 740)
         .commands {
             CommandMenu("大屏控制") {
-                Button("手机应用快启器...") {
+                Button("应用抽屉") {
                     model.toggleQuickLauncher()
                 }
                 .keyboardShortcut("k", modifiers: [.command])
                 .disabled(!model.isAuthenticated)
 
-                Button("弹出当前应用到独立窗口") {
+                Button("返回") {
+                    model.sendAndroidBack()
+                }
+                .keyboardShortcut("[", modifiers: [.command])
+                .disabled(!model.isAuthenticated)
+
+                Button("桌面") {
+                    model.sendAndroidHome()
+                }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+                .disabled(!model.isAuthenticated)
+
+                Button("多任务") {
+                    model.sendAndroidRecents()
+                }
+                .disabled(!model.isAuthenticated)
+
+                Divider()
+
+                Button("快捷左右分屏") {
+                    model.startQuickTwoSplit()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
+                .disabled(!model.isAuthenticated)
+
+                Button("弹出独立窗") {
                     model.popoutCurrentTopApp()
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
@@ -60,13 +85,7 @@ struct ExtBridgeMacApp: App {
 
                 Divider()
 
-                Button("切换扩展桌面 (DeX) / 镜像") {
-                    model.toggleDisplayMode()
-                }
-                .keyboardShortcut("d", modifiers: [.command, .shift])
-                .disabled(!model.isAuthenticated)
-
-                Button(model.isBlackoutActive ? "点亮手机主屏" : "一键熄灭手机主屏") {
+                Button(model.isBlackoutActive ? "点亮手机主屏" : "熄灭手机主屏") {
                     model.toggleBlackout()
                 }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
@@ -78,25 +97,22 @@ struct ExtBridgeMacApp: App {
                 .keyboardShortcut("m", modifiers: [.command, .shift])
                 .disabled(!model.isAuthenticated)
 
+                Button("切换 DeX / 镜像") {
+                    model.toggleDisplayMode()
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .disabled(!model.isAuthenticated)
+
                 Button("顺时针旋转 90°") {
                     model.rotateClockwise()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(!model.isAuthenticated)
 
-                Button("强制刷新画面关键帧 (IDR)") {
+                Button("强制刷新关键帧 (IDR)") {
                     model.requestIDR()
                 }
                 .disabled(!model.isAuthenticated)
-
-                Divider()
-
-                Button("Android 返回") { model.sendAndroidBack() }
-                    .disabled(!model.isAuthenticated)
-                Button("Android 主页") { model.sendAndroidHome() }
-                    .disabled(!model.isAuthenticated)
-                Button("Android 多任务") { model.sendAndroidRecents() }
-                    .disabled(!model.isAuthenticated)
 
                 Divider()
 
@@ -128,7 +144,8 @@ struct ExtBridgeMacApp: App {
     }
 
     private var windowTitle: String {
-        guard let conn = model.activeConnection else { return "ExtBridgeMac" }
-        return "\(conn.deviceName) — ExtBridgeMac"
+        guard let conn = model.activeConnection else { return "ExtBridge" }
+        let appLabel = model.deviceState.topAppLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return appLabel.isEmpty ? conn.deviceName : "\(conn.deviceName) · \(appLabel)"
     }
 }

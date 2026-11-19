@@ -2,27 +2,10 @@ import ExtBridgeCore
 import Foundation
 import os
 
-// MARK: - Quick Launcher, Popout Windows, Layout Actions, Display Controls & File Transfers
+// MARK: - Popout Windows, Display Controls & File Transfers
 
 extension AppModel {
-    // MARK: - Standalone Popout Windows & Quick Launcher
-
-    public func openQuickLauncher() {
-        guard isAuthenticated else { return }
-        isQuickLauncherPresented = true
-        requestAppList()
-    }
-
-    public func toggleQuickLauncher() {
-        guard isAuthenticated else { return }
-        if isQuickLauncherPresented { isQuickLauncherPresented = false } else { openQuickLauncher() }
-    }
-
-    public func requestAppList() {
-        guard isAuthenticated else { return }
-        isLoadingApps = true
-        session.send(.listApps())
-    }
+    // MARK: - Standalone Popout Windows
 
     public func popoutCurrentTopApp() {
         guard isAuthenticated else { return }
@@ -55,7 +38,7 @@ extension AppModel {
             onFilesDropped: { [weak self] urls in self?.sendFiles(urls) }
         )
         switch result {
-        case .opened, .focusedExisting: isQuickLauncherPresented = false
+        case .opened, .focusedExisting: activeDeXPanel = .none
         case .invalidPackage: showToast("应用包名无效，无法弹出独立窗口")
         case .limitReached(let maxCount): showToast("最多同时支持 \(maxCount) 个独立弹出 App 窗口，请先关闭或收回其中一个")
         }
@@ -83,7 +66,7 @@ extension AppModel {
 
     public func launchApp(_ app: RemoteAppInfo, mode: ExtCastLaunchMode = .adaptive, slot: Int = 0) {
         streamBridge.sendWindowAction(.launchApp(pkg: app.pkg, cls: app.cls, mode: mode, slot: slot), isAuthenticated: isAuthenticated)
-        isQuickLauncherPresented = false
+        activeDeXPanel = .none
     }
 
     public func setTilingTopology(_ topology: ExtCastTilingTopology, pkgs: [String] = [], ratios: [Int]? = nil) {

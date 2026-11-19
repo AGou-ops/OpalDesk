@@ -114,9 +114,9 @@ public final class PreferencesStore {
         self.resolutionPreset = DisplayResolutionPreset(rawValue: presetRaw) ?? .matchWindow
 
         self.customAdbPath = defaults.string(forKey: Key.customAdbPath) ?? ""
-        self.showHUDStats = defaults.object(forKey: Key.showHUDStats) as? Bool ?? true
+        self.showHUDStats = defaults.object(forKey: Key.showHUDStats) as? Bool ?? false
 
-        self.adaptiveSingleEnabled = defaults.object(forKey: Key.adaptiveSingleEnabled) as? Bool ?? true
+        self.adaptiveSingleEnabled = defaults.object(forKey: Key.adaptiveSingleEnabled) as? Bool ?? false
         let storedWidthDp = defaults.integer(forKey: Key.defaultSingleWidthDp)
         self.defaultSingleWidthDp = storedWidthDp > 0
             ? DisplayPresets.clampSingleWidthDp(storedWidthDp)

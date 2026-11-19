@@ -38,6 +38,9 @@ public final class DesktopWindowManager {
     public static final int MIN_WIDTH_PCT = 28;
     public static final int MAX_WIDTH_PCT = 100;
     public static final int MAX_SAVED_APP_PREFS = 256;
+    private static final float ADAPTIVE_VERTICAL_MARGIN_DP = 16f;
+    private static final int MIN_ADAPTIVE_VERTICAL_MARGIN_PX = 12;
+    private static final int MAX_ADAPTIVE_VERTICAL_MARGIN_PX = 32;
 
     // 5-tier width snapping presets (% of display width)
     public static final int[] SNAP_WIDTH_PCTS = new int[]{32, 42, 55, 72, 100};
@@ -270,10 +273,18 @@ public final class DesktopWindowManager {
             return new WindowRect(0, 0, sw, workBottom);
         }
 
-        int topMargin = (dock > 0) ? Math.min(16, Math.max(8, Math.round(sh * 0.01f))) : 0;
-        int bottomMargin = (dock > 0) ? Math.min(12, Math.max(6, Math.round(sh * 0.008f))) : 0;
+        // Keep symmetrical top/bottom breathing margins even when dock == 0 (Mac remote DeX mode)
+        // so centered apps float cleanly inside the virtual desktop canvas.
+        int breathMargin = Math.max(MIN_ADAPTIVE_VERTICAL_MARGIN_PX,
+                Math.min(MAX_ADAPTIVE_VERTICAL_MARGIN_PX,
+                        Math.round(ADAPTIVE_VERTICAL_MARGIN_DP * effDpi / 160f)));
+        int topMargin = (dock > 0) ? Math.min(16, Math.max(8, Math.round(sh * 0.01f))) : breathMargin;
+        int bottomMargin = (dock > 0) ? Math.min(12, Math.max(6, Math.round(sh * 0.008f))) : breathMargin;
+        int maxMarginEach = Math.max(0, (workBottom - 320) / 2);
+        topMargin = Math.min(topMargin, maxMarginEach);
+        bottomMargin = Math.min(bottomMargin, maxMarginEach);
         int top = topMargin;
-        int bottom = Math.max(top + 320, workBottom - bottomMargin);
+        int bottom = workBottom - bottomMargin;
         int left = Math.max(0, (sw - clampedW) / 2);
         return new WindowRect(left, top, left + clampedW, bottom);
     }
@@ -700,6 +711,44 @@ public final class DesktopWindowManager {
             }
         }
         return c;
+    }
+
+    /** Immutable, lock-consistent snapshot of active tiling topology, slots, and ratios. */
+    public static final class TilingSnapshot {
+        public final boolean active;
+        public final String topology;
+        public final List<String> slots;
+        public final List<Integer> ratios;
+
+        TilingSnapshot(boolean active, String topology, List<String> slots, List<Integer> ratios) {
+            this.active = active;
+            this.topology = topology;
+            this.slots = slots;
+            this.ratios = ratios;
+        }
+    }
+
+    public TilingSnapshot getTilingSnapshot() {
+        synchronized (lock) {
+            if (!isTilingActiveLocked()) {
+                return new TilingSnapshot(
+                        false, TilingLayoutEngine.TOPOLOGY_NONE,
+                        Collections.emptyList(), Collections.emptyList());
+            }
+            int slotCount = Math.min(tilingSlotPkgs.length, TilingLayoutEngine.slotCountForTopology(tilingTopology));
+            List<String> slots = new ArrayList<>(slotCount);
+            for (int i = 0; i < slotCount; i++) {
+                slots.add(tilingSlotPkgs[i] != null ? tilingSlotPkgs[i] : "");
+            }
+            List<Integer> ratios = new ArrayList<>(tilingRatios.length);
+            for (int r : tilingRatios) {
+                ratios.add(r);
+            }
+            return new TilingSnapshot(
+                    true, tilingTopology,
+                    Collections.unmodifiableList(slots),
+                    Collections.unmodifiableList(ratios));
+        }
     }
 
     public String getTilingTopology() {

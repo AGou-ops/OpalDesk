@@ -364,6 +364,8 @@ public final class ExtCastProtocol {
         public final String activeLayoutMode;
         public final String topAppPackage;
         public final String topAppLabel;
+        public final List<String> tilingSlots;
+        public final List<Integer> tilingRatios;
 
         public DeviceState(
                 String deviceName, int sinkType, int displayMode,
@@ -380,6 +382,20 @@ public final class ExtCastProtocol {
                 int bitrateKbps, int batteryPct, boolean blackout, boolean audioEnabled,
                 int injectStatus, boolean adaptiveSingleEnabled, int defaultSingleWidthDp,
                 String activeLayoutMode, String topAppPackage, String topAppLabel) {
+            this(deviceName, sinkType, displayMode, width, height, dpi, fps, rotation,
+                    bitrateKbps, batteryPct, blackout, audioEnabled,
+                    injectStatus, adaptiveSingleEnabled, defaultSingleWidthDp,
+                    activeLayoutMode, topAppPackage, topAppLabel,
+                    Collections.emptyList(), Collections.emptyList());
+        }
+
+        public DeviceState(
+                String deviceName, int sinkType, int displayMode,
+                int width, int height, int dpi, double fps, int rotation,
+                int bitrateKbps, int batteryPct, boolean blackout, boolean audioEnabled,
+                int injectStatus, boolean adaptiveSingleEnabled, int defaultSingleWidthDp,
+                String activeLayoutMode, String topAppPackage, String topAppLabel,
+                List<String> tilingSlots, List<Integer> tilingRatios) {
             this.deviceName = (deviceName != null) ? deviceName : "Android";
             this.sinkType = sinkType;
             this.displayMode = displayMode;
@@ -399,10 +415,36 @@ public final class ExtCastProtocol {
                     ? activeLayoutMode : "FULLSCREEN";
             this.topAppPackage = (topAppPackage != null) ? topAppPackage : "";
             this.topAppLabel = (topAppLabel != null) ? topAppLabel : "";
+            if (tilingSlots != null && !tilingSlots.isEmpty()) {
+                List<String> slotsCopy = new ArrayList<>(tilingSlots.size());
+                for (String slot : tilingSlots) {
+                    slotsCopy.add(slot != null ? slot : "");
+                }
+                this.tilingSlots = Collections.unmodifiableList(slotsCopy);
+            } else {
+                this.tilingSlots = Collections.emptyList();
+            }
+            if (tilingRatios != null && !tilingRatios.isEmpty()) {
+                List<Integer> ratiosCopy = new ArrayList<>(tilingRatios.size());
+                for (Integer ratio : tilingRatios) {
+                    ratiosCopy.add(ratio != null ? ratio : 0);
+                }
+                this.tilingRatios = Collections.unmodifiableList(ratiosCopy);
+            } else {
+                this.tilingRatios = Collections.emptyList();
+            }
         }
     }
 
     public static byte[] encodeDeviceState(DeviceState s) {
+        SimpleJson.ArrayBuilder slotsArr = new SimpleJson.ArrayBuilder();
+        for (String slot : s.tilingSlots) {
+            slotsArr.add(slot != null ? slot : "");
+        }
+        SimpleJson.ArrayBuilder ratiosArr = new SimpleJson.ArrayBuilder();
+        for (Integer ratio : s.tilingRatios) {
+            ratiosArr.add(ratio != null ? ratio : 0);
+        }
         String json = new SimpleJson.ObjectBuilder()
                 .put("deviceName", s.deviceName)
                 .put("sinkType", s.sinkType)
@@ -422,6 +464,8 @@ public final class ExtCastProtocol {
                 .put("activeLayoutMode", s.activeLayoutMode)
                 .put("topAppPackage", s.topAppPackage)
                 .put("topAppLabel", s.topAppLabel)
+                .putRaw("tilingSlots", slotsArr.build())
+                .putRaw("tilingRatios", ratiosArr.build())
                 .build();
         return json.getBytes(StandardCharsets.UTF_8);
     }
@@ -523,13 +567,20 @@ public final class ExtCastProtocol {
         public final String label;
         public final boolean runningOnExt;
         public final int taskId;
+        public final String iconPngBase64;
 
         public AppEntry(String pkg, String cls, String label, boolean runningOnExt, int taskId) {
+            this(pkg, cls, label, runningOnExt, taskId, "");
+        }
+
+        public AppEntry(
+                String pkg, String cls, String label, boolean runningOnExt, int taskId, String iconPngBase64) {
             this.pkg = (pkg != null) ? pkg : "";
             this.cls = (cls != null) ? cls : "";
             this.label = (label != null) ? label : "";
             this.runningOnExt = runningOnExt;
             this.taskId = taskId;
+            this.iconPngBase64 = (iconPngBase64 != null) ? iconPngBase64 : "";
         }
     }
 
@@ -548,13 +599,16 @@ public final class ExtCastProtocol {
         if (msg != null && msg.apps != null) {
             for (AppEntry e : msg.apps) {
                 if (e == null) continue;
-                arr.addRaw(new SimpleJson.ObjectBuilder()
+                SimpleJson.ObjectBuilder item = new SimpleJson.ObjectBuilder()
                         .put("pkg", e.pkg)
                         .put("cls", e.cls)
                         .put("label", e.label)
                         .put("runningOnExt", e.runningOnExt)
-                        .put("taskId", e.taskId)
-                        .build());
+                        .put("taskId", e.taskId);
+                if (e.iconPngBase64 != null && !e.iconPngBase64.isEmpty()) {
+                    item.put("icon", e.iconPngBase64);
+                }
+                arr.addRaw(item.build());
             }
         }
         String json = new SimpleJson.ObjectBuilder()

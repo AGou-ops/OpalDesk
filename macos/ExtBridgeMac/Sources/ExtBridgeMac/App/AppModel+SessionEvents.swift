@@ -108,12 +108,14 @@ extension AppModel {
             guard let state = StreamSessionBridge.decodePayload("DEVICE_STATE", logger: ExtBridgeLog.app, {
                 try DeviceStatePayload.decode(from: frame.payload)
             }) else { return }
+            let previousTopPkg = deviceState.topAppPackage
             deviceState = state
             isBlackoutActive = state.blackout
             if let mode = ExtCastDisplayMode(rawValue: UInt8(clamping: state.displayMode)), mode != .unchanged {
                 displayMode = mode
             }
             if !state.deviceName.isEmpty { activeConnection?.deviceName = state.deviceName }
+            refreshAppListIfForegroundChanged(previousTopPackage: previousTopPkg, newState: state)
 
         case .clipboardPush:
             if (frame.flags & ExtCastProtocol.flagClipboardImagePng) != 0 {
@@ -209,9 +211,28 @@ extension AppModel {
             wifiUpgrade.requestUpgradeIfEligible(transport: activeConnection?.transport, session: session)
         }
 
+        applyPostAuthBootstrap()
+    }
+
+    private func applyPostAuthBootstrap() {
         startClipboardSyncIfEnabled()
         syncInitialDesktopPreferences()
         syncCanvasSizeAfterAuth()
+        requestAppList(force: true)
+    }
+
+    private func refreshAppListIfForegroundChanged(previousTopPackage: String, newState: DeviceStatePayload) {
+        let newTopPkg = newState.topAppPackage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let topChangedToUnknownApp = !newTopPkg.isEmpty
+            && newTopPkg != previousTopPackage
+            && !remoteApps.contains(where: { $0.pkg == newTopPkg && $0.runningOnExt })
+        let hasUnknownSplitSlot = newState.tilingSlots.contains { slotPkg in
+            let trimmed = slotPkg.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !trimmed.isEmpty && !remoteApps.contains(where: { $0.pkg == trimmed })
+        }
+        if topChangedToUnknownApp || hasUnknownSplitSlot {
+            requestAppListIfNeeded()
+        }
     }
 
     private func handleAuthFailure(_ auth: AuthResultPayload) {
@@ -308,7 +329,12 @@ extension AppModel {
 
     func teardownCurrentSession(sendRemoteDisconnect: Bool) async {
         resizeDebounceTask?.cancel()
-        isQuickLauncherPresented = false
+        delayedAppListRefreshTask?.cancel()
+        activeDeXPanel = .none
+        pendingSplitPickSlot = nil
+        pendingSplitSeedSlots = []
+        pendingSplitTargetTopology = nil
+        lastAppListRequestNs = 0
         remoteApps.removeAll()
         isLoadingApps = false
         popoutManager.closeAll(sendDisconnect: sendRemoteDisconnect)
@@ -339,7 +365,10 @@ extension AppModel {
         sessionState = .idle
         rttMs = 0
         videoMetrics = VideoRendererMetrics()
-        deviceState = DeviceStatePayload()
+        deviceState = DeviceStatePayload(
+            adaptiveSingleEnabled: preferences.adaptiveSingleEnabled,
+            defaultSingleWidthDp: preferences.defaultSingleWidthDp
+        )
         lastRequestedConfig = nil
         activeTransfers.removeAll()
     }

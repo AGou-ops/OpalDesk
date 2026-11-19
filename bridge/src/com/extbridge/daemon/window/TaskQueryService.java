@@ -7,10 +7,13 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.ColorSpace;
 import android.graphics.Rect;
+import android.graphics.drawable.Drawable;
 import android.hardware.HardwareBuffer;
 import android.os.Parcel;
+import android.util.Base64;
 
 import com.extbridge.daemon.BridgeBuildConfig;
 import com.extbridge.daemon.DaemonConfig;
@@ -23,6 +26,7 @@ import com.extbridge.daemon.stream.ExtCastProtocol;
 
 import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,6 +40,9 @@ import java.util.concurrent.ConcurrentHashMap;
 final class TaskQueryService {
     private static final int MAX_RECENT_TASKS_PARCEL = 10;
     private static final int MAX_APP_LABEL_CACHE = 256;
+    private static final int MAX_APP_ICON_CACHE = 300;
+    private static final int APP_ICON_SIZE_PX = 48;
+    private static final int APP_ICON_PNG_QUALITY = 100;
 
     private static final class TaskSnap {
         int taskId, flags;
@@ -48,6 +55,7 @@ final class TaskQueryService {
     private final DesktopWindowManager windowManager;
     private final HelperClientBridge helperBridge;
     private final ConcurrentHashMap<String, String> appLabelCache = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, String> appIconCache = new ConcurrentHashMap<>();
 
     TaskQueryService(
             AndroidServices services, DaemonConfig config, TaskApiAdapter taskApi,
@@ -240,22 +248,22 @@ final class TaskQueryService {
     }
 
     ArrayList<String> pickTilingApps(List<String> reqPkgs, int slotCount) {
-        ArrayList<String> chosen = new ArrayList<>(slotCount);
-        if (reqPkgs != null) {
-            for (String p : reqPkgs) {
-                if (chosen.size() >= slotCount) break;
-                addIfEligibleTilePkg(p, chosen);
-            }
+        if (slotCount <= 0) return new ArrayList<>();
+        String[] existingSlots = windowManager.isTilingActive() ? windowManager.getTilingSlotPkgs() : null;
+        ArrayList<String> resolved = TilingLayoutEngine.resolveSlotPackages(
+                reqPkgs, existingSlots, Collections.emptyList(), slotCount, TaskQueryService::isEligibleTilePkg);
+        if (!hasEmptySlot(resolved, slotCount)) {
+            return resolved;
         }
+        ArrayList<String> fallbackPkgs = new ArrayList<>();
         List<?> running = taskApi.getTasks();
-        if (running != null && chosen.size() < slotCount) {
-            collectEligibleFromTasks(running, true, chosen, slotCount);
-            collectEligibleFromTasks(running, false, chosen, slotCount);
+        if (running != null) {
+            collectTaskPkgs(running, true, fallbackPkgs);
+            collectTaskPkgs(running, false, fallbackPkgs);
         }
-        if (chosen.size() < slotCount) {
-            collectEligibleFromTasks(taskApi.getRecentTasks(), false, chosen, slotCount);
-        }
-        return chosen;
+        collectTaskPkgs(taskApi.getRecentTasks(), false, fallbackPkgs);
+        return TilingLayoutEngine.resolveSlotPackages(
+                reqPkgs, existingSlots, fallbackPkgs, slotCount, TaskQueryService::isEligibleTilePkg);
     }
 
     void writeTasksToParcel(Parcel reply) {
@@ -348,7 +356,7 @@ final class TaskQueryService {
             }
         }
         LinkedHashMap<String, ExtCastProtocol.AppEntry> dedup = new LinkedHashMap<>();
-        if (services.context != null) {
+        if (services != null && services.context != null) {
             PackageManager pm = services.context.getPackageManager();
             List<ResolveInfo> ris = pm.queryIntentActivities(new Intent(Intent.ACTION_MAIN, null).addCategory(Intent.CATEGORY_LAUNCHER), 0);
             if (ris != null) {
@@ -363,8 +371,10 @@ final class TaskQueryService {
                         if (cs != null && cs.length() > 0) label = cs.toString().trim();
                     } catch (RuntimeException ignored) {}
                     if (appLabelCache.size() < MAX_APP_LABEL_CACHE) appLabelCache.put(pkg, label);
+                    String iconPngBase64 = resolveAppIconBase64(ri, pm, pkg);
                     Integer tid = extRunning.get(pkg);
-                    dedup.put(pkg, new ExtCastProtocol.AppEntry(pkg, cls != null ? cls : "", label, tid != null, tid != null ? tid : -1));
+                    dedup.put(pkg, new ExtCastProtocol.AppEntry(
+                            pkg, cls != null ? cls : "", label, tid != null, tid != null ? tid : -1, iconPngBase64));
                 }
             }
         }
@@ -373,20 +383,58 @@ final class TaskQueryService {
         return new ExtCastProtocol.AppListMsg(list);
     }
 
-    private void addIfEligibleTilePkg(String p, ArrayList<String> chosen) {
-        if (PackagePolicy.isValidPackageName(p) && !PackagePolicy.isProtectedSystemTaskPkg(p)
-                && !BridgeBuildConfig.HELPER_PACKAGE.equals(p) && !chosen.contains(p)) {
-            chosen.add(p);
+    private String resolveAppIconBase64(ResolveInfo ri, PackageManager pm, String pkg) {
+        if (ri == null || pm == null || pkg == null || pkg.isEmpty()) return "";
+        String cached = appIconCache.get(pkg);
+        if (cached != null) return cached;
+        Bitmap bmp = null;
+        try {
+            Drawable drawable = ri.loadIcon(pm);
+            if (drawable == null) return "";
+            bmp = Bitmap.createBitmap(APP_ICON_SIZE_PX, APP_ICON_SIZE_PX, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bmp);
+            drawable.setBounds(0, 0, APP_ICON_SIZE_PX, APP_ICON_SIZE_PX);
+            drawable.draw(canvas);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(2048);
+            if (!bmp.compress(Bitmap.CompressFormat.PNG, APP_ICON_PNG_QUALITY, baos)) return "";
+            byte[] pngBytes = baos.toByteArray();
+            if (pngBytes.length == 0) return "";
+            String encoded = Base64.encodeToString(pngBytes, Base64.NO_WRAP);
+            if (encoded == null || encoded.isEmpty()) return "";
+            if (appIconCache.size() < MAX_APP_ICON_CACHE) {
+                appIconCache.put(pkg, encoded);
+            }
+            return encoded;
+        } catch (RuntimeException ignored) {
+            return "";
+        } finally {
+            if (bmp != null && !bmp.isRecycled()) {
+                bmp.recycle();
+            }
         }
     }
 
-    private void collectEligibleFromTasks(List<?> list, boolean onlyExt, ArrayList<String> chosen, int limit) {
+    private static boolean isEligibleTilePkg(String p) {
+        return PackagePolicy.isValidPackageName(p) && !PackagePolicy.isProtectedSystemTaskPkg(p)
+                && !BridgeBuildConfig.HELPER_PACKAGE.equals(p);
+    }
+
+    private static boolean hasEmptySlot(List<String> slots, int slotCount) {
+        if (slots == null || slots.size() < slotCount) return true;
+        for (int i = 0; i < slotCount; i++) {
+            String p = slots.get(i);
+            if (p == null || p.isEmpty()) return true;
+        }
+        return false;
+    }
+
+    private void collectTaskPkgs(List<?> list, boolean onlyExt, ArrayList<String> out) {
         if (list == null) return;
         for (Object t : list) {
-            if (chosen.size() >= limit) return;
             if (t == null) continue;
             if (onlyExt && TaskApiAdapter.readIntField(t, "displayId", -1) != config.vdId) continue;
-            addIfEligibleTilePkg(TaskApiAdapter.extractTaskPkg(t), chosen);
+            String pkg = TaskApiAdapter.extractTaskPkg(t);
+            if (isEligibleTilePkg(pkg)) out.add(pkg);
         }
     }
 

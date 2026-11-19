@@ -410,7 +410,7 @@ class BridgeService : Service(), OverlayHost {
         safeBgExecute {
             val st = BridgeClient.getStatus()
             val dexActive = st.connected && st.mirrorMode == 0 && st.vdId > 0
-            val tasks = if (dexActive) BridgeClient.getTasks() else null
+            val tasks = if (dexActive && !st.isRemoteStreaming) BridgeClient.getTasks() else null
             val winSnap = if (dexActive) BridgeClient.getManagedWindows() else BridgeClient.WindowStateSnapshot()
             val needSys = st.connected && (st.vdId > 0 || (st.mirrorMode == 1 && st.sideVdId > 0))
             val sys = if (needSys) BridgeClient.getSysStatus() else lastSysStatus
@@ -446,6 +446,16 @@ class BridgeService : Service(), OverlayHost {
         if (!st.connected || st.vdId <= 0) {
             if (blackout.isBlackoutActive) blackout.setDexBlackout(false)
             detachExtOverlays(false); return
+        }
+        // In Remote Mac DeX mode, ExtBridgeMac renders the native taskbar, App Drawer,
+        // Quick Settings panel, and split seam divider. Keep Display 0 blackout and
+        // remoteDiscovery running while detaching Android-side external overlays.
+        if (st.isRemoteStreaming) {
+            if (attachedVdId != -1 || extCtx != null || stageAnimView != null) {
+                detachExtOverlays(keepBlackout = true)
+            }
+            lastObservedA11y = a11yNow
+            return
         }
         if (!a11yNow && !Settings.canDrawOverlays(this)) return
 
@@ -526,6 +536,7 @@ class BridgeService : Service(), OverlayHost {
     }
 
     private fun shouldHostInLauncher(): Boolean {
+        if (lastStatus.isRemoteStreaming) return false
         val hasManagedFg = lastWindowSnapshot.windows.any { !it.minimized && !OverlayConstants.isSystemOrLauncherPkg(it.pkg) }
         return !forceWindowOverlaysDuringAnim &&
             stageAnimView?.isAnimating() != true &&

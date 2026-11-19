@@ -14,6 +14,7 @@ class BridgeClientLogicTest {
         assertEquals(BridgeClient.SINK_NONE, st.sinkType)
         assertFalse(st.isRemoteSink)
         assertFalse(st.isRemoteDisplayActive)
+        assertFalse(st.isRemoteStreaming)
         assertFalse(st.isWifiServerEnabled)
         assertEquals(0f, st.streamFps, 0.001f)
         assertEquals("", st.shortCertFingerprint)
@@ -24,21 +25,30 @@ class BridgeClientLogicTest {
         assertFalse(st.isUhidInputActive)
         assertFalse(st.isMultiTilingActive)
 
-        val stPhys = st.copy(sinkType = BridgeClient.SINK_PHYSICAL)
+        val stPhys = st.copy(connected = true, sinkType = BridgeClient.SINK_PHYSICAL)
         assertFalse(stPhys.isRemoteSink)
         assertFalse(stPhys.isRemoteDisplayActive)
+        assertFalse(stPhys.isRemoteStreaming)
 
-        val stUsb = st.copy(sinkType = BridgeClient.SINK_REMOTE_USB)
+        // Disconnected status with stale remote sinkType must NOT report active remote streaming.
+        val stUsbDisconnected = st.copy(connected = false, sinkType = BridgeClient.SINK_REMOTE_USB)
+        assertTrue(stUsbDisconnected.isRemoteDisplayActive)
+        assertFalse(stUsbDisconnected.isRemoteStreaming)
+
+        val stUsb = st.copy(connected = true, sinkType = BridgeClient.SINK_REMOTE_USB)
         assertTrue(stUsb.isRemoteSink)
         assertTrue(stUsb.isRemoteDisplayActive)
+        assertTrue(stUsb.isRemoteStreaming)
 
-        val stWifiAdb = st.copy(sinkType = BridgeClient.SINK_REMOTE_WIFI_ADB)
+        val stWifiAdb = st.copy(connected = true, sinkType = BridgeClient.SINK_REMOTE_WIFI_ADB)
         assertEquals(4, BridgeClient.SINK_REMOTE_WIFI_ADB)
         assertTrue(stWifiAdb.isRemoteSink)
         assertTrue(stWifiAdb.isRemoteDisplayActive)
+        assertTrue(stWifiAdb.isRemoteStreaming)
         assertTrue(BridgeClient.isRemoteDisplayActive(BridgeClient.SINK_REMOTE_WIFI_ADB))
 
         val stWifi = st.copy(
+            connected = true,
             sinkType = BridgeClient.SINK_REMOTE_WIFI,
             wifiServerEnabled = 1,
             wifiServerPort = BridgeClient.DEFAULT_WIFI_REMOTE_PORT,
@@ -52,6 +62,7 @@ class BridgeClientLogicTest {
 
         assertTrue(stWifi.isRemoteSink)
         assertTrue(stWifi.isRemoteDisplayActive)
+        assertTrue(stWifi.isRemoteStreaming)
         assertTrue(stWifi.isWifiServerEnabled)
         assertTrue(stWifi.isUhidInputActive)
         assertTrue(stWifi.isMultiTilingActive)

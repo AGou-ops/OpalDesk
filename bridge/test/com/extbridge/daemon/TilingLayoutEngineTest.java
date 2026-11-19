@@ -1,11 +1,15 @@
 package com.extbridge.daemon;
 
+import com.extbridge.daemon.DaemonConfig.PackagePolicy;
 import com.extbridge.daemon.window.TilingLayoutEngine;
 import com.extbridge.daemon.window.TilingLayoutEngine.WindowRect;
 
 import org.junit.Test;
 
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
+import java.util.function.Predicate;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -162,5 +166,57 @@ public class TilingLayoutEngineTest {
 
         int dock = TilingLayoutEngine.computeDefaultDockInsetPx(1440, 240);
         assertTrue("Dock inset should be reasonable", dock >= 48 && dock <= 128);
+    }
+
+    @Test
+    public void testResolveSlotPackagesPreservesSwapReplaceAndRatioOrder() {
+        Predicate<String> eligible = p -> PackagePolicy.isValidPackageName(p)
+                && !PackagePolicy.isProtectedSystemTaskPkg(p)
+                && !BridgeBuildConfig.HELPER_PACKAGE.equals(p);
+        String[] active2 = new String[]{"com.alpha.app", "com.beta.app", "", ""};
+        List<String> runningFallback = Arrays.asList("com.beta.app", "com.alpha.app", "com.delta.app");
+
+        // Explicit [B, A] swap must preserve exact order instead of re-sorting
+        assertEquals(Arrays.asList("com.beta.app", "com.alpha.app"),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList("com.beta.app", "com.alpha.app"), active2, runningFallback, 2, eligible));
+
+        // Ratio-only update (empty reqPkgs) preserves existing active slot order even when running tasks differ
+        assertEquals(Arrays.asList("com.alpha.app", "com.beta.app"),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Collections.emptyList(), active2, runningFallback, 2, eligible));
+
+        // Single-slot replacement preserves the untouched slot in its original index
+        assertEquals(Arrays.asList("com.alpha.app", "com.gamma.app"),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList("", "com.gamma.app"), active2, runningFallback, 2, eligible));
+        assertEquals(Arrays.asList("com.gamma.app", "com.beta.app"),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList("com.gamma.app", ""), active2, runningFallback, 2, eligible));
+
+        // Assigning slot 1's existing app to slot 0 swaps cleanly with slot 0's previous app
+        assertEquals(Arrays.asList("com.beta.app", "com.alpha.app"),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList("com.beta.app", ""), active2, runningFallback, 2, eligible));
+
+        // Single app requested with no other running tasks keeps slot 0 and leaves slot 1 empty
+        assertEquals(Arrays.asList("com.tencent.mm", ""),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Collections.singletonList("com.tencent.mm"), null, Collections.emptyList(), 2, eligible));
+
+        // Backfills missing slot from fallback running tasks while preserving explicit slot 0
+        assertEquals(Arrays.asList("com.gamma.app", "com.beta.app"),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Collections.singletonList("com.gamma.app"), null, runningFallback, 2, eligible));
+
+        // Empty state with zero eligible apps returns empty list
+        assertTrue(TilingLayoutEngine.resolveSlotPackages(
+                Collections.emptyList(), null, Collections.emptyList(), 2, eligible).isEmpty());
+
+        // Filters out protected/helper packages and duplicates
+        assertEquals(Arrays.asList("", "com.tencent.mm", ""),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList(BridgeBuildConfig.HELPER_PACKAGE, "com.tencent.mm", "com.tencent.mm"),
+                        null, Collections.emptyList(), 3, eligible));
     }
 }

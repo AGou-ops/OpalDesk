@@ -52,9 +52,15 @@ public struct MenuBarView: View {
 
         Divider()
 
-        Button("手机应用快启 (⌘K)", systemImage: "magnifyingglass") {
+        Button("应用抽屉 (⌘K)", systemImage: "square.grid.3x3.fill") {
             openMainWindow()
             model.openQuickLauncher()
+        }
+        .disabled(!model.isAuthenticated)
+
+        Button("快捷左右分屏 (⌘⇧S)", systemImage: "rectangle.split.2x1") {
+            openMainWindow()
+            model.startQuickTwoSplit()
         }
         .disabled(!model.isAuthenticated)
 

@@ -40,6 +40,7 @@ class WindowChromeOverlayController(private val host: OverlayHost) {
 
     fun buildOverlays(ctx: Context, st: BridgeClient.Status) {
         detach()
+        if (st.isRemoteStreaming) return
         val preview = PreviewOverlayView(ctx).apply { visibility = View.GONE }
         val pLp = OverlayWindowParams.fullscreenNonTouchable(
             max(OverlayConstants.MIN_SURFACE_PX, host.overlayW), max(OverlayConstants.MIN_SURFACE_PX, host.overlayH), host.winType,
@@ -83,7 +84,7 @@ class WindowChromeOverlayController(private val host: OverlayHost) {
 
     fun updateFromState(st: BridgeClient.Status, snap: BridgeClient.WindowStateSnapshot, tasks: List<BridgeClient.TaskEntry>?) {
         val ctx = host.extCtx ?: return
-        val dexActive = st.connected && st.vdId > 0 && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX
+        val dexActive = st.connected && st.vdId > 0 && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX && !st.isRemoteStreaming
         if (!dexActive || st.isMultiTilingActive || BridgeClient.isTilingTopology(snap.tilingTopology)) {
             singleHandleController.hideAll()
             freeformSlots.forEach { it?.hide() }

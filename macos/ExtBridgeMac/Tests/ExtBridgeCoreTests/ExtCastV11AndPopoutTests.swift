@@ -65,9 +65,11 @@ struct ExtCastV11AndPopoutTests {
             injectStatus: ExtCastInjectStatus.uhid.rawValue,
             adaptiveSingleEnabled: true,
             defaultSingleWidthDp: 460,
-            activeLayoutMode: ExtCastLayoutMode.adaptiveSingle.rawValue,
+            activeLayoutMode: ExtCastLayoutMode.split2H.rawValue,
             topAppPackage: "com.xingin.xhs",
-            topAppLabel: "小红书"
+            topAppLabel: "小红书",
+            tilingSlots: ["com.tencent.mm", "tv.danmaku.bili"],
+            tilingRatios: [45, 55]
         )
         let decoded = try DeviceStatePayload.decode(from: try state.encode())
         #expect(decoded == state)
@@ -75,10 +77,12 @@ struct ExtCastV11AndPopoutTests {
         #expect(decoded.injectStatus == 2)
         #expect(decoded.adaptiveSingleEnabled == true)
         #expect(decoded.defaultSingleWidthDp == 460)
-        #expect(decoded.activeLayoutMode == "ADAPTIVE_SINGLE")
-        #expect(decoded.layoutMode == .adaptiveSingle)
+        #expect(decoded.activeLayoutMode == "SPLIT_2_H")
+        #expect(decoded.layoutMode == .split2H)
         #expect(decoded.topAppPackage == "com.xingin.xhs")
         #expect(decoded.topAppLabel == "小红书")
+        #expect(decoded.tilingSlots == ["com.tencent.mm", "tv.danmaku.bili"])
+        #expect(decoded.tilingRatios == [45, 55])
 
         let minimalJSON = Data(#"{"deviceName":"LegacyPhone"}"#.utf8)
         let defaulted = try DeviceStatePayload.decode(from: minimalJSON)
@@ -95,6 +99,8 @@ struct ExtCastV11AndPopoutTests {
         #expect(defaulted.layoutMode == .fullscreen)
         #expect(defaulted.topAppPackage == "")
         #expect(defaulted.topAppLabel == "")
+        #expect(defaulted.tilingSlots.isEmpty)
+        #expect(defaulted.tilingRatios.isEmpty)
     }
 
     @Test("0x14 WIFI_UPGRADE_READY, 0x15 APP_LIST, 0x29 REQUEST_WIFI_UPGRADE, 0x2A LIST_APPS frame roundtrip")
@@ -113,8 +119,16 @@ struct ExtCastV11AndPopoutTests {
         #expect(upgradeFrame.type == .wifiUpgradeReady)
         #expect(upgradeFrame.type.rawValue == 0x14)
 
+        let sampleIconBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
         let apps = AppListPayload(apps: [
-            RemoteAppInfo(pkg: "com.tencent.mm", cls: ".ui.LauncherUI", label: "微信", runningOnExt: true, taskId: 123),
+            RemoteAppInfo(
+                pkg: "com.tencent.mm",
+                cls: ".ui.LauncherUI",
+                label: "微信",
+                runningOnExt: true,
+                taskId: 123,
+                iconBase64: sampleIconBase64
+            ),
             RemoteAppInfo(pkg: "com.xunmeng.pinduoduo", cls: "", label: "拼多多", runningOnExt: false, taskId: -1)
         ])
         let appsFrame = try ExtCastFrame.appList(apps)
@@ -147,6 +161,15 @@ struct ExtCastV11AndPopoutTests {
 
         let decodedApps = try AppListPayload.decode(from: frames[1].payload)
         #expect(decodedApps == apps)
+        #expect(decodedApps.apps[0].iconBase64 == sampleIconBase64)
+        #expect(decodedApps.apps[1].iconBase64 == nil)
+
+        // Verify raw wire JSON uses exact key "icon" and stays backward compatible when omitted
+        let rawIconJSON = Data(#"{"apps":[{"pkg":"com.demo","label":"Demo","icon":"QUJD"},{"pkg":"com.legacy","label":"Legacy"}]}"#.utf8)
+        let decodedRawApps = try AppListPayload.decode(from: rawIconJSON)
+        #expect(decodedRawApps.apps.count == 2)
+        #expect(decodedRawApps.apps[0].iconBase64 == "QUJD")
+        #expect(decodedRawApps.apps[1].iconBase64 == nil)
 
         #expect(frames[2].type == .requestWifiUpgrade)
         #expect(frames[2].payload.isEmpty)
@@ -163,7 +186,11 @@ struct ExtCastV11AndPopoutTests {
             .setTiling(topology: .split3Master, pkgs: ["com.a", "com.b", "com.c"], ratios: [55, 45]),
             .reloadAppDpi(pkg: "com.tencent.mm"),
             .returnToDesktop(pkg: "com.tencent.mm", taskId: 123),
-            .setInputBackend(.uhid)
+            .setInputBackend(.uhid),
+            .focusWindow(taskId: 101, pkg: "com.tencent.mm"),
+            .minimizeWindow(taskId: 102, pkg: "com.tencent.mm"),
+            .closeWindow(taskId: 103, pkg: "tv.danmaku.bili"),
+            .closeWindow(taskId: 104)
         ]
 
         for action in actions {
@@ -198,6 +225,27 @@ struct ExtCastV11AndPopoutTests {
         ) as? [String: Any]
         #expect(backendJSON?["action"] as? String == "set_input_backend")
         #expect(backendJSON?["backend"] as? String == "uhid")
+
+        let focusJSON = try JSONSerialization.jsonObject(
+            with: try WindowActionPayload.focusWindow(taskId: 42, pkg: "com.tencent.mm").encode()
+        ) as? [String: Any]
+        #expect(focusJSON?["action"] as? String == "focus_window")
+        #expect(focusJSON?["taskId"] as? Int == 42)
+        #expect(focusJSON?["pkg"] as? String == "com.tencent.mm")
+
+        let minimizeJSON = try JSONSerialization.jsonObject(
+            with: try WindowActionPayload.minimizeWindow(taskId: 43).encode()
+        ) as? [String: Any]
+        #expect(minimizeJSON?["action"] as? String == "minimize_window")
+        #expect(minimizeJSON?["taskId"] as? Int == 43)
+        #expect(minimizeJSON?["pkg"] == nil)
+
+        let closeJSON = try JSONSerialization.jsonObject(
+            with: try WindowActionPayload.closeWindow(taskId: 44, pkg: "tv.danmaku.bili").encode()
+        ) as? [String: Any]
+        #expect(closeJSON?["action"] as? String == "close_window")
+        #expect(closeJSON?["taskId"] as? Int == 44)
+        #expect(closeJSON?["pkg"] as? String == "tv.danmaku.bili")
     }
 
     @Test("PNG clipboard frames (flags=0x01) exact wire layout and 8 MiB limit enforcement")
@@ -363,5 +411,30 @@ struct ExtCastV11AndPopoutTests {
 
         // Non-matching query returns empty
         #expect(AppFuzzyMatcher.filter(apps, query: "zzzzz").isEmpty)
+    }
+
+    @Test("AdbManager externalVolumeAdbCandidates discovers SDK platform-tools on external volumes")
+    func adbExternalVolumeDiscovery() throws {
+        let fm = FileManager.default
+        let fakeVolumesRoot = fm.temporaryDirectory
+            .appendingPathComponent("extbridge-volumes-\(UUID().uuidString)", isDirectory: true)
+        let adbDir = fakeVolumesRoot
+            .appendingPathComponent("lightlsle/dependencies/android-sdk/platform-tools", isDirectory: true)
+        try fm.createDirectory(at: adbDir, withIntermediateDirectories: true)
+        defer {
+            do {
+                try fm.removeItem(at: fakeVolumesRoot)
+            } catch {
+                Issue.record("Failed to clean up temp volumes fixture: \(error)")
+            }
+        }
+
+        let fakeAdb = adbDir.appendingPathComponent("adb")
+        try Data("#!/bin/sh\n".utf8).write(to: fakeAdb)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeAdb.path)
+
+        let candidates = AdbManager.externalVolumeAdbCandidates(volumesRoot: fakeVolumesRoot.path, fileManager: fm)
+        #expect(candidates.contains(fakeAdb.path))
+        #expect(candidates.first(where: { fm.isExecutableFile(atPath: $0) }) == fakeAdb.path)
     }
 }

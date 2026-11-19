@@ -77,7 +77,14 @@ final class TilingSessionController {
             if (TilingLayoutEngine.TOPOLOGY_NONE.equals(norm)) { exitTilingAndRestore(false); return true; }
             int slotCount = TilingLayoutEngine.slotCountForTopology(norm);
             if (slotCount <= 0) return false;
-            int[] ratios = (reqRatios != null && reqRatios.length > 0) ? reqRatios : TilingLayoutEngine.defaultRatiosForTopology(norm);
+            int[] ratios;
+            if (reqRatios != null && reqRatios.length > 0) {
+                ratios = reqRatios;
+            } else if (windowManager.isTilingActive() && norm.equals(windowManager.getTilingTopology())) {
+                ratios = windowManager.getTilingRatios();
+            } else {
+                ratios = TilingLayoutEngine.defaultRatiosForTopology(norm);
+            }
             if (slotCount == 2 && ratios.length > 0) lastSplitRatioPct = clampSplitPct(ratios[0]);
             ArrayList<String> chosen = queries.pickTilingApps(reqPkgs, slotCount);
             if (chosen.isEmpty()) return false;
@@ -310,6 +317,8 @@ final class TilingSessionController {
             for (long d : new long[]{240L, 700L}) {
                 mainHandler.postDelayed(() -> {
                     if (!windowManager.isTilingActive() || config.vdId <= 0) return;
+                    String[] curSlots = windowManager.getTilingSlotPkgs();
+                    if (slotIdx >= curSlots.length || !pkg.equals(curSlots[slotIdx])) return;
                     int t = queries.findTaskIdForPkg(pkg, true);
                     if (t > 0) {
                         windowManager.updateTilingSlotTaskId(slotIdx, t, pkg, bounds);

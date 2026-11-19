@@ -25,8 +25,15 @@ public final class AdbManager: Sendable {
         }
     }
 
+    private static let externalVolumeRelativeSDKPaths: [String] = [
+        "dependencies/android-sdk/platform-tools/adb",
+        "Android/sdk/platform-tools/adb",
+        "android-sdk/platform-tools/adb"
+    ]
+
     /// Locates `adb` in priority order: custom override -> app bundle -> ANDROID_HOME/SDK_ROOT ->
-    /// Homebrew Android commandlinetools -> Homebrew bin -> ~/Library/Android/sdk -> PATH.
+    /// Homebrew Android commandlinetools -> Homebrew bin -> ~/Library/Android/sdk -> PATH ->
+    /// external volumes (`/Volumes/*/dependencies/android-sdk/platform-tools/adb`, etc.).
     public func locateAdb() -> String? {
         let customPath = state.withLock { $0.customAdbPath }
         let fm = FileManager.default
@@ -60,7 +67,37 @@ public final class AdbManager: Sendable {
             }
         }
 
-        return candidates.first { fm.isExecutableFile(atPath: $0) }
+        if let localMatch = candidates.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return localMatch
+        }
+
+        return Self.externalVolumeAdbCandidates(fileManager: fm)
+            .first { fm.isExecutableFile(atPath: $0) }
+    }
+
+    /// Scans mounted external volumes for Android SDK `platform-tools/adb` binaries.
+    public static func externalVolumeAdbCandidates(
+        volumesRoot: String = "/Volumes",
+        fileManager: FileManager = .default
+    ) -> [String] {
+        let entries: [String]
+        do {
+            entries = try fileManager.contentsOfDirectory(atPath: volumesRoot).sorted()
+        } catch {
+            ExtBridgeLog.adb.debug(
+                "Unable to scan \(volumesRoot, privacy: .public) for Android SDK adb: \(error.localizedDescription, privacy: .public)"
+            )
+            return []
+        }
+
+        var paths: [String] = []
+        for volume in entries where !volume.hasPrefix(".") {
+            let volumePath = (volumesRoot as NSString).appendingPathComponent(volume)
+            for relativePath in externalVolumeRelativeSDKPaths {
+                paths.append((volumePath as NSString).appendingPathComponent(relativePath))
+            }
+        }
+        return paths
     }
 
     /// Scans USB and wireless-ADB Android devices via `adb devices -l`.

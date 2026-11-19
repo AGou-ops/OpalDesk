@@ -59,7 +59,7 @@ public final class DisplayCanvasNSView: NSView {
         self.callbacks = callbacks
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
+        layer?.backgroundColor = DeXTheme.canvasNSColor.cgColor
         allowedTouchTypes = [.indirect]
         wantsRestingTouches = false
         videoLayer.frame = bounds

@@ -73,6 +73,8 @@ extension DeviceStatePayload {
         let activeLayoutMode: String
         let topAppPackage: String
         let topAppLabel: String
+        let tilingSlots: [String]
+        let tilingRatios: [Int]
     }
 
     func encode() throws -> Data {
@@ -94,7 +96,9 @@ extension DeviceStatePayload {
             defaultSingleWidthDp: defaultSingleWidthDp,
             activeLayoutMode: activeLayoutMode,
             topAppPackage: topAppPackage,
-            topAppLabel: topAppLabel
+            topAppLabel: topAppLabel,
+            tilingSlots: tilingSlots,
+            tilingRatios: tilingRatios
         )
         return try ExtCastJSONCodec.encode(dto, context: "DEVICE_STATE")
     }
@@ -155,6 +159,7 @@ extension AppListPayload {
         let label: String
         let runningOnExt: Bool
         let taskId: Int
+        let icon: String?
     }
 
     private struct ListDTO: Encodable {
@@ -163,7 +168,14 @@ extension AppListPayload {
 
     func encode() throws -> Data {
         let dto = ListDTO(apps: apps.map {
-            AppDTO(pkg: $0.pkg, cls: $0.cls, label: $0.label, runningOnExt: $0.runningOnExt, taskId: $0.taskId)
+            AppDTO(
+                pkg: $0.pkg,
+                cls: $0.cls,
+                label: $0.label,
+                runningOnExt: $0.runningOnExt,
+                taskId: $0.taskId,
+                icon: $0.iconBase64
+            )
         })
         return try ExtCastJSONCodec.encode(dto, context: "APP_LIST")
     }

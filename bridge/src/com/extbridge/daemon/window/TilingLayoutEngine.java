@@ -3,9 +3,12 @@ package com.extbridge.daemon.window;
 import android.graphics.Rect;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.function.Predicate;
 
 /**
  * Pure-Java multi-slot tiling layout engine for ExtBridge v4.1.
@@ -190,6 +193,75 @@ public final class TilingLayoutEngine {
             if (!t.isEmpty()) out.add(t);
         }
         return out;
+    }
+
+    /**
+     * Resolves ordered tiling slot packages while preserving exact caller-requested slot indices
+     * (for explicit swap/replace), retaining untouched active slots in their original positions,
+     * and backfilling any remaining empty slots from {@code fallbackPkgs}.
+     * Returns an empty list if zero eligible packages are available.
+     */
+    public static ArrayList<String> resolveSlotPackages(
+            List<String> reqPkgs,
+            String[] existingSlots,
+            List<String> fallbackPkgs,
+            int slotCount,
+            Predicate<String> isEligible) {
+        if (slotCount <= 0) return new ArrayList<>();
+        String[] slots = new String[slotCount];
+        Arrays.fill(slots, "");
+        HashSet<String> used = new HashSet<>(slotCount * 2);
+
+        if (reqPkgs != null && !reqPkgs.isEmpty()) {
+            for (int i = 0; i < reqPkgs.size() && i < slotCount; i++) {
+                String p = (reqPkgs.get(i) != null) ? reqPkgs.get(i).trim() : "";
+                if (isEligiblePkg(p, isEligible) && used.add(p)) {
+                    slots[i] = p;
+                }
+            }
+        }
+        if (existingSlots != null && used.size() < slotCount) {
+            // Sub-pass 2a: preserve untouched existing slots in their exact original indices.
+            for (int i = 0; i < existingSlots.length && i < slotCount && used.size() < slotCount; i++) {
+                String p = (existingSlots[i] != null) ? existingSlots[i].trim() : "";
+                if (slots[i].isEmpty() && isEligiblePkg(p, isEligible) && used.add(p)) {
+                    slots[i] = p;
+                }
+            }
+            // Sub-pass 2b: move any remaining unused existing slot app into the next empty slot (supports single-app swap).
+            for (int i = 0; i < existingSlots.length && used.size() < slotCount; i++) {
+                String p = (existingSlots[i] != null) ? existingSlots[i].trim() : "";
+                if (!isEligiblePkg(p, isEligible) || used.contains(p)) continue;
+                int emptyIdx = firstEmptySlot(slots);
+                if (emptyIdx >= 0 && used.add(p)) {
+                    slots[emptyIdx] = p;
+                }
+            }
+        }
+        if (fallbackPkgs != null && used.size() < slotCount) {
+            for (String raw : fallbackPkgs) {
+                if (used.size() >= slotCount) break;
+                String p = (raw != null) ? raw.trim() : "";
+                if (!isEligiblePkg(p, isEligible) || used.contains(p)) continue;
+                int emptyIdx = firstEmptySlot(slots);
+                if (emptyIdx < 0) break;
+                slots[emptyIdx] = p;
+                used.add(p);
+            }
+        }
+        if (used.isEmpty()) return new ArrayList<>();
+        return new ArrayList<>(Arrays.asList(slots));
+    }
+
+    private static boolean isEligiblePkg(String pkg, Predicate<String> isEligible) {
+        return pkg != null && !pkg.isEmpty() && (isEligible == null || isEligible.test(pkg));
+    }
+
+    private static int firstEmptySlot(String[] slots) {
+        for (int i = 0; i < slots.length; i++) {
+            if (slots[i] == null || slots[i].isEmpty()) return i;
+        }
+        return -1;
     }
 
     public static WindowRect[] computeSlots(

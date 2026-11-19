@@ -86,7 +86,7 @@ public struct SettingsView: View {
 
             Section("辅助显示") {
                 Toggle("默认开启手机音频回传", isOn: $prefs.audioEnabled)
-                Toggle("在悬浮控制栏显示实时 FPS / RTT / 码率 / UHID HUD", isOn: $prefs.showHUDStats)
+                Toggle("在画面右上角显示实时 FPS / RTT / 码率 / UHID 性能浮标 (HUD)", isOn: $prefs.showHUDStats)
             }
         }
         .formStyle(.grouped)
@@ -149,7 +149,7 @@ public struct SettingsView: View {
                         .onChange(of: prefs.customAdbPath) { _, _ in model.refreshAdbPath() }
                     Button("浏览...") { pickCustomAdbBinary() }
                 }
-                Text("自动探测顺序：App 内置 → ANDROID_HOME → Homebrew Android CLI Tools → ~/Library/Android/sdk。")
+                Text("自动探测顺序：App 内置 → ANDROID_HOME → Homebrew → ~/Library/Android/sdk → 外接卷 Android SDK。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

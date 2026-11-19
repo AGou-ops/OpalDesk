@@ -91,3 +91,70 @@ public struct PopoutConnectionContext: Sendable, Equatable {
         self.mapCommandToCtrl = mapCommandToCtrl
     }
 }
+
+/// Mutually exclusive DeX floating panels anchored above the taskbar.
+public enum DeXOverlayPanel: Equatable, Sendable {
+    case none
+    case appDrawer
+    case quickSettings
+    case layoutPicker
+}
+
+/// High-level DeX desktop window layout modes presented in the Snap Layout picker.
+public enum DeXWindowMode: Equatable, Sendable {
+    case maximized
+    case centeredPhone
+    case tiling(ExtCastTilingTopology)
+}
+
+extension ExtCastTilingTopology {
+    public var slotCount: Int {
+        switch self {
+        case .split2H, .split2V: return 2
+        case .split3Master, .split3Cols: return 3
+        case .grid2x2: return 4
+        case .exit: return 0
+        }
+    }
+
+    public var systemImage: String {
+        switch self {
+        case .split2H: return "rectangle.split.2x1"
+        case .split2V: return "rectangle.split.1x2"
+        case .split3Master: return "rectangle.split.2x2"
+        case .split3Cols: return "rectangle.split.3x1"
+        case .grid2x2: return "square.grid.2x2"
+        case .exit: return "rectangle"
+        }
+    }
+
+    public func slotDisplayName(for index: Int) -> String {
+        switch self {
+        case .split2H:
+            return index == 0 ? "左侧分屏" : "右侧分屏"
+        case .split2V:
+            return index == 0 ? "上方分屏" : "下方分屏"
+        case .split3Master:
+            switch index {
+            case 0: return "左侧主屏"
+            case 1: return "右上分屏"
+            default: return "右下分屏"
+            }
+        case .split3Cols:
+            switch index {
+            case 0: return "左列分屏"
+            case 1: return "中列分屏"
+            default: return "右列分屏"
+            }
+        case .grid2x2:
+            switch index {
+            case 0: return "左上格"
+            case 1: return "右上格"
+            case 2: return "左下格"
+            default: return "右下格"
+            }
+        case .exit:
+            return "窗口 \(index + 1)"
+        }
+    }
+}

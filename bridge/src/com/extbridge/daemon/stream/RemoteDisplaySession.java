@@ -21,6 +21,8 @@ import com.extbridge.daemon.window.DesktopWindowManager;
 import com.extbridge.daemon.window.TaskWindowController;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * Package-private unified session holder for either the main remote desktop session
@@ -381,14 +383,26 @@ final class RemoteDisplaySession {
         double actualFps = (s != null && s.getActualFpsX100() > 0)
                 ? (s.getActualFpsX100() / 100.0) : ((s != null && s.getFps() > 0f) ? s.getFps() : fps);
         int bitrate = (s != null && s.isActive()) ? s.getBitrateKbps() : requestedBitrateKbps;
-        String layoutMode = standalone ? DesktopWindowManager.MODE_STANDALONE_APP : wm.resolveActiveLayoutMode();
+        String layoutMode;
+        List<String> tilingSlots;
+        List<Integer> tilingRatios;
+        if (standalone) {
+            layoutMode = DesktopWindowManager.MODE_STANDALONE_APP;
+            tilingSlots = Collections.emptyList();
+            tilingRatios = Collections.emptyList();
+        } else {
+            DesktopWindowManager.TilingSnapshot tiling = wm.getTilingSnapshot();
+            layoutMode = tiling.active ? tiling.topology : wm.resolveActiveLayoutMode();
+            tilingSlots = tiling.active ? tiling.slots : Collections.emptyList();
+            tilingRatios = tiling.active ? tiling.ratios : Collections.emptyList();
+        }
         return new ExtCastProtocol.DeviceState(
                 deviceName, standalone ? sinkType : activeSinkType,
                 standalone ? ExtCastProtocol.DISPLAY_MODE_DEX : mirrorMode,
                 w, h, d, actualFps, standalone ? rotation : virtRot,
                 bitrate, batteryPct, screenDimmed, audioOn, injectStatus,
                 wm.isAdaptiveSingleEnabled(), wm.getDefaultSingleWidthDp(),
-                layoutMode, topPkg, topLabel);
+                layoutMode, topPkg, topLabel, tilingSlots, tilingRatios);
     }
 
     private static final class SessionHostBridge implements RemoteInputBridge.HostBridge {

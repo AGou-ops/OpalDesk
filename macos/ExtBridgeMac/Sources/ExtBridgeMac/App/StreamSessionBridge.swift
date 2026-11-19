@@ -99,13 +99,14 @@ public final class StreamSessionBridge {
     }
 
     /// Builds `DisplayCanvasCallbacks` wiring mouse, touch, keyboard, IME text, three-finger swipes,
-    /// toolbar hover auto-hide, resize, and drag-and-drop cleanly for both main and popout windows.
+    /// optional toolbar hover auto-hide, resize, canvas interaction, and drag-and-drop cleanly for both main and popout windows.
     public func makeCanvasCallbacks(
         isAuthenticated: @escaping () -> Bool,
-        toolbar: HoverToolbarController,
+        toolbar: HoverToolbarController? = nil,
         onFilesDropped: @escaping ([URL]) -> Void,
         onDragHoverChange: @escaping (Bool) -> Void,
         onResize: @escaping (CGSize, CGFloat) -> Void,
+        onCanvasInteract: (() -> Void)? = nil,
         onQuickLauncher: (() -> Void)? = nil,
         onTogglePin: (() -> Void)? = nil
     ) -> DisplayCanvasCallbacks {
@@ -117,9 +118,12 @@ public final class StreamSessionBridge {
             onFilesDropped: onFilesDropped,
             onDragHoverChange: onDragHoverChange,
             onResize: onResize,
-            onTopEdgeHover: { nearTop in toolbar.handleTopEdgeHover(nearTop) },
-            onCursorClearedTopZone: { toolbar.handleCursorClearedTopZone() },
-            onCanvasInteract: { toolbar.handleCanvasInteract() },
+            onTopEdgeHover: { nearTop in toolbar?.handleTopEdgeHover(nearTop) },
+            onCursorClearedTopZone: { toolbar?.handleCursorClearedTopZone() },
+            onCanvasInteract: {
+                toolbar?.handleCanvasInteract()
+                onCanvasInteract?()
+            },
             onQuickLauncher: onQuickLauncher,
             onTogglePin: onTogglePin,
             onThreeFingerSwipe: { [weak self] dir in self?.handleThreeFingerSwipe(dir, isAuthenticated: isAuthenticated()) }

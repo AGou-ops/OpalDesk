@@ -61,6 +61,9 @@ data class DaemonStatus(
     val isRemoteSink: Boolean
         get() = isRemoteDisplayActive
 
+    val isRemoteStreaming: Boolean
+        get() = connected && isRemoteDisplayActive
+
     val isAdaptiveSingleEnabled: Boolean
         get() = adaptiveSingleEnabled != 0
 

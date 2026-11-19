@@ -22,6 +22,8 @@ public struct DeviceStatePayload: Decodable, Sendable, Equatable {
     public var activeLayoutMode: String
     public var topAppPackage: String
     public var topAppLabel: String
+    public var tilingSlots: [String]
+    public var tilingRatios: [Int]
 
     public var layoutMode: ExtCastLayoutMode? {
         ExtCastLayoutMode(rawValue: activeLayoutMode)
@@ -45,7 +47,9 @@ public struct DeviceStatePayload: Decodable, Sendable, Equatable {
         defaultSingleWidthDp: Int = DisplayPresets.defaultSingleWidthDp,
         activeLayoutMode: String = ExtCastLayoutMode.fullscreen.rawValue,
         topAppPackage: String = "",
-        topAppLabel: String = ""
+        topAppLabel: String = "",
+        tilingSlots: [String] = [],
+        tilingRatios: [Int] = []
     ) {
         self.deviceName = deviceName
         self.sinkType = sinkType
@@ -65,13 +69,15 @@ public struct DeviceStatePayload: Decodable, Sendable, Equatable {
         self.activeLayoutMode = activeLayoutMode.isEmpty ? ExtCastLayoutMode.fullscreen.rawValue : activeLayoutMode
         self.topAppPackage = topAppPackage
         self.topAppLabel = topAppLabel
+        self.tilingSlots = tilingSlots
+        self.tilingRatios = tilingRatios
     }
 
     private enum CodingKeys: String, CodingKey {
         case deviceName, sinkType, displayMode, width, height, dpi, fps, rotation
         case bitrateKbps, batteryPct, blackout, audioEnabled, injectStatus
         case adaptiveSingleEnabled, defaultSingleWidthDp, activeLayoutMode
-        case topAppPackage, topAppLabel
+        case topAppPackage, topAppLabel, tilingSlots, tilingRatios
     }
 
     public init(from decoder: Decoder) throws {
@@ -96,7 +102,9 @@ public struct DeviceStatePayload: Decodable, Sendable, Equatable {
             defaultSingleWidthDp: rawWidthDp,
             activeLayoutMode: rawLayout,
             topAppPackage: try c.decodeIfPresent(String.self, forKey: .topAppPackage) ?? "",
-            topAppLabel: try c.decodeIfPresent(String.self, forKey: .topAppLabel) ?? ""
+            topAppLabel: try c.decodeIfPresent(String.self, forKey: .topAppLabel) ?? "",
+            tilingSlots: try c.decodeIfPresent([String].self, forKey: .tilingSlots) ?? [],
+            tilingRatios: try c.decodeIfPresent([Int].self, forKey: .tilingRatios) ?? []
         )
     }
 

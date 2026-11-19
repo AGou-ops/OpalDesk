@@ -119,7 +119,9 @@ final class ExtCastClientTestCodec {
                     obj.getInt("defaultSingleWidthDp", 460),
                     obj.getString("activeLayoutMode", "FULLSCREEN"),
                     obj.getString("topAppPackage", ""),
-                    obj.getString("topAppLabel", ""));
+                    obj.getString("topAppLabel", ""),
+                    obj.getStringList("tilingSlots"),
+                    obj.getIntList("tilingRatios"));
         } catch (RuntimeException t) {
             throw new ProtocolException("Invalid DEVICE_STATE JSON: " + t.getMessage(), t);
         }
@@ -212,7 +214,8 @@ final class ExtCastClientTestCodec {
                         item.getString("cls", ""),
                         item.getString("label", ""),
                         item.getBoolean("runningOnExt", false),
-                        item.getInt("taskId", -1)));
+                        item.getInt("taskId", -1),
+                        item.getString("icon", "")));
             }
             return new AppListMsg(entries);
         } catch (RuntimeException t) {

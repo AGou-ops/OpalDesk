@@ -37,8 +37,8 @@ struct WindowChromeConfigurator: NSViewRepresentable {
 
             if isImmersiveCanvas {
                 window.titlebarAppearsTransparent = true
-                window.titleVisibility = .hidden
-                window.backgroundColor = .black
+                window.titleVisibility = .visible
+                window.backgroundColor = DeXTheme.canvasNSColor
                 window.appearance = NSAppearance(named: .darkAqua)
                 window.isMovableByWindowBackground = false
             } else {

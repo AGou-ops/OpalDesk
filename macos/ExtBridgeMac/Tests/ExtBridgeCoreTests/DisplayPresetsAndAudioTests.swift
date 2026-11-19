@@ -198,7 +198,10 @@ struct DisplayPresetsAndAudioTests {
             (.setTiling, "set_tiling"),
             (.reloadAppDpi, "reload_app_dpi"),
             (.returnToDesktop, "return_to_desktop"),
-            (.setInputBackend, "set_input_backend")
+            (.setInputBackend, "set_input_backend"),
+            (.focusWindow, "focus_window"),
+            (.minimizeWindow, "minimize_window"),
+            (.closeWindow, "close_window")
         ]
         #expect(WindowActionKind.allCases.count == expectedRawValues.count)
         for (kind, raw) in expectedRawValues {
@@ -212,7 +215,11 @@ struct DisplayPresetsAndAudioTests {
             (.setTiling(topology: .split3Cols, pkgs: ["a", "b", "c"]), "set_tiling", ["action", "topology", "pkgs", "ratios"]),
             (.reloadAppDpi(pkg: "com.demo"), "reload_app_dpi", ["action", "pkg"]),
             (.returnToDesktop(pkg: "com.demo", taskId: 42), "return_to_desktop", ["action", "pkg", "taskId"]),
-            (.setInputBackend(.inject), "set_input_backend", ["action", "backend"])
+            (.setInputBackend(.inject), "set_input_backend", ["action", "backend"]),
+            (.focusWindow(taskId: 77, pkg: "com.demo"), "focus_window", ["action", "taskId", "pkg"]),
+            (.focusWindow(taskId: 77), "focus_window", ["action", "taskId"]),
+            (.minimizeWindow(taskId: 88, pkg: "com.demo"), "minimize_window", ["action", "taskId", "pkg"]),
+            (.closeWindow(taskId: 99, pkg: "com.demo"), "close_window", ["action", "taskId", "pkg"])
         ]
 
         for (payload, expectedAction, expectedKeys) in cases {

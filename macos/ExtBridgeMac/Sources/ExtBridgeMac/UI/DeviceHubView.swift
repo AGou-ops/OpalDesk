@@ -1,8 +1,9 @@
+import AppKit
 import ExtBridgeCore
 import SwiftUI
 
-/// Primary discovery hub presenting USB wired devices (USB 2.0/3.0 without DP Alt Mode)
-/// and wireless LAN devices discovered via Bonjour (`_extbridge._tcp`) or manual IP:Port.
+/// Native macOS light/dark adaptive connection hub for launching the Samsung DeX desktop experience
+/// over USB/wireless ADB or automatic local-network discovery.
 public struct DeviceHubView: View {
     @Bindable public var model: AppModel
 
@@ -26,7 +27,7 @@ public struct DeviceHubView: View {
                     errorBanner(error)
                 }
 
-                wiredUSBSection
+                adbDevicesSection
                 wirelessLANSection
                 manualConnectSection
             }
@@ -61,9 +62,11 @@ public struct DeviceHubView: View {
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("ExtBridge Mac 大屏中心").font(.title2.weight(.semibold))
-                Text("无物理外接屏 · 硬件编解码低延迟 Android 桌面 / 镜像")
-                    .font(.callout).foregroundStyle(.secondary)
+                Text("ExtBridge 桌面中心")
+                    .font(.title2.weight(.semibold))
+                Text("连接你的 Android 手机，体验桌面级多窗口与无缝分屏")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
@@ -88,21 +91,15 @@ public struct DeviceHubView: View {
         }
     }
 
-    // MARK: - Wired USB Section
+    // MARK: - USB & Wireless Debugging Section
 
-    private var wiredUSBSection: some View {
+    private var adbDevicesSection: some View {
         let discovery = model.discovery
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Label("ADB 设备（USB / 无线调试）", systemImage: "cable.connector").font(.headline)
-                StatusBadgeView(
-                    text: "支持 USB 2.0 / 3.0 · 无需 DP Alt Mode",
-                    color: .accentColor,
-                    font: .caption,
-                    horizontalPadding: 8,
-                    backgroundOpacity: 0.12
-                )
+                Label("已连接的手机（USB / 无线调试）", systemImage: "cable.connector")
+                    .font(.headline)
                 Spacer()
                 if discovery.isScanningUSB { ProgressView().controlSize(.small) }
                 Button { Task { await model.refreshUSBDevices() } } label: {
@@ -118,19 +115,26 @@ public struct DeviceHubView: View {
                         icon: "exclamationmark.triangle",
                         tint: .orange,
                         title: "未找到 adb 工具",
-                        subtitle: "请安装 Android Platform Tools，或在「设置 → 有线 ADB」中手动指定 adb 路径。"
+                        subtitle: "请选择本机或外接硬盘中的 adb 可执行文件，或前往偏好设置配置路径。"
                     ) {
-                        SettingsLink { Text("配置 ADB") }.buttonStyle(.bordered)
+                        HStack(spacing: 8) {
+                            Button("选择 adb 文件...") { pickAdbBinary() }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                            SettingsLink { Text("偏好设置") }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
                     }
                 } else if discovery.usbDevices.isEmpty {
                     emptyStateRow(
                         icon: "cable.connector.horizontal",
-                        title: "未检测到 USB 连接的 Android 设备",
-                        subtitle: "用任意 USB 数据线连接手机并在开发者选项中开启「USB 调试」，即插即用。"
+                        title: "等待 USB 或无线调试设备接入",
+                        subtitle: "使用数据线连接手机并开启「USB 调试」，即可一键启动大屏桌面。"
                     )
                 } else {
                     ForEach(Array(discovery.usbDevices.enumerated()), id: \.element.id) { index, device in
-                        usbDeviceRow(device)
+                        adbDeviceRow(device)
                         if index < discovery.usbDevices.count - 1 { Divider().padding(.leading, 56) }
                     }
                 }
@@ -139,9 +143,11 @@ public struct DeviceHubView: View {
         }
     }
 
-    private func usbDeviceRow(_ device: AdbDevice) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "iphone.gen3")
+    private func adbDeviceRow(_ device: AdbDevice) -> some View {
+        let readyBadgeText = device.isWirelessAdb ? "已就绪 · 无线调试" : "已就绪 · USB 有线"
+
+        return HStack(spacing: 12) {
+            Image(systemName: device.isWirelessAdb ? "iphone.radiowaves.left.and.right" : "iphone.gen3")
                 .font(.system(size: 20))
                 .foregroundStyle(device.isReady ? Color.accentColor : Color.secondary)
                 .frame(width: 32)
@@ -150,20 +156,20 @@ public struct DeviceHubView: View {
                 HStack(spacing: 8) {
                     Text(device.displayName).font(.body.weight(.medium))
                     StatusBadgeView(
-                        text: device.isWirelessAdb ? "无线 ADB 隧道" : "USB 有线",
-                        color: device.isWirelessAdb ? .blue : .accentColor
+                        text: device.isReady ? readyBadgeText : device.state.displayLabel,
+                        color: device.isReady ? .green : .orange
                     )
-                    StatusBadgeView(text: device.state.displayLabel, color: device.isReady ? .green : .orange)
                 }
                 Text(device.isWirelessAdb
-                    ? "地址：\(device.serial) · 连接成功后自动升级为原生 Wi-Fi TLS 1.3 直连并释放 ADB 隧道"
-                    : "序列号：\(device.serial)")
-                    .font(.caption).foregroundStyle(.secondary)
+                    ? "无线调试地址：\(device.serial) · 连接后自动切换高速无线直连"
+                    : "设备标识：\(device.serial)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            Button("一键连接大屏") { Task { await model.connectWiredUSB(device) } }
+            Button("进入桌面") { Task { await model.connectWiredUSB(device) } }
                 .buttonStyle(.borderedProminent)
                 .disabled(!device.isReady || model.isConnectingFlow)
         }
@@ -178,13 +184,13 @@ public struct DeviceHubView: View {
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
-                Label("无线局域网设备", systemImage: "wifi").font(.headline)
-                Text("Bonjour 自动发现 · TLS 加密").font(.caption).foregroundStyle(.secondary)
+                Label("附近无线设备", systemImage: "wifi").font(.headline)
                 Spacer()
                 HStack(spacing: 5) {
                     Circle().fill(Color.green).frame(width: 7, height: 7)
-                    Text("监听 \(ExtCastProtocol.bonjourServiceType)")
-                        .font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text("自动搜索中")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -192,8 +198,8 @@ public struct DeviceHubView: View {
                 if bonjourDevices.isEmpty {
                     emptyStateRow(
                         icon: "dot.radiowaves.left.and.right",
-                        title: "正在等待局域网内的 Android 手机...",
-                        subtitle: "请在手机端 ExtBridge Helper 的「Mac / 无线大屏」卡片中开启无线大屏服务（默认安全关闭）。"
+                        title: "正在局域网中搜索已开启服务的手机...",
+                        subtitle: "请确保手机与 Mac 处于同一 Wi-Fi，并在手机端开启无线大屏服务。"
                     )
                 } else {
                     ForEach(Array(bonjourDevices.enumerated()), id: \.element.id) { index, device in
@@ -218,20 +224,21 @@ public struct DeviceHubView: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
                     Text(device.displayName).font(.body.weight(.medium))
-                    StatusBadgeView(text: isTrusted ? "已信任" : "需 PIN 配对", color: isTrusted ? .green : .blue)
+                    StatusBadgeView(text: isTrusted ? "已信任" : "需配对", color: isTrusted ? .green : .blue)
                 }
                 HStack(spacing: 8) {
                     if !device.model.isEmpty { Text(device.model) }
                     if !device.fingerprintPrefix.isEmpty {
-                        Text("指纹 \(device.shortFingerprint)").font(.caption.monospaced())
+                        Text("安全指纹 \(device.shortFingerprint)").font(.caption.monospaced())
                     }
                 }
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            Button(isTrusted ? "连接" : "配对并连接") { model.connectBonjourDevice(device) }
+            Button(isTrusted ? "进入桌面" : "配对并连接") { model.connectBonjourDevice(device) }
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isConnectingFlow || model.isProbingManualHost)
         }
@@ -257,7 +264,7 @@ public struct DeviceHubView: View {
                     if model.isProbingManualHost {
                         ProgressView().controlSize(.small)
                     } else {
-                        Text("核验指纹并连接")
+                        Text("连接")
                     }
                 }
                 .buttonStyle(.bordered)
@@ -265,7 +272,7 @@ public struct DeviceHubView: View {
             }
             .padding(.top, 10)
         } label: {
-            Label("手动输入 IP 与端口连接（跨子网或 mDNS 受限时使用）", systemImage: "network")
+            Label("手动输入 IP 地址连接", systemImage: "network")
                 .font(.subheadline.weight(.medium))
                 .foregroundStyle(.secondary)
         }
@@ -276,6 +283,20 @@ public struct DeviceHubView: View {
     private func triggerManualConnect() {
         let port = UInt16(manualPortText.trimmingCharacters(in: .whitespaces)) ?? ExtCastProtocol.defaultWifiPort
         Task { await model.connectManualHost(host: manualHost, port: port) }
+    }
+
+    private func pickAdbBinary() {
+        let panel = NSOpenPanel()
+        panel.title = "选择 adb 可执行文件"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        if panel.runModal() == .OK, let url = panel.url {
+            model.preferences.customAdbPath = url.path
+            model.refreshAdbPath()
+            Task { await model.refreshUSBDevices() }
+        }
     }
 
     // MARK: - Reusable Rows & Banners

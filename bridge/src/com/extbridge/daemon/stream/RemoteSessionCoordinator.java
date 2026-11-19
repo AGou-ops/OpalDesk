@@ -38,6 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class RemoteSessionCoordinator {
     private static final long REMOTE_STATE_PUSH_INTERVAL_MS = 4500L;
+    private static final long WINDOW_ACTION_STATE_SETTLE_MS = 260L;
 
     /** Consistent snapshot of remote stream state for Binder code 15. */
     public static final class RemoteStatusSnapshot {
@@ -409,17 +410,29 @@ public final class RemoteSessionCoordinator {
         return RemoteStreamSink.CODEC_PREF_AUTO_HEVC;
     }
 
+    private void pushDesktopStateNowAndSoon() {
+        pushDesktopDeviceState(true);
+        if (mainHandler != null) {
+            mainHandler.postDelayed(() -> pushDesktopDeviceState(true), WINDOW_ACTION_STATE_SETTLE_MS);
+        }
+    }
+
     private void handleWindowAction(int sessionId, ExtCastProtocol.WindowActionMsg msg) {
         if (msg == null || msg.action.isEmpty()) return;
         RemoteDisplaySession sas = standaloneSessions.get(sessionId);
         DesktopWindowManager wm = taskController.getWindowManager();
         switch (msg.action.toLowerCase(Locale.US)) {
-            case "set_adaptive_single":
-                taskController.setAdaptiveSingleConfig(
-                        msg.hasEnabled ? msg.enabled : wm.isAdaptiveSingleEnabled(),
-                        msg.defaultWidthDp > 0 ? msg.defaultWidthDp : wm.getDefaultSingleWidthDp());
+            case "set_adaptive_single": {
+                boolean enabled = msg.hasEnabled ? msg.enabled : wm.isAdaptiveSingleEnabled();
+                int widthDp = msg.defaultWidthDp > 0 ? msg.defaultWidthDp : wm.getDefaultSingleWidthDp();
+                taskController.setAdaptiveSingleConfig(enabled, widthDp);
+                pushDesktopStateNowAndSoon();
                 break;
-            case "set_single_width": taskController.setSingleWidthPct(msg.pkg, msg.widthPct, msg.remember); break;
+            }
+            case "set_single_width":
+                taskController.setSingleWidthPct(msg.pkg, msg.widthPct, msg.remember);
+                pushDesktopStateNowAndSoon();
+                break;
             case "launch_app":
                 if ("split".equalsIgnoreCase(msg.mode)) {
                     if (PackagePolicy.isValidPackageName(msg.pkg)) {
@@ -429,20 +442,48 @@ public final class RemoteSessionCoordinator {
                     taskController.launchInWindowMode(msg.pkg, msg.cls, DesktopWindowManager.parseModeString(msg.mode),
                             msg.hasBounds ? msg.left : 0, msg.hasBounds ? msg.top : 0, msg.hasBounds ? msg.right : 0, msg.hasBounds ? msg.bottom : 0);
                 }
+                pushDesktopStateNowAndSoon();
                 break;
             case "update_window": {
                 int m = DesktopWindowManager.parseModeString(msg.mode);
                 if (m == DesktopWindowManager.INT_MODE_AUTO) m = DesktopWindowManager.INT_MODE_FREEFORM;
                 taskController.updateWindowBounds(msg.taskId, msg.pkg, m, msg.left, msg.top, msg.right, msg.bottom, msg.remember);
+                pushDesktopStateNowAndSoon();
                 break;
             }
-            case "focus_window": taskController.windowLifecycleAction(msg.taskId, msg.pkg, BridgeProtocol.WIN_ACTION_FOCUS); break;
-            case "minimize_window": taskController.windowLifecycleAction(msg.taskId, msg.pkg, BridgeProtocol.WIN_ACTION_MINIMIZE); break;
-            case "close_window": taskController.windowLifecycleAction(msg.taskId, msg.pkg, BridgeProtocol.WIN_ACTION_CLOSE); break;
+            case "focus_window": {
+                int tid = (msg.taskId > 0) ? msg.taskId : taskController.findTaskIdForPkg(msg.pkg, false);
+                if (tid > 0) {
+                    taskController.windowLifecycleAction(tid, msg.pkg, BridgeProtocol.WIN_ACTION_FOCUS);
+                } else if (PackagePolicy.isValidPackageName(msg.pkg)) {
+                    taskController.switchToTaskOnVd(-1, msg.pkg);
+                }
+                pushDesktopStateNowAndSoon();
+                break;
+            }
+            case "minimize_window": {
+                int tid = (msg.taskId > 0) ? msg.taskId : taskController.findTaskIdForPkg(msg.pkg, false);
+                if (tid > 0) {
+                    wm.setMinimizedTask(tid, true);
+                }
+                taskController.minimizeToExtHome(tid, msg.pkg);
+                pushDesktopStateNowAndSoon();
+                break;
+            }
+            case "close_window": {
+                int tid = (msg.taskId > 0) ? msg.taskId : taskController.findTaskIdForPkg(msg.pkg, false);
+                if (tid <= 0 && PackagePolicy.isValidPackageName(msg.pkg)) {
+                    tid = taskController.findTaskIdForPkg(msg.pkg, true);
+                }
+                taskController.windowLifecycleAction(tid, msg.pkg, BridgeProtocol.WIN_ACTION_CLOSE);
+                pushDesktopStateNowAndSoon();
+                break;
+            }
             case "set_tiling": {
                 int[] ratios = new int[msg.ratios.size()];
                 for (int i = 0; i < msg.ratios.size(); i++) ratios[i] = msg.ratios.get(i);
                 taskController.setTilingLayout(msg.topology, msg.pkgs, ratios);
+                pushDesktopStateNowAndSoon();
                 break;
             }
             case "reload_app_dpi":

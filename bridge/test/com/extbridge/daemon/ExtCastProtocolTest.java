@@ -358,7 +358,7 @@ public class ExtCastProtocolTest {
         assertFalse(legacyDec.isStandaloneApp());
         assertEquals("", legacyDec.appPackage);
 
-        // Full v1.1 DEVICE_STATE
+        // Full v1.1 DEVICE_STATE (18-arg backward-compat defaults tiling lists to empty)
         ExtCastProtocol.DeviceState ds11 = new ExtCastProtocol.DeviceState(
                 "Xiaomi 15 Ultra", DisplaySink.SINK_REMOTE_WIFI_ADB, 0,
                 2560, 1440, 240, 120.0, 0, 18000, 92, false, true,
@@ -372,6 +372,25 @@ public class ExtCastProtocolTest {
         assertEquals("ADAPTIVE_SINGLE", dsDec.activeLayoutMode);
         assertEquals("com.tencent.mm", dsDec.topAppPackage);
         assertEquals("微信", dsDec.topAppLabel);
+        assertTrue(dsDec.tilingSlots.isEmpty());
+        assertTrue(dsDec.tilingRatios.isEmpty());
+
+        // Full v1.1 DEVICE_STATE with active split-screen tiling metadata (20-arg)
+        ExtCastProtocol.DeviceState dsTile = new ExtCastProtocol.DeviceState(
+                "Xiaomi 15 Ultra", DisplaySink.SINK_REMOTE_USB, 0,
+                2560, 1440, 240, 60.0, 0, 16000, 88, false, true,
+                1, true, 460, "SPLIT_2_H", "com.tencent.mm", "微信",
+                Arrays.asList("com.tencent.mm", "com.quark.browser"),
+                Arrays.asList(60, 40));
+        byte[] tileJsonBytes = ExtCastProtocol.encodeDeviceState(dsTile);
+        String tileJson = new String(tileJsonBytes, StandardCharsets.UTF_8);
+        assertTrue(tileJson.contains("\"tilingSlots\""));
+        assertTrue(tileJson.contains("\"tilingRatios\""));
+        ExtCastProtocol.Frame dtf = roundTrip(ExtCastProtocol.TYPE_DEVICE_STATE, 0, 201L, tileJsonBytes);
+        ExtCastProtocol.DeviceState dsTileDec = ExtCastClientTestCodec.decodeDeviceState(dtf.payload);
+        assertEquals("SPLIT_2_H", dsTileDec.activeLayoutMode);
+        assertEquals(Arrays.asList("com.tencent.mm", "com.quark.browser"), dsTileDec.tilingSlots);
+        assertEquals(Arrays.asList(60, 40), dsTileDec.tilingRatios);
 
         // Legacy v1.0 DEVICE_STATE JSON defaults safely
         byte[] legacyDs = "{\"deviceName\":\"Legacy\",\"sinkType\":2}".getBytes(StandardCharsets.UTF_8);
@@ -381,6 +400,8 @@ public class ExtCastProtocolTest {
         assertEquals(460, legacyDsDec.defaultSingleWidthDp);
         assertEquals("FULLSCREEN", legacyDsDec.activeLayoutMode);
         assertEquals("", legacyDsDec.topAppPackage);
+        assertTrue(legacyDsDec.tilingSlots.isEmpty());
+        assertTrue(legacyDsDec.tilingRatios.isEmpty());
     }
 
     @Test
@@ -406,19 +427,27 @@ public class ExtCastProtocolTest {
         assertEquals(tok, upgDec.authToken);
         assertEquals("", upgDec.message);
 
-        // 0x15 APP_LIST
+        // 0x15 APP_LIST (with and without base64 PNG icon)
+        String sampleIconB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         ExtCastProtocol.AppListMsg apps = new ExtCastProtocol.AppListMsg(Arrays.asList(
-                new ExtCastProtocol.AppEntry("com.tencent.mm", "com.tencent.mm.ui.LauncherUI", "微信", true, 123),
+                new ExtCastProtocol.AppEntry("com.tencent.mm", "com.tencent.mm.ui.LauncherUI", "微信", true, 123, sampleIconB64),
                 new ExtCastProtocol.AppEntry("com.quark.browser", "com.ucpro.MainActivity", "夸克", false, -1)));
-        ExtCastProtocol.Frame af = roundTrip(ExtCastProtocol.TYPE_APP_LIST, 0, 303L, ExtCastProtocol.encodeAppList(apps));
+        byte[] appListPayload = ExtCastProtocol.encodeAppList(apps);
+        String appListJson = new String(appListPayload, StandardCharsets.UTF_8);
+        assertTrue("Non-empty icon must serialize as JSON field \"icon\"", appListJson.contains("\"icon\":\"" + sampleIconB64 + "\""));
+        int iconOccurrences = appListJson.split("\"icon\"", -1).length - 1;
+        assertEquals("Empty iconPngBase64 must omit \"icon\" field", 1, iconOccurrences);
+        ExtCastProtocol.Frame af = roundTrip(ExtCastProtocol.TYPE_APP_LIST, 0, 303L, appListPayload);
         ExtCastProtocol.AppListMsg appsDec = ExtCastClientTestCodec.decodeAppList(af.payload);
         assertEquals(2, appsDec.apps.size());
         assertEquals("com.tencent.mm", appsDec.apps.get(0).pkg);
         assertEquals("微信", appsDec.apps.get(0).label);
         assertTrue(appsDec.apps.get(0).runningOnExt);
         assertEquals(123, appsDec.apps.get(0).taskId);
+        assertEquals(sampleIconB64, appsDec.apps.get(0).iconPngBase64);
         assertFalse(appsDec.apps.get(1).runningOnExt);
         assertEquals(-1, appsDec.apps.get(1).taskId);
+        assertEquals("", appsDec.apps.get(1).iconPngBase64);
 
         // 0x2B WINDOW_ACTION: set_tiling with nested pkgs & ratios arrays
         ExtCastProtocol.WindowActionMsg tiling = new ExtCastProtocol.WindowActionMsg(

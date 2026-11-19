@@ -7,6 +7,7 @@ public struct RemoteAppInfo: Decodable, Sendable, Equatable, Identifiable, Hasha
     public var label: String
     public var runningOnExt: Bool
     public var taskId: Int
+    public let iconBase64: String?
 
     public var id: String {
         cls.isEmpty ? pkg : "\(pkg)/\(cls)"
@@ -21,17 +22,20 @@ public struct RemoteAppInfo: Decodable, Sendable, Equatable, Identifiable, Hasha
         cls: String = "",
         label: String = "",
         runningOnExt: Bool = false,
-        taskId: Int = -1
+        taskId: Int = -1,
+        iconBase64: String? = nil
     ) {
         self.pkg = pkg
         self.cls = cls
         self.label = label
         self.runningOnExt = runningOnExt
         self.taskId = taskId
+        self.iconBase64 = iconBase64
     }
 
     private enum CodingKeys: String, CodingKey {
         case pkg, cls, label, runningOnExt, taskId
+        case iconBase64 = "icon"
     }
 
     public init(from decoder: Decoder) throws {
@@ -41,6 +45,7 @@ public struct RemoteAppInfo: Decodable, Sendable, Equatable, Identifiable, Hasha
         label = try c.decodeIfPresent(String.self, forKey: .label) ?? ""
         runningOnExt = try c.decodeIfPresent(Bool.self, forKey: .runningOnExt) ?? false
         taskId = try c.decodeIfPresent(Int.self, forKey: .taskId) ?? -1
+        iconBase64 = try c.decodeIfPresent(String.self, forKey: .iconBase64)
     }
 }
 
@@ -75,6 +80,9 @@ public enum WindowActionKind: String, Codable, Sendable, CaseIterable, Equatable
     case reloadAppDpi = "reload_app_dpi"
     case returnToDesktop = "return_to_desktop"
     case setInputBackend = "set_input_backend"
+    case focusWindow = "focus_window"
+    case minimizeWindow = "minimize_window"
+    case closeWindow = "close_window"
 }
 
 /// Uplink `0x2B WINDOW_ACTION` UTF-8 JSON payload covering adaptive single-window sizing,
@@ -182,6 +190,18 @@ public struct WindowActionPayload: Encodable, Sendable, Equatable {
 
     public static func setInputBackend(_ backend: ExtCastInputBackend) -> WindowActionPayload {
         WindowActionPayload(action: .setInputBackend, backend: backend.rawValue)
+    }
+
+    public static func focusWindow(taskId: Int, pkg: String? = nil) -> WindowActionPayload {
+        WindowActionPayload(action: .focusWindow, pkg: pkg, taskId: taskId)
+    }
+
+    public static func minimizeWindow(taskId: Int, pkg: String? = nil) -> WindowActionPayload {
+        WindowActionPayload(action: .minimizeWindow, pkg: pkg, taskId: taskId)
+    }
+
+    public static func closeWindow(taskId: Int, pkg: String? = nil) -> WindowActionPayload {
+        WindowActionPayload(action: .closeWindow, pkg: pkg, taskId: taskId)
     }
 
     public func encode() throws -> Data {

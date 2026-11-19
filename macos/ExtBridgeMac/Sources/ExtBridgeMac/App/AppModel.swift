@@ -25,6 +25,8 @@ public final class AppModel {
         static let minCanvasDimension: CGFloat = 200
         static let resizeDebounceNs: UInt64 = 300_000_000
         static let remoteDisconnectFlushNs: UInt64 = 60_000_000
+        static let appListRefreshThrottleNs: UInt64 = 1_500_000_000
+        static let postWindowActionRefreshDelayNs: UInt64 = 650_000_000
         static let wirelessAdbMaxLongEdge: Int = 1920
         static let defaultMaxLongEdge: Int = 2560
         static let wirelessAdbMaxBitrateKbps: Int = 10_000
@@ -57,8 +59,11 @@ public final class AppModel {
     public var selectedPreset: DisplayResolutionPreset = .matchWindow
     public var selectedDPI: Int = DisplayPresets.defaultDPI
 
-    // Quick Launcher, modals, transfers & notifications
-    public var isQuickLauncherPresented: Bool = false
+    // DeX overlay panels, split picking, modals, transfers & notifications
+    public var activeDeXPanel: DeXOverlayPanel = .none
+    public var pendingSplitPickSlot: Int? = nil
+    public var pendingSplitSeedSlots: [String] = []
+    public var pendingSplitTargetTopology: ExtCastTilingTopology? = nil
     public var remoteApps: [RemoteAppInfo] = []
     public var isLoadingApps: Bool = false
     public var pairingContext: PairingPromptContext?
@@ -68,11 +73,26 @@ public final class AppModel {
     public var statusMessage: String?
     public var toastNotice: String?
 
+    /// Computed alias keeping `⌘K` and Menu Bar launcher checks synchronized with `activeDeXPanel`.
+    public var isQuickLauncherPresented: Bool {
+        get { activeDeXPanel == .appDrawer }
+        set {
+            if newValue {
+                activeDeXPanel = .appDrawer
+                pendingSplitPickSlot = nil
+            } else if activeDeXPanel == .appDrawer {
+                activeDeXPanel = .none
+            }
+        }
+    }
+
     @ObservationIgnored var activeAdbForward: AdbForwardHandle?
     @ObservationIgnored var activeSessionEndpoint: ExtCastEndpoint?
     @ObservationIgnored var pendingAuth = PendingConnectionAuth()
     @ObservationIgnored var resizeDebounceTask: Task<Void, Never>?
     @ObservationIgnored var toastClearTask: Task<Void, Never>?
+    @ObservationIgnored var delayedAppListRefreshTask: Task<Void, Never>?
+    @ObservationIgnored var lastAppListRequestNs: UInt64 = 0
     @ObservationIgnored var lastRequestedConfig: (width: Int, height: Int, dpi: Int, fps: Int)?
     @ObservationIgnored var lastCanvasSize: CGSize = Tuning.defaultCanvasSize
     @ObservationIgnored var lastBackingScale: CGFloat = 2.0
@@ -93,6 +113,10 @@ public final class AppModel {
         self.clipboardSync = ClipboardSyncManager()
         self.fileSender = FileSender()
         self.popoutManager = PopoutWindowManager()
+        self.deviceState = DeviceStatePayload(
+            adaptiveSingleEnabled: prefs.adaptiveSingleEnabled,
+            defaultSingleWidthDp: prefs.defaultSingleWidthDp
+        )
 
         applyInitialSessionPreferences()
         configureCallbacks()
@@ -286,6 +310,7 @@ public final class AppModel {
 
         resizeDebounceTask?.cancel()
         toastClearTask?.cancel()
+        delayedAppListRefreshTask?.cancel()
         discovery.stop()
         popoutManager.closeAll(sendDisconnect: false)
         clipboardSync.stop()
