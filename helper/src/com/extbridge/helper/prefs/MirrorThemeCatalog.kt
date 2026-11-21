@@ -24,7 +24,9 @@ data class MirrorTheme(
  */
 object MirrorThemeCatalog {
     const val MIRROR_WIDGET_HOST_ID = 0xEB01
+    const val DESKTOP_WIDGET_HOST_ID = 0xEB02
     const val DEFAULT_MIRROR_PRESETS = "clock,battery,wifi,bt,audio,media,screendim"
+    const val DEFAULT_DESKTOP_PRESETS = "clock,battery,perf,netspeed,media,memo"
 
     val MIRROR_THEME_KEYS = arrayOf(
         "night", "oled", "frost", "cyber", "emerald", "amber", "custom",

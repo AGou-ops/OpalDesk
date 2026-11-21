@@ -45,6 +45,15 @@ public final class HelperClientBridge {
         t.setDaemon(true);
         return t;
     });
+    private final ExecutorService statePushExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ExtStatePush");
+        t.setDaemon(true);
+        return t;
+    });
+    private final Object pendingPushLock = new Object();
+    private String pendingWinJson;
+    private long pendingStateSeq = -1L;
+    private boolean statePushScheduled;
 
     private volatile IBinder ctlBinder;
     private volatile IBinder helperProcToken;
@@ -211,10 +220,60 @@ public final class HelperClientBridge {
 
     public void notifyHelperSync() {
         if (config.shuttingDown || !isHelperAlive()) return;
-        bgIoExec.execute(() -> {
+        statePushExec.execute(() -> {
             if (!config.shuttingDown && isHelperAlive()) {
                 callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_STATE, null);
             }
+        });
+    }
+
+    /**
+     * Coalescing zero-roundtrip push of the latest window snapshot JSON and monotonic {@code stateSeq}
+     * directly inside {@code PROVIDER_METHOD_SYNC_STATE}, giving the Helper sub-30ms focus/bounds updates.
+     */
+    public void pushWindowState(String winJson, long stateSeq) {
+        if (config.shuttingDown || !isHelperAlive() || winJson == null) return;
+        boolean shouldSchedule;
+        synchronized (pendingPushLock) {
+            pendingWinJson = winJson;
+            pendingStateSeq = stateSeq;
+            shouldSchedule = !statePushScheduled;
+            statePushScheduled = true;
+        }
+        if (!shouldSchedule) return;
+        statePushExec.execute(() -> {
+            while (!config.shuttingDown && isHelperAlive()) {
+                String json;
+                long seq;
+                synchronized (pendingPushLock) {
+                    json = pendingWinJson;
+                    seq = pendingStateSeq;
+                    pendingWinJson = null;
+                    if (json == null) {
+                        statePushScheduled = false;
+                        return;
+                    }
+                }
+                Bundle extras = new Bundle();
+                extras.putString(BridgeProtocol.EXTRA_SYNC_WIN_JSON, json);
+                extras.putLong(BridgeProtocol.EXTRA_SYNC_STATE_SEQ, seq);
+                callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_STATE, extras);
+            }
+            synchronized (pendingPushLock) {
+                pendingWinJson = null;
+                statePushScheduled = false;
+            }
+        });
+    }
+
+    /** Pushes a global DeX desktop keyboard shortcut action directly to the Helper overlay shell. */
+    public void pushDesktopShortcut(String shortcutAction) {
+        if (config.shuttingDown || !isHelperAlive() || shortcutAction == null || shortcutAction.isEmpty()) return;
+        statePushExec.execute(() -> {
+            if (config.shuttingDown || !isHelperAlive()) return;
+            Bundle extras = new Bundle();
+            extras.putString(BridgeProtocol.EXTRA_SYNC_SHORTCUT, shortcutAction);
+            callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_STATE, extras);
         });
     }
 
@@ -232,6 +291,10 @@ public final class HelperClientBridge {
         ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "10021", "allow");
         ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "ACCESS_RESTRICTED_SETTINGS", "allow");
         ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "SYSTEM_ALERT_WINDOW", "allow");
+        if (Build.VERSION.SDK_INT >= 37) {
+            ShellCommand.runOutput("pm", "grant", BridgeBuildConfig.HELPER_PACKAGE, "android.permission.ACCESS_LOCAL_NETWORK");
+            ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "ACCESS_LOCAL_NETWORK", "allow");
+        }
         AndroidServices.grantBindAppWidgetPermission(BridgeBuildConfig.HELPER_PACKAGE, 0);
     }
 

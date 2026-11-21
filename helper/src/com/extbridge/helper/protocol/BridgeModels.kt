@@ -131,10 +131,21 @@ data class ManagedWindowInfo(
     val bottom: Int,
     val focused: Boolean,
     val minimized: Boolean,
+    val presentation: String = if (mode.equals(BridgeProtocol.LayoutMode.FULLSCREEN, ignoreCase = true)) {
+        BridgeProtocol.WindowPresentation.IMMERSIVE
+    } else {
+        BridgeProtocol.WindowPresentation.FLOATING
+    },
+    val restoreLeft: Int = 0,
+    val restoreTop: Int = 0,
+    val restoreRight: Int = 0,
+    val restoreBottom: Int = 0,
 ) {
     val widthPx: Int get() = max(0, right - left)
     val heightPx: Int get() = max(0, bottom - top)
+    val hasRestoreBounds: Boolean get() = restoreRight > restoreLeft + 120 && restoreBottom > restoreTop + 120
     fun toRect(): Rect = Rect(left, top, right, bottom)
+    fun toRestoreRectOrNull(): Rect? = if (hasRestoreBounds) Rect(restoreLeft, restoreTop, restoreRight, restoreBottom) else null
 }
 
 data class WindowStateSnapshot(
@@ -144,6 +155,8 @@ data class WindowStateSnapshot(
     val tilingTopology: String = BridgeProtocol.LayoutMode.NONE,
     val ratios: List<Int> = emptyList(),
     val windows: List<ManagedWindowInfo> = emptyList(),
+    val stateSeq: Long = 0L,
+    val taskbarAutoHide: Boolean = false,
 )
 
 data class ApplyResult(

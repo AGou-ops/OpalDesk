@@ -19,6 +19,7 @@ import android.widget.TextClock
 import android.widget.TextView
 import com.extbridge.helper.BridgeClient
 import com.extbridge.helper.HyperUi
+import com.extbridge.helper.design.iosglass.LiquidGlassDrawable
 import com.extbridge.helper.overlay.*
 import java.util.Locale
 
@@ -65,8 +66,14 @@ internal object MirrorPresetCardFactory {
     fun makeCardContainer(ctx: Context, theme: BridgeClient.MirrorTheme, compact: Boolean): LinearLayout =
         LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(theme.cardBgColor, ctx.dpF(if (compact) 11f else 14f), 1, theme.cardStrokeColor)
-            setPadDp(if (compact) 9f else 13f, if (compact) 8f else 11f)
+            LiquidGlassDrawable.applyToView(
+                view = this,
+                fillColor = theme.cardBgColor,
+                cornerRadiusPx = ctx.dpF(if (compact) 18f else 22f),
+                strokeWidthPx = ctx.dpF(1f),
+                darkMode = !theme.lightMode,
+            )
+            setPadDp(if (compact) 10f else 14f, if (compact) 9f else 12f)
         }
 
     fun makeLabel(ctx: Context, text: String, sp: Float, color: Int, bold: Boolean = false): TextView =
@@ -79,12 +86,21 @@ internal object MirrorPresetCardFactory {
         TextView(ctx).apply {
             this.text = text; setTextColor(fgColor); setTextSize(TypedValue.COMPLEX_UNIT_SP, if (compact) 11.5f else 12.5f)
             paint.isFakeBoldText = true; gravity = Gravity.CENTER; isSingleLine = true
-            background = roundedBg(bgColor, ctx.dpF(8f), 1, theme.cardStrokeColor)
-            setPadDp(if (compact) 7f else 10f, if (compact) 4f else 6f)
+            LiquidGlassDrawable.applyToView(
+                view = this,
+                fillColor = bgColor,
+                cornerRadiusPx = ctx.dpF(if (compact) 11f else 14f),
+                strokeWidthPx = ctx.dpF(0.85f),
+                darkMode = !theme.lightMode,
+            )
+            setPadDp(if (compact) 8f else 11f, if (compact) 5f else 7f)
             setOnClickListener { onClick() }
         }
 
-    private fun setPillBg(btn: TextView, color: Int) { (btn.background as? GradientDrawable)?.setColor(color) }
+    private fun setPillBg(btn: TextView, color: Int) {
+        (btn.background as? LiquidGlassDrawable)?.baseFillColor = color
+        (btn.background as? GradientDrawable)?.setColor(color)
+    }
 
     private fun makeProgressBar(ctx: Context, tintColor: Int, initProgress: Int = 50): ProgressBar =
         ProgressBar(ctx, null, android.R.attr.progressBarStyleHorizontal).apply {

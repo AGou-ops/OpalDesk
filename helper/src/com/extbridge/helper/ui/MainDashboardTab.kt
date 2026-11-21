@@ -9,10 +9,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.extbridge.helper.design.iosglass.GlassTier
+import com.extbridge.helper.design.iosglass.LiquidGlassSegmentedTabs
+import com.extbridge.helper.design.iosglass.LiquidGlassSurface
+import com.extbridge.helper.design.iosglass.LiquidGlassTheme
+import com.extbridge.helper.design.iosglass.SquircleShape
 import com.extbridge.helper.protocol.BridgeLabels
 import com.extbridge.helper.protocol.BridgeProtocol.InputBackend
 import com.extbridge.helper.protocol.BridgeProtocol.MirrorMode
@@ -86,6 +92,13 @@ private fun DashboardPrimaryColumn(
     val connSummary = BridgeLabels.classifyConnectionSummary(st, ctrl.localLanIp)
 
     if (!allPermsOk) PermissionWarningCard(onOpenPermDialog)
+    if (st.connected && (st.vdId > 0 || st.extId > 0 || st.isRemoteSink)) {
+        ContinuityTrackpadBanner(
+            targetLabel = if (st.isRemoteSink) (st.remotePeerName.ifBlank { "Mac 远程屏" }) else "USB-C 外接屏",
+            resolution = "${st.virtW}×${st.virtH}",
+            onOpenTouchpad = onOpenTouchpad,
+        )
+    }
 
     HeroConnectionCard(
         status = st, summary = connSummary,
@@ -100,10 +113,10 @@ private fun DashboardPrimaryColumn(
     RemoteMacSummaryCard(st, connSummary, ctrl.localLanIp) { ctrl.openRemoteMacSheet() }
 
     SectionHeader("输出模式")
-    TabRowWithContour(
-        tabs = listOf("DeX 扩展桌面", "原生镜像投屏"),
-        selectedTabIndex = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0,
-        onTabSelected = { ctrl.switchOutputMode(if (it == 1) MirrorMode.MIRROR else MirrorMode.DEX) },
+    LiquidGlassSegmentedTabs(
+        items = listOf("电脑桌面模式", "融合边栏镜像"),
+        selectedIndex = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0,
+        onSelect = { ctrl.switchOutputMode(if (it == 1) MirrorMode.MIRROR else MirrorMode.DEX) },
         modifier = Modifier.fillMaxWidth(),
     )
 
@@ -115,7 +128,7 @@ private fun DashboardPrimaryColumn(
 
     if (showJumpCard) {
         val isMirror = st.mirrorMode == MirrorMode.MIRROR
-        Card {
+        LiquidGlassSurface(cornerRadius = 22.dp, contentPadding = PaddingValues(4.dp)) {
             ArrowPreference(
                 title = if (isMirror) "配置镜像布局与融合边栏" else "调节分辨率、DPI 与旋转方向",
                 summary = if (isMirror) {
@@ -130,18 +143,52 @@ private fun DashboardPrimaryColumn(
 }
 
 @Composable
+private fun ContinuityTrackpadBanner(
+    targetLabel: String,
+    resolution: String,
+    onOpenTouchpad: () -> Unit,
+) {
+    val glass = LiquidGlassTheme.colors
+    LiquidGlassSurface(
+        cornerRadius = 24.dp,
+        tier = GlassTier.Thick,
+        tintOverlay = glass.accentBlue.copy(alpha = 0.14f),
+        onClick = onOpenTouchpad,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier.size(42.dp).clip(SquircleShape(14.dp)).background(glass.accentBlue),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(ExtVectorIcons.Touchpad, "Continuity 触控板", tint = Color.White, modifier = Modifier.size(22.dp))
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Continuity 电脑触控板伴侣已就绪", fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = glass.textPrimary, maxLines = 1)
+                Spacer(Modifier.height(2.dp))
+                Text("$targetLabel ($resolution) · 点击化身多指手势触控板与快捷键键盘", fontSize = 12.sp, color = glass.textSecondary, maxLines = 2)
+            }
+            StatusPillBadge("进入伴侣台", glass.accentBlue)
+        }
+    }
+}
+
+@Composable
 private fun PermissionWarningCard(onClick: () -> Unit) {
-    Card(
-        colors = CardDefaults.defaultColors(color = HyperAmber.copy(alpha = 0.14f)),
-        insideMargin = PaddingValues(horizontal = 16.dp, vertical = 13.dp),
-        pressFeedbackType = PressFeedbackType.Sink, showIndication = true, onClick = onClick,
+    val glass = LiquidGlassTheme.colors
+    LiquidGlassSurface(
+        cornerRadius = 22.dp,
+        tintOverlay = HyperAmber.copy(alpha = 0.14f),
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 13.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(ExtVectorIcons.ShieldCheck, null, tint = HyperAmber, modifier = Modifier.size(22.dp))
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text("部分核心权限尚未开启", fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = MiuixTheme.colorScheme.onSurfaceContainer)
-                Text("点击一键核查无障碍、悬浮窗与通知权限", fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+                Text("部分核心权限尚未开启", fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = glass.textPrimary)
+                Text("点击一键核查无障碍、悬浮窗与通知权限", fontSize = 12.sp, color = glass.textSecondary)
             }
             StatusPillBadge("去处理", HyperAmber)
         }
@@ -158,20 +205,23 @@ private fun HeroConnectionCard(
     onDisconnectRemote: () -> Unit,
     onRebuild: () -> Unit,
 ) {
-    Card(
-        cornerRadius = 20.dp, insideMargin = PaddingValues(18.dp),
-        pressFeedbackType = PressFeedbackType.Sink, showIndication = true,
+    val glass = LiquidGlassTheme.colors
+    LiquidGlassSurface(
+        cornerRadius = 26.dp,
+        tier = GlassTier.Thick,
+        elevation = 14.dp,
         onClick = { if (!status.connected) onOpenActivation() else onOpenDiag() },
+        contentPadding = PaddingValues(18.dp),
     ) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text(
                 summary.headline, fontSize = 17.sp, fontWeight = FontWeight.Bold,
-                maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 8.dp),
+                color = glass.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 8.dp),
             )
             StatusPillBadge(summary.badgeLabel, summary.tone.toColor())
         }
         Spacer(Modifier.height(6.dp))
-        Text(summary.detail, fontSize = 13.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary)
+        Text(summary.detail, fontSize = 13.sp, color = glass.textSecondary)
 
         if (status.connected && status.injectStatus == InputBackend.INJECT_STATUS_UHID) {
             Spacer(Modifier.height(10.dp))
@@ -213,6 +263,7 @@ private fun HeroConnectionCard(
 
 @Composable
 private fun RemoteMacSummaryCard(status: DaemonStatus, summary: ConnectionSummary, localLanIp: String, onClick: () -> Unit) {
+    val glass = LiquidGlassTheme.colors
     val (remoteBadge, remoteBadgeColor) = when {
         !status.connected -> "需激活" to HyperAmber
         status.isRemoteSink -> summary.badgeLabel to summary.tone.toColor()
@@ -231,20 +282,21 @@ private fun RemoteMacSummaryCard(status: DaemonStatus, summary: ConnectionSummar
         else -> "开启无线大屏 TLS 服务、获取 6 位配对 PIN 码、调节编码码率与已信任 Mac"
     }
 
-    Card(
-        cornerRadius = 18.dp, insideMargin = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-        pressFeedbackType = PressFeedbackType.Sink, showIndication = true, onClick = onClick,
+    LiquidGlassSurface(
+        cornerRadius = 24.dp,
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
     ) {
         Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Box(
-                modifier = Modifier.size(40.dp).clip(RoundedCornerShape(12.dp)).background(HyperBlue.copy(alpha = 0.14f)),
+                modifier = Modifier.size(42.dp).clip(SquircleShape(14.dp)).background(HyperBlue.copy(alpha = 0.14f)),
                 contentAlignment = Alignment.Center,
             ) { Icon(ExtVectorIcons.LaptopMac, "Mac / 无线大屏", tint = HyperBlue, modifier = Modifier.size(22.dp)) }
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
-                Text("Mac 有线 / 无线大屏中心", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("Mac 有线 / 无线大屏中心", fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = glass.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(2.dp))
-                Text(remoteDetail, fontSize = 12.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(remoteDetail, fontSize = 12.sp, color = glass.textSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
             StatusPillBadge(remoteBadge, remoteBadgeColor)
         }

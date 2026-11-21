@@ -11,7 +11,6 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Canvas
-import android.graphics.Rect
 import android.graphics.drawable.Drawable
 import android.hardware.display.DisplayManager
 import android.media.AudioManager
@@ -26,11 +25,17 @@ import android.provider.Settings
 import android.util.Log
 import android.util.LruCache
 import android.view.MotionEvent
-import android.view.View
-import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Toast
-import com.extbridge.helper.overlay.*
+import com.extbridge.helper.desktop.state.DesktopShellCoordinator
+import com.extbridge.helper.desktop.state.ServiceBridgeCallbacks
+import com.extbridge.helper.overlay.BlackoutOverlayController
+import com.extbridge.helper.overlay.CursorOverlayController
+import com.extbridge.helper.overlay.MirrorSidebarController
+import com.extbridge.helper.overlay.OverlayDisplayContext
+import com.extbridge.helper.overlay.OverlayHost
+import com.extbridge.helper.overlay.OverlaySurfaceHost
+import com.extbridge.helper.overlay.PopoverCoordinator
 import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.protocol.MirrorWingMeta
 import com.extbridge.helper.service.BridgeNotificationBuilder
@@ -46,31 +51,96 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * Foreground service coordinating external display overlays, daemon Binder polling,
- * mDNS remote wireless discovery, and lifecycle delegation across modular overlay controllers.
+ * Foreground service hosting the Liquid Glass × Samsung DeX external desktop shell
+ * ([DesktopShellCoordinator]), Native Mirror sidebars ([MirrorSidebarController]),
+ * Display 0 blackout shield, software cursor, mDNS wireless discovery, and daemon Binder sync.
  */
-class BridgeService : Service(), OverlayHost {
+class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
 
     companion object {
         private const val TAG = "ExtBridgeService"
-        private const val SURFACE_KEY_STAGE_ANIM = "stage_anim"
         private const val POLL_ACTIVE_MS = 2200L
         private const val POLL_IDLE_MS = 6000L
+        private const val A11Y_SYNC_DEBOUNCE_MS = 32L
         private const val RIGHT_CLICK_SYNC_TIMEOUT_MS = 60L
 
         @Volatile private var sInstance: BridgeService? = null
         @Volatile var sUserStopping: Boolean = false
-        private var sLauncherHost: ViewGroup? = null
-        private var sLauncherHostDisplayId: Int = -1
 
         fun isBlackoutActive(): Boolean = sInstance?.blackout?.isBlackoutActive == true
-        fun isDockAutoHideEnabled(ctx: Context?): Boolean = sInstance?.dock?.isDockAutoHide ?: AppPrefs.isDockAutoHide(ctx)
-        fun dismissPanelOnHostTouch(winX: Float, winY: Float) { sInstance?.handleHostTouch(winX, winY) }
-        fun getMirrorWingMeta(wingSlot: Int): MirrorWingMeta? = sInstance?.mirrorController?.getMirrorWingMeta(wingSlot)
+
+        fun isDockAutoHideEnabled(ctx: Context?): Boolean =
+            sInstance?.desktopShell?.isTaskbarAutoHide ?: AppPrefs.isDockAutoHide(ctx)
+
+        fun isDeXShellAttached(displayId: Int): Boolean {
+            val svc = sInstance ?: return false
+            return !svc.isDestroyed && svc.attachedVdId > 0 && svc.attachedVdId == displayId
+        }
+
+        fun isDesktopActive(): Boolean {
+            val svc = sInstance ?: return false
+            val st = svc.lastStatus
+            return !svc.isDestroyed && svc.attachedVdId > 0 && st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX
+        }
+
+        fun toggleAppDrawerFromUi(focusSearch: Boolean = false) {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleAppDrawer(focusSearch) } }
+        }
+
+        fun toggleWindowSwitcherFromUi() {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleWindowSwitcher() } }
+        }
+
+        fun toggleShowDesktopFromUi() {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleShowDesktop() } }
+        }
+
+        fun onPushedWindowSnapshot(winJson: String, stateSeq: Long) {
+            if (sUserStopping || winJson.isEmpty()) return
+            sInstance?.let { svc ->
+                runOnMain(svc.handler) { svc.desktopShell.onPushedWindowSnapshot(winJson, stateSeq) }
+            }
+        }
+
+        fun onDesktopShortcutFromDaemon(action: String) {
+            if (sUserStopping || action.isEmpty()) return
+            sInstance?.let { svc ->
+                runOnMain(svc.handler) { svc.desktopShell.onDesktopShortcut(action) }
+            }
+        }
+
+        fun onA11yWindowStateChanged() {
+            if (sUserStopping) return
+            val svc = sInstance ?: return
+            if (svc.isDestroyed || svc.attachedVdId <= 0) return
+            svc.scheduleFastA11ySync()
+        }
+
+        fun dispatchPhysicalShortcutFromA11y(action: String): Boolean {
+            if (sUserStopping || action.isEmpty()) return false
+            val svc = sInstance ?: return false
+            if (!isDesktopActive()) return false
+            return runOnMainSync(svc.handler, RIGHT_CLICK_SYNC_TIMEOUT_MS, false) {
+                svc.desktopShell.onDesktopShortcut(action)
+            }
+        }
+
+        fun dismissPanelOnHostTouch(winX: Float, winY: Float) {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.onHostTouch(winX, winY) } }
+        }
+
+        fun getMirrorWingMeta(wingSlot: Int): MirrorWingMeta? =
+            sInstance?.mirrorController?.getMirrorWingMeta(wingSlot)
+
         fun renderMirrorWingToCanvas(canvas: Canvas?, dstW: Int, dstH: Int, wingSlot: Int): Boolean =
             sInstance?.mirrorController?.renderMirrorWingToCanvas(canvas, dstW, dstH, wingSlot) ?: false
-        fun onEdgeCaptureFromDaemon(enter: Boolean) { sInstance?.mirrorController?.onEdgeCaptureFromDaemon(enter) }
+
+        fun onEdgeCaptureFromDaemon(enter: Boolean) {
+            sInstance?.mirrorController?.onEdgeCaptureFromDaemon(enter)
+        }
+
         fun resetCapturedMouseMoveState() = MirrorSidebarController.resetCapturedMouseMoveState()
+
         fun handleCapturedPointerEventStatic(ev: MotionEvent?, exec: ExecutorService?, onExitCapture: Runnable?): Boolean =
             MirrorSidebarController.handleCapturedPointerEventStatic(sInstance, ev, exec, onExitCapture)
 
@@ -81,38 +151,39 @@ class BridgeService : Service(), OverlayHost {
                 Thread({ BridgeClient.execSysAction(BridgeClient.SYS_SCREEN_DIM, -1, null) }, "ExtDimToggle").start()
                 return
             }
-            inst.handler.post {
-                val st = inst.lastStatus
-                if (st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR) {
-                    if (inst.blackout.isBlackoutActive) inst.blackout.setDexBlackout(false)
-                    inst.execSysAndRefresh(BridgeClient.SYS_SCREEN_DIM, -1, null)
-                } else {
-                    inst.blackout.toggleDexBlackout()
-                }
-            }
+            inst.handler.post { inst.toggleBlackout() }
         }
 
-        fun performAssignSplitFromUi(slot: Int, taskId: Int, pkg: String?, cls: String?) {
+        fun performAssignSplitFromUi(slot: Int, @Suppress("UNUSED_PARAMETER") taskId: Int, pkg: String?, cls: String?) {
             val inst = sInstance
-            if (inst != null && inst.stageAnimView != null) {
-                val action = if (slot == 0) BridgeClient.SPLIT_ASSIGN_LEFT_TOP else BridgeClient.SPLIT_ASSIGN_RIGHT_BOTTOM
-                inst.handler.post { inst.split.performEnterOrAssignSplitAnimated(action, taskId, pkg, cls) }
-            } else {
-                Thread({
+            if (inst != null && !inst.isDestroyed) {
+                inst.safeBgExecute {
                     BridgeClient.assignSplitSlot(slot, pkg, cls)
-                    inst?.handler?.post { inst.pollRemoteStateAsync() }
-                }, "ExtAssignSplit").start()
+                    inst.safePost { inst.pollRemoteStateAsync() }
+                }
+            } else {
+                Thread({ BridgeClient.assignSplitSlot(slot, pkg, cls) }, "ExtAssignSplit").start()
             }
         }
 
         fun setDockAutoHideEnabled(ctx: Context?, enabled: Boolean) {
             AppPrefs.setDockAutoHide(ctx, enabled)
             val svc = sInstance ?: return
-            runOnMain(svc.handler) {
-                svc.dock.isDockAutoHide = enabled
-                svc.panel.updateDockAutoHideUi()
-                if (!enabled) { svc.dock.cancelAutoHideTimer(); svc.dock.applyDockHiddenAnimated(false) }
-                else svc.dock.evaluateDockAutoHide(false)
+            runOnMain(svc.handler) { svc.desktopShell.setTaskbarAutoHide(enabled) }
+        }
+
+        fun setDefaultLaunchModeFromUi(ctx: Context?, modeIdx: Int) {
+            AppPrefs.setDexDefaultLaunchMode(ctx, modeIdx)
+            val svc = sInstance
+            if (svc != null && !svc.isDestroyed) {
+                runOnMain(svc.handler) { svc.desktopShell.syncDefaultLaunchMode(modeIdx) }
+            } else {
+                val token = when (modeIdx) {
+                    1 -> BridgeClient.LAYOUT_ADAPTIVE_SINGLE
+                    2 -> BridgeClient.LAYOUT_FULLSCREEN
+                    else -> BridgeClient.LAYOUT_FREEFORM
+                }
+                Thread({ BridgeClient.setDesktopPrefs(AppPrefs.isDockAutoHide(ctx), token) }, "ExtDesktopPrefs").start()
             }
         }
 
@@ -130,28 +201,21 @@ class BridgeService : Service(), OverlayHost {
         }
 
         fun moveCursor(x: Float, y: Float, pressing: Boolean) {
-            sInstance?.let { svc -> runOnMain(svc.handler) { svc.cursor.updateCursorOnExt(x, y, pressing) } }
+            sInstance?.let { svc ->
+                runOnMain(svc.handler) { svc.cursor.updateCursorOnExt(x, y, pressing) }
+            }
         }
 
         fun setDockHidden(hidden: Boolean) {
-            sInstance?.let { svc -> runOnMain(svc.handler) { svc.dock.applyDockHidden(hidden) } }
-        }
-
-        fun setLauncherOverlayHost(host: ViewGroup?, displayId: Int) {
-            sLauncherHost = host; sLauncherHostDisplayId = displayId
-            sInstance?.let { svc -> runOnMain(svc.handler) { svc.syncOverlayHostSurface(false) } }
-        }
-
-        fun clearLauncherOverlayHost(host: ViewGroup?) {
-            if (sLauncherHost !== host) return
-            sLauncherHost = null; sLauncherHostDisplayId = -1
-            sInstance?.let { svc -> runOnMain(svc.handler) { svc.syncOverlayHostSurface(false) } }
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.setTaskbarHiddenDirect(hidden) } }
         }
 
         /** Thread-safe right-click target classifier: 1=handled locally, 2=dispatch secondary click, 0=Back. */
         fun classifyRightClickTarget(curX: Int, curY: Int): Int {
             val svc = sInstance ?: return 0
-            return runOnMainSync(svc.handler, RIGHT_CLICK_SYNC_TIMEOUT_MS, 0) { svc.classifyRightClickOnMain(curX, curY) }
+            return runOnMainSync(svc.handler, RIGHT_CLICK_SYNC_TIMEOUT_MS, 0) {
+                svc.desktopShell.classifyRightClick(curX, curY)
+            }
         }
 
         fun stopAllAndExit(ctx: Context?) {
@@ -171,7 +235,8 @@ class BridgeService : Service(), OverlayHost {
                 }
             } else {
                 runLogged("cancel notification") {
-                    (appCtx?.getSystemService(NOTIFICATION_SERVICE) as? NotificationManager)?.cancel(BridgeNotificationBuilder.NOTIFICATION_ID)
+                    (appCtx?.getSystemService(NOTIFICATION_SERVICE) as? NotificationManager)
+                        ?.cancel(BridgeNotificationBuilder.NOTIFICATION_ID)
                 }
             }
             runLogged("finish appTasks") {
@@ -220,7 +285,7 @@ class BridgeService : Service(), OverlayHost {
         }
     }
 
-    // --- OverlayHost State & Coordinators ---
+    // --- Shared Host State ---
     override val serviceContext: Context get() = this
     override lateinit var handler: Handler; private set
     override var displayManager: DisplayManager? = null; private set
@@ -229,48 +294,50 @@ class BridgeService : Service(), OverlayHost {
 
     override val surfaceHost = OverlaySurfaceHost()
     override val popovers = PopoverCoordinator()
-    override val stageChoreographer: StageChoreographer by lazy { StageChoreographer(this) }
-
-    override lateinit var dock: DockOverlayController; private set
-    override lateinit var panel: ControlPanelOverlayController; private set
-    override lateinit var split: SplitScreenOverlayController; private set
-    override lateinit var blackout: BlackoutOverlayController; private set
-    override lateinit var cursor: CursorOverlayController; private set
 
     override var extCtx: Context? = null; private set
     override var extWm: WindowManager? = null; private set
     override var winType: Int = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY; private set
-    override var inLauncherHost: Boolean = false; private set
-    override var overlayW: Int = 0; private set
-    override var overlayH: Int = 0; private set
-    override var overlayDpi: Int = 0; private set
-    override var stageAnimView: StageTransitionView? = null; private set
-    override val launcherHost: ViewGroup? get() = sLauncherHost
 
     @Volatile override var lastStatus: BridgeClient.Status = BridgeClient.Status(); private set
-    @Volatile override var lastWindowSnapshot: BridgeClient.WindowStateSnapshot = BridgeClient.WindowStateSnapshot(); private set
     @Volatile override var lastSysStatus: BridgeClient.SysStatus = BridgeClient.SysStatus(); private set
     @Volatile override var lastMirrorTelemetry: BridgeClient.MirrorTelemetry = BridgeClient.MirrorTelemetry(); private set
     override var batteryPct: Int = 100; private set
     override var batteryCharging: Boolean = false; private set
+    override val isBlackoutActive: Boolean get() = blackout.isBlackoutActive
 
     // Internal service infrastructure
     private var usingA11yOverlay = false
     private var attachedVdId = -1
+    private var a11yFallbackTriedForVdId = -1
+    private var overlayW = 0
+    private var overlayH = 0
+    private var overlayDpi = 0
     private val bgExec: ExecutorService = Executors.newSingleThreadExecutor()
     private val inputBgExec: ExecutorService = Executors.newSingleThreadExecutor()
     private val pollSeq = AtomicLong(0)
     private var nm: NotificationManager? = null
     private lateinit var notifBuilder: BridgeNotificationBuilder
     private var lastObservedA11y = false
-    private var stageAnimLp: WindowManager.LayoutParams? = null
-    private var forceWindowOverlaysDuringAnim = false
     private val iconCache = LruCache<String, Drawable>(48)
     private val labelCache = LruCache<String, String>(64)
 
     private lateinit var remoteDiscovery: RemoteDiscoveryManager
     private lateinit var mirrorController: MirrorSidebarController
-    private lateinit var windowChromeController: WindowChromeOverlayController
+    private lateinit var blackout: BlackoutOverlayController
+    private lateinit var cursor: CursorOverlayController
+    private lateinit var desktopShell: DesktopShellCoordinator
+
+    private val dockPinnedHook: (Context) -> Unit = { safePost { desktopShell.updateTaskbarPinnedApps() } }
+    private val themeChangedHook: (Context) -> Unit = { safePost { desktopShell.refreshTheme() } }
+
+    private val a11ySyncTask = Runnable {
+        if (isDestroyed || attachedVdId <= 0) return@Runnable
+        safeBgExecute {
+            val snap = BridgeClient.getManagedWindows()
+            safePost { desktopShell.onFastWindowSnapshot(snap) }
+        }
+    }
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = safePost { pollRemoteStateAsync() }
@@ -327,15 +394,14 @@ class BridgeService : Service(), OverlayHost {
 
         AppPrefs.onMirrorPrefsChanged = { refreshFromReceiver(it) }
         AppPrefs.onDeleteAppWidgetId = { ctx, prevId -> MirrorSidebarController.deleteAppWidgetId(ctx, prevId) }
+        AppPrefs.onDockPinnedAppsChanged = dockPinnedHook
+        AppPrefs.onThemeModeChanged = themeChangedHook
 
         remoteDiscovery = RemoteDiscoveryManager(this)
-        dock = DockOverlayController(this).apply { isDockAutoHide = AppPrefs.isDockAutoHide(this@BridgeService) }
-        panel = ControlPanelOverlayController(this)
-        split = SplitScreenOverlayController(this)
         mirrorController = MirrorSidebarController(this)
         blackout = BlackoutOverlayController(this)
         cursor = CursorOverlayController(this)
-        windowChromeController = WindowChromeOverlayController(this)
+        desktopShell = DesktopShellCoordinator(this)
 
         notifBuilder.ensureChannel()
         enterForegroundNow(lastStatus)
@@ -351,7 +417,21 @@ class BridgeService : Service(), OverlayHost {
         else @Suppress("DEPRECATION") registerReceiver(sysRx, flt)
         if (sticky != null) readBatteryIntent(sticky)
 
-        NavAssistService.setOnStateChanged { safePost { detachExtOverlays(false); pollRemoteStateAsync() } }
+        NavAssistService.setOnStateChanged {
+            safePost { a11yFallbackTriedForVdId = -1; detachExtOverlays(false); pollRemoteStateAsync() }
+        }
+        surfaceHost.onWmAddViewFailed = { entry, _ ->
+            safePost {
+                if (usingA11yOverlay && attachedVdId > 0 && a11yFallbackTriedForVdId != attachedVdId &&
+                    Settings.canDrawOverlays(this)
+                ) {
+                    Log.w(TAG, "A11y overlay addView failed (${entry.key}) on vd=$attachedVdId; falling back to TYPE_APPLICATION_OVERLAY")
+                    a11yFallbackTriedForVdId = attachedVdId
+                    val cur = lastStatus
+                    if (cur.connected && cur.vdId == attachedVdId) attachExtOverlays(cur, forceAppOverlay = true)
+                }
+            }
+        }
         handler.post(pollTask)
     }
 
@@ -366,6 +446,8 @@ class BridgeService : Service(), OverlayHost {
 
     override fun onDestroy() {
         NavAssistService.setOnStateChanged(null)
+        if (AppPrefs.onDockPinnedAppsChanged === dockPinnedHook) AppPrefs.onDockPinnedAppsChanged = null
+        if (AppPrefs.onThemeModeChanged === themeChangedHook) AppPrefs.onThemeModeChanged = null
         runLogged("unregisterDisplayListener") { displayManager?.unregisterDisplayListener(displayListener) }
         runLogged("unregisterReceiver") { unregisterReceiver(sysRx) }
         handler.removeCallbacksAndMessages(null)
@@ -387,8 +469,11 @@ class BridgeService : Service(), OverlayHost {
     private fun enterForegroundNow(st: BridgeClient.Status) {
         try {
             val n = notifBuilder.build(st, usingA11yOverlay)
-            if (Build.VERSION.SDK_INT >= 34) startForeground(BridgeNotificationBuilder.NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-            else startForeground(BridgeNotificationBuilder.NOTIFICATION_ID, n)
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(BridgeNotificationBuilder.NOTIFICATION_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(BridgeNotificationBuilder.NOTIFICATION_ID, n)
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "startForeground failed", t)
         }
@@ -402,19 +487,24 @@ class BridgeService : Service(), OverlayHost {
         batteryCharging = status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL
     }
 
-    // --- State Polling & Overlay Coordination ---
+    private fun scheduleFastA11ySync() {
+        handler.removeCallbacks(a11ySyncTask)
+        handler.postDelayed(a11ySyncTask, A11Y_SYNC_DEBOUNCE_MS)
+    }
+
+    // --- State Polling & Overlay Attachment ---
 
     override fun pollRemoteStateAsync() {
         if (isDestroyed) return
         val seq = pollSeq.incrementAndGet()
         safeBgExecute {
             val st = BridgeClient.getStatus()
-            val dexActive = st.connected && st.mirrorMode == 0 && st.vdId > 0
-            val tasks = if (dexActive && !st.isRemoteStreaming) BridgeClient.getTasks() else null
+            val dexActive = st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX && st.vdId > 0
+            val tasks = if (dexActive) BridgeClient.getTasks() else null
             val winSnap = if (dexActive) BridgeClient.getManagedWindows() else BridgeClient.WindowStateSnapshot()
-            val needSys = st.connected && (st.vdId > 0 || (st.mirrorMode == 1 && st.sideVdId > 0))
+            val needSys = st.connected && (st.vdId > 0 || (st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR && st.sideVdId > 0))
             val sys = if (needSys) BridgeClient.getSysStatus() else lastSysStatus
-            val inMirrorSide = st.connected && st.mirrorMode == 1 && st.sideVdId > 0
+            val inMirrorSide = st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR && st.sideVdId > 0
             val mt = if (inMirrorSide) BridgeClient.getMirrorTelemetry() else lastMirrorTelemetry
             if (inMirrorSide) mirrorController.sampleMirrorLocalMetrics()
             safePost { if (seq == pollSeq.get()) applyStateOnUi(st, tasks, sys, mt, winSnap) }
@@ -422,11 +512,14 @@ class BridgeService : Service(), OverlayHost {
     }
 
     private fun applyStateOnUi(
-        st: BridgeClient.Status, tasks: List<BridgeClient.TaskEntry>?,
-        sys: BridgeClient.SysStatus?, mt: BridgeClient.MirrorTelemetry?, winSnap: BridgeClient.WindowStateSnapshot,
+        st: BridgeClient.Status,
+        tasks: List<BridgeClient.TaskEntry>?,
+        sys: BridgeClient.SysStatus?,
+        mt: BridgeClient.MirrorTelemetry?,
+        winSnap: BridgeClient.WindowStateSnapshot,
     ) {
         if (isDestroyed) return
-        lastStatus = st; lastWindowSnapshot = winSnap
+        lastStatus = st
         if (sys != null && sys.valid) lastSysStatus = sys
         if (mt != null && mt.valid) lastMirrorTelemetry = mt
 
@@ -435,7 +528,7 @@ class BridgeService : Service(), OverlayHost {
         notifBuilder.notifyIfChanged(st, usingA11yOverlay)
 
         val a11yNow = NavAssistService.isRunning()
-        if (st.connected && st.mirrorMode == 1) {
+        if (st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR) {
             if (blackout.isBlackoutActive) blackout.setDexBlackout(false)
             detachExtOverlays(false)
             mirrorController.syncOnMirrorMode(st, a11yNow, lastObservedA11y)
@@ -445,16 +538,7 @@ class BridgeService : Service(), OverlayHost {
         mirrorController.detachAll()
         if (!st.connected || st.vdId <= 0) {
             if (blackout.isBlackoutActive) blackout.setDexBlackout(false)
-            detachExtOverlays(false); return
-        }
-        // In Remote Mac DeX mode, ExtBridgeMac renders the native taskbar, App Drawer,
-        // Quick Settings panel, and split seam divider. Keep Display 0 blackout and
-        // remoteDiscovery running while detaching Android-side external overlays.
-        if (st.isRemoteStreaming) {
-            if (attachedVdId != -1 || extCtx != null || stageAnimView != null) {
-                detachExtOverlays(keepBlackout = true)
-            }
-            lastObservedA11y = a11yNow
+            detachExtOverlays(false)
             return
         }
         if (!a11yNow && !Settings.canDrawOverlays(this)) return
@@ -463,60 +547,48 @@ class BridgeService : Service(), OverlayHost {
         if (st.vdId != attachedVdId || a11yNow != lastObservedA11y || targetDpi != overlayDpi) {
             attachExtOverlays(st)
         } else if (st.virtW != overlayW || st.virtH != overlayH) {
-            handleOverlayBoundsChanged(st)
+            overlayW = st.virtW; overlayH = st.virtH
+            desktopShell.onDisplayBoundsChanged(st.virtW, st.virtH, targetDpi)
         }
 
-        val topExt = tasks?.firstOrNull { it.isTopExt() }
-        dock.isOnLauncherHome = inLauncherHost || (tasks != null && (topExt == null || OverlayConstants.HELPER_PKG == topExt.pkg))
-
-        updateInputToggleUi(st.inputToExt)
-        if (tasks != null) dock.updateTaskStrip(tasks)
-        refreshLocalHardwareViews()
-        refreshSysViews()
-        panel.updateStatusChips(st)
-        split.updateSplitUi(st)
-        windowChromeController.updateFromState(st, winSnap, tasks)
-        dock.evaluateDockAutoHide(false)
+        desktopShell.onDaemonPollUpdate(st, winSnap, tasks, lastSysStatus, computeVolumeLevel())
     }
 
-    private fun handleOverlayBoundsChanged(st: BridgeClient.Status) {
-        overlayW = st.virtW; overlayH = st.virtH; dock.clearTaskSignature()
-        stageAnimLp?.let { lp ->
-            lp.width = max(OverlayConstants.MIN_SURFACE_PX, overlayW)
-            lp.height = max(OverlayConstants.MIN_SURFACE_PX, overlayH)
-            surfaceHost.updateWindowLayout(stageAnimView, lp, extWm)
-        }
-        repositionInteractiveSurfaces()
-        windowChromeController.onOverlayBoundsChanged()
-    }
-
-    private fun attachExtOverlays(st: BridgeClient.Status) {
+    private fun attachExtOverlays(st: BridgeClient.Status, forceAppOverlay: Boolean = false) {
         detachExtOverlays(true)
         val target = displayManager?.displays?.firstOrNull { it.displayId == st.vdId } ?: return
         val targetDpi = BridgeClient.computeOverlayDpi(st.virtW, st.virtH, st.virtDpi)
         lastObservedA11y = NavAssistService.isRunning()
+        val preferA11y = !forceAppOverlay && a11yFallbackTriedForVdId != st.vdId
 
-        val primary = OverlayDisplayContext.resolve(this, target, targetDpi, preferA11y = true) ?: return
+        val primary = OverlayDisplayContext.resolve(
+            this, target, targetDpi, preferA11y = preferA11y, requireTrustedDisplayForA11y = true,
+        ) ?: return
         if (!tryAttach(primary, st) && primary.isA11yOverlay && Settings.canDrawOverlays(this)) {
+            a11yFallbackTriedForVdId = st.vdId
             OverlayDisplayContext.resolve(this, target, targetDpi, preferA11y = false)?.let { tryAttach(it, st) }
         }
     }
 
     private fun tryAttach(resolved: OverlayDisplayContext, st: BridgeClient.Status): Boolean = try {
         val uiCtx = resolved.uiContext
-        extCtx = uiCtx; extWm = resolved.windowManager; winType = resolved.windowType
-        usingA11yOverlay = resolved.isA11yOverlay; attachedVdId = st.vdId
-        overlayW = st.virtW; overlayH = st.virtH; overlayDpi = resolved.targetDpi
-        dock.clearTaskSignature()
+        extCtx = uiCtx
+        extWm = resolved.windowManager
+        winType = resolved.windowType
+        usingA11yOverlay = resolved.isA11yOverlay
+        attachedVdId = st.vdId
+        overlayW = st.virtW
+        overlayH = st.virtH
+        overlayDpi = resolved.targetDpi
 
-        buildStageAnimOverlay(uiCtx, st)
-        split.buildSplitOverlays(uiCtx)
-        dock.buildDockOverlays(uiCtx, st)
-        panel.buildPanelOverlay(uiCtx, st)
-        windowChromeController.buildOverlays(uiCtx, st)
+        desktopShell.attach(uiCtx, st)
         cursor.buildCursorOverlay(uiCtx, st)
-        syncOverlayHostSurface(true)
-        notifBuilder.resetSignature(); notifBuilder.notifyIfChanged(st, usingA11yOverlay)
+        // Attach all registered surfaces once in exact OverlayLayer Z-order (CURSOR topmost)
+        surfaceHost.reattachAll(inLauncher = false, launcherHost = null, wm = extWm)
+
+        LauncherActivity.notifyOverlayStateChanged()
+        notifBuilder.resetSignature()
+        notifBuilder.notifyIfChanged(st, usingA11yOverlay)
         true
     } catch (t: Throwable) {
         Log.w(TAG, "attachExtOverlays failed (a11y=${resolved.isA11yOverlay})", t)
@@ -524,93 +596,25 @@ class BridgeService : Service(), OverlayHost {
         false
     }
 
-    private fun buildStageAnimOverlay(ctx: Context, st: BridgeClient.Status) {
-        val anim = StageTransitionView(ctx)
-        val lp = OverlayWindowParams.fullscreenNonTouchable(
-            max(OverlayConstants.MIN_SURFACE_PX, st.virtW), max(OverlayConstants.MIN_SURFACE_PX, st.virtH), winType,
-        )
-        stageAnimView = anim; stageAnimLp = lp
-        surfaceHost.register(
-            OverlaySurfaceHost.SurfaceEntry(SURFACE_KEY_STAGE_ANIM, OverlayLayer.STAGE_ANIM, anim, lp, canDetachForReorder = { !anim.isAnimating() }),
-        )
-    }
-
-    private fun shouldHostInLauncher(): Boolean {
-        if (lastStatus.isRemoteStreaming) return false
-        val hasManagedFg = lastWindowSnapshot.windows.any { !it.minimized && !OverlayConstants.isSystemOrLauncherPkg(it.pkg) }
-        return !forceWindowOverlaysDuringAnim &&
-            stageAnimView?.isAnimating() != true &&
-            !usingA11yOverlay && attachedVdId > 0 && sLauncherHost != null &&
-            sLauncherHostDisplayId == attachedVdId && !lastStatus.isMultiTilingActive &&
-            !BridgeClient.isTilingTopology(lastWindowSnapshot.tilingTopology) && !hasManagedFg
-    }
-
-    override fun syncOverlayHostSurface(forceAttach: Boolean) {
-        val dockRoot = dock.dockRoot ?: return
-        if (extCtx == null) return
-        val wantHost = shouldHostInLauncher()
-        if (!forceAttach && wantHost == inLauncherHost) {
-            val p = dockRoot.parent
-            if (if (wantHost) p === sLauncherHost else (p != null && p !is ViewGroup)) return
-        }
-        split.resetClosedVisualsBeforeHostSwap()
-        dock.resetClosedVisualsBeforeHostSwap()
-        panel.resetClosedVisualsBeforeHostSwap()
-
-        inLauncherHost = wantHost
-        surfaceHost.reattachAll(wantHost, sLauncherHost, extWm)
-        repositionInteractiveSurfaces()
-        if (wantHost) sLauncherHost?.post { if (inLauncherHost) repositionInteractiveSurfaces() }
-        dock.evaluateDockAutoHide(false)
-    }
-
-    private fun repositionInteractiveSurfaces() {
-        dock.syncDockEdgeVisibility()
-        dock.repositionDock()
-        split.repositionSplitDivider()
-        split.repositionSplitMenu()
-        dock.repositionTaskBubbleIfOpen()
-        panel.repositionIfOpen()
-    }
-
-    private fun classifyRightClickOnMain(curX: Int, curY: Int): Int {
-        if (popovers.isAnyOpen()) { popovers.dismissAll(); return 1 }
-        val st = lastStatus
-        if (st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_DEX) {
-            val dockRoot = dock.dockRoot
-            if (!dock.isDockHidden && dockRoot != null && dockRoot.visibility == View.VISIBLE) {
-                if (OverlayUiUtils.isPointInViewOnScreen(dock.taskStrip, curX.toFloat(), curY.toFloat())) return 2
-                if (OverlayUiUtils.isPointInViewOnScreen(dock.btnDockSplit, curX.toFloat(), curY.toFloat())) {
-                    split.toggleSplitMenu(); return 1
-                }
-            }
-            if ((dock.isOnLauncherHome || st.splitActive == 1) && LauncherActivity.shouldConsumeRightClickAt(curX, curY)) return 2
-        }
-        return 0
-    }
-
-    private fun handleHostTouch(winX: Float, winY: Float) {
-        if (!inLauncherHost) return
-        if (panel.isOpen && !panel.isPointInCard(winX, winY) && !OverlayUiUtils.isPointInView(dock.trayBtn, winX, winY)) panel.dismiss()
-        if (dock.isTaskBubbleOpen() && !dock.isPointInTaskBubbleCard(winX, winY)) dock.dismissTaskBubble()
-        windowChromeController.dismissMenus()
-    }
-
     private fun detachExtOverlays(keepBlackout: Boolean) {
-        dock.cancelAutoHideTimer()
+        handler.removeCallbacks(a11ySyncTask)
         if (!keepBlackout) {
             if (blackout.isBlackoutActive) blackout.setDexBlackout(false) else blackout.removeBlackoutOverlay()
         }
-        stageAnimView?.cancelActiveAnimation(); forceWindowOverlaysDuringAnim = false
-        windowChromeController.detach(); split.detach(); dock.detach(); panel.detach(); cursor.detach()
-        surfaceHost.detachAll(extWm); popovers.clear()
+        desktopShell.detach()
+        cursor.detach()
+        surfaceHost.detachAll(extWm)
+        popovers.clear()
 
-        inLauncherHost = false; extWm = null; extCtx = null; usingA11yOverlay = false
+        extWm = null; extCtx = null; usingA11yOverlay = false
         winType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-        stageAnimView = null; stageAnimLp = null; attachedVdId = -1; overlayW = 0; overlayH = 0; overlayDpi = 0
+        attachedVdId = -1; overlayW = 0; overlayH = 0; overlayDpi = 0
+        LauncherActivity.notifyOverlayStateChanged()
     }
 
-    private fun computeVolumeIconLevel(): Int {
+    // --- Shared Callbacks (OverlayHost + ServiceBridgeCallbacks) ---
+
+    override fun computeVolumeLevel(): Int {
         var muted = false; var volPct = 50
         audioManager?.let { am ->
             val maxVol = max(1, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC))
@@ -623,17 +627,25 @@ class BridgeService : Service(), OverlayHost {
     }
 
     private fun refreshLocalHardwareViews() {
-        val lvl = computeVolumeIconLevel()
-        dock.refreshLocalHardwareViews(lvl); panel.refreshLocalHardwareViews(lvl)
+        desktopShell.refreshHardware(computeVolumeLevel(), lastSysStatus)
         mirrorController.refreshMirrorSideViewsIfAttached()
     }
 
-    private fun refreshSysViews() {
-        val sys = lastSysStatus
-        if (sys.valid) { dock.refreshSysViews(sys); panel.refreshSysViews(sys) }
-    }
+    override fun onBlackoutStateChanged() = refreshLocalHardwareViews()
+    override fun onCursorMoved(x: Float, y: Float) = desktopShell.onCursorMoved(x, y)
+    override fun onHardwareRefreshRequested() = refreshLocalHardwareViews()
+    override fun requestFullPoll() = pollRemoteStateAsync()
+    override fun bringCursorToFront() = cursor.bringCursorToFront()
 
-    // --- OverlayHost Service Capabilities ---
+    override fun toggleBlackout() {
+        val st = lastStatus
+        if (st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR) {
+            if (blackout.isBlackoutActive) blackout.setDexBlackout(false)
+            execSysAndRefresh(BridgeClient.SYS_SCREEN_DIM, -1, null)
+        } else {
+            blackout.toggleDexBlackout()
+        }
+    }
 
     override fun safeBgExecute(r: Runnable) = executeSafe(bgExec, "bgExec", r)
     override fun safeInputExecute(r: Runnable) = executeSafe(inputBgExec, "inputBgExec", r)
@@ -645,10 +657,7 @@ class BridgeService : Service(), OverlayHost {
         catch (t: RejectedExecutionException) { Log.d(TAG, "$name rejected task during shutdown: ${t.message}") }
     }
 
-    override fun beginWindowOverlayStage() { forceWindowOverlaysDuringAnim = true; syncOverlayHostSurface(false); cursor.bringCursorToFront() }
-    override fun endWindowOverlayStage() { forceWindowOverlaysDuringAnim = false; syncOverlayHostSurface(false); cursor.bringCursorToFront() }
-
-    override fun cloneDrawable(d: Drawable?): Drawable? = try {
+    private fun cloneDrawable(d: Drawable?): Drawable? = try {
         d?.constantState?.newDrawable(resources)?.mutate() ?: d
     } catch (t: Throwable) { Log.d(TAG, "cloneDrawable fallback: ${t.message}"); d }
 
@@ -661,24 +670,11 @@ class BridgeService : Service(), OverlayHost {
     override fun getCachedLabel(pm: PackageManager, pkg: String): String {
         labelCache.get(pkg)?.let { return it }
         return try {
-            pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString().also { if (it.isNotEmpty()) labelCache.put(pkg, it) }.ifEmpty { pkg }
+            pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                .also { if (it.isNotEmpty()) labelCache.put(pkg, it) }
+                .ifEmpty { pkg }
         } catch (t: Throwable) { Log.d(TAG, "getApplicationLabel($pkg) failed: ${t.message}"); pkg }
     }
-
-    override fun buildCardSpec(pkg: String?, snap: BridgeClient.TaskSnapshotData?, startR: Rect, endR: Rect) =
-        StageTransitionView.CardSpec().apply {
-            if (snap?.bitmap != null) { snapshot = snap.bitmap; ownSnapshot = snap.ownBitmap }
-            if (!pkg.isNullOrEmpty() && OverlayConstants.HELPER_PKG != pkg) {
-                icon = getCachedIcon(packageManager, pkg); label = getCachedLabel(packageManager, pkg)
-            } else { label = "扩展桌面" }
-            setRects(startR, endR)
-        }
-
-    override fun setDockAutoHideEnabled(enabled: Boolean) = setDockAutoHideEnabled(this, enabled)
-    override fun updateSplitButtons(splitActive: Boolean) { dock.updateDockSplitButton(splitActive); panel.updateSplitButton(splitActive) }
-    override fun updateInputToggleUi(inputToExt: Int) { dock.updateInputToggleUi(inputToExt); panel.updateInputToggleUi(inputToExt) }
-    override fun onLocalHardwareRefreshRequested() = refreshLocalHardwareViews()
-    override fun refreshTrayIconsOnly() { val lvl = computeVolumeIconLevel(); dock.refreshVolumeIconOnly(lvl); panel.refreshVolumeIconOnly(lvl) }
 
     override fun openExtSettings(action: String) {
         popovers.dismissAll()
@@ -706,7 +702,10 @@ class BridgeService : Service(), OverlayHost {
                 handler.postDelayed({
                     safeBgExecute {
                         val sys = BridgeClient.getSysStatus()
-                        safePost { if (sys.valid) lastSysStatus = sys; refreshSysViews(); mirrorController.refreshMirrorSideViewsIfAttached() }
+                        safePost {
+                            if (sys.valid) lastSysStatus = sys
+                            refreshLocalHardwareViews()
+                        }
                     }
                 }, 220L)
             }

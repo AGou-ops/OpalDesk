@@ -29,7 +29,9 @@ object AdbProcessRunner {
 
     fun getAdbFile(ctx: Context): File = File(ctx.applicationInfo.nativeLibraryDir, "libadb.so")
 
-    fun isNativeAdbAvailable(ctx: Context): Boolean = getAdbFile(ctx).let { it.exists() && it.canExecute() }
+    fun isNativeAdbAvailable(ctx: Context): Boolean = getAdbFile(ctx).let {
+        it.exists() && it.canExecute() && (!it.canWrite() || it.absolutePath.startsWith("/data/app/"))
+    }
 
     fun getPrivateAdbSocketFile(ctx: Context): File {
         val sockDir = File(ctx.cacheDir, "asrv").apply {

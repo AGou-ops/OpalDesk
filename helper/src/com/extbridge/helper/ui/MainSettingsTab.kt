@@ -47,7 +47,7 @@ fun SettingsPage(
                 SectionHeader("扩展桌面行为")
                 Card {
                     SwitchPreference(
-                        title = "Dock 栏自动隐藏", summary = "进入应用后闲置自动收起底部 Dock，鼠标移至底边唤醒",
+                        title = "底部 DeX 任务栏自动隐藏", summary = "进入应用后自动收起底部任务栏，鼠标移至底边瞬时唤醒",
                         checked = ctrl.dockAutoHide,
                         onCheckedChange = { ctrl.dockAutoHide = it; BridgeService.setDockAutoHideEnabled(ctx, it) },
                     )

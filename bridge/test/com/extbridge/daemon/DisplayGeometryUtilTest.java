@@ -1,5 +1,6 @@
 package com.extbridge.daemon;
 
+import com.extbridge.daemon.ipc.BridgeProtocol;
 import org.junit.Test;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -104,5 +105,30 @@ public class DisplayGeometryUtilTest {
         float[] dexPt = DisplayGeometryUtil.mapStreamPointToDisplay(2000f, -10f, 1920, 1080, 1920, 1080, false);
         assertEquals(1919f, dexPt[0], 0.01f);
         assertEquals(0f, dexPt[1], 0.01f);
+    }
+
+    @Test
+    public void testUnifiedWorkAreaAndMirrorPlacementModes() {
+        DisplayGeometryUtil.WorkArea waPinned = DisplayGeometryUtil.computeDesktopWorkArea(2560, 1440, 160, false);
+        assertEquals(8, waPinned.left);
+        assertEquals(8, waPinned.top);
+        assertEquals(2552, waPinned.right);
+        assertEquals(1440 - 72, waPinned.bottom);
+
+        DisplayGeometryUtil.WorkArea waAutoHide = DisplayGeometryUtil.computeDesktopWorkArea(2560, 1440, 160, true);
+        assertEquals(1440 - 8, waAutoHide.bottom);
+
+        // Portrait 1080x2400 phone mirrored onto 1920x1080 canvas -> fit = 0.45 -> mirW = 486, mirH = 1080
+        int[] centerDual = DisplayGeometryUtil.computeMirrorPlacement(
+                1080, 2400, 1920, 1080, BridgeProtocol.MIRROR_SIDE_CENTER_DUAL);
+        assertArrayEquals(new int[]{(1920 - 486) / 2, 0, 486, 1080}, centerDual);
+
+        int[] alignLeft = DisplayGeometryUtil.computeMirrorPlacement(
+                1080, 2400, 1920, 1080, BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT);
+        assertArrayEquals(new int[]{0, 0, 486, 1080}, alignLeft);
+
+        int[] alignRight = DisplayGeometryUtil.computeMirrorPlacement(
+                1080, 2400, 1920, 1080, BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT);
+        assertArrayEquals(new int[]{1920 - 486, 0, 486, 1080}, alignRight);
     }
 }

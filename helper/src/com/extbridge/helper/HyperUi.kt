@@ -8,9 +8,9 @@ import android.graphics.Path
 import android.graphics.PixelFormat
 import android.graphics.RectF
 import android.graphics.drawable.Drawable
-import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.widget.TextView
+import com.extbridge.helper.design.iosglass.LiquidGlassDrawable
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
@@ -18,24 +18,27 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 
 /**
- * Shared Xiaomi HyperOS 2.0 visual tokens and anti-aliased vector icon drawables
- * for Android View-based peripheral overlays (BridgeService Dock/Flyout/Split/Sidebar,
- * LauncherActivity desktop bar, and SideControlActivity).
+ * Shared iOS Liquid Glass visual tokens and anti-aliased vector icon drawables
+ * for Android View-based peripheral overlays (Menu Bar, Dock, Control Center,
+ * Window Chrome, and Mirror StandBy Cards).
  */
 object HyperUi {
-    // HyperOS 2.0 Signature Palette (aligned with ExtMiuixComponents)
-    const val HYPER_BLUE: Int = 0xFF0D84FF.toInt()
-    const val HYPER_RED: Int = 0xFFE94634.toInt()
-    const val HYPER_GREEN: Int = 0xFF28C76F.toInt()
+    // iOS Liquid Glass Frosted Palette (冰透毛玻璃 + 连续曲率大圆角)
+    const val HYPER_BLUE: Int = 0xFF007AFF.toInt()
+    const val HYPER_RED: Int = 0xFFFF3B30.toInt()
+    const val HYPER_GREEN: Int = 0xFF34C759.toInt()
 
-    const val FLYOUT_BG: Int = 0xF2191B20.toInt()
-    const val FLYOUT_STROKE: Int = 0x26FFFFFF
-    const val DOCK_BG: Int = 0xEB181A20.toInt()
-    const val DOCK_STROKE: Int = 0x28FFFFFF
-    const val TILE_INACTIVE: Int = 0xFF2A2D35.toInt()
-    const val CHIP_INACTIVE: Int = 0xFF262931.toInt()
-    const val CHIP_ACTIVE_BG: Int = 0x330D84FF
-    private const val CHIP_ACTIVE_STROKE: Int = 0x770D84FF
+    const val TEXT_PRIMARY: Int = 0xFF11141C.toInt()
+    const val TEXT_SECONDARY: Int = 0xFF5B6272.toInt()
+    const val DIVIDER: Int = 0x180F172A
+
+    const val FLYOUT_BG: Int = 0xCCF9FBFF.toInt()
+    const val FLYOUT_STROKE: Int = 0xDCFFFFFF.toInt()
+    const val DOCK_BG: Int = 0xC2F8FAFF.toInt()
+    const val DOCK_STROKE: Int = 0xDCFFFFFF.toInt()
+    const val TILE_INACTIVE: Int = 0x8CF6F9FF.toInt()
+    const val CHIP_INACTIVE: Int = 0x7AF4F7FE.toInt()
+    const val CHIP_ACTIVE_BG: Int = 0xFF007AFF.toInt()
 
     // Vector Icon Kinds
     const val ICON_DEX = 1
@@ -79,6 +82,14 @@ object HyperUi {
     const val ICON_VOLUME_LOW = 46
     const val ICON_VOLUME_HIGH = 47
 
+    // Samsung DeX window chrome & taskbar vector icons
+    const val ICON_MAXIMIZE = 50
+    const val ICON_RESTORE = 51
+    const val ICON_MORE = 52
+    const val ICON_HOME_NAV = 53
+    const val ICON_RECENTS_NAV = 54
+    const val ICON_SHOW_DESKTOP = 55
+
     fun dp(ctx: Context, v: Float): Int = max(
         1,
         TypedValue.applyDimension(
@@ -112,19 +123,22 @@ object HyperUi {
     fun styleHyperChip(tv: TextView?, active: Boolean) {
         if (tv == null) return
         val ctx = tv.context
-        val bg = (tv.background as? GradientDrawable) ?: GradientDrawable().also {
-            tv.background = it
-        }
-        bg.cornerRadius = dp(ctx, 13f).toFloat()
-        if (active) {
-            bg.setColor(CHIP_ACTIVE_BG)
-            bg.setStroke(dp(ctx, 1f), CHIP_ACTIVE_STROKE)
-            tv.setTextColor(0xFFFFFFFF.toInt())
+        val radiusPx = dp(ctx, 16f).toFloat()
+        val fill = if (active) CHIP_ACTIVE_BG else CHIP_INACTIVE
+        val existing = tv.background as? LiquidGlassDrawable
+        if (existing != null) {
+            existing.baseFillColor = fill
+            existing.darkMode = active
         } else {
-            bg.setColor(CHIP_INACTIVE)
-            bg.setStroke(dp(ctx, 1f), 0x1EFFFFFF)
-            tv.setTextColor(0xFFD8DEE9.toInt())
+            LiquidGlassDrawable.applyToView(
+                view = tv,
+                fillColor = fill,
+                cornerRadiusPx = radiusPx,
+                strokeWidthPx = dp(ctx, 1f).toFloat(),
+                darkMode = active,
+            )
         }
+        tv.setTextColor(if (active) 0xFFFFFFFF.toInt() else TEXT_PRIMARY)
     }
 
     private class VectorIconDrawable(
@@ -436,6 +450,40 @@ object HyperUi {
                             c.drawArc(rect, -52f, 104f, false, paint)
                         }
                     }
+                }
+                ICON_MAXIMIZE -> {
+                    rect.set(w * 0.22f, h * 0.22f, w * 0.78f, h * 0.78f)
+                    c.drawRoundRect(rect, s * 0.14f, s * 0.14f, paint)
+                }
+                ICON_RESTORE -> {
+                    rect.set(w * 0.20f, h * 0.30f, w * 0.68f, h * 0.78f)
+                    c.drawRoundRect(rect, s * 0.12f, s * 0.12f, paint)
+                    path.moveTo(w * 0.34f, h * 0.28f)
+                    path.lineTo(w * 0.34f, h * 0.20f)
+                    path.lineTo(w * 0.80f, h * 0.20f)
+                    path.lineTo(w * 0.80f, h * 0.66f)
+                    path.lineTo(w * 0.70f, h * 0.66f)
+                    c.drawPath(path, paint)
+                }
+                ICON_MORE -> {
+                    paint.style = Paint.Style.FILL
+                    val r = max(1.6f, s * 0.085f)
+                    c.drawCircle(w * 0.26f, cy, r, paint)
+                    c.drawCircle(cx, cy, r, paint)
+                    c.drawCircle(w * 0.74f, cy, r, paint)
+                }
+                ICON_HOME_NAV -> {
+                    c.drawCircle(cx, cy, s * 0.30f, paint)
+                }
+                ICON_RECENTS_NAV -> {
+                    c.drawLine(w * 0.28f, h * 0.24f, w * 0.28f, h * 0.76f, paint)
+                    c.drawLine(cx, h * 0.24f, cx, h * 0.76f, paint)
+                    c.drawLine(w * 0.72f, h * 0.24f, w * 0.72f, h * 0.76f, paint)
+                }
+                ICON_SHOW_DESKTOP -> {
+                    rect.set(w * 0.16f, h * 0.22f, w * 0.84f, h * 0.78f)
+                    c.drawRoundRect(rect, s * 0.14f, s * 0.14f, paint)
+                    c.drawLine(w * 0.16f, h * 0.64f, w * 0.84f, h * 0.64f, paint)
                 }
             }
             c.restore()

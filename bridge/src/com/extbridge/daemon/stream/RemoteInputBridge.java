@@ -8,6 +8,7 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 
 import com.extbridge.daemon.DisplayGeometryUtil;
+import com.extbridge.daemon.input.DesktopShortcutMatcher;
 import com.extbridge.daemon.input.InputInjector;
 
 import java.util.HashMap;
@@ -21,12 +22,17 @@ public final class RemoteInputBridge {
 
     public interface HostBridge {
         int getTargetDisplayId();
+        default int resolveTargetDisplayId(float streamX, float streamY) { return getTargetDisplayId(); }
+        default float[] mapStreamPoint(int targetDisplayId, float streamX, float streamY) { return null; }
         boolean isMirrorMode();
         int getStreamWidth();
         int getStreamHeight();
         int getTargetDisplayWidth();
         int getTargetDisplayHeight();
         boolean injectInputEvent(InputEvent ev, int targetDisplayId, int mode);
+        default void onPointerDown(int targetDisplayId) {}
+        default void onPointerRelease(int targetDisplayId) {}
+        default boolean onDesktopShortcut(String shortcutAction) { return false; }
         void focusDisplay(int displayId);
         void updateCursorPosition(float x, float y);
         void performHome();
@@ -43,10 +49,12 @@ public final class RemoteInputBridge {
     // Pointer / key state
     private int activeMouseButtons = 0;
     private long mouseDownTime = 0L;
+    private int activeMouseDisplayId = -1;
     private float lastMouseX = 0f;
     private float lastMouseY = 0f;
     private boolean mouseHovering = false;
     private long touchDownTime = 0L;
+    private int activeTouchDisplayId = -1;
     private final Map<Integer, Long> keyDownTimes = new HashMap<>();
 
     public RemoteInputBridge(HostBridge host) {
@@ -66,10 +74,12 @@ public final class RemoteInputBridge {
     public void handleMouse(ExtCastProtocol.MouseEventMsg msg) {
         if (msg == null || !Float.isFinite(msg.x) || !Float.isFinite(msg.y)) return;
         synchronized (inputLock) {
-            int dispId = host.getTargetDisplayId();
+            int resolvedDispId = host.resolveTargetDisplayId(msg.x, msg.y);
+            int dispId = (activeMouseButtons != 0 && activeMouseDisplayId >= 0)
+                    ? activeMouseDisplayId : resolvedDispId;
             if (dispId < 0) return;
 
-            float[] mapped = mapCoords(msg.x, msg.y);
+            float[] mapped = mapCoordsForDisplay(dispId, msg.x, msg.y);
             float tx = mapped[0];
             float ty = mapped[1];
             lastMouseX = tx;
@@ -107,6 +117,7 @@ public final class RemoteInputBridge {
                     activeMouseButtons = nextButtons;
                     if (firstButton) {
                         mouseDownTime = now;
+                        activeMouseDisplayId = dispId;
                         if (!mouseHovering) {
                             mouseHovering = true;
                             dispatchMouse(MotionEvent.ACTION_HOVER_MOVE, now, now, tx, ty, 0, 0, 0f, 0f, dispId);
@@ -114,6 +125,7 @@ public final class RemoteInputBridge {
                         dispatchMouse(MotionEvent.ACTION_DOWN, mouseDownTime, now, tx, ty, nextButtons, 0, 0f, 0f, dispId);
                     }
                     dispatchMouse(MotionEvent.ACTION_BUTTON_PRESS, mouseDownTime, now, tx, ty, nextButtons, pressBtn, 0f, 0f, dispId);
+                    host.onPointerDown(dispId);
                     break;
                 }
                 case ExtCastProtocol.MOUSE_BUTTON_UP: {
@@ -126,7 +138,9 @@ public final class RemoteInputBridge {
                     if (activeMouseButtons == 0) {
                         dispatchMouse(MotionEvent.ACTION_UP, downT, now, tx, ty, 0, 0, 0f, 0f, dispId);
                         mouseDownTime = 0L;
+                        activeMouseDisplayId = -1;
                         dispatchMouse(MotionEvent.ACTION_HOVER_MOVE, now, now, tx, ty, 0, 0, 0f, 0f, dispId);
+                        host.onPointerRelease(dispId);
                     }
                     break;
                 }
@@ -142,6 +156,7 @@ public final class RemoteInputBridge {
                         long downT = (mouseDownTime > 0L) ? mouseDownTime : now;
                         activeMouseButtons = 0;
                         mouseDownTime = 0L;
+                        activeMouseDisplayId = -1;
                         dispatchMouse(MotionEvent.ACTION_BUTTON_RELEASE, downT, now, tx, ty, 0, prev, 0f, 0f, dispId);
                         dispatchMouse(MotionEvent.ACTION_UP, downT, now, tx, ty, 0, 0, 0f, 0f, dispId);
                     }
@@ -175,7 +190,10 @@ public final class RemoteInputBridge {
     public void handleTouch(ExtCastProtocol.TouchEventMsg msg) {
         if (msg == null || msg.pointers == null || msg.pointers.length == 0) return;
         synchronized (inputLock) {
-            int dispId = host.getTargetDisplayId();
+            ExtCastProtocol.TouchPointer firstPtr = msg.pointers[0];
+            int resolvedDispId = host.resolveTargetDisplayId(firstPtr.x, firstPtr.y);
+            int dispId = (msg.action != ExtCastProtocol.TOUCH_DOWN && activeTouchDisplayId >= 0)
+                    ? activeTouchDisplayId : resolvedDispId;
             if (dispId < 0) return;
 
             int count = Math.min(msg.pointers.length, ExtCastProtocol.MAX_TOUCH_POINTERS);
@@ -186,6 +204,7 @@ public final class RemoteInputBridge {
             switch (msg.action) {
                 case ExtCastProtocol.TOUCH_DOWN:
                     touchDownTime = now;
+                    activeTouchDisplayId = dispId;
                     if (dispId > 0) host.focusDisplay(dispId);
                     androidAction = MotionEvent.ACTION_DOWN;
                     break;
@@ -217,7 +236,7 @@ public final class RemoteInputBridge {
             MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[count];
             for (int i = 0; i < count; i++) {
                 ExtCastProtocol.TouchPointer p = msg.pointers[i];
-                float[] mapped = mapCoords(p.x, p.y);
+                float[] mapped = mapCoordsForDisplay(dispId, p.x, p.y);
                 props[i] = new MotionEvent.PointerProperties();
                 props[i].id = p.pointerId;
                 props[i].toolType = MotionEvent.TOOL_TYPE_FINGER;
@@ -247,6 +266,8 @@ public final class RemoteInputBridge {
 
             if (msg.action == ExtCastProtocol.TOUCH_UP || msg.action == ExtCastProtocol.TOUCH_CANCEL) {
                 touchDownTime = 0L;
+                activeTouchDisplayId = -1;
+                host.onPointerRelease(dispId);
             }
         }
     }
@@ -261,6 +282,13 @@ public final class RemoteInputBridge {
             long now = SystemClock.uptimeMillis();
             boolean isDown = (msg.action == ExtCastProtocol.KEY_DOWN);
             int androidAction = isDown ? KeyEvent.ACTION_DOWN : KeyEvent.ACTION_UP;
+
+            if (isDown && msg.repeatCount == 0 && dispId > 0 && !host.isMirrorMode()) {
+                String shortcut = DesktopShortcutMatcher.match(msg.androidKeyCode, msg.metaState);
+                if (shortcut != null && host.onDesktopShortcut(shortcut)) {
+                    return;
+                }
+            }
 
             long downTime;
             if (isDown) {
@@ -353,7 +381,9 @@ public final class RemoteInputBridge {
 
     // ---- Helpers ----
 
-    private float[] mapCoords(float streamX, float streamY) {
+    private float[] mapCoordsForDisplay(int targetDisplayId, float streamX, float streamY) {
+        float[] custom = host.mapStreamPoint(targetDisplayId, streamX, streamY);
+        if (custom != null && custom.length >= 2) return custom;
         return DisplayGeometryUtil.mapStreamPointToDisplay(
                 streamX, streamY,
                 host.getStreamWidth(), host.getStreamHeight(),
@@ -365,8 +395,10 @@ public final class RemoteInputBridge {
         synchronized (inputLock) {
             activeMouseButtons = 0;
             mouseDownTime = 0L;
+            activeMouseDisplayId = -1;
             mouseHovering = false;
             touchDownTime = 0L;
+            activeTouchDisplayId = -1;
             keyDownTimes.clear();
         }
     }
@@ -399,8 +431,10 @@ public final class RemoteInputBridge {
             }
             activeMouseButtons = 0;
             mouseDownTime = 0L;
+            activeMouseDisplayId = -1;
             mouseHovering = false;
             touchDownTime = 0L;
+            activeTouchDisplayId = -1;
             keyDownTimes.clear();
         }
     }

@@ -27,7 +27,7 @@ class BridgeProvider : ContentProvider() {
         }
         return when (method) {
             HelperActions.PROVIDER_METHOD_SET_BINDER -> handleSetBinder(extras)
-            HelperActions.PROVIDER_METHOD_SYNC_STATE -> handleSyncState()
+            HelperActions.PROVIDER_METHOD_SYNC_STATE -> handleSyncState(extras)
             HelperActions.PROVIDER_METHOD_MIR_EDGE_CAPTURE -> handleMirrorEdgeCapture(extras)
             else -> Bundle()
         }
@@ -50,15 +50,28 @@ class BridgeProvider : ContentProvider() {
         }
     }
 
-    private fun handleSyncState(): Bundle {
+    private fun handleSyncState(extras: Bundle?): Bundle {
         val ctx = context
         if (ctx != null && !BridgeService.sUserStopping) {
-            BridgeService.refreshFromReceiver(ctx)
-            try {
-                val syncIntent = Intent(HelperActions.STATE_SYNC).setPackage(ctx.packageName)
-                ctx.sendBroadcast(syncIntent)
-            } catch (t: Throwable) {
-                Log.w(TAG, "Failed to broadcast STATE_SYNC", t)
+            val pushedShortcut = extras?.getString(HelperActions.EXTRA_SYNC_SHORTCUT).orEmpty()
+            val pushedWinJson = extras?.getString(HelperActions.EXTRA_SYNC_WIN_JSON).orEmpty()
+            val pushedSeq = extras?.getLong(HelperActions.EXTRA_SYNC_STATE_SEQ, 0L) ?: 0L
+
+            if (pushedShortcut.isNotEmpty()) {
+                BridgeService.onDesktopShortcutFromDaemon(pushedShortcut)
+            }
+            if (pushedWinJson.isNotEmpty()) {
+                // Fast zero-roundtrip path: apply pushed window state directly to DeX shell
+                BridgeService.onPushedWindowSnapshot(pushedWinJson, pushedSeq)
+            } else if (pushedShortcut.isEmpty()) {
+                // Legacy or full-status sync signal
+                BridgeService.refreshFromReceiver(ctx)
+                try {
+                    val syncIntent = Intent(HelperActions.STATE_SYNC).setPackage(ctx.packageName)
+                    ctx.sendBroadcast(syncIntent)
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Failed to broadcast STATE_SYNC", t)
+                }
             }
         }
         return Bundle().apply { putBoolean("ok", true) }

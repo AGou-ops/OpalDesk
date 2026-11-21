@@ -1,6 +1,7 @@
 package com.extbridge.daemon.display;
 
 import android.content.ComponentName;
+import android.os.Build;
 import android.os.SystemClock;
 
 import com.extbridge.daemon.DaemonConfig;
@@ -45,6 +46,7 @@ public final class CompatPolicyController {
     private static final String[] LAND_ENABLE = {
             CID_IGNORE_ORIENTATION, CID_MIN_ASPECT_RATIO, CID_ANY_ORIENTATION,
             CID_FULLSCREEN, CID_CAMERA_COMPAT, CID_DEFAULT_MIN_ASPECT};
+    private static final String[] API37_LAND_ENABLE = {CID_FULLSCREEN, CID_CAMERA_COMPAT};
     private static final String[] LAND_DISABLE = {CID_NON_RESIZE_APP, CID_PORTRAIT_COMPAT};
     private static final String[] PORT_DISABLE = {CID_IGNORE_ORIENTATION, CID_MIN_ASPECT_RATIO, CID_ANY_ORIENTATION};
     private static final String[] PORT_ENABLE = {CID_NON_RESIZE_APP, CID_PORTRAIT_COMPAT};
@@ -73,6 +75,10 @@ public final class CompatPolicyController {
     }
 
     public void applyDisplayFullscreenPolicy(int vdId, boolean enable) {
+        applyDisplayFullscreenPolicy(vdId, enable, false);
+    }
+
+    public void applyDisplayFullscreenPolicy(int vdId, boolean enable, boolean desktopFreeformDisplay) {
         Object wm = services.iWindowManager;
         if (vdId <= 0 || wm == null) return;
         // Disable system decors on virtual display so Display 0 gesture navigation stays isolated.
@@ -89,8 +95,23 @@ public final class CompatPolicyController {
             if (enable) ShellCommand.runOutput("wm", "user-rotation", "-d", String.valueOf(vdId), "lock", "0");
             else ShellCommand.runOutput("wm", "user-rotation", "-d", String.valueOf(vdId), "free");
         }
-        // Keep VD container FULLSCREEN (1) so force_desktop_mode cannot default it to FREEFORM (5).
-        invokeWmByArity(wm, "setDisplayWindowingMode", 2, vdId, BridgeProtocol.WINDOWING_MODE_FULLSCREEN);
+        if (desktopFreeformDisplay) {
+            // Enable native FREEFORM (5) on the desktop virtual display so Android 15/16/HyperOS
+            // honors ActivityOptions.setLaunchWindowingMode(5) + setLaunchBounds() on frame 0
+            // without flashing fullscreen before shrinking into a small window.
+            boolean wmOk = invokeWmByArity(wm, "setDisplayWindowingMode", 2, vdId, BridgeProtocol.WINDOWING_MODE_FREEFORM);
+            if (!wmOk) {
+                ShellCommand.runOutput("wm", "set-display-windowing-mode", "-d", String.valueOf(vdId),
+                        String.valueOf(BridgeProtocol.WINDOWING_MODE_FREEFORM));
+            }
+            bgIoExec.execute(() -> {
+                ShellCommand.runOutput("settings", "put", "global", "enable_freeform_support", "1");
+                ShellCommand.runOutput("settings", "put", "global", "force_resizable_activities", "1");
+            });
+        } else {
+            // Keep standalone/non-desktop VD container FULLSCREEN (1).
+            invokeWmByArity(wm, "setDisplayWindowingMode", 2, vdId, BridgeProtocol.WINDOWING_MODE_FULLSCREEN);
+        }
     }
 
     public void applyAppModeCompat(String pkg, int mode, boolean forceApply) {
@@ -107,8 +128,14 @@ public final class CompatPolicyController {
             compatOverriddenModes.put(pkg, mode);
         }
         if (mode == BridgeProtocol.APP_MODE_LAND_FULL) {
-            runCompatBatch("enable", LAND_ENABLE, pkg);
-            runCompatBatch("disable", LAND_DISABLE, pkg);
+            if (Build.VERSION.SDK_INT >= 37) {
+                // Android 17 ignores orientation & resizability locks natively on sw > 600dp displays;
+                // only apply fullscreen/camera compat to avoid disruptive process kills/restarts.
+                runCompatBatch("enable", API37_LAND_ENABLE, pkg);
+            } else {
+                runCompatBatch("enable", LAND_ENABLE, pkg);
+                runCompatBatch("disable", LAND_DISABLE, pkg);
+            }
         } else {
             runCompatBatch("disable", PORT_DISABLE, pkg);
             runCompatBatch("enable", PORT_ENABLE, pkg);

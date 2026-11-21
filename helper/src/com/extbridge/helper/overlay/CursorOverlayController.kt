@@ -73,10 +73,9 @@ class CursorOverlayController(private val host: OverlayHost) {
     }
 
     fun bringCursorToFront() {
-        val view = cursorView ?: return
+        if (cursorView == null) return
         try {
-            if (host.inLauncherHost) view.bringToFront()
-            else host.surfaceHost.bringLayerToFront(OverlayLayer.CURSOR, inLauncher = false, wm = host.extWm)
+            host.surfaceHost.bringLayerToFront(OverlayLayer.CURSOR, inLauncher = false, wm = host.extWm)
         } catch (t: Throwable) {
             Log.w(TAG, "bringCursorToFront failed", t)
         }
@@ -89,7 +88,7 @@ class CursorOverlayController(private val host: OverlayHost) {
             suppressedForRemoteSink = true
             host.handler.removeCallbacks(hideCursorTask)
             if (cursorVisible || view.visibility == View.VISIBLE) setCursorVisible(false)
-            host.dock.onCursorMoved(x, y)
+            host.onCursorMoved(x, y)
             return
         }
         try {
@@ -97,14 +96,10 @@ class CursorOverlayController(private val host: OverlayHost) {
             view.setPressing(pressing)
             lp.x = x.roundToInt() - HOTSPOT_OFFSET_X
             lp.y = y.roundToInt() - HOTSPOT_OFFSET_Y
-            if (host.inLauncherHost) {
-                view.translationX = lp.x.toFloat(); view.translationY = lp.y.toFloat(); view.bringToFront()
-            } else {
-                host.surfaceHost.updateWindowLayout(view, lp, host.extWm)
-            }
+            host.surfaceHost.updateWindowLayout(view, lp, host.extWm)
             host.handler.removeCallbacks(hideCursorTask)
             host.handler.postDelayed(hideCursorTask, AUTO_HIDE_TIMEOUT_MS)
-            host.dock.onCursorMoved(x, y)
+            host.onCursorMoved(x, y)
         } catch (t: Throwable) {
             Log.w(TAG, "updateCursorOnExt failed", t)
         }
@@ -123,12 +118,13 @@ class CursorOverlayController(private val host: OverlayHost) {
     }
 
     class CursorView(ctx: Context) : View(ctx) {
-        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF0F172A.toInt(); style = Paint.Style.FILL }
+        private val shadow = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x38000000; style = Paint.Style.FILL }
+        private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF1D1D1F.toInt(); style = Paint.Style.FILL }
         private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 2.6f; strokeJoin = Paint.Join.ROUND
+            color = Color.WHITE; style = Paint.Style.STROKE; strokeWidth = 2.4f; strokeJoin = Paint.Join.ROUND
         }
         private val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0x9938BDF8.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.5f
+            color = 0x99007AFF.toInt(); style = Paint.Style.STROKE; strokeWidth = 2.4f
         }
         private val arrow = Path().apply {
             moveTo(6f, 4f); lineTo(6f, 34f); lineTo(13.5f, 26.5f); lineTo(19f, 38f)
@@ -136,10 +132,20 @@ class CursorOverlayController(private val host: OverlayHost) {
         }
         private var pressing = false
 
-        fun setPressing(p: Boolean) { if (pressing != p) { pressing = p; invalidate() } }
+        fun setPressing(p: Boolean) {
+            if (pressing != p) {
+                pressing = p
+                animate().scaleX(if (p) 0.90f else 1f).scaleY(if (p) 0.90f else 1f).setDuration(70L).start()
+                invalidate()
+            }
+        }
 
         override fun onDraw(canvas: Canvas) {
             if (pressing) canvas.drawCircle(6f, 6f, 10f, ring)
+            canvas.save()
+            canvas.translate(1.5f, 2f)
+            canvas.drawPath(arrow, shadow)
+            canvas.restore()
             canvas.drawPath(arrow, fill)
             canvas.drawPath(arrow, stroke)
         }

@@ -72,7 +72,24 @@ public final class BridgeProtocol {
     public static final int TX_WINDOW_LIFECYCLE_ACTION = 54;
     public static final int TX_SET_ADAPTIVE_SINGLE_CONFIG = 55;
     public static final int TX_SET_INPUT_BACKEND = 56;
+    public static final int TX_SET_DESKTOP_PREFS = 57;
     public static final int TX_SHUTDOWN = 99;
+
+    // ---- Push-Sync Bundle Extras (PROVIDER_METHOD_SYNC_STATE) ----
+    public static final String EXTRA_SYNC_WIN_JSON = "winJson";
+    public static final String EXTRA_SYNC_STATE_SEQ = "stateSeq";
+    public static final String EXTRA_SYNC_SHORTCUT = "desktopShortcut";
+
+    // ---- Global Desktop Shortcut Action Tokens ----
+    public static final String SHORTCUT_WINDOW_SWITCHER = "window_switcher";
+    public static final String SHORTCUT_APP_DRAWER = "app_drawer";
+    public static final String SHORTCUT_SHOW_DESKTOP = "show_desktop";
+    public static final String SHORTCUT_SNAP_LEFT = "snap_left";
+    public static final String SHORTCUT_SNAP_RIGHT = "snap_right";
+    public static final String SHORTCUT_MAXIMIZE_TOGGLE = "maximize_toggle";
+    public static final String SHORTCUT_MINIMIZE_OR_RESTORE = "minimize_or_restore";
+    public static final String SHORTCUT_CLOSE_FOCUSED = "close_focused";
+    public static final String SHORTCUT_DISMISS_OVERLAY = "dismiss_overlay";
 
     // ---- Android WindowConfiguration Windowing Modes ----
     public static final int WINDOWING_MODE_UNDEFINED = 0;
@@ -81,10 +98,16 @@ public final class BridgeProtocol {
     public static final int WINDOWING_MODE_MULTI_WINDOW = 6;
 
     // ---- VirtualDisplay Flag Bitmasks ----
-    /** Includes ROTATES_WITH_CONTENT (0x0080) for compatibility mode. */
-    public static final int VD_FLAGS_COMPAT = 0x44CB;
-    /** Strips ROTATES_WITH_CONTENT so DeX desktop remains locked landscape. */
-    public static final int VD_FLAGS_DEX_FIXED = 0x444B;
+    /**
+     * Legacy {@code VIRTUAL_DISPLAY_FLAG_PRESENTATION} bit ({@code 0x0002}); stripped by default so
+     * video apps running in standalone windows do not auto-cast Presentation ("扩展播放中") onto
+     * the main desktop display.
+     */
+    public static final int VD_FLAG_PRESENTATION = 0x0002;
+    /** Includes ROTATES_WITH_CONTENT (0x0080) for compatibility mode; excludes PRESENTATION. */
+    public static final int VD_FLAGS_COMPAT = 0x44C9;
+    /** Strips ROTATES_WITH_CONTENT and PRESENTATION so DeX desktop remains locked landscape. */
+    public static final int VD_FLAGS_DEX_FIXED = 0x4449;
 
     // ---- Mirror Modes & Side Modes ----
     public static final int MIRROR_MODE_DEX = 0;
@@ -155,6 +178,8 @@ public final class BridgeProtocol {
     public static final int WIN_ACTION_MINIMIZE = 2;
     public static final int WIN_ACTION_CLOSE = 3;
     public static final int WIN_ACTION_RELOAD_DPI = 4;
+    public static final int WIN_ACTION_SEND_BACK = 5;
+    public static final int WIN_ACTION_TOGGLE_MAXIMIZE = 6;
 
     private BridgeProtocol() {}
 }

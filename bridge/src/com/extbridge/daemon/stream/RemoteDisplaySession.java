@@ -13,6 +13,7 @@ import android.view.Surface;
 
 import com.extbridge.daemon.DaemonConfig;
 import com.extbridge.daemon.DisplayGeometryUtil;
+import com.extbridge.daemon.display.NativeMirrorController;
 import com.extbridge.daemon.input.InputInjector;
 import com.extbridge.daemon.ipc.BridgeProtocol;
 import com.extbridge.daemon.platform.VirtualDisplayFactory;
@@ -30,6 +31,11 @@ import java.util.List;
  * resize/aspect-flip task migration, peripherals, and {@link RemoteInputBridge.HostBridge}.
  */
 final class RemoteDisplaySession {
+    private static final int[] REMOTE_MIRROR_COMP_VD_FLAGS = {
+            BridgeProtocol.VD_FLAGS_DEX_FIXED,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC | DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY,
+            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+    };
     private static final int[] REMOTE_MIRROR_VD_FLAGS = {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC | DisplayManager.VIRTUAL_DISPLAY_FLAG_SECURE | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC | DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
@@ -45,6 +51,7 @@ final class RemoteDisplaySession {
 
     volatile VirtualDisplay vd;
     volatile VirtualDisplay mirrorVd;
+    volatile int mirrorCompDisplayId = -1;
     volatile int vdId = -1;
     volatile String vdUniqueId;
     volatile int width;
@@ -134,12 +141,17 @@ final class RemoteDisplaySession {
 
     boolean attachDexVd(RemoteSessionCoordinator coord, Surface codecSurf) {
         if (codecSurf == null || coord.services.displayManager == null) return false;
-        releaseDisplays(coord.config, coord.injector);
+        releaseDisplays(coord.config, coord.injector, coord.mirrorDisplay);
         try {
             String vdName = standalone ? ("ExtBridge-App-" + appPackage) : "ExtBridge-Remote";
             int vdFlags = standalone ? BridgeProtocol.VD_FLAGS_DEX_FIXED : coord.config.getVirtualDisplayFlags();
-            VirtualDisplay created = VirtualDisplayFactory.create(
-                    coord.services.displayManager, vdName, width, height, dpi, vdFlags, fps, codecSurf);
+            int[] flagCandidates = new int[]{
+                    vdFlags,
+                    vdFlags | BridgeProtocol.VD_FLAG_PRESENTATION
+            };
+            VirtualDisplay created = VirtualDisplayFactory.createWithFlagFallback(
+                    coord.services.displayManager, vdName, width, height, dpi,
+                    flagCandidates, fps, codecSurf, null);
             if (created == null || created.getDisplay() == null) {
                 System.err.println("EXTBRIDGE_REMOTE_CREATE_VD_FAILED name=" + vdName);
                 return false;
@@ -150,7 +162,7 @@ final class RemoteDisplaySession {
             this.vdUniqueId = VirtualDisplayFactory.getUniqueId(disp);
             this.createdVdW = width;
             this.createdVdH = height;
-            coord.compatPolicy.applyDisplayFullscreenPolicy(vdId, standalone || coord.config.fullscreenPolicy == 1);
+            coord.compatPolicy.applyDisplayFullscreenPolicy(vdId, standalone || coord.config.fullscreenPolicy == 1, !standalone);
 
             if (!standalone) {
                 syncDesktopConfig(coord.config, vdId, vdUniqueId, "REMOTE_DEX");
@@ -168,7 +180,7 @@ final class RemoteDisplaySession {
             System.out.println("EXTBRIDGE_REMOTE_VD_ATTACHED sid=" + sessionId + " standalone=" + standalone
                     + " vdId=" + vdId + " size=" + width + "x" + height + "@" + dpi + "dpi");
             return true;
-        } catch (ReflectiveOperationException | RuntimeException e) {
+        } catch (RuntimeException e) {
             System.err.println("EXTBRIDGE_REMOTE_VD_ERR sid=" + sessionId + ": " + e.getMessage());
             return false;
         }
@@ -176,8 +188,33 @@ final class RemoteDisplaySession {
 
     void attachMirrorVdLocked(RemoteSessionCoordinator coord, Surface codecSurf) {
         if (codecSurf == null || coord.services.displayManager == null) return;
-        releaseDisplays(coord.config, coord.injector);
+        releaseDisplays(coord.config, coord.injector, coord.mirrorDisplay);
         int[] chosenFlags = new int[1];
+        if (coord.mirrorDisplay != null) {
+            coord.mirrorDisplay.resetSideVdAttempt();
+            VirtualDisplay compVd = VirtualDisplayFactory.createWithFlagFallback(
+                    coord.services.displayManager, "ExtBridge-RemoteMirrorComp",
+                    width, height, dpi, REMOTE_MIRROR_COMP_VD_FLAGS, fps, codecSurf, chosenFlags);
+            if (compVd != null && compVd.getDisplay() != null) {
+                int compId = compVd.getDisplay().getDisplayId();
+                coord.compatPolicy.applyDisplayFullscreenPolicy(compId, false, false);
+                if (coord.mirrorDisplay.attachRemoteMirrorDisplay(compId, width, height, fps)) {
+                    this.mirrorVd = compVd;
+                    this.mirrorCompDisplayId = compId;
+                    String modeTag = (coord.mirrorDisplay.getSideVdId() > 0) ? "REMOTE_MIRROR_SIDEBAR" : "REMOTE_MIRROR_COMP";
+                    syncDesktopConfig(coord.config, -1, null, modeTag);
+                    coord.helperBridge.startHelperService();
+                    coord.pushDeviceState(this);
+                    if (sink != null) sink.requestKeyFrame();
+                    System.out.println("EXTBRIDGE_REMOTE_MIRROR_COMP_ATTACHED dispId=" + compId
+                            + " sideVdId=" + coord.mirrorDisplay.getSideVdId()
+                            + " size=" + width + "x" + height + "@" + dpi + "dpi");
+                    return;
+                }
+                try { compVd.release(); }
+                catch (RuntimeException e) { System.err.println("EXTBRIDGE_REMOTE_MIRROR_COMP_REL_WARN: " + e.getMessage()); }
+            }
+        }
         VirtualDisplay mirVd = VirtualDisplayFactory.createWithFlagFallback(
                 coord.services.displayManager, "ExtBridge-RemoteMirror",
                 width, height, dpi, REMOTE_MIRROR_VD_FLAGS, fps, codecSurf, chosenFlags);
@@ -237,9 +274,14 @@ final class RemoteDisplaySession {
             if (!s.reconfigureAndSwap(nextW, nextH, nextDpi, nextFps, nextBr, codecPref,
                     ExtCastProtocol.DISPLAY_MODE_MIRROR, nextRot, (newSurf, aw, ah, aDpi) -> {
                         width = cfg.virtW = aw; height = cfg.virtH = ah; dpi = cfg.virtDpi = aDpi;
+                        cfg.physW = aw; cfg.physH = ah; cfg.physFps = nextFps;
                         if (mirrorVd != null) {
-                            try { mirrorVd.resize(aw, ah, aDpi); mirrorVd.setSurface(newSurf); return; }
-                            catch (RuntimeException e) { System.err.println("EXTBRIDGE_REMOTE_MIRROR_SWAP_WARN: " + e.getMessage()); }
+                            if (mirrorCompDisplayId > 0 && coord.mirrorDisplay != null) {
+                                releaseMirrorVd(coord.mirrorDisplay);
+                            } else {
+                                try { mirrorVd.resize(aw, ah, aDpi); mirrorVd.setSurface(newSurf); return; }
+                                catch (RuntimeException e) { System.err.println("EXTBRIDGE_REMOTE_MIRROR_SWAP_WARN: " + e.getMessage()); }
+                            }
                         }
                         attachMirrorVdLocked(coord, newSurf);
                     })) {
@@ -249,7 +291,7 @@ final class RemoteDisplaySession {
             return;
         }
 
-        releaseMirrorVd();
+        releaseMirrorVd(coord.mirrorDisplay);
         boolean aspectFlipped = vd != null && createdVdW > 0 && createdVdH > 0
                 && DisplayGeometryUtil.isOrientationAspectFlipped(createdVdW, createdVdH, nextW, nextH);
         if (vd != null && !aspectFlipped && !modeChanged
@@ -262,13 +304,19 @@ final class RemoteDisplaySession {
                         })) {
             if (!standalone) {
                 coord.localInput.clampCursor(cfg.virtW, cfg.virtH);
-                if (coord.mainHandler != null) coord.mainHandler.postDelayed(coord.taskController::relayoutManagedWindowsOnResize, 300L);
+                coord.taskController.scheduleRelayoutAfterResize();
             }
             coord.pushDeviceState(this);
             return;
         }
 
         ArrayList<Integer> prevTasks = (vdId > 0) ? coord.taskController.collectExtUserTaskIds(vdId) : new ArrayList<>();
+        List<DesktopWindowManager.ManagedWindow> prevManaged = (!standalone && !modeChanged)
+                ? coord.taskController.getWindowManager().getManagedWindowsSnapshot()
+                : Collections.emptyList();
+        if (!standalone && !prevManaged.isEmpty()) {
+            coord.taskController.beginDisplayMigration();
+        }
         Surface nextSurf = s.startOrReconfigure(
                 nextW, nextH, nextDpi, nextFps, nextBr, codecPref, ExtCastProtocol.DISPLAY_MODE_DEX, nextRot);
         if (nextSurf != null) {
@@ -279,10 +327,14 @@ final class RemoteDisplaySession {
                     if (standalone) coord.taskApi.detachFreeformAndEnsureFullscreen(tid, vdId, width, height, true, null);
                 }
                 if (standalone && prevTasks.isEmpty()) launchOrMoveStandaloneApp(coord);
-                else if (!standalone && !prevTasks.isEmpty() && coord.mainHandler != null) {
-                    coord.mainHandler.postDelayed(coord.taskController::relayoutManagedWindowsOnResize, 280L);
+                else if (!standalone) {
+                    coord.taskController.finishDisplayMigrationAndRelayout(prevManaged);
                 }
+            } else if (!standalone) {
+                coord.taskController.endDisplayMigration();
             }
+        } else if (!standalone) {
+            coord.taskController.endDisplayMigration();
         }
         coord.pushDeviceState(this);
     }
@@ -323,12 +375,13 @@ final class RemoteDisplaySession {
             }
             if (sink != null && sink.isActive()) sink.requestKeyFrame();
             coord.pushDeviceState(this);
+            coord.pushDesktopDeviceState(true);
         };
         coord.mainHandler.postDelayed(verify, 260L);
         coord.mainHandler.postDelayed(verify, 780L);
     }
 
-    void close(DaemonConfig config, InputInjector injector) {
+    void close(DaemonConfig config, InputInjector injector, NativeMirrorController mirrorDisplay) {
         synchronized (lock) {
             if (closed && sink == null && vd == null && mirrorVd == null) return;
             closed = true;
@@ -336,13 +389,13 @@ final class RemoteDisplaySession {
             if (fileTransferReceiver != null) { fileTransferReceiver.onSessionEnded(); fileTransferReceiver = null; }
             if (inputBridge != null) { inputBridge.onSessionEnded(); inputBridge = null; }
             if (sink != null) { sink.stop(); sink = null; }
-            releaseDisplays(config, injector);
+            releaseDisplays(config, injector, mirrorDisplay);
         }
     }
 
-    void releaseDisplays(DaemonConfig config, InputInjector injector) {
+    void releaseDisplays(DaemonConfig config, InputInjector injector, NativeMirrorController mirrorDisplay) {
         releaseDexVd(config, injector);
-        releaseMirrorVd();
+        releaseMirrorVd(mirrorDisplay);
     }
 
     void releaseDexVd(DaemonConfig config, InputInjector injector) {
@@ -357,7 +410,12 @@ final class RemoteDisplaySession {
         if (!standalone && config.vdId == prevVdId) { config.vdId = -1; config.vdUniqueId = null; }
     }
 
-    void releaseMirrorVd() {
+    void releaseMirrorVd(NativeMirrorController mirrorDisplay) {
+        int compId = mirrorCompDisplayId;
+        mirrorCompDisplayId = -1;
+        if (compId > 0 && mirrorDisplay != null) {
+            mirrorDisplay.teardownForDisplay(compId);
+        }
         VirtualDisplay curMir = mirrorVd;
         mirrorVd = null;
         if (curMir != null) {
@@ -418,6 +476,41 @@ final class RemoteDisplaySession {
             if (session.closed) return -1;
             return session.standalone ? session.vdId
                     : ((coord.config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR) ? 0 : coord.config.vdId);
+        }
+        @Override public int resolveTargetDisplayId(float streamX, float streamY) {
+            if (session.closed) return -1;
+            if (isMirrorMode() && session.mirrorCompDisplayId > 0
+                    && coord.mirrorDisplay != null && coord.mirrorDisplay.hasActiveRemoteComposition()) {
+                return coord.mirrorDisplay.resolveMirrorTargetDisplay(streamX, streamY);
+            }
+            return getTargetDisplayId();
+        }
+        @Override public float[] mapStreamPoint(int targetDisplayId, float streamX, float streamY) {
+            if (isMirrorMode() && session.mirrorCompDisplayId > 0
+                    && coord.mirrorDisplay != null && coord.mirrorDisplay.hasActiveRemoteComposition()) {
+                return new float[]{
+                        coord.mirrorDisplay.mapMirrorX(targetDisplayId, streamX),
+                        coord.mirrorDisplay.mapMirrorY(targetDisplayId, streamY)
+                };
+            }
+            return null;
+        }
+        @Override public void onPointerDown(int targetDisplayId) {
+            if (!session.standalone && !isMirrorMode() && targetDisplayId > 0) {
+                coord.taskController.scheduleFastFocusSync();
+            }
+        }
+        @Override public void onPointerRelease(int targetDisplayId) {
+            if (isMirrorMode() && coord.mirrorDisplay != null && targetDisplayId > 0
+                    && targetDisplayId == coord.mirrorDisplay.getSideVdId()) {
+                coord.mirrorDisplay.scheduleMirrorSideClickPostChecks();
+            } else if (!session.standalone && !isMirrorMode() && targetDisplayId > 0) {
+                coord.taskController.scheduleFastFocusSync();
+            }
+        }
+        @Override public boolean onDesktopShortcut(String shortcutAction) {
+            if (session.standalone || isMirrorMode()) return false;
+            return coord.taskController.handleDesktopShortcut(shortcutAction);
         }
         @Override public boolean isMirrorMode() { return !session.standalone && coord.config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR; }
         @Override public int getStreamWidth() { RemoteStreamSink s = session.sink; return (s != null && s.getWidth() > 0) ? s.getWidth() : session.width; }

@@ -44,19 +44,19 @@ class BlackoutOverlayController(private val host: OverlayHost) {
 
     fun setDexBlackout(on: Boolean) {
         if (on && isBlackoutActive && blackoutView != null) {
-            host.panel.updateBlackoutUi()
+            host.onBlackoutStateChanged()
             return
         }
         if (on) {
             val st = host.lastStatus
             if (!st.connected || st.mirrorMode != BridgeClient.MIRROR_MODE_DEX || st.vdId <= 0) {
                 host.serviceContext.toast("仅在 DeX 扩展桌面已连接外接屏时可用")
-                host.panel.updateBlackoutUi()
+                host.onBlackoutStateChanged()
                 return
             }
             if (!attachBlackoutOverlay()) {
                 isBlackoutActive = false
-                host.panel.updateBlackoutUi()
+                host.onBlackoutStateChanged()
                 host.serviceContext.toast("请开启无障碍或悬浮窗权限后使用一键黑屏")
                 return
             }
@@ -65,7 +65,7 @@ class BlackoutOverlayController(private val host: OverlayHost) {
             isBlackoutActive = false
             removeBlackoutOverlay()
         }
-        host.panel.updateBlackoutUi()
+        host.onBlackoutStateChanged()
         val arg = if (on) 1 else 0
         host.runDaemonAndPoll { BridgeClient.execSysAction(BridgeClient.SYS_SCREEN_DIM, arg, null) }
     }

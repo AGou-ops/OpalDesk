@@ -58,6 +58,7 @@ object BridgeClient {
     const val SINK_REMOTE_WIFI = SinkType.REMOTE_WIFI
     const val SINK_REMOTE_WIFI_ADB = SinkType.REMOTE_WIFI_ADB
 
+    const val WIN_MODE_AUTO = WindowMode.AUTO
     const val WIN_MODE_FULLSCREEN = WindowMode.FULLSCREEN
     const val WIN_MODE_ADAPTIVE_SINGLE = WindowMode.ADAPTIVE_SINGLE
     const val WIN_MODE_FREEFORM = WindowMode.FREEFORM
@@ -66,6 +67,8 @@ object BridgeClient {
     const val WIN_ACTION_MINIMIZE = WindowAction.MINIMIZE
     const val WIN_ACTION_CLOSE = WindowAction.CLOSE
     const val WIN_ACTION_RELOAD_DPI = WindowAction.RELOAD_DPI
+    const val WIN_ACTION_SEND_BACK = WindowAction.SEND_BACK
+    const val WIN_ACTION_TOGGLE_MAXIMIZE = WindowAction.TOGGLE_MAXIMIZE
 
     const val INPUT_BACKEND_UHID = InputBackend.UHID
     const val INJECT_STATUS_UHID = InputBackend.INJECT_STATUS_UHID
@@ -265,7 +268,13 @@ object BridgeClient {
         BinderTransport.transactBool(TxCode.WINDOW_LIFECYCLE_ACTION) {
             writeInt(taskId)
             writeString(pkg.orEmpty())
-            writeInt(action.coerceIn(WIN_ACTION_FOCUS, WIN_ACTION_RELOAD_DPI))
+            writeInt(action.coerceIn(WIN_ACTION_FOCUS, WIN_ACTION_TOGGLE_MAXIMIZE))
+        }
+
+    fun setDesktopPrefs(taskbarAutoHide: Boolean, defaultLaunchMode: String? = null): Boolean =
+        BinderTransport.transactBool(TxCode.SET_DESKTOP_PREFS) {
+            writeInt(if (taskbarAutoHide) 1 else 0)
+            if (defaultLaunchMode != null) writeString(defaultLaunchMode)
         }
 
     fun setAdaptiveSingleConfig(enabled: Boolean, defaultWidthDp: Int): Boolean =

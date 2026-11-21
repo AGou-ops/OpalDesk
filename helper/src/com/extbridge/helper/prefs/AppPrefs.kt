@@ -34,6 +34,16 @@ object AppPrefs {
     private const val KEY_MIRROR_CURSOR_SPEED = "mirror_cursor_speed_idx"
     private const val KEY_MIRROR_WIDGET_RATIO_L = "mirror_widget_ratio_l"
     private const val KEY_MIRROR_WIDGET_RATIO_R = "mirror_widget_ratio_r"
+    private const val KEY_DESKTOP_PINNED_INIT = "desktop_pinned_initialized_v1"
+    private const val KEY_DESKTOP_PINNED_APPS = "desktop_pinned_apps"
+    private const val KEY_DESKTOP_LAYOUT_V2 = "desktop_layout_v2_json"
+    private const val KEY_DOCK_PINNED_APPS = "dock_pinned_apps"
+    private const val KEY_DESKTOP_WIDGET_IDS = "desktop_custom_widget_ids"
+    private const val KEY_DESKTOP_PRESETS = "desktop_preset_slots"
+    private const val KEY_DESKTOP_SYNC_MIRROR = "desktop_sync_mirror_widgets"
+    private const val KEY_RIGHT_CLICK_PASSTHROUGH = "dex_right_click_passthrough"
+    private const val KEY_DESKTOP_DOUBLE_CLICK = "dex_desktop_double_click"
+    private const val KEY_DEX_DEFAULT_LAUNCH_MODE = "dex_default_launch_mode"
 
     // extbridge_prefs keys
     private const val KEY_AUTO_ROOT = "auto_root_enabled"
@@ -70,6 +80,153 @@ object AppPrefs {
 
     private fun prefs(ctx: Context, name: String): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(name, Context.MODE_PRIVATE)
+
+    /** Optional hook set by LauncherActivity so desktop icon/widget edits trigger live refresh. */
+    @Volatile
+    var onDesktopPrefsChanged: ((Context) -> Unit)? = null
+
+    fun isDesktopPinnedInitialized(ctx: Context?): Boolean =
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DESKTOP_PINNED_INIT, false) } ?: false
+
+    fun getDesktopPinnedApps(ctx: Context?): List<String> {
+        if (ctx == null) return emptyList()
+        val raw = prefs(ctx, FILE_EXT).getString(KEY_DESKTOP_PINNED_APPS, "").orEmpty()
+        return raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    }
+
+    fun setDesktopPinnedApps(ctx: Context?, pkgs: List<String>, markInitialized: Boolean = true) {
+        if (ctx == null) return
+        val joined = pkgs.map { it.trim() }.filter { it.isNotEmpty() }.distinct().joinToString(",")
+        prefs(ctx, FILE_EXT).edit().apply {
+            putString(KEY_DESKTOP_PINNED_APPS, joined)
+            if (markInitialized) putBoolean(KEY_DESKTOP_PINNED_INIT, true)
+        }.apply()
+        onDesktopPrefsChanged?.invoke(ctx)
+    }
+
+    fun isDesktopAppPinned(ctx: Context?, pkg: String): Boolean =
+        getDesktopPinnedApps(ctx).contains(pkg.trim())
+
+    fun pinDesktopApp(ctx: Context?, pkg: String) {
+        val clean = pkg.trim()
+        if (ctx == null || clean.isEmpty()) return
+        val next = getDesktopPinnedApps(ctx).toMutableList()
+        if (!next.contains(clean)) next.add(clean)
+        setDesktopPinnedApps(ctx, next)
+    }
+
+    fun unpinDesktopApp(ctx: Context?, pkg: String) {
+        val clean = pkg.trim()
+        if (ctx == null || clean.isEmpty()) return
+        val next = getDesktopPinnedApps(ctx).filterNot { it == clean }
+        setDesktopPinnedApps(ctx, next)
+    }
+
+    fun getDesktopLayoutJson(ctx: Context?): String =
+        ctx?.let { prefs(it, FILE_EXT).getString(KEY_DESKTOP_LAYOUT_V2, "").orEmpty() } ?: ""
+
+    fun setDesktopLayoutJson(ctx: Context?, json: String, notify: Boolean = false) {
+        if (ctx == null) return
+        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_LAYOUT_V2, json).apply()
+        if (notify) onDesktopPrefsChanged?.invoke(ctx)
+    }
+
+    @Volatile
+    var onDockPinnedAppsChanged: ((Context) -> Unit)? = null
+
+    fun getDockPinnedApps(ctx: Context?): List<String> {
+        if (ctx == null) return emptyList()
+        val raw = prefs(ctx, FILE_EXT).getString(KEY_DOCK_PINNED_APPS, "").orEmpty()
+        return raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    }
+
+    fun isDockAppPinned(ctx: Context?, pkg: String): Boolean =
+        getDockPinnedApps(ctx).contains(pkg.trim())
+
+    fun setDockPinnedApps(ctx: Context?, pkgs: List<String>) {
+        if (ctx == null) return
+        val joined = pkgs.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(6).joinToString(",")
+        prefs(ctx, FILE_EXT).edit().putString(KEY_DOCK_PINNED_APPS, joined).apply()
+        onDockPinnedAppsChanged?.invoke(ctx)
+    }
+
+    fun toggleDockPinnedApp(ctx: Context?, pkg: String): Boolean {
+        val clean = pkg.trim()
+        if (ctx == null || clean.isEmpty()) return false
+        val cur = getDockPinnedApps(ctx).toMutableList()
+        val nowPinned = if (cur.contains(clean)) {
+            cur.remove(clean)
+            false
+        } else {
+            if (cur.size >= 6) cur.removeAt(0)
+            cur.add(clean)
+            true
+        }
+        setDockPinnedApps(ctx, cur)
+        return nowPinned
+    }
+
+    fun isDesktopSyncMirrorWidgets(ctx: Context?): Boolean =
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DESKTOP_SYNC_MIRROR, true) } ?: true
+
+    fun setDesktopSyncMirrorWidgets(ctx: Context?, sync: Boolean) {
+        if (ctx == null) return
+        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_DESKTOP_SYNC_MIRROR, sync).apply()
+        onDesktopPrefsChanged?.invoke(ctx)
+    }
+
+    fun getDesktopCustomWidgetIds(ctx: Context?): List<Int> {
+        if (ctx == null) return emptyList()
+        val raw = prefs(ctx, FILE_EXT).getString(KEY_DESKTOP_WIDGET_IDS, "").orEmpty()
+        return raw.split(",").mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
+    }
+
+    fun addDesktopCustomWidgetId(ctx: Context?, widgetId: Int) {
+        if (ctx == null || widgetId <= 0) return
+        val next = getDesktopCustomWidgetIds(ctx).toMutableList()
+        if (!next.contains(widgetId)) next.add(widgetId)
+        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_WIDGET_IDS, next.joinToString(",")).apply()
+        onDesktopPrefsChanged?.invoke(ctx)
+    }
+
+    fun removeDesktopCustomWidgetId(ctx: Context?, widgetId: Int) {
+        if (ctx == null || widgetId <= 0) return
+        val next = getDesktopCustomWidgetIds(ctx).filterNot { it == widgetId }
+        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_WIDGET_IDS, next.joinToString(",")).apply()
+        try {
+            AppWidgetHost(ctx.applicationContext, MirrorThemeCatalog.DESKTOP_WIDGET_HOST_ID).deleteAppWidgetId(widgetId)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to delete desktop AppWidgetId=$widgetId", t)
+        }
+        onDesktopPrefsChanged?.invoke(ctx)
+    }
+
+    fun getDesktopPresetCards(ctx: Context?): List<String> {
+        if (ctx == null) return MirrorThemeCatalog.DEFAULT_DESKTOP_PRESETS.split(",")
+        val sp = prefs(ctx, FILE_EXT)
+        val raw = sp.getString(KEY_DESKTOP_PRESETS, null)
+        val src = if (raw.isNullOrBlank()) {
+            if (isDesktopSyncMirrorWidgets(ctx)) {
+                getMirrorPresetSlots(ctx).filterNot { it == "quickctrl" || it == "screendim" }
+            } else {
+                MirrorThemeCatalog.DEFAULT_DESKTOP_PRESETS.split(",")
+            }
+        } else {
+            raw.split(",").map { it.trim() }.filter { it.isNotEmpty() && MirrorThemeCatalog.mirrorPresetIndex(it) >= 0 }
+        }
+        return src.ifEmpty { MirrorThemeCatalog.DEFAULT_DESKTOP_PRESETS.split(",") }
+    }
+
+    fun setDesktopPresetCards(ctx: Context?, keys: List<String>?) {
+        if (ctx == null) return
+        val joined = keys?.map { it.trim() }
+            ?.filter { it.isNotEmpty() && MirrorThemeCatalog.mirrorPresetIndex(it) >= 0 }
+            ?.distinct()
+            ?.joinToString(",")
+            .orEmpty()
+        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_PRESETS, joined).apply()
+        onDesktopPrefsChanged?.invoke(ctx)
+    }
 
     // --- ext_prefs: Dock & Mirror Sidebar ---
 
@@ -310,6 +467,35 @@ object AppPrefs {
             .apply()
     }
 
+    /** Optional hook set by BridgeService so theme mode changes live-update DeX glass overlays. */
+    @Volatile
+    var onThemeModeChanged: ((Context) -> Unit)? = null
+
+    fun isRightClickPassthroughInApps(ctx: Context?): Boolean =
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_RIGHT_CLICK_PASSTHROUGH, true) } ?: true
+
+    fun setRightClickPassthroughInApps(ctx: Context?, passthrough: Boolean) {
+        ctx ?: return
+        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_RIGHT_CLICK_PASSTHROUGH, passthrough).apply()
+    }
+
+    fun isDesktopDoubleClickLaunch(ctx: Context?): Boolean =
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DESKTOP_DOUBLE_CLICK, false) } ?: false
+
+    fun setDesktopDoubleClickLaunch(ctx: Context?, enabled: Boolean) {
+        ctx ?: return
+        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_DESKTOP_DOUBLE_CLICK, enabled).apply()
+    }
+
+    /** 0 = Floating (Default), 1 = Maximized WorkArea, 2 = Immersive Fullscreen. */
+    fun getDexDefaultLaunchMode(ctx: Context?): Int =
+        ctx?.let { prefs(it, FILE_EXT).getInt(KEY_DEX_DEFAULT_LAUNCH_MODE, 0).coerceIn(0, 2) } ?: 0
+
+    fun setDexDefaultLaunchMode(ctx: Context?, mode: Int) {
+        ctx ?: return
+        prefs(ctx, FILE_EXT).edit().putInt(KEY_DEX_DEFAULT_LAUNCH_MODE, mode.coerceIn(0, 2)).apply()
+    }
+
     // --- extbridge_ui_prefs: Compose UI Theme Mode ---
 
     fun getUiThemeModeIndex(ctx: Context): Int =
@@ -317,5 +503,6 @@ object AppPrefs {
 
     fun setUiThemeModeIndex(ctx: Context, idx: Int) {
         prefs(ctx, FILE_UI).edit().putInt(KEY_UI_THEME_MODE, idx.coerceIn(0, 2)).apply()
+        onThemeModeChanged?.invoke(ctx)
     }
 }

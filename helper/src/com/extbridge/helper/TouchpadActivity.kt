@@ -12,6 +12,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.*
 import androidx.core.view.WindowCompat
+import com.extbridge.helper.design.iosglass.CrossWindowBlurController
 import com.extbridge.helper.protocol.BridgeProtocol.InputBackend
 import com.extbridge.helper.protocol.BridgeProtocol.MouseAction
 import com.extbridge.helper.service.DisplayLaunchHelper
@@ -64,6 +65,7 @@ class TouchpadActivity : ComponentActivity() {
         if (DisplayLaunchHelper.ensureOnDisplay0(this)) return
         window.decorView.filterTouchesWhenObscured = true
         enableEdgeToEdge()
+        CrossWindowBlurController.applyToActivityWindow(window)
 
         dispatcher = TrackpadInputDispatcher { actionType, x, y, injectStatus ->
             curX = x; curY = y
@@ -123,7 +125,11 @@ class TouchpadActivity : ComponentActivity() {
         },
         onRightClickOrBack = ::performRightClickOrBack,
         onSendBack = { dispatcher.sendBack() },
-        onRelaunchLauncher = { dispatcher.relaunchLauncher() },
+        onRelaunchLauncher = {
+            if (BridgeService.isDesktopActive()) BridgeService.toggleShowDesktopFromUi()
+            else dispatcher.relaunchLauncher()
+        },
+        onOpenMissionControl = { BridgeService.toggleWindowSwitcherFromUi() },
         onCycleSpeed = { speedIdx = (speedIdx + 1) % SPEEDS.size },
         onToggleBlackout = {
             blackoutActive = !blackoutActive

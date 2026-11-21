@@ -34,6 +34,12 @@ public class DesktopWindowManagerTest {
 
         assertTrue("Adaptive single must be enabled by default", wm.isAdaptiveSingleEnabled());
         assertEquals(460, wm.getDefaultSingleWidthDp());
+        assertEquals(DesktopWindowManager.MODE_FREEFORM, wm.getDefaultLaunchMode());
+        assertEquals(DesktopWindowManager.MODE_FREEFORM, wm.resolveActiveLayoutMode());
+        assertEquals(DesktopWindowManager.MODE_FREEFORM,
+                wm.resolveLaunchMode("com.new.app", DesktopWindowManager.INT_MODE_AUTO));
+
+        wm.setDefaultLaunchMode(DesktopWindowManager.MODE_ADAPTIVE_SINGLE);
         assertEquals(DesktopWindowManager.MODE_ADAPTIVE_SINGLE, wm.resolveActiveLayoutMode());
 
         // On 2560x1440 @ 240dpi: 460dp = 460 * 1.5 = 690px; min 28% = 717px -> centered around x=1280
@@ -85,9 +91,16 @@ public class DesktopWindowManagerTest {
         assertNotEquals("Window 2 should cascade away from window 1", r1.left, r2.left);
         assertNotEquals("Window 3 should cascade away from window 2", r2.left, r3.left);
         assertTrue(r1.right <= 2560 && r1.bottom <= 1340);
+        assertTrue("Window top must reserve top breathing margin", r1.top >= 24);
         assertTrue(r2.right <= 2560 && r2.bottom <= 1340);
         assertTrue(r3.right <= 2560 && r3.bottom <= 1340);
         assertEquals(DesktopWindowManager.MODE_FREEFORM, wm.resolveActiveLayoutMode());
+
+        // Returning to desktop minimizes freeform windows too
+        wm.minimizeAllWindows();
+        assertTrue(wm.getManagedWindow(101).minimized);
+        assertTrue(wm.getManagedWindow(102).minimized);
+        assertTrue(wm.getManagedWindow(103).minimized);
     }
 
     @Test
@@ -281,5 +294,77 @@ public class DesktopWindowManagerTest {
         assertFalse(cleared.active);
         assertTrue(cleared.slots.isEmpty());
         assertTrue(cleared.ratios.isEmpty());
+    }
+
+    @Test
+    public void testAeroSnapBoundsAndTenWindowCapacity() throws Exception {
+        File prefs = new File(tmpDir.newFolder(), "extbridge_win_prefs.conf");
+        DesktopWindowManager wm = new DesktopWindowManager(prefs);
+
+        WindowRect maxWa = DesktopWindowManager.computeSnapBounds(
+                DesktopWindowManager.SNAP_MAXIMIZE_WORKAREA, 2560, 1440, 160, false);
+        assertEquals(8, maxWa.left);
+        assertEquals(46, maxWa.top); // 8dp top safe margin + 38dp DeX window header bar
+        assertEquals(2552, maxWa.right);
+        assertEquals(1440 - 72, maxWa.bottom); // Pure bottom Taskbar inset, zero chin
+
+        WindowRect leftHalf = DesktopWindowManager.computeSnapBounds(
+                DesktopWindowManager.SNAP_LEFT_HALF, 2560, 1440, 160, false);
+        WindowRect rightHalf = DesktopWindowManager.computeSnapBounds(
+                DesktopWindowManager.SNAP_RIGHT_HALF, 2560, 1440, 160, false);
+        assertTrue(leftHalf.right < rightHalf.left);
+        assertEquals(leftHalf.top, rightHalf.top);
+        assertEquals(leftHalf.bottom, rightHalf.bottom);
+
+        WindowRect tl = DesktopWindowManager.computeSnapBounds(
+                DesktopWindowManager.SNAP_TOP_LEFT, 2560, 1440, 160, false);
+        WindowRect br = DesktopWindowManager.computeSnapBounds(
+                DesktopWindowManager.SNAP_BOTTOM_RIGHT, 2560, 1440, 160, false);
+        assertTrue(tl.right < br.left);
+        assertTrue(tl.bottom < br.top);
+
+        // Presentation classification & Toggle Maximize <-> Restore preserves original floating frame
+        WindowRect origFloat = new WindowRect(200, 120, 1080, 920);
+        wm.putManagedWindow(901, "com.demo.editor", DesktopWindowManager.MODE_FREEFORM,
+                DesktopWindowManager.PRES_FLOATING, origFloat, true, -1);
+        long seqBefore = wm.getStateSeq();
+        WindowRect toMax = wm.resolveToggleMaximizeTarget(901, "com.demo.editor", 2560, 1440, 160);
+        assertEquals(maxWa.left, toMax.left);
+        assertEquals(maxWa.top, toMax.top);
+        assertEquals(maxWa.right, toMax.right);
+        assertEquals(maxWa.bottom, toMax.bottom);
+        String presMax = DesktopWindowManager.classifyPresentation(
+                DesktopWindowManager.MODE_FREEFORM, toMax, 2560, 1440, 160, false);
+        assertEquals(DesktopWindowManager.PRES_MAXIMIZED, presMax);
+        wm.putManagedWindow(901, "com.demo.editor", DesktopWindowManager.MODE_FREEFORM, presMax, toMax, true, -1);
+        assertTrue("stateSeq must monotonically advance", wm.getStateSeq() > seqBefore);
+
+        WindowRect restored = wm.resolveToggleMaximizeTarget(901, "com.demo.editor", 2560, 1440, 160);
+        assertEquals(origFloat.left, restored.left);
+        assertEquals(origFloat.top, restored.top);
+        assertEquals(origFloat.right, restored.right);
+        assertEquals(origFloat.bottom, restored.bottom);
+
+        // Taskbar auto-hide persists across reloads and serializes in Binder 50 JSON
+        wm.setTaskbarAutoHide(true);
+        DesktopWindowManager reloadedAuto = new DesktopWindowManager(prefs);
+        assertTrue(reloadedAuto.isTaskbarAutoHide());
+        SimpleJson.JsonObjectView jsonObj = SimpleJson.parseObject(wm.toManagedWindowsJson());
+        assertTrue(jsonObj.getBoolean("taskbarAutoHide", false));
+        assertTrue(jsonObj.getInt("stateSeq", 0) > 0);
+
+        // Verify 10 concurrent visible freeform windows stay open, and 11th auto-minimizes oldest
+        wm.clearAllManagedWindows();
+        for (int i = 1; i <= 11; i++) {
+            WindowRect r = wm.computeNextFreeformBounds(2560, 1440, 160, 72, "com.app.w" + i);
+            wm.putManagedWindow(500 + i, "com.app.w" + i, DesktopWindowManager.MODE_FREEFORM, r, true, -1);
+        }
+        int visibleCount = 0;
+        for (DesktopWindowManager.ManagedWindow w : wm.getManagedWindowsSnapshot()) {
+            if (!w.minimized) visibleCount++;
+        }
+        assertEquals(DesktopWindowManager.MAX_VISIBLE_FREEFORM_WINDOWS, visibleCount);
+        assertTrue("Oldest window (501) should be auto-minimized when 11th opens", wm.getManagedWindow(501).minimized);
+        assertFalse("Newest window (511) must stay visible and focused", wm.getManagedWindow(511).minimized);
     }
 }

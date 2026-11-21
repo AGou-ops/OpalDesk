@@ -207,18 +207,38 @@ public final class TilingLayoutEngine {
             List<String> fallbackPkgs,
             int slotCount,
             Predicate<String> isEligible) {
+        return resolveSlotPackages(reqPkgs, existingSlots, fallbackPkgs, slotCount, isEligible, true);
+    }
+
+    /**
+     * Resolves ordered tiling slot packages while preserving exact caller-requested slot indices.
+     * When {@code allowFallbackFill} is {@code false} and {@code reqPkgs} is non-empty, explicit
+     * empty entries ({@code ""}) are preserved so the UI can show in-slot candidate app pickers
+     * instead of backfilling unrelated background tasks.
+     */
+    public static ArrayList<String> resolveSlotPackages(
+            List<String> reqPkgs,
+            String[] existingSlots,
+            List<String> fallbackPkgs,
+            int slotCount,
+            Predicate<String> isEligible,
+            boolean allowFallbackFill) {
         if (slotCount <= 0) return new ArrayList<>();
         String[] slots = new String[slotCount];
         Arrays.fill(slots, "");
         HashSet<String> used = new HashSet<>(slotCount * 2);
 
-        if (reqPkgs != null && !reqPkgs.isEmpty()) {
+        boolean hasCallerList = reqPkgs != null && !reqPkgs.isEmpty();
+        if (hasCallerList) {
             for (int i = 0; i < reqPkgs.size() && i < slotCount; i++) {
                 String p = (reqPkgs.get(i) != null) ? reqPkgs.get(i).trim() : "";
                 if (isEligiblePkg(p, isEligible) && used.add(p)) {
                     slots[i] = p;
                 }
             }
+        }
+        if (!allowFallbackFill && hasCallerList) {
+            return new ArrayList<>(Arrays.asList(slots));
         }
         if (existingSlots != null && used.size() < slotCount) {
             // Sub-pass 2a: preserve untouched existing slots in their exact original indices.

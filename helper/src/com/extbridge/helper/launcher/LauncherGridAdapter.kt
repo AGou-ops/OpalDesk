@@ -9,12 +9,15 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.StateListDrawable
 import android.text.TextUtils
 import android.util.TypedValue
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.PointerIcon
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.BaseAdapter
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -25,23 +28,24 @@ import com.extbridge.helper.protocol.BridgeProtocol.AppMode
 import kotlin.math.roundToInt
 
 /**
- * ViewHolder-backed Samsung DeX desktop grid adapter with rounded icon containers,
- * subtle hover/press feedback, and balanced 2-line aligned labels.
+ * ViewHolder-backed macOS-inspired desktop grid adapter with squircle icon containers,
+ * subtle hover/press spring feedback, and balanced 2-line aligned labels.
  */
 class LauncherGridAdapter(
     private val context: Context,
-    private val onSecondaryClick: (LauncherAppEntry) -> Unit,
+    private val darkInkOnLightSurface: Boolean = false,
+    private val onSecondaryClick: (LauncherAppEntry, View) -> Unit,
 ) : BaseAdapter() {
 
     companion object {
         private const val TILE_RADIUS_DP = 16f
-        private const val ICON_BOX_FULL_DP = 58
+        private const val ICON_BOX_FULL_DP = 56
         private const val ICON_BOX_COMPACT_DP = 44
-        private const val ICON_CORNER_FULL_DP = 15f
-        private const val ICON_CORNER_COMPACT_DP = 11f
-        private const val PRESSED_SCALE = 0.94f
-        private const val PRESS_DOWN_MS = 70L
-        private const val PRESS_UP_MS = 140L
+        private const val ICON_CORNER_FULL_DP = 14.5f
+        private const val ICON_CORNER_COMPACT_DP = 11.5f
+        private const val PRESSED_SCALE = 0.92f
+        private const val PRESS_DOWN_MS = 75L
+        private const val PRESS_UP_MS = 170L
     }
 
     private class ViewHolder(
@@ -61,6 +65,7 @@ class LauncherGridAdapter(
     private var apps: List<LauncherAppEntry> = emptyList()
     private var appModes: Map<String, Int> = emptyMap()
     private var compactMode: Boolean = false
+    private var lastSecondaryClickMs: Long = 0L
 
     val itemCount: Int get() = apps.size
     fun itemAt(position: Int): LauncherAppEntry? = apps.getOrNull(position)
@@ -97,9 +102,9 @@ class LauncherGridAdapter(
             holder.badge.text = BridgeLabels.appModeBadge(mode)
             holder.badgeBg.setColor(
                 when (mode) {
-                    AppMode.LAND_FULL -> 0xB80284C7.toInt()
-                    AppMode.PORT_COMPAT -> 0xB8D97706.toInt()
-                    else -> 0xB87C3AED.toInt()
+                    AppMode.LAND_FULL -> 0xCC0A84FF.toInt()
+                    AppMode.PORT_COMPAT -> 0xCCFF9F0A.toInt()
+                    else -> 0xCCBF5AF2.toInt()
                 },
             )
         } else {
@@ -111,14 +116,14 @@ class LauncherGridAdapter(
     @SuppressLint("ClickableViewAccessibility")
     private fun createHolder(): ViewHolder {
         val pressedBg = GradientDrawable().apply {
-            setColor(0x36FFFFFF)
+            setColor(if (darkInkOnLightSurface) 0x1A007AFF else 0x38FFFFFF)
             cornerRadius = dpF(TILE_RADIUS_DP)
-            setStroke(1, 0x44FFFFFF)
+            setStroke(1, if (darkInkOnLightSurface) 0x33007AFF else 0x55FFFFFF)
         }
         val hoverBg = GradientDrawable().apply {
-            setColor(0x20FFFFFF)
+            setColor(if (darkInkOnLightSurface) 0x0E000000 else 0x22FFFFFF)
             cornerRadius = dpF(TILE_RADIUS_DP)
-            setStroke(1, 0x28FFFFFF)
+            setStroke(1, if (darkInkOnLightSurface) 0x14000000 else 0x30FFFFFF)
         }
         val stateBg = StateListDrawable().apply {
             addState(intArrayOf(android.R.attr.state_pressed), pressedBg)
@@ -128,16 +133,16 @@ class LauncherGridAdapter(
         }
 
         val iconFrameBg = GradientDrawable().apply {
-            setColor(0x1AFFFFFF)
+            setColor(if (darkInkOnLightSurface) 0xB8FFFFFF.toInt() else 0x2EFFFFFF)
             cornerRadius = dpF(ICON_CORNER_FULL_DP)
-            setStroke(1, 0x24FFFFFF)
+            setStroke(1, if (darkInkOnLightSurface) 0x16000000 else 0x48FFFFFF)
         }
         val icon = ImageView(context).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
         }
         val iconFrame = FrameLayout(context).apply {
             background = iconFrameBg
-            elevation = dpF(4f)
+            elevation = dpF(6f)
             clipToOutline = true
             addView(
                 icon,
@@ -149,8 +154,12 @@ class LauncherGridAdapter(
             )
         }
         val label = TextView(context).apply {
-            setTextColor(0xFFF8FAFC.toInt())
-            setShadowLayer(dpF(3.5f), 0f, dpF(1.2f), 0xCC000000.toInt())
+            if (darkInkOnLightSurface) {
+                setTextColor(0xFF1D1D1F.toInt())
+            } else {
+                setTextColor(0xFFF8FAFC.toInt())
+                setShadowLayer(dpF(4f), 0f, dpF(1.3f), 0xD8000000.toInt())
+            }
             gravity = Gravity.CENTER_HORIZONTAL or Gravity.TOP
             maxLines = 2
             minLines = 2
@@ -176,21 +185,35 @@ class LauncherGridAdapter(
             addView(
                 badge,
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                    topMargin = dp(4)
+                    topMargin = dp(3)
                 },
             )
         }
         return ViewHolder(card, iconFrame, iconFrameBg, icon, label, badge, badgeBg).also { holder ->
             card.tag = holder
+            card.pointerIcon = PointerIcon.getSystemIcon(context, PointerIcon.TYPE_HAND)
             iconFrame.outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
                     outline.setRoundRect(0, 0, view.width, view.height, holder.iconCornerPx)
                 }
             }
+            fun fireSecondaryOnce() {
+                val now = SystemClock.uptimeMillis()
+                if (now - lastSecondaryClickMs < 220L) return
+                lastSecondaryClickMs = now
+                holder.boundEntry?.let { onSecondaryClick(it, holder.iconFrame) }
+            }
+            card.setOnHoverListener { _, ev ->
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_HOVER_ENTER -> iconFrame.animate().scaleX(1.07f).scaleY(1.07f).setDuration(110L).setInterpolator(DecelerateInterpolator()).start()
+                    MotionEvent.ACTION_HOVER_EXIT -> iconFrame.animate().scaleX(1f).scaleY(1f).setDuration(120L).setInterpolator(DecelerateInterpolator()).start()
+                }
+                false
+            }
             card.setOnTouchListener { v, ev ->
                 if (ev == null) return@setOnTouchListener false
                 if (ev.actionMasked == MotionEvent.ACTION_DOWN && (ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
-                    holder.boundEntry?.let(onSecondaryClick)
+                    fireSecondaryOnce()
                     return@setOnTouchListener true
                 }
                 when (ev.actionMasked) {
@@ -202,14 +225,14 @@ class LauncherGridAdapter(
                     MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                         v.animate().cancel()
                         v.animate().scaleX(1f).scaleY(1f)
-                            .setDuration(PRESS_UP_MS).setInterpolator(DecelerateInterpolator()).start()
+                            .setDuration(PRESS_UP_MS).setInterpolator(OvershootInterpolator(1.4f)).start()
                     }
                 }
                 false
             }
             card.setOnGenericMotionListener { _, ev ->
                 if (ev?.actionMasked == MotionEvent.ACTION_BUTTON_PRESS && ev.actionButton == MotionEvent.BUTTON_SECONDARY) {
-                    holder.boundEntry?.let(onSecondaryClick)
+                    fireSecondaryOnce()
                     true
                 } else {
                     false

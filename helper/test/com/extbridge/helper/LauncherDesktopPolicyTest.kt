@@ -1,5 +1,6 @@
 package com.extbridge.helper
 
+import com.extbridge.helper.launcher.DesktopBackdropState
 import com.extbridge.helper.launcher.DesktopPresentationMode
 import com.extbridge.helper.launcher.LauncherDesktopPolicy
 import com.extbridge.helper.protocol.BridgeProtocol.LayoutMode
@@ -15,7 +16,7 @@ import org.junit.Test
 class LauncherDesktopPolicyTest {
 
     @Test
-    fun remoteStreamingAlwaysUsesPureRemoteMacPresentation() {
+    fun remoteStreamingUsesSameUnifiedDesktopAndSplitPickerAsPhysicalMonitor() {
         val remoteIdle = DaemonStatus(
             connected = true,
             vdId = 2,
@@ -24,12 +25,12 @@ class LauncherDesktopPolicyTest {
             sinkType = SinkType.REMOTE_USB,
         )
         val idleMode = LauncherDesktopPolicy.computeDesktopLayoutMode(remoteIdle, 2560, 1440)
-        assertEquals(DesktopPresentationMode.REMOTE_MAC, idleMode.presentation)
-        assertTrue(idleMode.isRemoteMac)
+        assertEquals(DesktopPresentationMode.PHYSICAL_DESKTOP, idleMode.presentation)
+        assertFalse(idleMode.isRemoteMac)
         assertFalse(idleMode.singleEmptySlot)
         assertFalse(idleMode.compact)
 
-        // Even if split has 1 empty slot during Remote Mac streaming, Mac App Drawer handles picking.
+        // Remote split with 1 empty slot shares Android's split picker with USB monitor mode.
         val remoteHalfSplit = remoteIdle.copy(
             sinkType = SinkType.REMOTE_WIFI,
             splitActive = 1,
@@ -37,8 +38,9 @@ class LauncherDesktopPolicyTest {
             splitSlot1Pkg = "",
         )
         val splitMode = LauncherDesktopPolicy.computeDesktopLayoutMode(remoteHalfSplit, 1280, 1440)
-        assertEquals(DesktopPresentationMode.REMOTE_MAC, splitMode.presentation)
-        assertFalse(splitMode.singleEmptySlot)
+        assertEquals(DesktopPresentationMode.PHYSICAL_SPLIT_PICKER, splitMode.presentation)
+        assertTrue(splitMode.singleEmptySlot)
+        assertTrue(splitMode.compact)
     }
 
     @Test
@@ -122,11 +124,23 @@ class LauncherDesktopPolicyTest {
         val pickerLayout = LauncherDesktopPolicy.computeDesktopLayoutMode(pickerStatus, 960, 1080)
         assertFalse(LauncherDesktopPolicy.shouldDimBackdrop(pickerStatus, activeAppSnap, isResumed = false, isTopResumed = false, layoutMode = pickerLayout))
 
-        // Remote Mac split (even with 1 slot empty) DOES dim when paused/covered so nothing bleeds through 8px seam.
+        // Floating FREEFORM windows keep desktop softly visible behind them (no blank dim).
+        val freeformSnap = WindowStateSnapshot(
+            layoutMode = LayoutMode.FREEFORM,
+            windows = listOf(
+                ManagedWindowInfo(14, "com.tencent.mm", LayoutMode.FREEFORM, 120, 80, 920, 1000, focused = true, minimized = false),
+            ),
+        )
+        assertEquals(
+            DesktopBackdropState.SOFT_BEHIND_FREEFORM,
+            LauncherDesktopPolicy.computeBackdropState(physStatus, freeformSnap, isResumed = false, isTopResumed = false, layoutMode = physLayout),
+        )
+        assertFalse(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, freeformSnap, isResumed = false, isTopResumed = false, layoutMode = physLayout))
+
+        // Unified remote split picker behaves identically to physical monitor picker.
         val remoteSplit = pickerStatus.copy(sinkType = SinkType.REMOTE_USB)
-        val remoteLayout = LauncherDesktopPolicy.computeDesktopLayoutMode(remoteSplit, 1920, 1080)
-        assertTrue(LauncherDesktopPolicy.shouldDimBackdrop(remoteSplit, activeAppSnap, isResumed = false, isTopResumed = false, layoutMode = remoteLayout))
-        assertTrue(LauncherDesktopPolicy.shouldDimBackdrop(remoteSplit, emptySnap, isResumed = true, isTopResumed = false, layoutMode = remoteLayout))
+        val remoteLayout = LauncherDesktopPolicy.computeDesktopLayoutMode(remoteSplit, 960, 1080)
+        assertFalse(LauncherDesktopPolicy.shouldDimBackdrop(remoteSplit, activeAppSnap, isResumed = false, isTopResumed = false, layoutMode = remoteLayout))
     }
 
     @Test

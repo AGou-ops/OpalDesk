@@ -255,6 +255,8 @@ public final class TaskApiAdapter {
 
     public boolean moveRootTaskToDisplay(int taskId, int targetDisplayId) {
         if (taskId <= 0 || targetDisplayId < 0 || atm == null) return false;
+        Object existingOnTarget = matchRootTaskById(getAllRootTaskInfosOnDisplay(targetDisplayId), taskId);
+        if (existingOnTarget != null) return true;
         try {
             for (Method m : atm.getClass().getMethods()) {
                 if ("moveRootTaskToDisplay".equals(m.getName()) && m.getParameterCount() == 2) {
@@ -262,11 +264,35 @@ public final class TaskApiAdapter {
                     return true;
                 }
             }
+        } catch (java.lang.reflect.InvocationTargetException e) {
+            Throwable cause = e.getTargetException() != null ? e.getTargetException() : e;
+            System.err.println("EXTBRIDGE_MOVE_TASK_ERR tid=" + taskId
+                    + " dst=" + targetDisplayId + ": " + cause.getMessage());
         } catch (ReflectiveOperationException | RuntimeException e) {
             System.err.println("EXTBRIDGE_MOVE_TASK_ERR tid=" + taskId
                     + " dst=" + targetDisplayId + ": " + e.getMessage());
         }
         return false;
+    }
+
+    /** Reorders a root task to the top ({@code toTop=true}) or bottom ({@code toTop=false}) of its display. */
+    public boolean reorderTask(int taskId, int preferredDisplayId, boolean toTop) {
+        if (taskId <= 0 || atm == null) return false;
+        try {
+            Object tok = findRootTaskToken(taskId, preferredDisplayId);
+            if (tok == null) return false;
+            Object wo = atm.getClass().getMethod("getWindowOrganizerController").invoke(atm);
+            if (wo == null) return false;
+            Class<?> wctCls = Class.forName("android.window.WindowContainerTransaction");
+            Class<?> tokCls = Class.forName("android.window.WindowContainerToken");
+            Object wct = wctCls.getConstructor().newInstance();
+            wctCls.getMethod("reorder", tokCls, boolean.class).invoke(wct, tok, toTop);
+            wo.getClass().getMethod("applyTransaction", wctCls).invoke(wo, wct);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("EXTBRIDGE_REORDER_TASK_ERR tid=" + taskId + " toTop=" + toTop + ": " + e.getMessage());
+            return false;
+        }
     }
 
     public boolean startActivityFromRecents(int taskId, Bundle options) {
@@ -426,21 +452,26 @@ public final class TaskApiAdapter {
         setTaskResizeable(taskId, 2);
 
         int curWm = getTaskWindowingMode(taskId);
+        boolean modeChanged = (curWm != WINDOWING_MODE_MULTI_WINDOW);
+        Rect initBounds = (bounds != null && !bounds.isEmpty()) ? bounds : null;
         if (curWm == WINDOWING_MODE_FREEFORM) {
-            if (!applyWctForTask(taskId, displayId, Boolean.FALSE, WINDOWING_MODE_FULLSCREEN, null)) {
+            // Atomically hand off FREEFORM (5) -> MULTI_WINDOW (6) at the exact same bounds in ONE WCT
+            // so the task never passes through an intermediate FULLSCREEN state or flashes full-screen.
+            if (applyWctForTask(taskId, displayId, Boolean.FALSE, WINDOWING_MODE_MULTI_WINDOW, initBounds)) {
+                curWm = WINDOWING_MODE_MULTI_WINDOW;
+            } else {
                 clearTaskAlwaysOnTop(taskId, displayId);
-                forceTaskWindowingMode(taskId, displayId, WINDOWING_MODE_FULLSCREEN);
+                forceTaskWindowingMode(taskId, displayId, WINDOWING_MODE_MULTI_WINDOW);
+                curWm = WINDOWING_MODE_MULTI_WINDOW;
             }
-            curWm = WINDOWING_MODE_FULLSCREEN;
         }
         if (curWm != WINDOWING_MODE_MULTI_WINDOW) {
-            Rect initBounds = (bounds != null && !bounds.isEmpty()) ? bounds : null;
             if (!applyWctForTask(taskId, displayId, null, WINDOWING_MODE_MULTI_WINDOW, initBounds)) {
                 forceTaskWindowingMode(taskId, displayId, WINDOWING_MODE_MULTI_WINDOW);
             }
         }
         if (bounds != null && !bounds.isEmpty()) {
-            resizeTaskBoundsOnly(taskId, displayId, bounds, forceSyncIfEqual);
+            resizeTaskBoundsOnly(taskId, displayId, bounds, forceSyncIfEqual || modeChanged);
         }
         return true;
     }

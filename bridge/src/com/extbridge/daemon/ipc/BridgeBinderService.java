@@ -217,6 +217,13 @@ public final class BridgeBinderService extends Binder {
                 taskController.setAdaptiveSingleConfig(data.readInt() != 0, data.readInt());
                 writeInt(reply, 1);
                 return true;
+            case BridgeProtocol.TX_SET_DESKTOP_PREFS: {
+                boolean taskbarAutoHide = data.readInt() != 0;
+                String launchMode = (data.dataAvail() > 0) ? data.readString() : null;
+                taskController.setDesktopPrefs(taskbarAutoHide, launchMode);
+                writeInt(reply, 1);
+                return true;
+            }
 
             // ---- System Status, Controls, Wallpaper & Telemetry ----
             case BridgeProtocol.TX_GET_WALLPAPER:
@@ -344,6 +351,7 @@ public final class BridgeBinderService extends Binder {
             if (config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR) {
                 if ((prev == 0) != (next == 0)) config.forceRebuild = true;
                 tickTrigger.run();
+                remoteCoordinator.requestDesktopKeyFrame();
             }
             helperBridge.notifyHelperSync();
         }
@@ -378,15 +386,16 @@ public final class BridgeBinderService extends Binder {
         MirrorGeom g = mirrorDisplay.getMirrorGeom();
         RemoteStatusSnapshot rem = remoteCoordinator.snapshotStatus(physicalDisplay.findExternalDisplay() != null);
         DesktopWindowManager wm = taskController.getWindowManager();
-        boolean physMirror = (d.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR && !remoteCoordinator.isDesktopSessionActive());
+        boolean mirrorCanvas = d.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR
+                && (!remoteCoordinator.isDesktopSessionActive() || mirrorDisplay.hasActiveRemoteComposition());
 
         reply.writeInt(d.extId);
         reply.writeInt(d.vdId);
         reply.writeInt(d.physW);
         reply.writeInt(d.physH);
         reply.writeInt(Math.round(d.physFps * 100f));
-        reply.writeInt(physMirror ? d.physW : d.virtW);
-        reply.writeInt(physMirror ? d.physH : d.virtH);
+        reply.writeInt(mirrorCanvas ? d.physW : d.virtW);
+        reply.writeInt(mirrorCanvas ? d.physH : d.virtH);
         reply.writeInt(d.virtDpi);
         reply.writeInt(Math.round(d.virtFps * 100f));
         reply.writeInt(d.inputToExt);

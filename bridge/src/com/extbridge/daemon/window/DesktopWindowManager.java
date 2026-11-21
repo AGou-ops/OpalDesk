@@ -1,5 +1,6 @@
 package com.extbridge.daemon.window;
 
+import com.extbridge.daemon.DisplayGeometryUtil;
 import com.extbridge.daemon.stream.SimpleJson;
 import com.extbridge.daemon.util.AtomicFiles;
 import com.extbridge.daemon.window.TilingLayoutEngine.WindowRect;
@@ -38,6 +39,9 @@ public final class DesktopWindowManager {
     public static final int MIN_WIDTH_PCT = 28;
     public static final int MAX_WIDTH_PCT = 100;
     public static final int MAX_SAVED_APP_PREFS = 256;
+    public static final int MAX_VISIBLE_FREEFORM_WINDOWS = 10;
+    public static final float FREEFORM_TITLE_BAR_DP = DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP;
+    public static final float FREEFORM_BOTTOM_CHIN_DP = DisplayGeometryUtil.WINDOW_BOTTOM_CHIN_DP;
     private static final float ADAPTIVE_VERTICAL_MARGIN_DP = 16f;
     private static final int MIN_ADAPTIVE_VERTICAL_MARGIN_PX = 12;
     private static final int MAX_ADAPTIVE_VERTICAL_MARGIN_PX = 32;
@@ -53,17 +57,40 @@ public final class DesktopWindowManager {
     public static final String MODE_TILING = "TILING";
     public static final String MODE_STANDALONE_APP = "STANDALONE_APP";
 
+    // Semantic DeX window presentation states
+    public static final String PRES_FLOATING = "FLOATING";
+    public static final String PRES_MAXIMIZED = "MAXIMIZED";
+    public static final String PRES_SNAPPED_LEFT = "SNAPPED_LEFT";
+    public static final String PRES_SNAPPED_RIGHT = "SNAPPED_RIGHT";
+    public static final String PRES_SNAPPED_TL = "SNAPPED_TL";
+    public static final String PRES_SNAPPED_TR = "SNAPPED_TR";
+    public static final String PRES_SNAPPED_BL = "SNAPPED_BL";
+    public static final String PRES_SNAPPED_BR = "SNAPPED_BR";
+    public static final String PRES_IMMERSIVE = "IMMERSIVE";
+
     // Binder code 51 & 52 integer modes
     public static final int INT_MODE_AUTO = 0;
     public static final int INT_MODE_FULLSCREEN = 1;
     public static final int INT_MODE_ADAPTIVE_SINGLE = 2;
     public static final int INT_MODE_FREEFORM = 3;
 
+    // Desktop Aero Snap zones within WorkArea
+    public static final int SNAP_NONE = 0;
+    public static final int SNAP_MAXIMIZE_WORKAREA = 1;
+    public static final int SNAP_LEFT_HALF = 2;
+    public static final int SNAP_RIGHT_HALF = 3;
+    public static final int SNAP_TOP_LEFT = 4;
+    public static final int SNAP_TOP_RIGHT = 5;
+    public static final int SNAP_BOTTOM_LEFT = 6;
+    public static final int SNAP_BOTTOM_RIGHT = 7;
+
     public static final class ManagedWindow {
         public final int taskId;
         public final String pkg;
         public String mode;
+        public String presentation;
         public WindowRect bounds;
+        public WindowRect restoreBounds;
         public boolean focused;
         public boolean minimized;
         public int slotIndex;
@@ -77,14 +104,17 @@ public final class DesktopWindowManager {
                 boolean focused,
                 boolean minimized,
                 int slotIndex) {
-            this(taskId, pkg, mode, bounds, focused, minimized, slotIndex, System.currentTimeMillis());
+            this(taskId, pkg, mode, MODE_FULLSCREEN.equals(mode) ? PRES_IMMERSIVE : PRES_FLOATING,
+                    bounds, null, focused, minimized, slotIndex, System.currentTimeMillis());
         }
 
         private ManagedWindow(
                 int taskId,
                 String pkg,
                 String mode,
+                String presentation,
                 WindowRect bounds,
+                WindowRect restoreBounds,
                 boolean focused,
                 boolean minimized,
                 int slotIndex,
@@ -92,7 +122,10 @@ public final class DesktopWindowManager {
             this.taskId = taskId;
             this.pkg = (pkg != null) ? pkg : "";
             this.mode = (mode != null && !mode.isEmpty()) ? mode : MODE_ADAPTIVE_SINGLE;
+            this.presentation = (presentation != null && !presentation.isEmpty())
+                    ? presentation : (MODE_FULLSCREEN.equals(this.mode) ? PRES_IMMERSIVE : PRES_FLOATING);
             this.bounds = (bounds != null) ? bounds : new WindowRect(0, 0, 0, 0);
+            this.restoreBounds = (restoreBounds != null && !restoreBounds.isEmpty()) ? restoreBounds : null;
             this.focused = focused;
             this.minimized = minimized;
             this.slotIndex = slotIndex;
@@ -100,7 +133,7 @@ public final class DesktopWindowManager {
         }
 
         public ManagedWindow copy() {
-            return new ManagedWindow(taskId, pkg, mode, bounds, focused, minimized, slotIndex, updatedAtMs);
+            return new ManagedWindow(taskId, pkg, mode, presentation, bounds, restoreBounds, focused, minimized, slotIndex, updatedAtMs);
         }
     }
 
@@ -125,6 +158,9 @@ public final class DesktopWindowManager {
 
     private boolean adaptiveSingleEnabled = true;
     private int defaultSingleWidthDp = DEFAULT_SINGLE_WIDTH_DP;
+    private String defaultLaunchMode = MODE_FREEFORM;
+    private boolean taskbarAutoHide = false;
+    private long stateSeq = 0L;
 
     // taskId -> ManagedWindow (insertion order preserved; most recently focused moved to end)
     private final LinkedHashMap<Integer, ManagedWindow> managedWindows = new LinkedHashMap<>();
@@ -161,12 +197,74 @@ public final class DesktopWindowManager {
         }
     }
 
+    public String getDefaultLaunchMode() {
+        synchronized (lock) {
+            return defaultLaunchMode;
+        }
+    }
+
+    public boolean isTaskbarAutoHide() {
+        synchronized (lock) {
+            return taskbarAutoHide;
+        }
+    }
+
+    public void setTaskbarAutoHide(boolean autoHide) {
+        synchronized (lock) {
+            if (this.taskbarAutoHide != autoHide) {
+                this.taskbarAutoHide = autoHide;
+                bumpSeqLocked();
+                savePrefsLocked();
+            }
+        }
+    }
+
+    public long getStateSeq() {
+        synchronized (lock) {
+            return stateSeq;
+        }
+    }
+
+    private long bumpSeqLocked() {
+        return ++stateSeq;
+    }
+
+    public int computeActiveTaskbarInsetPx(int screenH, int dpi) {
+        int effDpi = Math.max(120, Math.min(640, dpi > 0 ? dpi : 240));
+        int dp = isTaskbarAutoHide()
+                ? DisplayGeometryUtil.TASKBAR_AUTOHIDE_INSET_DP
+                : DisplayGeometryUtil.TASKBAR_RESERVED_INSET_DP;
+        return Math.min(Math.max(0, screenH / 3), DisplayGeometryUtil.dpToPx(dp, effDpi));
+    }
+
+    public static String normalizeLaunchMode(String raw) {
+        if (raw == null) return MODE_FREEFORM;
+        String m = raw.trim().toUpperCase(Locale.US);
+        if (MODE_FULLSCREEN.equals(m) || "FULL".equals(m)) return MODE_FULLSCREEN;
+        if (MODE_ADAPTIVE_SINGLE.equals(m) || "ADAPTIVE".equals(m) || "SINGLE".equals(m)) return MODE_ADAPTIVE_SINGLE;
+        return MODE_FREEFORM;
+    }
+
     public void setAdaptiveSingleConfig(boolean enabled, int widthDp) {
         synchronized (lock) {
             this.adaptiveSingleEnabled = enabled;
             if (widthDp > 0) {
                 this.defaultSingleWidthDp = clampWidthDp(widthDp);
             }
+            if (!enabled) {
+                this.defaultLaunchMode = MODE_FULLSCREEN;
+            } else if (MODE_FULLSCREEN.equals(this.defaultLaunchMode)) {
+                this.defaultLaunchMode = MODE_FREEFORM;
+            }
+            savePrefsLocked();
+        }
+    }
+
+    public void setDefaultLaunchMode(String mode) {
+        String normalized = normalizeLaunchMode(mode);
+        synchronized (lock) {
+            this.defaultLaunchMode = normalized;
+            this.adaptiveSingleEnabled = !MODE_FULLSCREEN.equals(normalized);
             savePrefsLocked();
         }
     }
@@ -292,6 +390,9 @@ public final class DesktopWindowManager {
     /**
      * Computes staggered cascading initial bounds for a new freeform window so multiple
      * windows do not stack identically on top of each other.
+     * Enforces the strict DeX invariant: {@code top >= workArea.top + headerPx} and
+     * {@code bottom <= workArea.bottom} so headers never clip off-screen and windows never
+     * hide behind the bottom Taskbar.
      */
     public WindowRect computeNextFreeformBounds(
             int screenW, int screenH, int dpi, int bottomDockPx, String pkg) {
@@ -299,21 +400,25 @@ public final class DesktopWindowManager {
         int sh = Math.max(480, screenH);
         int effDpi = Math.max(120, Math.min(640, dpi > 0 ? dpi : 240));
         int dock = Math.max(0, Math.min(sh / 3, bottomDockPx));
+        int topSafeMarginPx = DisplayGeometryUtil.dpToPx(DisplayGeometryUtil.WORKAREA_TOP_INSET_DP, effDpi);
+        int headerPx = DisplayGeometryUtil.dpToPx(DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP, effDpi);
         int workBottom = Math.max(360, sh - dock);
+        int minTitleTop = Math.min(Math.max(0, workBottom - 280), topSafeMarginPx + headerPx);
 
         synchronized (lock) {
             AppWindowPref pref = (pkg != null && !pkg.isEmpty()) ? appPrefs.get(pkg) : null;
             if (pref != null && pref.freeformBounds != null) {
-                WindowRect candidate = clampBoundsToWorkArea(pref.freeformBounds, sw, workBottom);
-                return avoidExactOriginCollisionLocked(candidate, sw, workBottom);
+                WindowRect candidate = clampBoundsToWorkArea(pref.freeformBounds, sw, workBottom, minTitleTop);
+                return avoidExactOriginCollisionLocked(candidate, sw, workBottom, minTitleTop);
             }
 
-            int baseW = Math.round(500f * effDpi / 160f);
-            int w = Math.max(400, Math.min(Math.round(sw * 0.52f), Math.max(Math.round(sw * 0.34f), baseW)));
+            int baseW = Math.round(680f * effDpi / 160f);
+            int w = Math.max(440, Math.min(Math.round(sw * 0.56f), Math.max(Math.round(sw * 0.38f), baseW)));
             if (sw < 900) w = Math.max(360, Math.round(sw * 0.72f));
             w = Math.min(sw - 32, w);
 
-            int h = Math.max(440, Math.min(workBottom - 40, Math.round(workBottom * 0.80f)));
+            int availH = Math.max(300, workBottom - minTitleTop - 16);
+            int h = Math.max(360, Math.min(availH, Math.round((workBottom - minTitleTop) * 0.84f)));
 
             int visibleFreeformCount = 0;
             for (ManagedWindow mw : managedWindows.values()) {
@@ -322,12 +427,12 @@ public final class DesktopWindowManager {
                 }
             }
 
-            int stepIdx = visibleFreeformCount % 5;
+            int stepIdx = visibleFreeformCount % 6;
             int stepX = Math.max(40, Math.min(96, (sw - w) / 5));
-            int stepY = Math.max(32, Math.min(64, Math.max(32, (workBottom - h) / 4)));
+            int stepY = Math.max(28, Math.min(52, Math.max(28, (availH - h + 36) / 3)));
 
             int baseLeft = Math.max(24, (sw - w) / 2 - stepX);
-            int baseTop = Math.max(24, (workBottom - h) / 2 - stepY / 2);
+            int baseTop = Math.max(minTitleTop, minTitleTop + Math.max(0, (workBottom - minTitleTop - h) / 2));
 
             int left = baseLeft + stepIdx * stepX;
             int top = baseTop + stepIdx * stepY;
@@ -335,14 +440,90 @@ public final class DesktopWindowManager {
                 left = Math.max(16, 24 + (stepIdx * 36) % Math.max(40, sw - w - 32));
             }
             if (top + h > workBottom - 12) {
-                top = Math.max(16, 24 + (stepIdx * 28) % Math.max(32, workBottom - h - 24));
+                top = Math.max(minTitleTop, minTitleTop + (stepIdx * 28) % Math.max(32, workBottom - h - minTitleTop - 12));
             }
-            WindowRect initial = clampBoundsToWorkArea(new WindowRect(left, top, left + w, top + h), sw, workBottom);
-            return avoidExactOriginCollisionLocked(initial, sw, workBottom);
+            WindowRect initial = clampBoundsToWorkArea(new WindowRect(left, top, left + w, top + h), sw, workBottom, minTitleTop);
+            return avoidExactOriginCollisionLocked(initial, sw, workBottom, minTitleTop);
         }
     }
 
-    private WindowRect avoidExactOriginCollisionLocked(WindowRect rect, int sw, int workBottom) {
+    /**
+     * Computes pixel bounds for Desktop Aero Snap zones inside the usable {@link DisplayGeometryUtil.WorkArea}
+     * (pure bottom DeX Taskbar, no top menu bar, 38dp header seated flush above {@code top}).
+     */
+    public static WindowRect computeSnapBounds(
+            int snapZone, int screenW, int screenH, int dpi, boolean taskbarAutoHide) {
+        DisplayGeometryUtil.WorkArea wa = DisplayGeometryUtil.computeDesktopWorkArea(
+                screenW, screenH, dpi, taskbarAutoHide);
+        int effDpi = Math.max(120, Math.min(640, dpi > 0 ? dpi : 160));
+        int headerPx = DisplayGeometryUtil.dpToPx(DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP, effDpi);
+        int top = Math.min(Math.max(0, wa.bottom - 240), wa.top + headerPx);
+        int bottom = Math.max(top + 220, wa.bottom);
+        int left = wa.left;
+        int right = wa.right;
+        int gap = Math.max(4, DisplayGeometryUtil.dpToPx(8, effDpi));
+        int halfGap = gap / 2;
+        int midX = (left + right) / 2;
+        int midY = (top + bottom) / 2;
+        int quarterBottomTop = Math.min(bottom - 180, midY + halfGap + headerPx);
+
+        switch (snapZone) {
+            case SNAP_LEFT_HALF:
+                return new WindowRect(left, top, Math.max(left + 200, midX - halfGap), bottom);
+            case SNAP_RIGHT_HALF:
+                return new WindowRect(Math.min(right - 200, midX + halfGap), top, right, bottom);
+            case SNAP_TOP_LEFT:
+                return new WindowRect(left, top, Math.max(left + 200, midX - halfGap), Math.max(top + 180, midY - halfGap));
+            case SNAP_TOP_RIGHT:
+                return new WindowRect(Math.min(right - 200, midX + halfGap), top, right, Math.max(top + 180, midY - halfGap));
+            case SNAP_BOTTOM_LEFT:
+                return new WindowRect(left, quarterBottomTop, Math.max(left + 200, midX - halfGap), bottom);
+            case SNAP_BOTTOM_RIGHT:
+                return new WindowRect(Math.min(right - 200, midX + halfGap), quarterBottomTop, right, bottom);
+            case SNAP_MAXIMIZE_WORKAREA:
+            default:
+                return new WindowRect(left, top, right, bottom);
+        }
+    }
+
+    public static String classifyPresentation(
+            String mode, WindowRect bounds, int screenW, int screenH, int dpi, boolean taskbarAutoHide) {
+        if (MODE_FULLSCREEN.equals(mode)) return PRES_IMMERSIVE;
+        if (bounds == null || bounds.isEmpty() || screenW <= 0 || screenH <= 0) return PRES_FLOATING;
+        int tol = Math.max(16, DisplayGeometryUtil.dpToPx(12, dpi > 0 ? dpi : 160));
+        if (approxEquals(bounds, computeSnapBounds(SNAP_MAXIMIZE_WORKAREA, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_MAXIMIZED;
+        }
+        if (approxEquals(bounds, computeSnapBounds(SNAP_LEFT_HALF, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_SNAPPED_LEFT;
+        }
+        if (approxEquals(bounds, computeSnapBounds(SNAP_RIGHT_HALF, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_SNAPPED_RIGHT;
+        }
+        if (approxEquals(bounds, computeSnapBounds(SNAP_TOP_LEFT, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_SNAPPED_TL;
+        }
+        if (approxEquals(bounds, computeSnapBounds(SNAP_TOP_RIGHT, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_SNAPPED_TR;
+        }
+        if (approxEquals(bounds, computeSnapBounds(SNAP_BOTTOM_LEFT, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_SNAPPED_BL;
+        }
+        if (approxEquals(bounds, computeSnapBounds(SNAP_BOTTOM_RIGHT, screenW, screenH, dpi, taskbarAutoHide), tol)) {
+            return PRES_SNAPPED_BR;
+        }
+        return PRES_FLOATING;
+    }
+
+    private static boolean approxEquals(WindowRect a, WindowRect b, int tol) {
+        if (a == null || b == null) return false;
+        return Math.abs(a.left - b.left) <= tol
+                && Math.abs(a.top - b.top) <= tol
+                && Math.abs(a.right - b.right) <= tol
+                && Math.abs(a.bottom - b.bottom) <= tol;
+    }
+
+    private WindowRect avoidExactOriginCollisionLocked(WindowRect rect, int sw, int workBottom, int minTop) {
         WindowRect cur = rect;
         for (int attempt = 0; attempt < 6; attempt++) {
             boolean collision = false;
@@ -359,24 +540,29 @@ public final class DesktopWindowManager {
             int nl = cur.left + 48;
             int nt = cur.top + 40;
             if (nl + w > sw - 12) nl = 24;
-            if (nt + h > workBottom - 12) nt = 24;
-            cur = clampBoundsToWorkArea(new WindowRect(nl, nt, nl + w, nt + h), sw, workBottom);
+            if (nt + h > workBottom - 12) nt = Math.max(24, minTop);
+            cur = clampBoundsToWorkArea(new WindowRect(nl, nt, nl + w, nt + h), sw, workBottom, minTop);
         }
         return cur;
     }
 
     public static WindowRect clampBoundsToWorkArea(WindowRect rect, int screenW, int workBottom) {
+        return clampBoundsToWorkArea(rect, screenW, workBottom, 0);
+    }
+
+    public static WindowRect clampBoundsToWorkArea(WindowRect rect, int screenW, int workBottom, int minTop) {
         int sw = Math.max(480, screenW);
         int wb = Math.max(360, workBottom);
+        int safeMinTop = Math.max(0, Math.min(minTop, Math.max(0, wb - 280)));
         if (rect == null || rect.isEmpty()) {
-            return new WindowRect(0, 0, sw, wb);
+            return new WindowRect(0, safeMinTop, sw, wb);
         }
         int minW = Math.min(280, sw);
-        int minH = Math.min(280, wb);
+        int minH = Math.min(280, Math.max(160, wb - safeMinTop));
         int w = Math.max(minW, Math.min(sw, rect.width()));
-        int h = Math.max(minH, Math.min(wb, rect.height()));
+        int h = Math.max(minH, Math.min(wb - safeMinTop, rect.height()));
         int left = Math.max(0, Math.min(sw - w, rect.left));
-        int top = Math.max(0, Math.min(wb - h, rect.top));
+        int top = Math.max(safeMinTop, Math.min(wb - h, rect.top));
         return new WindowRect(left, top, left + w, top + h);
     }
 
@@ -395,7 +581,7 @@ public final class DesktopWindowManager {
                     if (MODE_FREEFORM.equals(pref.mode)) return MODE_FREEFORM;
                 }
             }
-            return adaptiveSingleEnabled ? MODE_ADAPTIVE_SINGLE : MODE_FULLSCREEN;
+            return defaultLaunchMode;
         }
     }
 
@@ -436,6 +622,11 @@ public final class DesktopWindowManager {
 
     public ManagedWindow putManagedWindow(
             int taskId, String pkg, String mode, WindowRect bounds, boolean focused, int slotIndex) {
+        return putManagedWindow(taskId, pkg, mode, null, bounds, focused, slotIndex);
+    }
+
+    public ManagedWindow putManagedWindow(
+            int taskId, String pkg, String mode, String presentation, WindowRect bounds, boolean focused, int slotIndex) {
         if (taskId <= 0) return null;
         synchronized (lock) {
             if (focused) {
@@ -443,9 +634,6 @@ public final class DesktopWindowManager {
                     mw.focused = false;
                 }
             }
-            // When focusing a single-app window (ADAPTIVE_SINGLE or FULLSCREEN), keep other
-            // single-app entries tracked as minimized rather than deleting them so background
-            // tasks in MULTI_WINDOW (6) remain exempted from fullscreen rescue yanking them to front.
             if (MODE_ADAPTIVE_SINGLE.equals(mode) || MODE_FULLSCREEN.equals(mode)) {
                 for (ManagedWindow existing : managedWindows.values()) {
                     if (existing.taskId != taskId && !MODE_FREEFORM.equals(existing.mode)) {
@@ -455,10 +643,20 @@ public final class DesktopWindowManager {
                 }
             }
             ManagedWindow mw = managedWindows.remove(taskId);
+            String resolvedMode = (mode != null && !mode.isEmpty()) ? mode : (mw != null ? mw.mode : MODE_FREEFORM);
+            String resolvedPres = (presentation != null && !presentation.isEmpty())
+                    ? presentation
+                    : (MODE_FULLSCREEN.equals(resolvedMode) ? PRES_IMMERSIVE : PRES_FLOATING);
             if (mw == null) {
-                mw = new ManagedWindow(taskId, pkg, mode, bounds, focused, false, slotIndex);
+                mw = new ManagedWindow(taskId, pkg, resolvedMode, resolvedPres, bounds, null, focused, false, slotIndex, System.currentTimeMillis());
             } else {
-                mw.mode = (mode != null && !mode.isEmpty()) ? mode : mw.mode;
+                // Save prior floating bounds before transitioning into maximized/snapped/immersive.
+                if (PRES_FLOATING.equals(mw.presentation) && !PRES_FLOATING.equals(resolvedPres)
+                        && mw.bounds != null && !mw.bounds.isEmpty()) {
+                    mw.restoreBounds = mw.bounds;
+                }
+                mw.mode = resolvedMode;
+                mw.presentation = resolvedPres;
                 if (bounds != null && !bounds.isEmpty()) mw.bounds = bounds;
                 mw.focused = focused;
                 mw.minimized = false;
@@ -466,7 +664,54 @@ public final class DesktopWindowManager {
                 mw.updatedAtMs = System.currentTimeMillis();
             }
             managedWindows.put(taskId, mw);
+            if (MODE_FREEFORM.equals(mw.mode)) {
+                enforceFreeformWindowCapLocked(taskId);
+            }
+            bumpSeqLocked();
             return mw.copy();
+        }
+    }
+
+    /**
+     * Resolves the next target bounds when toggling Maximize <-> Restore on {@code taskId},
+     * persisting prior floating geometry so restore always returns to the exact user frame.
+     */
+    public WindowRect resolveToggleMaximizeTarget(int taskId, String pkg, int screenW, int screenH, int dpi) {
+        WindowRect maxRect = computeSnapBounds(SNAP_MAXIMIZE_WORKAREA, screenW, screenH, dpi, isTaskbarAutoHide());
+        synchronized (lock) {
+            ManagedWindow mw = managedWindows.get(taskId);
+            boolean currentlyMax = mw != null && (PRES_MAXIMIZED.equals(mw.presentation)
+                    || approxEquals(mw.bounds, maxRect, Math.max(20, DisplayGeometryUtil.dpToPx(14, dpi))));
+            if (currentlyMax) {
+                WindowRect restore = (mw != null) ? mw.restoreBounds : null;
+                if (restore != null && !restore.isEmpty()) {
+                    int workBottom = Math.max(360, screenH - computeActiveTaskbarInsetPx(screenH, dpi));
+                    int minTop = DisplayGeometryUtil.dpToPx(
+                            DisplayGeometryUtil.WORKAREA_TOP_INSET_DP + DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP, dpi);
+                    return clampBoundsToWorkArea(restore, screenW, workBottom, minTop);
+                }
+                return computeNextFreeformBounds(screenW, screenH, dpi, computeActiveTaskbarInsetPx(screenH, dpi), pkg);
+            }
+            if (mw != null && mw.bounds != null && !mw.bounds.isEmpty() && PRES_FLOATING.equals(mw.presentation)) {
+                mw.restoreBounds = mw.bounds;
+            }
+            return maxRect;
+        }
+    }
+
+    private void enforceFreeformWindowCapLocked(int keepTaskId) {
+        int visibleCount = 0;
+        for (ManagedWindow w : managedWindows.values()) {
+            if (!w.minimized && MODE_FREEFORM.equals(w.mode)) visibleCount++;
+        }
+        if (visibleCount <= MAX_VISIBLE_FREEFORM_WINDOWS) return;
+        for (ManagedWindow w : managedWindows.values()) {
+            if (visibleCount <= MAX_VISIBLE_FREEFORM_WINDOWS) break;
+            if (w.taskId != keepTaskId && !w.minimized && MODE_FREEFORM.equals(w.mode)) {
+                w.minimized = true;
+                w.focused = false;
+                visibleCount--;
+            }
         }
     }
 
@@ -480,15 +725,22 @@ public final class DesktopWindowManager {
     public void setFocusedTask(int taskId) {
         synchronized (lock) {
             ManagedWindow target = managedWindows.remove(taskId);
+            boolean changed = false;
             for (ManagedWindow mw : managedWindows.values()) {
-                mw.focused = false;
+                if (mw.focused) {
+                    mw.focused = false;
+                    changed = true;
+                }
             }
             if (target != null) {
+                if (!target.focused || target.minimized) changed = true;
                 target.focused = true;
                 target.minimized = false;
                 target.updatedAtMs = System.currentTimeMillis();
                 managedWindows.put(taskId, target);
+                changed = true;
             }
+            if (changed) bumpSeqLocked();
         }
     }
 
@@ -496,21 +748,39 @@ public final class DesktopWindowManager {
         synchronized (lock) {
             ManagedWindow mw = managedWindows.get(taskId);
             if (mw != null) {
-                mw.minimized = minimized;
-                if (minimized) mw.focused = false;
-                mw.updatedAtMs = System.currentTimeMillis();
+                if (mw.minimized != minimized || (minimized && mw.focused)) {
+                    mw.minimized = minimized;
+                    if (minimized) mw.focused = false;
+                    mw.updatedAtMs = System.currentTimeMillis();
+                    bumpSeqLocked();
+                }
             }
         }
     }
 
     public void minimizeAllSingleWindows() {
         synchronized (lock) {
+            boolean changed = false;
             for (ManagedWindow mw : managedWindows.values()) {
                 if (!MODE_FREEFORM.equals(mw.mode)) {
+                    if (mw.focused || !mw.minimized) changed = true;
                     mw.focused = false;
                     mw.minimized = true;
                 }
             }
+            if (changed) bumpSeqLocked();
+        }
+    }
+
+    public void minimizeAllWindows() {
+        synchronized (lock) {
+            boolean changed = false;
+            for (ManagedWindow mw : managedWindows.values()) {
+                if (mw.focused || !mw.minimized) changed = true;
+                mw.focused = false;
+                mw.minimized = true;
+            }
+            if (changed) bumpSeqLocked();
         }
     }
 
@@ -528,6 +798,7 @@ public final class DesktopWindowManager {
                     clearTilingStateLocked();
                 }
             }
+            if (removed != null) bumpSeqLocked();
             return removed;
         }
     }
@@ -601,25 +872,32 @@ public final class DesktopWindowManager {
 
     /**
      * Returns true when an untracked non-launcher task appearing on the virtual display
-     * should be auto-adopted into ADAPTIVE_SINGLE golden centered bounds.
+     * should be auto-adopted into multi-window bounds (FREEFORM or ADAPTIVE_SINGLE).
      */
     public boolean shouldAutoApplyAdaptiveSingle(int taskId, String pkg) {
         if (taskId <= 0 || pkg == null || pkg.isEmpty()) return false;
         synchronized (lock) {
-            if (!adaptiveSingleEnabled) return false;
             if (isTilingActiveLocked()) return false;
             ManagedWindow existing = managedWindows.get(taskId);
             if (existing != null) {
                 return false; // Already tracked (explicit FULLSCREEN, FREEFORM, or ADAPTIVE_SINGLE)
             }
-            for (ManagedWindow mw : managedWindows.values()) {
-                if (!mw.minimized && MODE_FREEFORM.equals(mw.mode)) {
-                    return false;
-                }
-            }
             AppWindowPref pref = appPrefs.get(pkg);
             if (pref != null && MODE_FULLSCREEN.equals(pref.mode)) {
                 return false;
+            }
+            if (pref != null && (MODE_FREEFORM.equals(pref.mode) || MODE_ADAPTIVE_SINGLE.equals(pref.mode))) {
+                return true;
+            }
+            if (MODE_FULLSCREEN.equals(defaultLaunchMode) || !adaptiveSingleEnabled) {
+                return false;
+            }
+            if (MODE_ADAPTIVE_SINGLE.equals(defaultLaunchMode)) {
+                for (ManagedWindow mw : managedWindows.values()) {
+                    if (!mw.minimized && MODE_FREEFORM.equals(mw.mode)) {
+                        return false;
+                    }
+                }
             }
             return true;
         }
@@ -858,7 +1136,7 @@ public final class DesktopWindowManager {
                 if (MODE_ADAPTIVE_SINGLE.equals(focusedWin.mode)) return MODE_ADAPTIVE_SINGLE;
             }
             if (hasVisibleAdaptive) return MODE_ADAPTIVE_SINGLE;
-            return adaptiveSingleEnabled ? MODE_ADAPTIVE_SINGLE : MODE_FULLSCREEN;
+            return defaultLaunchMode;
         }
     }
 
@@ -884,19 +1162,28 @@ public final class DesktopWindowManager {
             SimpleJson.ArrayBuilder winsArr = new SimpleJson.ArrayBuilder();
             for (ManagedWindow mw : managedWindows.values()) {
                 WindowRect b = (mw.bounds != null) ? mw.bounds : new WindowRect(0, 0, 0, 0);
-                winsArr.addRaw(new SimpleJson.ObjectBuilder()
+                SimpleJson.ObjectBuilder wb = new SimpleJson.ObjectBuilder()
                         .put("taskId", mw.taskId)
                         .put("pkg", mw.pkg)
                         .put("mode", mw.mode)
+                        .put("presentation", mw.presentation != null ? mw.presentation : PRES_FLOATING)
                         .put("left", b.left)
                         .put("top", b.top)
                         .put("right", b.right)
                         .put("bottom", b.bottom)
                         .put("focused", mw.focused)
-                        .put("minimized", mw.minimized)
-                        .build());
+                        .put("minimized", mw.minimized);
+                if (mw.restoreBounds != null && !mw.restoreBounds.isEmpty()) {
+                    wb.put("restoreLeft", mw.restoreBounds.left)
+                      .put("restoreTop", mw.restoreBounds.top)
+                      .put("restoreRight", mw.restoreBounds.right)
+                      .put("restoreBottom", mw.restoreBounds.bottom);
+                }
+                winsArr.addRaw(wb.build());
             }
             return new SimpleJson.ObjectBuilder()
+                    .put("stateSeq", stateSeq)
+                    .put("taskbarAutoHide", taskbarAutoHide)
                     .put("layoutMode", resolveActiveLayoutMode())
                     .put("adaptiveSingleEnabled", adaptiveSingleEnabled)
                     .put("defaultSingleWidthDp", defaultSingleWidthDp)
@@ -927,6 +1214,14 @@ public final class DesktopWindowManager {
                                 defaultSingleWidthDp = clampWidthDp(Integer.parseInt(p[2].trim()));
                             } catch (NumberFormatException nfe) {
                                 System.err.println("EXTBRIDGE_WIN_PREFS_BAD_WIDTH raw=" + p[2].trim());
+                            }
+                            if (p.length >= 4 && !p[3].trim().isEmpty()) {
+                                defaultLaunchMode = normalizeLaunchMode(p[3].trim());
+                            } else {
+                                defaultLaunchMode = adaptiveSingleEnabled ? MODE_FREEFORM : MODE_FULLSCREEN;
+                            }
+                            if (p.length >= 5) {
+                                taskbarAutoHide = "1".equals(p[4].trim());
                             }
                         }
                         continue;
@@ -964,7 +1259,9 @@ public final class DesktopWindowManager {
         if (prefsFile == null) return;
         StringBuilder sb = new StringBuilder(256);
         sb.append("GLOBAL\t").append(adaptiveSingleEnabled ? 1 : 0)
-          .append('\t').append(defaultSingleWidthDp).append('\n');
+          .append('\t').append(defaultSingleWidthDp)
+          .append('\t').append(defaultLaunchMode)
+          .append('\t').append(taskbarAutoHide ? 1 : 0).append('\n');
         for (AppWindowPref p : appPrefs.values()) {
             sb.append(p.pkg).append('\t')
               .append(p.mode).append('\t')

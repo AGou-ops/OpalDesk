@@ -218,5 +218,15 @@ public class TilingLayoutEngineTest {
                 TilingLayoutEngine.resolveSlotPackages(
                         Arrays.asList(BridgeBuildConfig.HELPER_PACKAGE, "com.tencent.mm", "com.tencent.mm"),
                         null, Collections.emptyList(), 3, eligible));
+
+        // Explicit empty-slot preservation mode keeps unassigned slots empty for candidate pickers
+        assertEquals(Arrays.asList("com.alpha.app", "", ""),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList("com.alpha.app", "", ""),
+                        active2, runningFallback, 3, eligible, false));
+        assertEquals(Arrays.asList("", ""),
+                TilingLayoutEngine.resolveSlotPackages(
+                        Arrays.asList("", ""),
+                        active2, runningFallback, 2, eligible, false));
     }
 }

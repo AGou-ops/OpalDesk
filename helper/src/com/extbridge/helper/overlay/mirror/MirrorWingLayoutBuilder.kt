@@ -244,7 +244,7 @@ internal object MirrorWingLayoutBuilder {
         if (hasR) addSlot(rightId, 1, gap = false)
     }
 
-    private fun mountAppWidget(
+    internal fun mountAppWidget(
         ctx: Context, box: FrameLayout, widgetId: Int, slot: Int, availW: Int, availH: Int, compact: Boolean,
         theme: BridgeClient.MirrorTheme, mgr: AppWidgetManager?, wHost: AppWidgetHost?, ratioFn: (Int) -> Int,
     ) {

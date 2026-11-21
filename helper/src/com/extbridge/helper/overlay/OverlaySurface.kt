@@ -15,6 +15,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import com.extbridge.helper.NavAssistService
+import com.extbridge.helper.design.iosglass.CrossWindowBlurController
 import kotlin.math.roundToInt
 
 private const val TAG = "ExtOverlaySurface"
@@ -144,9 +145,11 @@ object OverlayWindowParams {
         gravity: Int = Gravity.TOP or Gravity.LEFT,
         watchOutsideTouch: Boolean = false,
         touchModal: Boolean = false,
+        blurBehind: Boolean = false,
     ): WindowManager.LayoutParams {
         var flags = BASE_OVERLAY_FLAGS
         if (!touchModal) flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        if (blurBehind) flags = flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
         if (watchOutsideTouch) flags = flags or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH
         return WindowManager.LayoutParams(width, height, windowType, flags, PixelFormat.TRANSLUCENT).apply {
             this.gravity = gravity
@@ -162,7 +165,11 @@ object OverlayWindowParams {
         x: Int = 0,
         y: Int = 0,
         gravity: Int = Gravity.TOP or Gravity.LEFT,
-    ): WindowManager.LayoutParams = floating(width, height, windowType, x, y, gravity, watchOutsideTouch = true)
+        ctx: Context? = null,
+        wm: WindowManager? = null,
+    ): WindowManager.LayoutParams = floating(width, height, windowType, x, y, gravity, watchOutsideTouch = true).also { lp ->
+        if (ctx != null) CrossWindowBlurController.applyToOverlayParams(ctx, wm, lp, blurBehindRadiusDp = 32f)
+    }
 
     fun fullscreenNonTouchable(
         width: Int,
@@ -199,9 +206,10 @@ object OverlayWindowParams {
 enum class OverlayLayer(val zOrder: Int) {
     BASE_CHROME(10),
     SPLIT_DIVIDER(20),
+    IMMERSIVE_HANDLE(25),
     DOCK(30),
     POPOVER(40),
-    STAGE_ANIM(50),
+    SWITCHER(45),
     CURSOR(60),
 }
 
@@ -221,6 +229,7 @@ class OverlaySurfaceHost {
     )
 
     private val entries = LinkedHashMap<String, SurfaceEntry>()
+    var onWmAddViewFailed: ((SurfaceEntry, Throwable) -> Unit)? = null
 
     fun register(entry: SurfaceEntry) { entries[entry.key] = entry }
 
@@ -318,7 +327,21 @@ class OverlaySurfaceHost {
     }
 
     fun updateWindowLayout(view: View?, lp: WindowManager.LayoutParams?, wm: WindowManager?) {
-        if (view == null || lp == null || wm == null || !view.isAttachedToWindow) return
+        if (view == null || lp == null || wm == null) return
+        if (!view.isAttachedToWindow) {
+            if (view.parent == null) {
+                view.post {
+                    if (view.isAttachedToWindow) {
+                        try {
+                            wm.updateViewLayout(view, lp)
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "Deferred updateViewLayout failed for ${view.javaClass.simpleName}", t)
+                        }
+                    }
+                }
+            }
+            return
+        }
         try {
             wm.updateViewLayout(view, lp)
         } catch (t: Throwable) {
@@ -361,6 +384,7 @@ class OverlaySurfaceHost {
                 return true
             } catch (t: Throwable) {
                 Log.w(TAG, "Failed to addView key=${entry.key}", t)
+                onWmAddViewFailed?.invoke(entry, t)
             }
         }
         return false

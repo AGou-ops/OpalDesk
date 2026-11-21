@@ -7,14 +7,19 @@ import com.extbridge.helper.protocol.WindowStateSnapshot
 import java.util.Locale
 import kotlin.math.roundToInt
 
-/** Visual presentation mode for the external DeX desktop activity. */
+/** Visual presentation mode for the unified external DeX desktop (shared identically by USB & Mac). */
 internal enum class DesktopPresentationMode {
-    /** Remote Mac streaming: Mac renders native DeX taskbar & App Drawer; Android shows pure wallpaper. */
-    REMOTE_MAC,
-    /** Physical Type-C monitor: clean Launchpad/DeX desktop with centered search pill & max-width app grid. */
+    /** Unified computer desktop with pinned app icons, desktop widgets, and all-apps drawer trigger. */
     PHYSICAL_DESKTOP,
-    /** Physical Type-C monitor split screen with one empty slot awaiting an app pick. */
+    /** Split screen with one empty slot awaiting an app pick. */
     PHYSICAL_SPLIT_PICKER,
+}
+
+/** Visual backdrop visibility state behind active desktop windows. */
+internal enum class DesktopBackdropState {
+    ACTIVE,
+    SOFT_BEHIND_FREEFORM,
+    FULL_DIM,
 }
 
 internal data class DesktopLayoutMode(
@@ -23,7 +28,7 @@ internal data class DesktopLayoutMode(
     val compact: Boolean,
 ) {
     val isRemoteMac: Boolean
-        get() = presentation == DesktopPresentationMode.REMOTE_MAC
+        get() = false
 }
 
 /**
@@ -36,13 +41,6 @@ internal object LauncherDesktopPolicy {
     private const val COMPACT_WINDOW_RATIO = 0.88f
 
     fun computeDesktopLayoutMode(status: DaemonStatus, winW: Int, winH: Int): DesktopLayoutMode {
-        if (status.isRemoteStreaming) {
-            return DesktopLayoutMode(
-                presentation = DesktopPresentationMode.REMOTE_MAC,
-                singleEmptySlot = false,
-                compact = false,
-            )
-        }
         val singleEmpty = status.connected &&
             status.splitActive == 1 &&
             (status.splitSlot0Pkg.isEmpty() != status.splitSlot1Pkg.isEmpty())
@@ -70,9 +68,37 @@ internal object LauncherDesktopPolicy {
     fun hasVisibleManagedForegroundApp(snapshot: WindowStateSnapshot): Boolean =
         snapshot.windows.any { !it.minimized && !OverlayConstants.isSystemOrLauncherPkg(it.pkg) }
 
+    fun hasVisibleNonFreeformCoveringApp(status: DaemonStatus, snapshot: WindowStateSnapshot): Boolean {
+        if (status.splitActive == 1 || status.isMultiTilingActive || LayoutMode.isTilingTopology(snapshot.tilingTopology)) {
+            return true
+        }
+        return snapshot.windows.any {
+            !it.minimized && !OverlayConstants.isSystemOrLauncherPkg(it.pkg) &&
+                !it.mode.equals(LayoutMode.FREEFORM, ignoreCase = true)
+        }
+    }
+
+    fun computeBackdropState(
+        status: DaemonStatus,
+        windowSnapshot: WindowStateSnapshot,
+        isResumed: Boolean,
+        isTopResumed: Boolean,
+        layoutMode: DesktopLayoutMode,
+    ): DesktopBackdropState {
+        if (layoutMode.singleEmptySlot) return DesktopBackdropState.ACTIVE
+        if (hasVisibleNonFreeformCoveringApp(status, windowSnapshot)) {
+            return if (!isResumed || !isTopResumed) DesktopBackdropState.FULL_DIM else DesktopBackdropState.ACTIVE
+        }
+        if (hasVisibleManagedForegroundApp(windowSnapshot)) {
+            return DesktopBackdropState.SOFT_BEHIND_FREEFORM
+        }
+        if (!isResumed) return DesktopBackdropState.FULL_DIM
+        return DesktopBackdropState.ACTIVE
+    }
+
     /**
-     * Determines whether the desktop UI should fade out into the deep charcoal stage backdrop
-     * so nothing from LauncherActivity bleeds behind centered apps, freeform windows, or split seams.
+     * Determines whether the desktop UI should fully fade out into the deep charcoal stage backdrop.
+     * Floating small FREEFORM windows keep desktop icons and widgets softly visible beneath them.
      */
     fun shouldDimBackdrop(
         status: DaemonStatus,
@@ -80,12 +106,8 @@ internal object LauncherDesktopPolicy {
         isResumed: Boolean,
         isTopResumed: Boolean,
         layoutMode: DesktopLayoutMode,
-    ): Boolean {
-        if (layoutMode.singleEmptySlot) return false
-        if (!isResumed) return true
-        if (isTopResumed) return false
-        return hasVisibleManagedForegroundApp(windowSnapshot) || status.isMultiTilingActive
-    }
+    ): Boolean =
+        computeBackdropState(status, windowSnapshot, isResumed, isTopResumed, layoutMode) == DesktopBackdropState.FULL_DIM
 
     fun computeGridColumns(gridWidthDp: Float, compact: Boolean): Int {
         val cellDp = if (compact) 96f else 128f

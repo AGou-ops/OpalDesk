@@ -25,7 +25,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import com.extbridge.helper.HyperUi
-import com.extbridge.helper.StageTransitionView
+import com.extbridge.helper.design.iosglass.LiquidGlassDrawable
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -112,7 +112,7 @@ object OverlayUiUtils {
     private data class ChipStyleKey(val active: Boolean, val iconKind: Int, val text: String)
 
     fun makeVerticalDivider(ctx: Context): View = View(ctx).apply {
-        setBackgroundColor(0x38FFFFFF)
+        setBackgroundColor(HyperUi.DIVIDER)
         layoutParams = ctx.llp(1, ctx.dp(22f), leftDp = 7f, rightDp = 7f)
     }
 
@@ -123,25 +123,26 @@ object OverlayUiUtils {
         tv.ellipsize = TextUtils.TruncateAt.END
     }
 
-    fun makeDockBtn(ctx: Context, txt: String, color: Int, textColor: Int = Color.WHITE): TextView =
+    fun makeDockBtn(ctx: Context, txt: String, color: Int, textColor: Int = HyperUi.TEXT_PRIMARY): TextView =
         TextView(ctx).apply {
             text = txt
             setTextColor(textColor)
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f)
-            setPadDp(10f, 5f)
+            paint.isFakeBoldText = true
+            setPadDp(11f, 6f)
             enforceSingleLine(this)
-            background = roundedBg(color, ctx.dpF(13f))
+            LiquidGlassDrawable.applyToView(this, color, ctx.dpF(18f), strokeWidthPx = ctx.dpF(0.9f))
             layoutParams = ctx.llp(leftDp = 3f, rightDp = 3f)
         }
 
     fun makeFooterChip(ctx: Context, txt: String, centered: Boolean = false): TextView =
         TextView(ctx).apply {
             text = txt
-            setTextColor(0xFFD8DEE9.toInt())
+            setTextColor(HyperUi.TEXT_PRIMARY)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
             gravity = if (centered) Gravity.CENTER else Gravity.CENTER_VERTICAL
             isSingleLine = true
-            setPadDp(11f, 6f)
+            setPadDp(11f, 7f)
             HyperUi.styleHyperChip(this, false)
         }
 
@@ -177,16 +178,22 @@ object OverlayUiUtils {
         if (text != null) tv.text = text
         HyperUi.styleHyperChip(tv, active)
         if (iconKind > 0) {
-            HyperUi.setStartIcon(tv, iconKind, if (active) Color.WHITE else 0xFFD8DEE9.toInt(), sizeDp, padDp)
+            HyperUi.setStartIcon(tv, iconKind, if (active) Color.WHITE else HyperUi.TEXT_PRIMARY, sizeDp, padDp)
         }
     }
 
-    fun makeFlyoutCard(ctx: Context, cornerDp: Float = 18f, padHDp: Float = 12f, padVDp: Float = 10f, elevationDp: Float = 18f): LinearLayout =
+    fun makeFlyoutCard(ctx: Context, cornerDp: Float = 28f, padHDp: Float = 16f, padVDp: Float = 14f, elevationDp: Float = 22f): LinearLayout =
         LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             setPadDp(padHDp, padVDp)
             elevation = ctx.dpF(elevationDp)
-            background = roundedBg(HyperUi.FLYOUT_BG, ctx.dpF(cornerDp), 1, HyperUi.FLYOUT_STROKE)
+            LiquidGlassDrawable.applyToView(
+                view = this,
+                fillColor = HyperUi.FLYOUT_BG,
+                cornerRadiusPx = ctx.dpF(cornerDp),
+                strokeWidthPx = ctx.dpF(1.1f),
+                darkMode = false,
+            )
         }
 
     fun makeStateListBg(ctx: Context, normalColor: Int, activeColor: Int, radiusDp: Float = 10f): StateListDrawable {
@@ -279,14 +286,6 @@ object OverlayUiUtils {
             if (slot == 0) Rect(0, 0, sw, max(240, div - 4)) else Rect(0, min(sh - 240, div + 4), sw, sh)
         }
     }
-
-    fun recycleUnusedCard(c: StageTransitionView.CardSpec?) {
-        val b = c?.snapshot ?: return
-        c.snapshot = null
-        if (c.ownSnapshot && !b.isRecycled) {
-            try { b.recycle() } catch (t: Throwable) { Log.w(TAG, "Failed to recycle CardSpec bitmap", t) }
-        }
-    }
 }
 
 /** Dirty-checked [ImageView] wrapper around [HyperUi.icon] replacing the legacy `MiniIconView`. */
@@ -321,15 +320,16 @@ class QuickTile(
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
     }
-    private val iconHolder = VectorIconHolder(ctx, iconKind, Color.WHITE, 18f)
+    private val iconHolder = VectorIconHolder(ctx, iconKind, HyperUi.TEXT_PRIMARY, 18f)
     private val splitSep: View?
+    private val arrowView: TextView?
     private val label: TextView
-    private val bg = GradientDrawable()
+    private var glassBg: LiquidGlassDrawable? = null
     private var active = false
     private var bgInit = false
 
     init {
-        root.addView(box, ctx.llp(MATCH, ctx.dp(44f), bottomDp = 5f))
+        root.addView(box, ctx.llp(MATCH, ctx.dp(46f), bottomDp = 5f))
         val leftWrap = LinearLayout(ctx).apply {
             gravity = Gravity.CENTER
             setOnClickListener { onToggle() }
@@ -337,17 +337,18 @@ class QuickTile(
         }
         box.addView(leftWrap, ctx.llp(0, MATCH, 1f))
         if (hasArrow) {
-            splitSep = View(ctx).apply { setBackgroundColor(0x28FFFFFF) }
+            splitSep = View(ctx).apply { setBackgroundColor(HyperUi.DIVIDER) }
             box.addView(splitSep, ctx.llp(1, MATCH))
-            box.addView(TextView(ctx).apply {
-                text = "›"; setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f); gravity = Gravity.CENTER
+            arrowView = TextView(ctx).apply {
+                text = "›"; setTextColor(HyperUi.TEXT_SECONDARY); setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f); gravity = Gravity.CENTER
                 setOnClickListener { onMore?.invoke() }
-            }, ctx.llp(ctx.dp(32f), MATCH))
+            }.also { box.addView(it, ctx.llp(ctx.dp(32f), MATCH)) }
         } else {
             splitSep = null
+            arrowView = null
         }
         label = TextView(ctx).apply {
-            text = initialLabel; setTextColor(0xFFE2E8F0.toInt()); setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            text = initialLabel; setTextColor(HyperUi.TEXT_PRIMARY); setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             gravity = Gravity.CENTER; isSingleLine = true; ellipsize = TextUtils.TruncateAt.END
         }
         root.addView(label, ctx.llp(MATCH, WRAP))
@@ -358,11 +359,23 @@ class QuickTile(
         if (caption != null && label.text?.toString() != caption) label.text = caption
         if (bgInit && on == active) return
         active = on; bgInit = true
-        bg.setColor(if (on) HyperUi.HYPER_BLUE else HyperUi.TILE_INACTIVE)
-        bg.cornerRadius = ctx.dpF(14f)
-        bg.setStroke(1, if (on) 0x48FFFFFF else 0x1AFFFFFF)
-        box.background = bg
-        splitSep?.setBackgroundColor(if (on) 0x38FFFFFF else 0x22FFFFFF)
+        val fill = if (on) HyperUi.HYPER_BLUE else HyperUi.TILE_INACTIVE
+        val cur = glassBg
+        if (cur != null) {
+            cur.baseFillColor = fill
+            cur.darkMode = on
+        } else {
+            glassBg = LiquidGlassDrawable.applyToView(
+                view = box,
+                fillColor = fill,
+                cornerRadiusPx = ctx.dpF(18f),
+                strokeWidthPx = ctx.dpF(1f),
+                darkMode = on,
+            )
+        }
+        iconHolder.update(tint = if (on) Color.WHITE else HyperUi.TEXT_PRIMARY)
+        arrowView?.setTextColor(if (on) Color.WHITE else HyperUi.TEXT_SECONDARY)
+        splitSep?.setBackgroundColor(if (on) 0x38FFFFFF else HyperUi.DIVIDER)
     }
 }
 
@@ -371,10 +384,13 @@ class MiniBatteryView(ctx: Context) : View(ctx) {
     private val rect = RectF()
     private var pct = 100
     private var charging = false
+    private var inkColor = HyperUi.TEXT_PRIMARY
 
-    fun setBattery(pct: Int, charging: Boolean) {
-        if (this.pct != pct || this.charging != charging) {
-            this.pct = pct; this.charging = charging
+    fun setBattery(pct: Int, charging: Boolean, inkColor: Int = this.inkColor) {
+        if (this.pct != pct || this.charging != charging || this.inkColor != inkColor) {
+            this.pct = pct
+            this.charging = charging
+            this.inkColor = inkColor
             invalidate()
         }
     }
@@ -383,13 +399,13 @@ class MiniBatteryView(ctx: Context) : View(ctx) {
         val w = width.toFloat(); val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
         val bodyR = w * 0.86f; val stroke = max(1.4f, h * 0.11f)
-        paint.style = Paint.Style.STROKE; paint.strokeWidth = stroke; paint.color = 0xFFE2E8F0.toInt()
+        paint.style = Paint.Style.STROKE; paint.strokeWidth = stroke; paint.color = inkColor
         rect.set(stroke, stroke, bodyR, h - stroke)
         c.drawRoundRect(rect, h * 0.18f, h * 0.18f, paint)
         paint.style = Paint.Style.FILL
         rect.set(bodyR + stroke * 0.5f, h * 0.30f, w - 1f, h * 0.70f)
         c.drawRoundRect(rect, 1.5f, 1.5f, paint)
-        paint.color = when { charging -> 0xFF4ADE80.toInt(); pct <= 20 -> 0xFFF87171.toInt(); else -> 0xFFE2E8F0.toInt() }
+        paint.color = when { charging -> HyperUi.HYPER_GREEN; pct <= 20 -> HyperUi.HYPER_RED; else -> inkColor }
         val pad = stroke * 1.6f
         rect.set(pad, pad, pad + max(0f, bodyR - pad * 2f) * (pct / 100f), h - pad)
         c.drawRoundRect(rect, h * 0.10f, h * 0.10f, paint)

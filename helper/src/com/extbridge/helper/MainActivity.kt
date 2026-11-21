@@ -7,6 +7,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
@@ -14,9 +16,19 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import com.extbridge.helper.design.iosglass.CrossWindowBlurController
+import com.extbridge.helper.design.iosglass.LiquidGlassTheme
+import com.extbridge.helper.design.iosglass.LiquidMeshBackground
+import com.extbridge.helper.design.iosglass.LiquidShapes
+import com.extbridge.helper.design.iosglass.SquircleShape
+import com.extbridge.helper.design.iosglass.rememberAdaptiveViewportInfo
 import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.protocol.BridgeLabels
 import com.extbridge.helper.service.DisplayLaunchHelper
@@ -45,6 +57,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         if (DisplayLaunchHelper.ensureOnDisplay0(this)) return
         enableEdgeToEdge()
+        CrossWindowBlurController.applyToActivityWindow(window)
 
         ctrl = MainController(this)
         widgetBinder = MainWidgetBinder(this, ctrl.scope) { ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel) }
@@ -152,8 +165,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            val isWide = maxWidth >= 760.dp
+        val viewport = rememberAdaptiveViewportInfo()
+        val isWide = viewport.isTwoPaneCapable && viewport.widthDp >= 720
+        LiquidMeshBackground(modifier = Modifier.fillMaxSize()) {
             val scrollBehavior = MiuixScrollBehavior()
             Scaffold(
                 modifier = Modifier.fillMaxSize(),
@@ -161,10 +175,12 @@ class MainActivity : ComponentActivity() {
                     if (!isWide) TopAppBar(navItems[ctrl.navTab].third, subtitle = subtitle, scrollBehavior = scrollBehavior, actions = { TopBarQuickActions() })
                 },
                 bottomBar = {
-                    if (!isWide) NavigationBar {
-                        navItems.forEachIndexed { idx, (label, icon, _) ->
-                            NavigationBarItem(selected = ctrl.navTab == idx, onClick = { ctrl.navTab = idx }, icon = icon, label = label)
-                        }
+                    if (!isWide) {
+                        IosFloatingGlassBottomBar(
+                            items = navItems,
+                            selectedIndex = ctrl.navTab,
+                            onSelect = { ctrl.navTab = it },
+                        )
                     }
                 },
             ) { innerPadding ->
@@ -173,7 +189,7 @@ class MainActivity : ComponentActivity() {
                         NavigationRail(
                             header = {
                                 Box(
-                                    modifier = Modifier.padding(vertical = 8.dp).size(38.dp).clip(RoundedCornerShape(11.dp))
+                                    modifier = Modifier.padding(vertical = 8.dp).size(40.dp).clip(SquircleShape(13.dp))
                                         .background(HyperBlue.copy(alpha = 0.15f)),
                                     contentAlignment = Alignment.Center,
                                 ) { Icon(ExtVectorIcons.MonitorDex, "ExtBridge", tint = HyperBlue, modifier = Modifier.size(20.dp)) }
@@ -197,12 +213,61 @@ class MainActivity : ComponentActivity() {
                             contentPadding = PaddingValues(
                                 start = 16.dp, end = 16.dp,
                                 top = innerPadding.calculateTopPadding() + 8.dp,
-                                bottom = innerPadding.calculateBottomPadding() + 18.dp,
+                                bottom = innerPadding.calculateBottomPadding() + 24.dp,
                             ),
                         )
                     }
                 }
                 MainOverlays()
+            }
+        }
+    }
+
+    @Composable
+    private fun IosFloatingGlassBottomBar(
+        items: List<Triple<String, androidx.compose.ui.graphics.vector.ImageVector, String>>,
+        selectedIndex: Int,
+        onSelect: (Int) -> Unit,
+    ) {
+        val glass = LiquidGlassTheme.colors
+        val rim = remember(glass) {
+            Brush.linearGradient(listOf(glass.specularTopLeft, glass.specularMid, glass.specularBottomRight))
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 18.dp, vertical = 10.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(LiquidShapes.Capsule)
+                    .background(glass.glassThick)
+                    .border(1.dp, rim, LiquidShapes.Capsule)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                items.forEachIndexed { idx, (label, icon, _) ->
+                    val selected = idx == selectedIndex
+                    val tint = if (selected) Color.White else glass.textSecondary
+                    Row(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(LiquidShapes.Capsule)
+                            .background(if (selected) glass.accentBlue else Color.Transparent)
+                            .clickable { onSelect(idx) }
+                            .padding(vertical = 8.dp, horizontal = 6.dp),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(icon, label, tint = tint, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(label, fontSize = 11.5.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium, color = tint, maxLines = 1)
+                    }
+                }
             }
         }
     }

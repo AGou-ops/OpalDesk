@@ -13,6 +13,7 @@ import com.extbridge.daemon.platform.TaskApiAdapter;
 import com.extbridge.daemon.util.ShellCommand;
 
 import java.util.List;
+import java.util.function.Function;
 
 /**
  * Local Helper virtual touchpad / mouse / keyboard injection, shared cursor state,
@@ -25,6 +26,8 @@ public final class LocalInputController {
     private final Object cursorLock = new Object();
 
     private volatile NativeMirrorController mirrorController;
+    private volatile Runnable onExtPointerActivity;
+    private volatile Function<String, Boolean> onDesktopShortcut;
     private volatile float cursorX = 1280f, cursorY = 720f;
     private volatile int mouseButtons = 0;
     private long mouseDownTime = 0L;
@@ -38,6 +41,10 @@ public final class LocalInputController {
     }
 
     public void setMirrorController(NativeMirrorController mc) { this.mirrorController = mc; }
+    public void setDesktopHooks(Runnable onExtPointerActivity, Function<String, Boolean> onDesktopShortcut) {
+        this.onExtPointerActivity = onExtPointerActivity;
+        this.onDesktopShortcut = onDesktopShortcut;
+    }
     public Object getCursorLock() { return cursorLock; }
     public float getCursorX() { return cursorX; }
     public float getCursorY() { return cursorY; }
@@ -92,6 +99,13 @@ public final class LocalInputController {
     public void injectKey(int keyCode, int metaState) {
         int dispId = (config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR) ? 0 : config.vdId;
         if (dispId < 0 || !injector.canInject()) return;
+        if (dispId > 0 && config.mirrorMode == BridgeProtocol.MIRROR_MODE_DEX) {
+            String shortcut = DesktopShortcutMatcher.match(keyCode, metaState);
+            Function<String, Boolean> handler = onDesktopShortcut;
+            if (shortcut != null && handler != null && Boolean.TRUE.equals(handler.apply(shortcut))) {
+                return;
+            }
+        }
         if (dispId == 0 && keyCode == KeyEvent.KEYCODE_BACK && metaState == 0 && isHelperTopOnDisplay0()) return;
         if (dispId > 0) injector.focusDisplayForKey(dispId);
         long tDown = SystemClock.uptimeMillis();
@@ -228,6 +242,11 @@ public final class LocalInputController {
             if (mirror && mir != null) {
                 mir.updateMirrorCursorSurface(cursorX, cursorY, mouseButtons != 0 || type == BridgeProtocol.MOUSE_LEFT_DOWN, true);
             }
+        }
+        if (!triggerBack && config.mirrorMode == BridgeProtocol.MIRROR_MODE_DEX
+                && (type == BridgeProtocol.MOUSE_LEFT_CLICK || type == BridgeProtocol.MOUSE_LEFT_DOWN || type == BridgeProtocol.MOUSE_LEFT_UP)) {
+            Runnable cb = onExtPointerActivity;
+            if (cb != null) cb.run();
         }
         if (triggerBack) injectKey(KeyEvent.KEYCODE_BACK, 0);
     }

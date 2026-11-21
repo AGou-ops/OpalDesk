@@ -45,6 +45,8 @@ fun parsePlatformApiVersion(dirName: String): Double? {
 }
 
 fun resolveAndroidJar(sdkDir: File): File {
+    val preferred372 = File(sdkDir, "platforms/android-37.2/android.jar")
+    if (preferred372.isFile) return preferred372
     val preferred = File(sdkDir, "platforms/android-37.0/android.jar")
     if (preferred.isFile) return preferred
 

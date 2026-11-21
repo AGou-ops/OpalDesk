@@ -14,6 +14,8 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.*
 import android.widget.*
+import com.extbridge.helper.design.iosglass.CrossWindowBlurController
+import com.extbridge.helper.design.iosglass.LiquidGlassDrawable
 import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.prefs.MirrorTheme
 import com.extbridge.helper.prefs.MirrorThemeCatalog
@@ -90,6 +92,7 @@ class SideControlActivity : Activity(), TextureView.SurfaceTextureListener {
         super.onCreate(savedInstanceState)
         if (DisplayLaunchHelper.ensureOnDisplay0(this)) return
         window.decorView.filterTouchesWhenObscured = true
+        CrossWindowBlurController.applyToActivityWindow(window)
         touchExec = Executors.newSingleThreadExecutor()
         theme = AppPrefs.getActiveMirrorTheme(this)
 
@@ -119,7 +122,9 @@ class SideControlActivity : Activity(), TextureView.SurfaceTextureListener {
             wideTouchBoost = !wideTouchBoost
             btn.text = if (wideTouchBoost) "宽屏易触" else "原比例"
             HyperUi.setStartIcon(btn, if (wideTouchBoost) HyperUi.ICON_ZOOM else HyperUi.ICON_RATIO, Color.WHITE, 14f, 5f)
-            (btn.background as? GradientDrawable)?.setColor(if (wideTouchBoost) HyperUi.HYPER_BLUE else HyperUi.CHIP_INACTIVE)
+            val fill = if (wideTouchBoost) HyperUi.HYPER_BLUE else 0x33FFFFFF
+            (btn.background as? LiquidGlassDrawable)?.baseFillColor = fill
+            (btn.background as? GradientDrawable)?.setColor(fill)
             lastLayoutKey = Long.MIN_VALUE
             syncStageLayoutAndMeta()
         }
@@ -153,9 +158,14 @@ class SideControlActivity : Activity(), TextureView.SurfaceTextureListener {
         rippleOverlay = TouchRippleOverlay(this)
         val match = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         mirrorCardFrame = FrameLayout(this).apply {
-            background = GradientDrawable().apply {
-                setColor(0xFF0B1221.toInt()); cornerRadius = dp(18).toFloat(); setStroke(dp(1), HyperUi.HYPER_BLUE)
-            }
+            LiquidGlassDrawable.applyToView(
+                view = this,
+                fillColor = 0xEE0B1221.toInt(),
+                cornerRadiusPx = dp(24).toFloat(),
+                strokeWidthPx = dp(1).toFloat(),
+                darkMode = true,
+                clipOutline = true,
+            )
             clipToOutline = true
             addView(textureView, match)
             addView(rippleOverlay, FrameLayout.LayoutParams(match))
@@ -211,9 +221,13 @@ class SideControlActivity : Activity(), TextureView.SurfaceTextureListener {
             this.text = text; setTextColor(Color.WHITE); setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
             gravity = Gravity.CENTER_VERTICAL; setSingleLine(true); setPadding(dp(12), dp(8), dp(12), dp(8))
             if (iconKind > 0) HyperUi.setStartIcon(this, iconKind, Color.WHITE, 14f, 5f)
-            background = GradientDrawable().apply {
-                setColor(bgColor); cornerRadius = dp(13).toFloat(); setStroke(dp(1), 0x24FFFFFF)
-            }
+            LiquidGlassDrawable.applyToView(
+                view = this,
+                fillColor = if (bgColor == HyperUi.CHIP_INACTIVE) 0x33FFFFFF else bgColor,
+                cornerRadiusPx = dp(16).toFloat(),
+                strokeWidthPx = dp(1).toFloat(),
+                darkMode = true,
+            )
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 setMargins(dp(4), 0, dp(4), 0)
             }
@@ -225,8 +239,10 @@ class SideControlActivity : Activity(), TextureView.SurfaceTextureListener {
 
     private fun selectWing(slot: Int) {
         wingSlot = slot
-        (btnWingLeft.background as? GradientDrawable)?.setColor(if (wingSlot == 0) HyperUi.HYPER_BLUE else HyperUi.CHIP_INACTIVE)
-        (btnWingRight.background as? GradientDrawable)?.setColor(if (wingSlot == 1) HyperUi.HYPER_BLUE else HyperUi.CHIP_INACTIVE)
+        val leftFill = if (wingSlot == 0) HyperUi.HYPER_BLUE else 0x33FFFFFF
+        val rightFill = if (wingSlot == 1) HyperUi.HYPER_BLUE else 0x33FFFFFF
+        (btnWingLeft.background as? LiquidGlassDrawable)?.baseFillColor = leftFill
+        (btnWingRight.background as? LiquidGlassDrawable)?.baseFillColor = rightFill
         lastLayoutKey = Long.MIN_VALUE
         syncStageLayoutAndMeta()
     }

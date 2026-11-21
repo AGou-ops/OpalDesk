@@ -7,22 +7,26 @@ kotlin {
     jvmToolchain(21)
 }
 
+val resolvedSdkDir = (rootProject.extra["extBridgeAndroidSdkDir"] as? String).orEmpty()
+val hasAndroid37Minor2 = resolvedSdkDir.isNotBlank() &&
+    file("$resolvedSdkDir/platforms/android-37.2/android.jar").isFile
+
 @Suppress("UnstableApiUsage")
 android {
     namespace = "com.extbridge.helper"
     buildToolsVersion = "37.0.0"
     compileSdk {
         version = release(37) {
-            minorApiLevel = 0
+            minorApiLevel = if (hasAndroid37Minor2) 2 else 0
         }
     }
 
     defaultConfig {
         applicationId = "com.extbridge.helper"
         minSdk = 30
-        targetSdk = 35
-        versionCode = 25
-        versionName = "3.5.3"
+        targetSdk = 37
+        versionCode = 26
+        versionName = "4.0.0"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -144,6 +148,8 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.13.0")
     implementation("org.jetbrains.compose.foundation:foundation:1.12.0")
     implementation("org.jetbrains.compose.ui:ui:1.12.0")
+    implementation("androidx.window:window:1.5.0")
+    implementation("androidx.window:window-core:1.5.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("top.yukonga.miuix.kmp:miuix-ui:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.4")

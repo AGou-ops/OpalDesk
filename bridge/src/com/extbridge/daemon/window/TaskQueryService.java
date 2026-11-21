@@ -248,8 +248,16 @@ final class TaskQueryService {
     }
 
     ArrayList<String> pickTilingApps(List<String> reqPkgs, int slotCount) {
+        return pickTilingApps(reqPkgs, slotCount, false);
+    }
+
+    ArrayList<String> pickTilingApps(List<String> reqPkgs, int slotCount, boolean preserveEmptySlots) {
         if (slotCount <= 0) return new ArrayList<>();
         String[] existingSlots = windowManager.isTilingActive() ? windowManager.getTilingSlotPkgs() : null;
+        if (preserveEmptySlots && reqPkgs != null && !reqPkgs.isEmpty()) {
+            return TilingLayoutEngine.resolveSlotPackages(
+                    reqPkgs, existingSlots, Collections.emptyList(), slotCount, TaskQueryService::isEligibleTilePkg, false);
+        }
         ArrayList<String> resolved = TilingLayoutEngine.resolveSlotPackages(
                 reqPkgs, existingSlots, Collections.emptyList(), slotCount, TaskQueryService::isEligibleTilePkg);
         if (!hasEmptySlot(resolved, slotCount)) {

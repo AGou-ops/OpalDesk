@@ -10,6 +10,7 @@ import com.extbridge.daemon.DaemonConfig.PackagePolicy;
 import com.extbridge.daemon.DisplayGeometryUtil;
 import com.extbridge.daemon.audio.AudioStreamCapturer;
 import com.extbridge.daemon.display.CompatPolicyController;
+import com.extbridge.daemon.display.NativeMirrorController;
 import com.extbridge.daemon.display.PhysicalDisplayController;
 import com.extbridge.daemon.display.SystemControlService;
 import com.extbridge.daemon.input.InputInjector;
@@ -73,6 +74,7 @@ public final class RemoteSessionCoordinator {
     final InputInjector injector;
     final LocalInputController localInput;
     final PhysicalDisplayController physicalDisplay;
+    final NativeMirrorController mirrorDisplay;
     final TaskWindowController taskController;
     final TaskApiAdapter taskApi;
     final Handler mainHandler;
@@ -98,7 +100,8 @@ public final class RemoteSessionCoordinator {
             AndroidServices services, DaemonConfig config, CompatPolicyController compatPolicy,
             SystemControlService systemControl, HelperClientBridge helperBridge,
             InputInjector injector, LocalInputController localInput,
-            PhysicalDisplayController physicalDisplay, TaskWindowController taskController,
+            PhysicalDisplayController physicalDisplay, NativeMirrorController mirrorDisplay,
+            TaskWindowController taskController,
             TaskApiAdapter taskApi, Handler mainHandler, ExecutorService bgIoExec) {
         this.services = services;
         this.config = config;
@@ -108,6 +111,7 @@ public final class RemoteSessionCoordinator {
         this.injector = injector;
         this.localInput = localInput;
         this.physicalDisplay = physicalDisplay;
+        this.mirrorDisplay = mirrorDisplay;
         this.taskController = taskController;
         this.taskApi = taskApi;
         this.mainHandler = mainHandler;
@@ -134,7 +138,7 @@ public final class RemoteSessionCoordinator {
     }
 
     public void shutdown() {
-        for (RemoteDisplaySession sas : new ArrayList<>(standaloneSessions.values())) sas.close(config, injector);
+        for (RemoteDisplaySession sas : new ArrayList<>(standaloneSessions.values())) sas.close(config, injector, mirrorDisplay);
         standaloneSessions.clear();
         RemoteDisplaySession desk;
         synchronized (config.displayLock) {
@@ -142,7 +146,7 @@ public final class RemoteSessionCoordinator {
             desktopSession = null;
         }
         stopAudioQuietly();
-        if (desk != null) desk.close(config, injector);
+        if (desk != null) desk.close(config, injector, mirrorDisplay);
         injector.releaseAllUhidDevices();
         RemoteStreamServer srv = server;
         if (srv != null) srv.shutdown();
@@ -247,19 +251,36 @@ public final class RemoteSessionCoordinator {
         if (config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR) {
             if (desk.vd != null || config.forceRebuild) {
                 config.forceRebuild = false;
-                desk.releaseDisplays(config, injector);
+                desk.releaseDisplays(config, injector, mirrorDisplay);
             }
-            if (desk.mirrorVd == null && desk.sink != null) desk.attachMirrorVdLocked(this, desk.sink.getInputSurface());
+            if (desk.mirrorVd == null && desk.sink != null) {
+                desk.attachMirrorVdLocked(this, desk.sink.getInputSurface());
+            } else if (desk.mirrorCompDisplayId > 0 && mirrorDisplay != null) {
+                if (mirrorDisplay.needsAttachOrRebuildForTarget(desk.mirrorCompDisplayId, true) && desk.sink != null) {
+                    desk.attachMirrorVdLocked(this, desk.sink.getInputSurface());
+                } else {
+                    mirrorDisplay.updateMirrorGeometry(true);
+                    mirrorDisplay.reassert();
+                    mirrorDisplay.scheduleStrayTaskRescueIfActive();
+                }
+            }
         } else {
-            desk.releaseMirrorVd();
+            desk.releaseMirrorVd(mirrorDisplay);
             if (config.forceRebuild && desk.vd != null) {
                 config.forceRebuild = false;
-                desk.releaseDisplays(config, injector);
+                desk.releaseDisplays(config, injector, mirrorDisplay);
             }
             if (desk.vd == null && desk.sink != null) desk.attachDexVd(this, desk.sink.getInputSurface());
             else taskController.enforceRunningExtTasksFullscreen(config.fullscreenPolicy == 1);
         }
         pushDesktopDeviceState(false);
+    }
+
+    public void requestDesktopKeyFrame() {
+        RemoteDisplaySession desk = desktopSession;
+        if (desk != null && !desk.closed && desk.sink != null && desk.sink.isActive()) {
+            desk.sink.requestKeyFrame();
+        }
     }
 
     public void applyDesktopResizeFromConfig() {
@@ -532,7 +553,7 @@ public final class RemoteSessionCoordinator {
                 desktopSession = null;
                 if (teardownPhysicalForRemote != null) teardownPhysicalForRemote.run();
                 if (audioCapturer != null) audioCapturer.stop();
-                if (prevDesk != null) prevDesk.close(config, injector);
+                if (prevDesk != null) prevDesk.close(config, injector, mirrorDisplay);
 
                 config.activeSinkType = sinkType;
                 config.mirrorMode = (hello.displayMode == ExtCastProtocol.DISPLAY_MODE_MIRROR)
@@ -564,7 +585,7 @@ public final class RemoteSessionCoordinator {
             RemoteDisplaySession sas = createAndStartSession(sessionId, sinkType, true, hello, new Object());
             if (sas == null) { if (server != null) server.disconnectSession(sessionId, "Standalone video encoder unavailable"); return; }
             if (!sas.attachDexVd(RemoteSessionCoordinator.this, sas.sink.getInputSurface())) {
-                sas.close(config, injector);
+                sas.close(config, injector, mirrorDisplay);
                 if (server != null) server.disconnectSession(sessionId, "Standalone VirtualDisplay failed");
                 return;
             }
@@ -572,6 +593,7 @@ public final class RemoteSessionCoordinator {
             standaloneSessions.put(sessionId, sas);
             sas.launchOrMoveStandaloneApp(RemoteSessionCoordinator.this);
             pushDeviceState(sas);
+            pushDesktopDeviceState(true);
             helperBridge.notifyHelperSync();
         }
 
@@ -580,7 +602,7 @@ public final class RemoteSessionCoordinator {
             if (ExtCastProtocol.SESSION_ROLE_STANDALONE_APP.equalsIgnoreCase(sessionRole)) {
                 System.out.println("EXTBRIDGE_STANDALONE_DISCONNECTED sid=" + sessionId + " reason=" + reason);
                 RemoteDisplaySession removed = standaloneSessions.remove(sessionId);
-                if (removed != null) removed.close(config, injector);
+                if (removed != null) removed.close(config, injector, mirrorDisplay);
                 helperBridge.notifyHelperSync();
                 return;
             }
@@ -594,7 +616,7 @@ public final class RemoteSessionCoordinator {
                 closing.closed = true;
             }
             if (audioCapturer != null) audioCapturer.stop();
-            closing.close(config, injector);
+            closing.close(config, injector, mirrorDisplay);
             synchronized (config.displayLock) {
                 if (desktopSession == null) {
                     if (cleanupAfterRemoteDisconnect != null) cleanupAfterRemoteDisconnect.run();
@@ -639,8 +661,12 @@ public final class RemoteSessionCoordinator {
                 if (srv == null) return;
                 Set<Integer> extIds = new HashSet<>();
                 if (config.vdId > 0) extIds.add(config.vdId);
-                for (RemoteDisplaySession sas : standaloneSessions.values()) {
-                    if (sas != null && !sas.closed && sas.vdId > 0) extIds.add(sas.vdId);
+                RemoteDisplaySession desk = desktopSession;
+                boolean isDesktopQuery = (desk != null && desk.sessionId == sessionId);
+                if (!isDesktopQuery) {
+                    for (RemoteDisplaySession sas : standaloneSessions.values()) {
+                        if (sas != null && !sas.closed && sas.vdId > 0) extIds.add(sas.vdId);
+                    }
                 }
                 srv.sendAppList(sessionId, taskController.collectAppList(extIds));
             });

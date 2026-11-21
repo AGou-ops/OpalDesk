@@ -8,6 +8,7 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.BLUETOOTH" />
 
@@ -29,10 +30,15 @@
 
     <application
         android:allowBackup="false"
+        android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:label="ExtBridge"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <property
+            android:name="android.window.PROPERTY_SUPPORTS_MULTI_INSTANCE_SYSTEM_UI"
+            android:value="true" />
 
         <activity
             android:name=".MainActivity"
@@ -40,7 +46,8 @@
             android:label="ExtBridge"
             android:launchMode="singleTask"
             android:taskAffinity="com.extbridge.helper.tablet"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode">
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -53,8 +60,9 @@
             android:label="ExtBridge 触摸板"
             android:launchMode="singleTask"
             android:taskAffinity="com.extbridge.helper.tablet"
+            android:resizeableActivity="true"
             android:windowSoftInputMode="adjustResize|stateHidden"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|uiMode" />
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
             android:name=".SideControlActivity"
@@ -62,7 +70,8 @@
             android:label="ExtBridge 副屏直控"
             android:launchMode="singleTask"
             android:taskAffinity="com.extbridge.helper.tablet"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|uiMode" />
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
             android:name=".SideMouseCaptureActivity"
@@ -84,7 +93,7 @@
             android:resizeableActivity="true"
             android:windowSoftInputMode="stateAlwaysHidden|adjustNothing"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density" />
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <service
             android:name=".BridgeService"

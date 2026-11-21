@@ -58,6 +58,7 @@ object BridgeProtocol {
         const val WINDOW_LIFECYCLE_ACTION = 54
         const val SET_ADAPTIVE_SINGLE_CONFIG = 55
         const val SET_INPUT_BACKEND = 56
+        const val SET_DESKTOP_PREFS = 57
         const val SHUTDOWN = 99
     }
 
@@ -120,6 +121,32 @@ object BridgeProtocol {
         const val MINIMIZE = 2
         const val CLOSE = 3
         const val RELOAD_DPI = 4
+        const val SEND_BACK = 5
+        const val TOGGLE_MAXIMIZE = 6
+    }
+
+    object WindowPresentation {
+        const val FLOATING = "FLOATING"
+        const val MAXIMIZED = "MAXIMIZED"
+        const val SNAPPED_LEFT = "SNAPPED_LEFT"
+        const val SNAPPED_RIGHT = "SNAPPED_RIGHT"
+        const val SNAPPED_TL = "SNAPPED_TL"
+        const val SNAPPED_TR = "SNAPPED_TR"
+        const val SNAPPED_BL = "SNAPPED_BL"
+        const val SNAPPED_BR = "SNAPPED_BR"
+        const val IMMERSIVE = "IMMERSIVE"
+    }
+
+    object ShortcutAction {
+        const val WINDOW_SWITCHER = "window_switcher"
+        const val APP_DRAWER = "app_drawer"
+        const val SHOW_DESKTOP = "show_desktop"
+        const val SNAP_LEFT = "snap_left"
+        const val SNAP_RIGHT = "snap_right"
+        const val MAXIMIZE_TOGGLE = "maximize_toggle"
+        const val MINIMIZE_OR_RESTORE = "minimize_or_restore"
+        const val CLOSE_FOCUSED = "close_focused"
+        const val DISMISS_OVERLAY = "dismiss_overlay"
     }
 
     object InputBackend {
@@ -215,6 +242,9 @@ object BridgeProtocol {
         const val EXTRA_CALLBACK_BINDER = "cb"
         const val EXTRA_PROC_TOKEN = "proc"
         const val EXTRA_EDGE_ENTER = "enter"
+        const val EXTRA_SYNC_WIN_JSON = "winJson"
+        const val EXTRA_SYNC_STATE_SEQ = "stateSeq"
+        const val EXTRA_SYNC_SHORTCUT = "desktopShortcut"
     }
 }
 

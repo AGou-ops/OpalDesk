@@ -25,6 +25,7 @@ object DaemonBootstrapScripts {
         "appops set $HELPER_PKG 10021 allow",
         "appops set $HELPER_PKG ACCESS_RESTRICTED_SETTINGS allow",
         "pm grant $HELPER_PKG android.permission.POST_NOTIFICATIONS",
+        "pm grant $HELPER_PKG android.permission.ACCESS_LOCAL_NETWORK",
         "dumpsys deviceidle whitelist +$HELPER_PKG",
     )
 
@@ -33,11 +34,14 @@ object DaemonBootstrapScripts {
 
     fun stageBridgeJarWithSha256(ctx: Context): Pair<String, String>? {
         val outFile = File(ctx.filesDir, "extbridge_stage.jar")
+        if (outFile.exists()) {
+            runCatching { outFile.setWritable(true, true); outFile.delete() }
+        }
         val sha = hashAssetJar(ctx, copyTo = outFile) ?: return null
         outFile.setReadable(false, false)
         outFile.setReadable(true, true)
+        // Android 17 (API 37) enforces read-only permissions on staged DEX/code archives.
         outFile.setWritable(false, false)
-        outFile.setWritable(true, true)
         return outFile.absolutePath to sha
     }
 

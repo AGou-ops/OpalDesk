@@ -60,6 +60,8 @@ public final class NativeMirrorController {
     private volatile SurfaceLayerHelper.BlastSurface sideBlast;
     private volatile VirtualDisplay sideVd;
     private volatile int sideVdId = -1;
+    private volatile int targetDisplayId = -1;
+    private volatile boolean remoteTarget = false;
     private volatile MirrorGeom mirGeom = MirrorGeom.EMPTY;
     private volatile int lastAppliedMirSideMode = -1;
     private volatile boolean sideVdAttempted = false;
@@ -93,30 +95,65 @@ public final class NativeMirrorController {
         return rootSc != null || mir0Sc != null || sideVd != null || "NATIVE_MIRROR_STOCK".equals(config.renderMode);
     }
 
+    public boolean hasActiveRemoteComposition() {
+        return remoteTarget && targetDisplayId > 0 && rootSc != null && mir0Sc != null;
+    }
+
+    public int getTargetDisplayId() {
+        return targetDisplayId;
+    }
+
     public boolean needsAttachOrRebuild(int extId) {
+        return needsAttachOrRebuildForTarget(extId, false);
+    }
+
+    public boolean needsAttachOrRebuildForTarget(int displayId, boolean isRemote) {
         boolean needSide = config.mirrorSideMode > BridgeProtocol.MIRROR_SIDE_OFF;
-        boolean stock = "NATIVE_MIRROR_STOCK".equals(config.renderMode);
+        boolean stock = !isRemote && "NATIVE_MIRROR_STOCK".equals(config.renderMode);
         boolean sideRetry = needSide && sideVd == null
                 && (!sideVdAttempted || lastSideVdAttemptMode != config.mirrorSideMode);
-        return extId != config.extId || (!stock && (rootSc == null || mir0Sc == null || sideRetry || (!needSide && sideVd != null)));
+        return displayId != targetDisplayId
+                || isRemote != remoteTarget
+                || (!isRemote && displayId != config.extId)
+                || (!stock && (rootSc == null || mir0Sc == null || sideRetry || (!needSide && sideVd != null)));
     }
 
     public void attachMirrorDisplay(int extId) {
+        attachMirrorTargetInternal(extId, false, config.physW, config.physH, config.physFps);
+    }
+
+    /**
+     * Attaches the unified Display 0 + SideBar VirtualDisplay composition onto a remote stream
+     * container VirtualDisplay so Mac Mirror Mode gets pixel-identical layout and 14-card/AppWidget
+     * sidebars as a USB-C DisplayPort monitor.
+     */
+    public boolean attachRemoteMirrorDisplay(int remoteVdId, int streamW, int streamH, float streamFps) {
+        if (remoteVdId <= 0 || streamW <= 0 || streamH <= 0) return false;
+        return attachMirrorTargetInternal(remoteVdId, true, streamW, streamH, streamFps);
+    }
+
+    private boolean attachMirrorTargetInternal(int dispId, boolean isRemote, int outW, int outH, float outFps) {
         config.forceRebuild = false;
         try {
             Object mir0 = services.mirrorDisplay(0);
             if (mir0 == null) {
-                config.extId = extId;
+                if (isRemote) return false;
+                config.extId = dispId;
+                targetDisplayId = dispId;
+                remoteTarget = false;
                 config.vdId = -1;
                 config.vdUniqueId = null;
                 sideVdId = -1;
                 config.renderMode = "NATIVE_MIRROR_STOCK";
-                services.replaceContentOnDisplay(extId, null);
+                services.replaceContentOnDisplay(dispId, null);
                 helperBridge.enqueuePushBinder(true);
                 helperBridge.notifyHelperSync();
-                System.out.println("EXTBRIDGE_MIRROR_FALLBACK_STOCK extId=" + extId);
-                return;
+                System.out.println("EXTBRIDGE_MIRROR_FALLBACK_STOCK extId=" + dispId);
+                return true;
             }
+            config.physW = outW;
+            config.physH = outH;
+            config.physFps = outFps;
             rootSc = SurfaceLayerHelper.buildContainerLayer("ExtRoot", null, false);
             bgSc = SurfaceLayerHelper.buildColorLayer("ExtBg", rootSc, false);
             mir0WrapSc = SurfaceLayerHelper.buildContainerLayer("ExtMir0Clip", rootSc, false);
@@ -127,45 +164,66 @@ public final class NativeMirrorController {
             }
 
             boolean sideReady = (config.mirrorSideMode > BridgeProtocol.MIRROR_SIDE_OFF) && attachSideBarVd();
-            config.extId = extId;
+            targetDisplayId = dispId;
+            remoteTarget = isRemote;
+            config.extId = isRemote ? -1 : dispId;
             config.vdId = -1;
             config.vdUniqueId = null;
-            config.renderMode = sideReady ? "MIRROR_SIDEBAR" : "MIRROR_COMP";
+            config.renderMode = isRemote
+                    ? (sideReady ? "REMOTE_MIRROR_SIDEBAR" : "REMOTE_MIRROR_COMP")
+                    : (sideReady ? "MIRROR_SIDEBAR" : "MIRROR_COMP");
             localInput.resetCursorCenter(config.physW, config.physH);
             lastAppliedMirSideMode = -1;
 
             cursorController.initOverlay(rootSc);
             registerDisplayListener();
             updateMirrorGeometry(false);
-            reassert();
+            if (!reassert() && isRemote) {
+                teardown(false);
+                return false;
+            }
             systemControl.grantAppWidgetBind();
             cursorController.startPoller();
             helperBridge.enqueuePushBinder(true);
             helperBridge.notifyHelperSync();
             MirrorGeom g = mirGeom;
-            System.out.println("EXTBRIDGE_MIRROR_ATTACHED extId=" + extId + " sideVdId=" + sideVdId
+            System.out.println("EXTBRIDGE_MIRROR_ATTACHED dispId=" + dispId + " remote=" + isRemote + " sideVdId=" + sideVdId
                     + " d0=" + g.d0W + "x" + g.d0H + " mir=" + g.mirW + "x" + g.mirH + "@" + g.mirX + "," + g.mirY);
+            return true;
         } catch (ReflectiveOperationException | RuntimeException e) {
             System.err.println("EXTBRIDGE_MIRROR_ATTACH_ERR: " + e.getMessage());
             teardown(false);
+            return false;
         }
     }
 
-    public void reassert() {
+    public boolean reassert() {
         Object root = rootSc;
-        if (config.extId <= 0 || root == null) return;
-        services.replaceContentOnDisplay(config.extId, root);
+        int tid = targetDisplayId;
+        if (tid <= 0 || root == null) return false;
+        boolean ok = services.replaceContentOnDisplay(tid, root);
+        if (!ok) return false;
         try (SurfaceLayerHelper.Transaction tx = SurfaceLayerHelper.openTransaction()) {
             tx.setLayer(root, Integer.MAX_VALUE).setPosition(root, 0f, 0f).show(root).apply();
         } catch (ReflectiveOperationException | RuntimeException e) {
             System.err.println("EXTBRIDGE_MIRROR_REASSERT_WARN: " + e.getMessage());
+        }
+        return true;
+    }
+
+    public void teardownForDisplay(int expectedDisplayId) {
+        if (expectedDisplayId > 0 && targetDisplayId == expectedDisplayId) {
+            teardown(true);
         }
     }
 
     public void teardown(boolean unbindWm) {
         Object[] curLayers = cursorController.detachOverlayLayers();
         unregisterDisplayListener();
-        if (unbindWm && config.extId > 0) services.replaceContentOnDisplay(config.extId, null);
+        int prevTarget = targetDisplayId;
+        targetDisplayId = -1;
+        remoteTarget = false;
+        if (unbindWm && prevTarget > 0) services.replaceContentOnDisplay(prevTarget, null);
         releaseSideResources();
 
         Object[] all = {curLayers[0], curLayers[1], mir0Sc, mir0BgSc, mir0WrapSc, bgSc, rootSc};
@@ -190,19 +248,9 @@ public final class NativeMirrorController {
             int curD0W = (d0.x > 0 && d0.y > 0) ? d0.x : 1920;
             int curD0H = (d0.x > 0 && d0.y > 0) ? d0.y : 1200;
             int physW = config.physW, physH = config.physH, sideMode = config.mirrorSideMode;
-
             float fit = Math.min(physW / (float) curD0W, physH / (float) curD0H);
-            int mirW = Math.max(1, Math.round(curD0W * fit));
-            int mirH = Math.max(1, Math.round(curD0H * fit));
-            int mirX = Math.max(0, (physW - mirW) / 2);
-            int mirY = Math.max(0, (physH - mirH) / 2);
-            if (physW - mirW >= EDGE_MARGIN_MIN_PX) {
-                if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT) mirX = 0;
-                else if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT) mirX = Math.max(0, physW - mirW);
-            } else if (physH - mirH >= EDGE_MARGIN_MIN_PX) {
-                if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT) mirY = 0;
-                else if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT) mirY = Math.max(0, physH - mirH);
-            }
+            int[] placed = DisplayGeometryUtil.computeMirrorPlacement(curD0W, curD0H, physW, physH, sideMode);
+            int mirX = placed[0], mirY = placed[1], mirW = placed[2], mirH = placed[3];
 
             MirrorGeom prev = mirGeom;
             boolean changed = curD0W != prev.d0W || curD0H != prev.d0H

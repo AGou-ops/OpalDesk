@@ -1,5 +1,6 @@
 package com.extbridge.helper
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.ActivityOptions
 import android.content.BroadcastReceiver
@@ -10,11 +11,8 @@ import android.content.IntentFilter
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.RenderEffect
-import android.graphics.Shader
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
-import android.graphics.drawable.StateListDrawable
 import android.os.Build
 import android.os.Bundle
 import android.text.Editable
@@ -24,7 +22,6 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
-import android.view.Menu
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -36,24 +33,32 @@ import android.widget.FrameLayout
 import android.widget.GridView
 import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedDispatcher
 import com.extbridge.helper.ipc.DaemonStateStore
+import com.extbridge.helper.launcher.DesktopBackdropState
+import com.extbridge.helper.launcher.DesktopGridWorkspaceView
 import com.extbridge.helper.launcher.DesktopLayoutMode
 import com.extbridge.helper.launcher.DesktopPresentationMode
+import com.extbridge.helper.launcher.DesktopWidgetBoardController
 import com.extbridge.helper.launcher.LauncherAppDialogs
 import com.extbridge.helper.launcher.LauncherAppEntry
 import com.extbridge.helper.launcher.LauncherAppRepository
 import com.extbridge.helper.launcher.LauncherDesktopPolicy
 import com.extbridge.helper.launcher.LauncherGridAdapter
+import com.extbridge.helper.launcher.MacMenuEntry
+import com.extbridge.helper.launcher.MacMenuHeader
+import com.extbridge.helper.launcher.MacSheetItem
+import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.protocol.BridgeProtocol.AppMode
 import com.extbridge.helper.protocol.BridgeProtocol.HelperActions
+import com.extbridge.helper.protocol.BridgeProtocol.ShortcutAction
 import com.extbridge.helper.protocol.BridgeProtocol.WindowMode
 import com.extbridge.helper.protocol.DaemonStatus
 import com.extbridge.helper.protocol.WindowStateSnapshot
 import com.extbridge.helper.service.DisplayLaunchHelper
+import com.extbridge.helper.ui.ExtThemePrefs
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -66,6 +71,14 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+/**
+ * Pure Samsung DeX external desktop wallpaper canvas hosting pinned app icons/folders
+ * ([DesktopGridWorkspaceView]), desktop widgets ([DesktopWidgetBoardController]), and the
+ * empty-slot split picker fallback.
+ *
+ * All global shell chrome (Taskbar, App Drawer, Quick Settings, Window Switcher, Window Headers)
+ * lives permanently in WindowManager via [com.extbridge.helper.desktop.state.DesktopShellCoordinator].
+ */
 class LauncherActivity : Activity() {
 
     companion object {
@@ -74,25 +87,41 @@ class LauncherActivity : Activity() {
         private const val FOCUS_FADE_IN_MS = 220L
         private const val FOCUS_CONTENT_SCALE = 0.96f
         private const val FOCUS_WALLPAPER_SCALE = 1.03f
-        private const val FOCUS_WALLPAPER_BLUR_PX = 18f
+        private const val SOFT_SCRIM_ALPHA = 0.0f
         private const val FOCUS_SCRIM_ALPHA = 0.66f
-        private const val REMOTE_HINT_ALPHA = 0.45f
-        private const val MENU_APP_MODES = 1
-        private const val MENU_SYNC_WALLPAPER = 2
+        private const val MAX_INITIAL_PINNED_APPS = 8
 
         private var sPendingQuery = ""
 
         @Volatile
         private var sResumedInstance: LauncherActivity? = null
 
+        fun notifyOverlayStateChanged() {
+            val inst = sResumedInstance
+            if (inst != null && !inst.isFinishing && !inst.isDestroyed) {
+                inst.runOnUiThread { inst.syncDesktopLayout() }
+            }
+        }
+
         fun shouldConsumeRightClickAt(screenX: Int, screenY: Int): Boolean {
             val act = sResumedInstance
             if (act == null || act.isFinishing || act.isDestroyed ||
-                act.isBackdropFocused || act.isRemoteDesktopMode || act.dialogs.isShowing
+                act.backdropState == DesktopBackdropState.FULL_DIM || act.dialogs.isShowing
             ) {
                 return false
             }
-            val grid = act.gridView
+            if (act.desktopGridWorkspace.visibility == View.VISIBLE) {
+                return true
+            }
+            return isPointInGridItem(act.gridView, act.gridAdapter, screenX, screenY)
+        }
+
+        private fun isPointInGridItem(
+            grid: GridView,
+            adapter: LauncherGridAdapter,
+            screenX: Int,
+            screenY: Int,
+        ): Boolean {
             if (grid.visibility != View.VISIBLE || grid.width <= 0 || grid.height <= 0) return false
             val loc = IntArray(2)
             grid.getLocationOnScreen(loc)
@@ -100,32 +129,32 @@ class LauncherActivity : Activity() {
             val ly = screenY - loc[1]
             if (lx < 0 || ly < 0 || lx >= grid.width || ly >= grid.height) return false
             val pos = grid.pointToPosition(lx, ly)
-            return pos != AdapterView.INVALID_POSITION && pos in 0 until act.gridAdapter.itemCount
+            return pos != AdapterView.INVALID_POSITION && pos in 0 until adapter.itemCount
         }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private lateinit var rootView: FrameLayout
-    private lateinit var overlayHost: FrameLayout
     private lateinit var wallpaperView: ImageView
     private lateinit var focusScrimView: View
     private lateinit var contentView: FrameLayout
-    private lateinit var remoteHintView: TextView
     private lateinit var physicalWorkspace: LinearLayout
     private lateinit var splitPickerHeader: TextView
-    private lateinit var topBar: FrameLayout
+    private lateinit var pickerSearchWrap: LinearLayout
     private lateinit var searchPill: LinearLayout
-    private lateinit var menuButton: ImageView
+    private lateinit var workspaceColumnsRow: LinearLayout
+    private lateinit var desktopLeftPane: LinearLayout
     private lateinit var gridStage: FrameLayout
     private lateinit var searchInput: EditText
     private lateinit var btnClear: TextView
     private lateinit var emptyView: TextView
+    private lateinit var desktopGridWorkspace: DesktopGridWorkspaceView
     private lateinit var gridView: GridView
     private lateinit var gridAdapter: LauncherGridAdapter
+    private lateinit var widgetBoard: DesktopWidgetBoardController
     private lateinit var dialogs: LauncherAppDialogs
 
-    private var activePopupMenu: PopupMenu? = null
     private var allApps: List<LauncherAppEntry> = emptyList()
     private var appModes: Map<String, Int> = emptyMap()
     private var query = ""
@@ -139,10 +168,7 @@ class LauncherActivity : Activity() {
     private var hasResumedOnce = false
 
     @Volatile
-    private var isBackdropFocused = false
-
-    @Volatile
-    private var isRemoteDesktopMode = false
+    private var backdropState: DesktopBackdropState = DesktopBackdropState.ACTIVE
 
     @Volatile
     private var cachedStatus: DaemonStatus = DaemonStateStore.status.value
@@ -162,6 +188,16 @@ class LauncherActivity : Activity() {
             if (!isFinishing && !isDestroyed) {
                 refreshStatusAsync()
                 loadWallpaperAsync(false)
+            }
+        }
+    }
+
+    private val desktopPrefsChangedHook: (Context) -> Unit = {
+        runOnUiThread {
+            if (!isFinishing && !isDestroyed) {
+                if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.reloadFromPrefs()
+                applyFilter(query)
+                widgetBoard.rebuildBoard(force = false)
             }
         }
     }
@@ -187,8 +223,16 @@ class LauncherActivity : Activity() {
 
         dialogs = LauncherAppDialogs(this, ::runIo) { latest ->
             appModes = latest
+            if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.updateModes(latest)
             gridAdapter.updateModes(latest)
         }
+        widgetBoard = DesktopWidgetBoardController(this, dialogs.presenter, ::runIo) { pkg ->
+            if (pkg.isNullOrBlank()) ""
+            else allApps.firstOrNull { it.pkg == pkg }?.label ?: pkg
+        }
+        AppPrefs.onDesktopPrefsChanged = desktopPrefsChangedHook
+
+        applyDesktopCaptionBarStyle()
         buildUi()
         if (sPendingQuery.isNotEmpty()) {
             query = sPendingQuery
@@ -239,8 +283,12 @@ class LauncherActivity : Activity() {
     }
 
     private fun handleDesktopBack() {
-        if (activePopupMenu != null) {
-            dismissPopupMenu()
+        if (dialogs.isShowing) {
+            dialogs.dismissAll()
+            return
+        }
+        if (::desktopGridWorkspace.isInitialized && desktopGridWorkspace.isFolderOpen) {
+            desktopGridWorkspace.closeFolder()
             return
         }
         if (query.isNotEmpty()) {
@@ -259,8 +307,8 @@ class LauncherActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        if (!cachedStatus.isRemoteStreaming) BridgeService.setDockHidden(false)
-        BridgeService.setLauncherOverlayHost(overlayHost, display?.displayId ?: -1)
+        BridgeService.setDockHidden(false)
+        widgetBoard.startUpdates()
     }
 
     override fun onResume() {
@@ -269,11 +317,12 @@ class LauncherActivity : Activity() {
         hasResumedOnce = true
         isActivityResumed = true
         isTopResumed = true
-        setBackdropFocusMode(false)
+        setBackdropState(DesktopBackdropState.ACTIVE)
         syncDesktopLayout()
         refreshStatusAsync()
         loadWallpaperAsync(false)
         refreshAppModesAsync()
+        widgetBoard.startUpdates()
     }
 
     override fun onTopResumedActivityChanged(isTopResumedActivity: Boolean) {
@@ -287,31 +336,38 @@ class LauncherActivity : Activity() {
         if (sResumedInstance === this) sResumedInstance = null
         isActivityResumed = false
         isTopResumed = false
-        dismissPopupMenu()
+        dialogs.dismissAll()
         if (!computeDesktopLayoutMode().singleEmptySlot) {
-            setBackdropFocusMode(true)
+            syncBackdropFocusMode()
         }
         super.onPause()
     }
 
     override fun onStop() {
-        BridgeService.clearLauncherOverlayHost(overlayHost)
+        widgetBoard.stopUpdates()
         super.onStop()
     }
 
     override fun onDestroy() {
         if (sResumedInstance === this) sResumedInstance = null
-        dismissPopupMenu()
+        if (AppPrefs.onDesktopPrefsChanged === desktopPrefsChangedHook) AppPrefs.onDesktopPrefsChanged = null
+        widgetBoard.release()
         dialogs.dismissAll()
         scope.cancel()
         BridgeClient.removeOnBinderReady(binderReadyCb)
-        BridgeService.clearLauncherOverlayHost(overlayHost)
         try {
             unregisterReceiver(syncReceiver)
         } catch (t: Throwable) {
             Log.d(TAG, "unregister skipped: ${t.message}")
         }
         super.onDestroy()
+    }
+
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        widgetBoard.onActivityResult(requestCode, resultCode)
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent?): Boolean {
@@ -336,21 +392,44 @@ class LauncherActivity : Activity() {
         refreshStatusAsync()
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (isRemoteDesktopMode || isBackdropFocused) return super.onKeyDown(keyCode, event)
-        if (keyCode == KeyEvent.KEYCODE_ESCAPE && query.isNotEmpty()) {
-            clearSearch()
-            return true
+    private fun applyDesktopCaptionBarStyle() {
+        if (Build.VERSION.SDK_INT >= 35) {
+            try {
+                val controller = window.insetsController ?: return
+                val cls = android.view.WindowInsetsController::class.java
+                val transFlag = cls.getField("APPEARANCE_TRANSPARENT_CAPTION_BAR_BACKGROUND").getInt(null)
+                val lightFlag = cls.getField("APPEARANCE_LIGHT_CAPTION_BARS").getInt(null)
+                controller.setSystemBarsAppearance(transFlag or lightFlag, transFlag or lightFlag)
+            } catch (t: Throwable) {
+                Log.d(TAG, "Desktop caption bar appearance unavailable: ${t.message}")
+            }
         }
-        if (!searchInput.hasFocus()) {
-            val ch = event?.unicodeChar ?: 0
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (backdropState == DesktopBackdropState.FULL_DIM) return super.onKeyDown(keyCode, event)
+        if (event != null) {
+            val shortcut = NavAssistService.matchPhysicalShortcut(keyCode, event.metaState)
+            if (shortcut != null && BridgeService.dispatchPhysicalShortcutFromA11y(shortcut)) {
+                return true
+            }
+        }
+        if (keyCode == KeyEvent.KEYCODE_ESCAPE) {
+            if (dialogs.isShowing || query.isNotEmpty() || (::desktopGridWorkspace.isInitialized && desktopGridWorkspace.isFolderOpen)) {
+                handleDesktopBack()
+                return true
+            }
+        }
+        val isSplitPicker = computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_SPLIT_PICKER
+        if (isSplitPicker && !searchInput.hasFocus()) {
             if (keyCode == KeyEvent.KEYCODE_SLASH || (keyCode == KeyEvent.KEYCODE_F && event?.isCtrlPressed == true)) {
                 searchInput.requestFocus()
                 return true
             }
+        } else if (!isSplitPicker) {
+            val ch = event?.unicodeChar ?: 0
             if (ch >= 0x20 && !Character.isISOControl(ch) && ch < 0xE000) {
-                searchInput.requestFocus()
-                searchInput.append(ch.toChar().toString())
+                BridgeService.toggleAppDrawerFromUi(focusSearch = true)
                 return true
             }
         }
@@ -374,13 +453,11 @@ class LauncherActivity : Activity() {
                 intArrayOf(0xFF0A0E17.toInt(), 0xFF11192B.toInt(), 0xFF0C1220.toInt()),
             )
         }
-        wallpaperView = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-        }
+        wallpaperView = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP }
         val vignetteView = View(this).apply {
             background = GradientDrawable(
                 GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(0x3A080B12, 0x12080B12, 0x52080B12),
+                intArrayOf(0x30080B12, 0x0A080B12, 0x46080B12),
             )
         }
         focusScrimView = View(this).apply {
@@ -395,21 +472,8 @@ class LauncherActivity : Activity() {
             isFocusable = true
             isFocusableInTouchMode = true
             addView(buildPhysicalWorkspace(), FrameLayout.LayoutParams(match))
-            addView(
-                buildRemoteHintView(),
-                FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL,
-                ).apply { bottomMargin = dp(64) },
-            )
-        }
-        overlayHost = FrameLayout(this).apply {
-            clipChildren = false
-            clipToPadding = false
         }
         rootView.addView(contentView, FrameLayout.LayoutParams(match))
-        rootView.addView(overlayHost, FrameLayout.LayoutParams(match))
 
         rootView.addOnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
             val w = r - l
@@ -429,19 +493,7 @@ class LauncherActivity : Activity() {
         refreshStatusAsync()
     }
 
-    private fun buildRemoteHintView(): TextView = TextView(this).apply {
-        text = "点击左下角应用图标或按 ⌘K 打开应用"
-        setTextColor(Color.WHITE)
-        setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12f)
-        setShadowLayer(dpF(3f), 0f, dpF(1f), 0xB3000000.toInt())
-        setPadding(dp(14), dp(6), dp(14), dp(6))
-        background = glassBg(0x420B0E14, 14f, 0x1AFFFFFF)
-        alpha = REMOTE_HINT_ALPHA
-        maxLines = 1
-        ellipsize = TextUtils.TruncateAt.END
-        visibility = View.GONE
-    }.also { remoteHintView = it }
-
+    @SuppressLint("ClickableViewAccessibility")
     private fun buildPhysicalWorkspace(): LinearLayout {
         splitPickerHeader = TextView(this).apply {
             text = "选择要加入分屏的应用"
@@ -455,20 +507,75 @@ class LauncherActivity : Activity() {
             visibility = View.GONE
         }
 
-        topBar = FrameLayout(this).apply {
-            addView(
-                buildSearchPill(),
-                FrameLayout.LayoutParams(dp(LauncherDesktopPolicy.MAX_SEARCH_PILL_WIDTH_DP), ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER),
-            )
-            addView(
-                buildMenuButton(),
-                FrameLayout.LayoutParams(dp(38), dp(38), Gravity.END or Gravity.CENTER_VERTICAL),
-            )
+        pickerSearchWrap = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(6), dp(14), dp(6))
+            visibility = View.GONE
+            addView(buildSearchPill(), LinearLayout.LayoutParams(dp(LauncherDesktopPolicy.MAX_PICKER_SEARCH_WIDTH_DP), ViewGroup.LayoutParams.WRAP_CONTENT))
         }
 
+        desktopGridWorkspace = DesktopGridWorkspaceView(
+            ctx = this,
+            menuPresenter = dialogs.presenter,
+            onLaunchApp = ::launchApp,
+            onShowAppMenu = { entry, anchor ->
+                if (!dialogs.isShowing) {
+                    dialogs.showAppModeDialog(entry, appModes[entry.pkg] ?: AppMode.DEFAULT, anchorView = anchor)
+                }
+            },
+            onShowDesktopMenu = { ax, ay ->
+                if (computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_DESKTOP) {
+                    showDesktopMenu(anchorX = ax, anchorY = ay)
+                }
+            },
+        )
         gridStage = FrameLayout(this).apply {
             addView(buildEmptyView(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(desktopGridWorkspace, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(buildAppGrid(), FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            setOnLongClickListener {
+                if (computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_DESKTOP) {
+                    showDesktopMenu()
+                    true
+                } else false
+            }
+            setOnTouchListener { _, ev ->
+                if (ev?.actionMasked == MotionEvent.ACTION_DOWN && (ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
+                    if (computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_DESKTOP) {
+                        showDesktopMenu(anchorX = ev.rawX.roundToInt(), anchorY = ev.rawY.roundToInt())
+                        return@setOnTouchListener true
+                    }
+                }
+                false
+            }
+            setOnGenericMotionListener { _, ev ->
+                if (ev?.actionMasked == MotionEvent.ACTION_BUTTON_PRESS && ev.actionButton == MotionEvent.BUTTON_SECONDARY) {
+                    if (computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_DESKTOP) {
+                        showDesktopMenu(anchorX = ev.rawX.roundToInt(), anchorY = ev.rawY.roundToInt())
+                        return@setOnGenericMotionListener true
+                    }
+                }
+                false
+            }
+        }
+
+        desktopLeftPane = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(gridStage, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        }
+
+        val boardView = widgetBoard.buildView()
+        workspaceColumnsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(desktopLeftPane, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f))
+            addView(
+                boardView,
+                LinearLayout.LayoutParams(dp(336), ViewGroup.LayoutParams.MATCH_PARENT).apply {
+                    leftMargin = dp(18)
+                    bottomMargin = dp(18)
+                },
+            )
         }
 
         return LinearLayout(this).apply {
@@ -478,16 +585,16 @@ class LauncherActivity : Activity() {
                 splitPickerHeader,
                 LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                     topMargin = dp(14)
-                    bottomMargin = dp(8)
+                    bottomMargin = dp(6)
                     leftMargin = dp(14)
                     rightMargin = dp(14)
                 },
             )
-            addView(topBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            addView(pickerSearchWrap, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
             addView(
-                gridStage,
-                LinearLayout.LayoutParams(dp(LauncherDesktopPolicy.MAX_DESKTOP_GRID_WIDTH_DP), 0, 1f).apply {
-                    gravity = Gravity.CENTER_HORIZONTAL
+                workspaceColumnsRow,
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+                    topMargin = dp(16)
                 },
             )
         }.also { physicalWorkspace = it }
@@ -495,16 +602,16 @@ class LauncherActivity : Activity() {
 
     private fun buildSearchPill(): LinearLayout {
         val searchIcon = ImageView(this).apply {
-            setImageDrawable(HyperUi.icon(this@LauncherActivity, HyperUi.ICON_SEARCH, 0xFFCBD5E1.toInt(), 15f))
+            setImageDrawable(HyperUi.icon(this@LauncherActivity, HyperUi.ICON_SEARCH, HyperUi.TEXT_SECONDARY, 14f))
         }
         searchInput = EditText(this).apply {
-            hint = "搜索应用"
-            setHintTextColor(0x99CBD5E1.toInt())
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f)
+            hint = "搜索要加入分屏的应用…"
+            setHintTextColor(0x996E6E73.toInt())
+            setTextColor(HyperUi.TEXT_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f)
             setSingleLine(true)
             setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(2), dp(6), dp(6), dp(6))
+            setPadding(dp(2), dp(5), dp(6), dp(5))
             imeOptions = EditorInfo.IME_ACTION_GO or EditorInfo.IME_FLAG_NO_EXTRACT_UI
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
@@ -517,97 +624,134 @@ class LauncherActivity : Activity() {
                 if (isGo) {
                     gridAdapter.itemAt(0)?.let(::launchApp)
                     true
-                } else {
-                    false
-                }
+                } else false
             }
         }
         btnClear = TextView(this).apply {
             text = "×"
-            setTextColor(0xFFCBD5E1.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16f)
+            setTextColor(HyperUi.TEXT_SECONDARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 15f)
             gravity = Gravity.CENTER
-            setPadding(dp(8), dp(2), dp(6), dp(2))
+            setPadding(dp(6), dp(2), dp(4), dp(2))
             visibility = View.GONE
             setOnClickListener { clearSearch() }
         }
         return LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            elevation = dpF(6f)
-            setPadding(dp(14), dp(3), dp(10), dp(3))
-            background = glassBg(0x7A131822, 22f, 0x32FFFFFF)
-            addView(searchIcon, LinearLayout.LayoutParams(dp(15), dp(15)).apply { rightMargin = dp(8) })
+            setPadding(dp(12), dp(2), dp(8), dp(2))
+            background = glassBg(0xDDF5F7FA.toInt(), 18f, 0xCCFFFFFF.toInt())
+            addView(searchIcon, LinearLayout.LayoutParams(dp(14), dp(14)).apply { rightMargin = dp(7) })
             addView(searchInput, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(btnClear)
         }.also { searchPill = it }
     }
 
-    private fun buildMenuButton(): ImageView {
-        val activeBg = glassBg(0x99252E3F.toInt(), 19f, 0x4CFFFFFF)
-        val idleBg = glassBg(0x66131822, 19f, 0x2EFFFFFF)
-        val bg = StateListDrawable().apply {
-            addState(intArrayOf(android.R.attr.state_pressed), activeBg)
-            addState(intArrayOf(android.R.attr.state_hovered), activeBg)
-            addState(intArrayOf(android.R.attr.state_focused), activeBg)
-            addState(intArrayOf(), idleBg)
+    private fun showDesktopMenu(anchorView: View? = null, anchorX: Int? = null, anchorY: Int? = null) {
+        val nextThemeIdx = (ExtThemePrefs.getThemeModeIndex(this) + 1) % 3
+        val curThemeLabel = when (ExtThemePrefs.getThemeModeIndex(this)) {
+            ExtThemePrefs.MODE_LIGHT -> "冰透浅色"
+            ExtThemePrefs.MODE_DARK -> "黑曜深色"
+            else -> "跟随系统"
         }
-        return ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_INSIDE
-            setImageDrawable(HyperUi.icon(this@LauncherActivity, HyperUi.ICON_SETTINGS, 0xFFE2E8F0.toInt(), 17f))
-            background = bg
-            elevation = dpF(4f)
-            contentDescription = "桌面选项"
-            setOnClickListener { showDesktopMenu(it) }
-        }.also { menuButton = it }
+        dialogs.presenter.showContextMenu(
+            header = MacMenuHeader("ExtBridge DeX 桌面", "图标、小组件与玻璃外观"),
+            entries = listOf(
+                MacMenuEntry.Action(
+                    label = "全部应用抽屉",
+                    subtitle = "悬浮在窗口上方搜索并启动应用",
+                    iconKind = HyperUi.ICON_APPS,
+                    onClick = { BridgeService.toggleAppDrawerFromUi(focusSearch = false) },
+                ),
+                MacMenuEntry.Action(
+                    label = "多任务窗口视图",
+                    subtitle = "预览与切换所有运行中的窗口 (Alt+Tab)",
+                    iconKind = HyperUi.ICON_WINDOW,
+                    onClick = { BridgeService.toggleWindowSwitcherFromUi() },
+                ),
+                MacMenuEntry.Divider,
+                MacMenuEntry.Action(
+                    label = "管理桌面固定应用",
+                    subtitle = "自定义常驻桌面图标",
+                    iconKind = HyperUi.ICON_PIN,
+                    onClick = { showManagePinnedAppsDialog() },
+                ),
+                MacMenuEntry.Action(
+                    label = "管理桌面小组件",
+                    subtitle = "添加系统小组件与信息卡片",
+                    iconKind = HyperUi.ICON_SIDEBAR,
+                    onClick = { widgetBoard.showAddWidgetMenu(anchorView) },
+                ),
+                MacMenuEntry.Divider,
+                MacMenuEntry.Action(
+                    label = "应用显示规则",
+                    subtitle = "为单个应用设置横屏 / 竖屏兼容",
+                    iconKind = HyperUi.ICON_SLIDERS,
+                    onClick = { dialogs.showAllAppModesPicker(allApps, appModes) },
+                ),
+                MacMenuEntry.Action(
+                    label = "切换毛玻璃外观（当前：$curThemeLabel）",
+                    iconKind = HyperUi.ICON_MOON,
+                    onClick = { ExtThemePrefs.setThemeModeIndex(this, nextThemeIdx) },
+                ),
+                MacMenuEntry.Action(
+                    label = "同步主屏壁纸",
+                    iconKind = HyperUi.ICON_WALLPAPER,
+                    onClick = {
+                        loadWallpaperAsync(true)
+                        Toast.makeText(this, "正在同步主屏壁纸…", Toast.LENGTH_SHORT).show()
+                    },
+                ),
+            ),
+            anchorView = anchorView,
+            anchorX = anchorX,
+            anchorY = anchorY,
+            widthDp = 264f,
+            triggerHaptic = anchorView == null,
+        )
     }
 
-    private fun showDesktopMenu(anchor: View) {
-        dismissPopupMenu()
-        val popup = PopupMenu(this, anchor, Gravity.END)
-        popup.menu.add(Menu.NONE, MENU_APP_MODES, 0, "应用显示规则")
-        popup.menu.add(Menu.NONE, MENU_SYNC_WALLPAPER, 1, "同步主屏壁纸")
-        popup.setOnMenuItemClickListener { item ->
-            when (item.itemId) {
-                MENU_APP_MODES -> {
-                    dialogs.showAllAppModesPicker(allApps, appModes)
-                    true
-                }
-                MENU_SYNC_WALLPAPER -> {
-                    loadWallpaperAsync(true)
-                    Toast.makeText(this, "正在同步主屏壁纸…", Toast.LENGTH_SHORT).show()
-                    true
-                }
-                else -> false
-            }
+    private fun showManagePinnedAppsDialog() {
+        if (allApps.isEmpty()) return
+        val current = AppPrefs.getDesktopPinnedApps(this).toSet()
+        val sheetItems = allApps.map { entry ->
+            MacSheetItem(
+                id = entry.pkg,
+                title = entry.label,
+                subtitle = entry.pkg,
+                icon = entry.icon,
+                selected = current.contains(entry.pkg),
+            )
         }
-        popup.setOnDismissListener { if (activePopupMenu === popup) activePopupMenu = null }
-        activePopupMenu = popup
-        popup.show()
-    }
-
-    private fun dismissPopupMenu() {
-        val popup = activePopupMenu
-        activePopupMenu = null
-        try {
-            popup?.dismiss()
-        } catch (t: Throwable) {
-            Log.d(TAG, "PopupMenu dismiss skipped: ${t.message}")
-        }
+        dialogs.presenter.showListSheet(
+            title = "管理桌面固定应用",
+            subtitle = "勾选常驻在桌面的应用图标",
+            items = sheetItems,
+            searchable = true,
+            searchHint = "搜索应用名或包名…",
+            multiSelect = true,
+            onMultiConfirm = { selected ->
+                val chosen = allApps.filter { selected.contains(it.pkg) }.map { it.pkg }
+                AppPrefs.setDesktopPinnedApps(this, chosen, markInitialized = true)
+            },
+        )
     }
 
     private fun buildEmptyView(): TextView = TextView(this).apply {
-        text = "未找到匹配的应用"
+        text = "桌面暂无固定应用 · 点此打开应用抽屉或右键桌面管理"
         setTextColor(0xFFE2E8F0.toInt())
         setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13.5f)
         setShadowLayer(dpF(3f), 0f, dpF(1.2f), 0xCC000000.toInt())
         gravity = Gravity.CENTER
         visibility = View.GONE
+        setOnClickListener { BridgeService.toggleAppDrawerFromUi(focusSearch = false) }
     }.also { emptyView = it }
 
     private fun buildAppGrid(): GridView {
-        gridAdapter = LauncherGridAdapter(this) { entry ->
-            if (!dialogs.isShowing) dialogs.showAppModeDialog(entry, appModes[entry.pkg] ?: AppMode.DEFAULT)
+        gridAdapter = LauncherGridAdapter(this) { entry, anchor ->
+            if (!dialogs.isShowing) {
+                dialogs.showAppModeDialog(entry, appModes[entry.pkg] ?: AppMode.DEFAULT, anchorView = anchor)
+            }
         }
         gridView = GridView(this).apply {
             verticalSpacing = dp(18)
@@ -617,9 +761,9 @@ class LauncherActivity : Activity() {
             clipToPadding = false
             adapter = gridAdapter
             setOnItemClickListener { _, _, position, _ -> gridAdapter.itemAt(position)?.let(::launchApp) }
-            setOnItemLongClickListener { _, _, position, _ ->
+            setOnItemLongClickListener { _, itemView, position, _ ->
                 val entry = gridAdapter.itemAt(position) ?: return@setOnItemLongClickListener false
-                dialogs.showAppModeDialog(entry, appModes[entry.pkg] ?: AppMode.DEFAULT)
+                dialogs.showAppModeDialog(entry, appModes[entry.pkg] ?: AppMode.DEFAULT, anchorView = itemView)
                 true
             }
         }
@@ -635,73 +779,60 @@ class LauncherActivity : Activity() {
 
     private fun syncDesktopLayout(): DesktopLayoutMode {
         val mode = computeDesktopLayoutMode()
-        isRemoteDesktopMode = mode.isRemoteMac
-
-        if (mode.presentation == DesktopPresentationMode.REMOTE_MAC) {
-            physicalWorkspace.visibility = View.GONE
-            remoteHintView.visibility = View.VISIBLE
-            dismissPopupMenu()
-            if (searchInput.hasFocus()) {
-                searchInput.clearFocus()
-                rootView.requestFocus()
-            }
-            return mode
-        }
-
-        remoteHintView.visibility = View.GONE
         physicalWorkspace.visibility = View.VISIBLE
 
         val dm = resources.displayMetrics
         val winW = if (rootView.width > 0) rootView.width else dm.widthPixels
         val isSplitPicker = mode.presentation == DesktopPresentationMode.PHYSICAL_SPLIT_PICKER
+        val showWidgetBoard = !isSplitPicker && !mode.compact && winW >= dp(640)
+        val isNarrow = winW < dp(560)
+        val taskbarAutoHide = BridgeService.isDockAutoHideEnabled(this)
 
         splitPickerHeader.visibility = if (isSplitPicker) View.VISIBLE else View.GONE
-        menuButton.visibility = if (isSplitPicker) View.GONE else View.VISIBLE
-        if (isSplitPicker) dismissPopupMenu()
+        pickerSearchWrap.visibility = if (isSplitPicker) View.VISIBLE else View.GONE
+        widgetBoard.rootView.visibility = if (showWidgetBoard) View.VISIBLE else View.GONE
+        if (isSplitPicker) dialogs.dismissAll()
 
-        val topPadH = dp(if (isSplitPicker) 14 else 24)
-        val topPadTop = dp(if (isSplitPicker) 2 else 20)
-        val topPadBottom = dp(if (isSplitPicker) 10 else 18)
-        topBar.setPadding(topPadH, topPadTop, topPadH, topPadBottom)
-
-        val maxSearchPx = if (isSplitPicker) {
-            min(dp(LauncherDesktopPolicy.MAX_PICKER_SEARCH_WIDTH_DP), max(dp(160), winW - topPadH * 2))
-        } else {
-            val sideReserve = topPadH * 2 + dp(38) * 2 + dp(24)
-            min(dp(LauncherDesktopPolicy.MAX_SEARCH_PILL_WIDTH_DP), max(dp(180), winW - sideReserve))
-        }
-        (searchPill.layoutParams as? FrameLayout.LayoutParams)?.let { lp ->
-            if (lp.width != maxSearchPx) {
-                lp.width = maxSearchPx
-                searchPill.layoutParams = lp
+        if (isSplitPicker) {
+            val maxSearchPx = min(dp(LauncherDesktopPolicy.MAX_PICKER_SEARCH_WIDTH_DP), max(dp(160), winW - dp(28)))
+            (searchPill.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+                if (lp.width != maxSearchPx) {
+                    lp.width = maxSearchPx
+                    searchPill.layoutParams = lp
+                }
             }
         }
 
-        val gridHorizMargin = dp(if (mode.compact) 16 else 48)
-        val targetGridW = if (isSplitPicker) {
-            max(dp(200), winW - gridHorizMargin)
-        } else {
-            min(dp(LauncherDesktopPolicy.MAX_DESKTOP_GRID_WIDTH_DP), max(dp(220), winW - gridHorizMargin))
-        }
-        (gridStage.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
-            if (lp.width != targetGridW) {
-                lp.width = targetGridW
-                gridStage.layoutParams = lp
+        val horizPad = dp(if (isSplitPicker) 8 else if (isNarrow) 12 else 24)
+        val bottomPad = dp(if (isSplitPicker || taskbarAutoHide) 14 else 72)
+        workspaceColumnsRow.setPadding(horizPad, 0, horizPad, bottomPad)
+
+        val boardW = if (showWidgetBoard) (winW * 0.30f).roundToInt().coerceIn(dp(276), dp(364)) else 0
+        if (showWidgetBoard) {
+            (widgetBoard.rootView.layoutParams as? LinearLayout.LayoutParams)?.let { lp ->
+                if (lp.width != boardW) {
+                    lp.width = boardW
+                    widgetBoard.rootView.layoutParams = lp
+                }
             }
+            widgetBoard.onAvailableWidthChanged(boardW)
         }
 
-        val gridDpW = targetGridW / max(0.5f, dm.density)
-        gridView.numColumns = LauncherDesktopPolicy.computeGridColumns(gridDpW, mode.compact)
+        val leftPaneW = max(dp(220), winW - horizPad * 2 - (if (showWidgetBoard) boardW + dp(18) else 0))
+        val gridDpW = leftPaneW / max(0.5f, dm.density)
+        val cols = LauncherDesktopPolicy.computeGridColumns(gridDpW, mode.compact)
+        gridView.numColumns = cols
+        if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.setColumnsAndDensity(cols, mode.compact)
 
         if (compactModeApplied != mode.compact) {
             compactModeApplied = mode.compact
-            val gridPadH = dp(if (mode.compact) 8 else 16)
-            val gridPadBottom = dp(if (mode.compact) 56 else 84)
-            gridView.setPadding(gridPadH, dp(4), gridPadH, gridPadBottom)
+            val gridPadH = dp(if (mode.compact) 6 else 10)
+            gridView.setPadding(gridPadH, dp(4), gridPadH, dp(16))
             gridView.horizontalSpacing = dp(if (mode.compact) 6 else 14)
             gridView.verticalSpacing = dp(if (mode.compact) 10 else 18)
             gridAdapter.setCompactMode(mode.compact)
         }
+        applyFilter(query)
         return mode
     }
 
@@ -714,81 +845,60 @@ class LauncherActivity : Activity() {
 
     private fun syncBackdropFocusMode(layoutMode: DesktopLayoutMode = computeDesktopLayoutMode()) {
         if (!hasResumedOnce) return
-        val shouldDim = LauncherDesktopPolicy.shouldDimBackdrop(
+        val next = LauncherDesktopPolicy.computeBackdropState(
             status = cachedStatus,
             windowSnapshot = cachedWindowSnapshot,
             isResumed = isActivityResumed,
             isTopResumed = isTopResumed,
             layoutMode = layoutMode,
         )
-        setBackdropFocusMode(shouldDim)
+        setBackdropState(next)
     }
 
-    /**
-     * Smoothly fades desktop chrome out and dims/soft-blurs the wallpaper into a deep charcoal stage
-     * backdrop whenever an app covers the desktop, preventing icons or hints from bleeding behind
-     * centered apps, freeform windows, or 8px split seams.
-     */
-    private fun setBackdropFocusMode(dimmed: Boolean) {
-        if (isBackdropFocused == dimmed) return
-        isBackdropFocused = dimmed
+    private fun setBackdropState(next: DesktopBackdropState) {
+        if (backdropState == next) return
+        backdropState = next
 
         contentView.animate().cancel()
         focusScrimView.animate().cancel()
         wallpaperView.animate().cancel()
 
-        if (dimmed) {
-            dismissPopupMenu()
-            if (searchInput.hasFocus()) {
-                searchInput.clearFocus()
-                rootView.requestFocus()
+        when (next) {
+            DesktopBackdropState.FULL_DIM -> {
+                dialogs.dismissAll()
+                if (searchInput.hasFocus()) {
+                    searchInput.clearFocus()
+                    rootView.requestFocus()
+                }
+                val interp = DecelerateInterpolator(1.4f)
+                contentView.animate().alpha(0f).scaleX(FOCUS_CONTENT_SCALE).scaleY(FOCUS_CONTENT_SCALE)
+                    .setDuration(FOCUS_FADE_OUT_MS).setInterpolator(interp).start()
+                focusScrimView.animate().alpha(FOCUS_SCRIM_ALPHA)
+                    .setDuration(FOCUS_FADE_OUT_MS).setInterpolator(interp).start()
+                wallpaperView.animate().scaleX(FOCUS_WALLPAPER_SCALE).scaleY(FOCUS_WALLPAPER_SCALE)
+                    .setDuration(FOCUS_FADE_OUT_MS).setInterpolator(interp).start()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) wallpaperView.setRenderEffect(null)
             }
-            val interp = DecelerateInterpolator(1.4f)
-            contentView.animate()
-                .alpha(0f)
-                .scaleX(FOCUS_CONTENT_SCALE)
-                .scaleY(FOCUS_CONTENT_SCALE)
-                .setDuration(FOCUS_FADE_OUT_MS)
-                .setInterpolator(interp)
-                .start()
-            focusScrimView.animate()
-                .alpha(FOCUS_SCRIM_ALPHA)
-                .setDuration(FOCUS_FADE_OUT_MS)
-                .setInterpolator(interp)
-                .start()
-            wallpaperView.animate()
-                .scaleX(FOCUS_WALLPAPER_SCALE)
-                .scaleY(FOCUS_WALLPAPER_SCALE)
-                .setDuration(FOCUS_FADE_OUT_MS)
-                .setInterpolator(interp)
-                .start()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                wallpaperView.setRenderEffect(
-                    RenderEffect.createBlurEffect(FOCUS_WALLPAPER_BLUR_PX, FOCUS_WALLPAPER_BLUR_PX, Shader.TileMode.CLAMP),
-                )
+            DesktopBackdropState.SOFT_BEHIND_FREEFORM -> {
+                dialogs.dismissAll()
+                val interp = DecelerateInterpolator(1.5f)
+                contentView.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                    .setDuration(FOCUS_FADE_IN_MS).setInterpolator(interp).start()
+                focusScrimView.animate().alpha(SOFT_SCRIM_ALPHA)
+                    .setDuration(FOCUS_FADE_IN_MS).setInterpolator(interp).start()
+                wallpaperView.animate().scaleX(1f).scaleY(1f)
+                    .setDuration(FOCUS_FADE_IN_MS).setInterpolator(interp).start()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) wallpaperView.setRenderEffect(null)
             }
-        } else {
-            val interp = DecelerateInterpolator(1.6f)
-            contentView.animate()
-                .alpha(1f)
-                .scaleX(1f)
-                .scaleY(1f)
-                .setDuration(FOCUS_FADE_IN_MS)
-                .setInterpolator(interp)
-                .start()
-            focusScrimView.animate()
-                .alpha(0f)
-                .setDuration(FOCUS_FADE_IN_MS)
-                .setInterpolator(interp)
-                .start()
-            wallpaperView.animate()
-                .scaleX(1f)
-                .scaleY(1f)
-                .setDuration(FOCUS_FADE_IN_MS)
-                .setInterpolator(interp)
-                .start()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                wallpaperView.setRenderEffect(null)
+            DesktopBackdropState.ACTIVE -> {
+                val interp = DecelerateInterpolator(1.6f)
+                contentView.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                    .setDuration(FOCUS_FADE_IN_MS).setInterpolator(interp).start()
+                focusScrimView.animate().alpha(0f)
+                    .setDuration(FOCUS_FADE_IN_MS).setInterpolator(interp).start()
+                wallpaperView.animate().scaleX(1f).scaleY(1f)
+                    .setDuration(FOCUS_FADE_IN_MS).setInterpolator(interp).start()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) wallpaperView.setRenderEffect(null)
             }
         }
     }
@@ -798,12 +908,34 @@ class LauncherActivity : Activity() {
         rootView.requestFocus()
     }
 
+    private fun resolveDesktopPinnedSource(): List<LauncherAppEntry> {
+        val isSplitPicker = computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_SPLIT_PICKER
+        if (isSplitPicker || query.isNotEmpty()) return allApps
+        val pinnedSet = AppPrefs.getDesktopPinnedApps(this).toHashSet()
+        if (pinnedSet.isEmpty()) return emptyList()
+        val byPkg = allApps.associateBy { it.pkg }
+        return AppPrefs.getDesktopPinnedApps(this).mapNotNull { byPkg[it] }
+    }
+
     private fun applyFilter(raw: String) {
         query = raw.trim().lowercase(Locale.ROOT)
         btnClear.visibility = if (query.isEmpty()) View.GONE else View.VISIBLE
-        val filtered = LauncherAppRepository.filterApps(allApps, query)
+        val isSplitPicker = computeDesktopLayoutMode().presentation == DesktopPresentationMode.PHYSICAL_SPLIT_PICKER
+        val useFreeformDesktop = !isSplitPicker && query.isEmpty() && ::desktopGridWorkspace.isInitialized
+        if (useFreeformDesktop) {
+            val empty = !desktopGridWorkspace.hasItems()
+            emptyView.text = "桌面暂无固定应用 · 点此打开应用抽屉或右键桌面管理"
+            emptyView.visibility = if (empty) View.VISIBLE else View.GONE
+            desktopGridWorkspace.visibility = if (empty) View.GONE else View.VISIBLE
+            gridView.visibility = View.GONE
+            return
+        }
+        if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.visibility = View.GONE
+        val base = resolveDesktopPinnedSource()
+        val filtered = LauncherAppRepository.filterApps(base, query)
         gridAdapter.updateApps(filtered)
-        val empty = query.isNotEmpty() && filtered.isEmpty()
+        val empty = filtered.isEmpty()
+        emptyView.text = if (query.isNotEmpty()) "未找到匹配的应用" else "桌面暂无固定应用 · 点此打开应用抽屉或右键桌面管理"
         emptyView.visibility = if (empty) View.VISIBLE else View.GONE
         gridView.visibility = if (empty) View.GONE else View.VISIBLE
     }
@@ -821,6 +953,7 @@ class LauncherActivity : Activity() {
         withContext(Dispatchers.Main.immediate) {
             if (!isFinishing && !isDestroyed) {
                 appModes = modes
+                if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.updateModes(modes)
                 gridAdapter.updateModes(modes)
             }
         }
@@ -841,7 +974,15 @@ class LauncherActivity : Activity() {
         withContext(Dispatchers.Main.immediate) {
             if (!isFinishing && !isDestroyed) {
                 allApps = loaded
+                if (!AppPrefs.isDesktopPinnedInitialized(this@LauncherActivity) && loaded.isNotEmpty()) {
+                    val starter = loaded.filterNot { it.pkg == packageName }
+                        .take(MAX_INITIAL_PINNED_APPS)
+                        .map { it.pkg }
+                    AppPrefs.setDesktopPinnedApps(this@LauncherActivity, starter, markInitialized = true)
+                }
+                if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.updateCatalog(loaded, appModes)
                 applyFilter(query)
+                widgetBoard.rebuildBoard(force = false)
             }
         }
     }

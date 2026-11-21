@@ -1,5 +1,7 @@
 package com.extbridge.daemon;
 
+import com.extbridge.daemon.ipc.BridgeProtocol;
+
 /**
  * Pure-Java display geometry, encoder dimension alignment, rotation, and mirror
  * coordinate mapping utilities shared by ExtBridge, RemoteStreamSink, and RemoteInputBridge.
@@ -15,8 +17,57 @@ public final class DisplayGeometryUtil {
     public static final int MAX_DPI = 640;
     public static final float MIN_FPS = 15.0f;
     public static final float MAX_FPS = 360.0f;
+    public static final int EDGE_MARGIN_MIN_PX = 48;
+
+    // Unified Samsung DeX Desktop WorkArea constants (SSOT shared with helper DesktopGeometry)
+    public static final int MENU_BAR_HEIGHT_DP = 0;
+    public static final int WORKAREA_TOP_INSET_DP = 8;
+    public static final int TASKBAR_HEIGHT_DP = 56;
+    public static final int TASKBAR_RESERVED_INSET_DP = 72;
+    public static final int TASKBAR_AUTOHIDE_INSET_DP = 8;
+    public static final int WINDOW_HEADER_HEIGHT_DP = 38;
+    public static final int WINDOW_BOTTOM_CHIN_DP = 0;
+    public static final int DOCK_RESERVED_INSET_DP = TASKBAR_RESERVED_INSET_DP;
+    public static final int DOCK_AUTOHIDE_INSET_DP = TASKBAR_AUTOHIDE_INSET_DP;
+    public static final int WORKAREA_SIDE_INSET_DP = 8;
+
+    /** Immutable pixel bounds of the usable desktop area excluding Taskbar and safe margins. */
+    public static final class WorkArea {
+        public final int left;
+        public final int top;
+        public final int right;
+        public final int bottom;
+
+        public WorkArea(int left, int top, int right, int bottom) {
+            this.left = left;
+            this.top = top;
+            this.right = Math.max(left + 1, right);
+            this.bottom = Math.max(top + 1, bottom);
+        }
+
+        public int width() { return Math.max(1, right - left); }
+        public int height() { return Math.max(1, bottom - top); }
+    }
 
     private DisplayGeometryUtil() {}
+
+    public static int dpToPx(int dp, int dpi) {
+        int effDpi = clampDpi(dpi, 1920, 1080);
+        return Math.max(0, Math.round(dp * (effDpi / 160f)));
+    }
+
+    /**
+     * Computes the unified DeX desktop usable {@link WorkArea} for any USB or Mac canvas.
+     * Reserves no top menu bar (pure bottom floating taskbar) and leaves clean breathing margins.
+     */
+    public static WorkArea computeDesktopWorkArea(int displayW, int displayH, int dpi, boolean taskbarAutoHide) {
+        int w = Math.max(320, displayW);
+        int h = Math.max(240, displayH);
+        int topPx = Math.min(h / 4, dpToPx(WORKAREA_TOP_INSET_DP, dpi));
+        int bottomInsetPx = Math.min(h / 3, dpToPx(taskbarAutoHide ? TASKBAR_AUTOHIDE_INSET_DP : TASKBAR_RESERVED_INSET_DP, dpi));
+        int sidePx = Math.min(w / 16, dpToPx(WORKAREA_SIDE_INSET_DP, dpi));
+        return new WorkArea(sidePx, topPx, Math.max(sidePx + 1, w - sidePx), Math.max(topPx + 1, h - bottomInsetPx));
+    }
 
     public static boolean isValidDims(int w, int h) {
         int longEdge = Math.max(w, h);
@@ -158,6 +209,37 @@ public final class DisplayGeometryUtil {
         int x = (dstW - scaledW) / 2;
         int y = (dstH - scaledH) / 2;
         return new int[]{x, y, scaledW, scaledH};
+    }
+
+    /**
+     * Computes unified Display 0 mirror placement {@code {mirX, mirY, mirW, mirH}} inside an external
+     * or remote canvas {@code (outW, outH)} for any {@code sideMode} ({@code OFF}, {@code LEFT},
+     * {@code RIGHT}, {@code CENTER_DUAL}), identical across USB physical monitors and Mac streams.
+     */
+    public static int[] computeMirrorPlacement(int d0W, int d0H, int outW, int outH, int sideMode) {
+        int safeD0W = d0W > 0 ? d0W : 1920;
+        int safeD0H = d0H > 0 ? d0H : 1200;
+        int safeOutW = Math.max(1, outW);
+        int safeOutH = Math.max(1, outH);
+        float fit = Math.min(safeOutW / (float) safeD0W, safeOutH / (float) safeD0H);
+        int mirW = Math.max(1, Math.round(safeD0W * fit));
+        int mirH = Math.max(1, Math.round(safeD0H * fit));
+        int mirX = Math.max(0, (safeOutW - mirW) / 2);
+        int mirY = Math.max(0, (safeOutH - mirH) / 2);
+        if (safeOutW - mirW >= EDGE_MARGIN_MIN_PX) {
+            if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT) {
+                mirX = 0;
+            } else if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT) {
+                mirX = Math.max(0, safeOutW - mirW);
+            }
+        } else if (safeOutH - mirH >= EDGE_MARGIN_MIN_PX) {
+            if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT) {
+                mirY = 0;
+            } else if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT) {
+                mirY = Math.max(0, safeOutH - mirH);
+            }
+        }
+        return new int[]{mirX, mirY, mirW, mirH};
     }
 
     /**

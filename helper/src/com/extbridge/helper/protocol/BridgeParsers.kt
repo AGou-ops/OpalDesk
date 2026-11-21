@@ -27,6 +27,9 @@ object BridgeParsers {
             ?.mapNotNull { elem -> parseManagedWindow(elem as? Map<*, *>) }
             .orEmpty()
 
+        val stateSeq = (parsed["stateSeq"] as? Number)?.toLong() ?: 0L
+        val taskbarAutoHide = parseBooleanOrDefault(parsed["taskbarAutoHide"], default = false)
+
         return WindowStateSnapshot(
             layoutMode = layoutMode,
             adaptiveSingleEnabled = adaptiveEnabled,
@@ -34,6 +37,8 @@ object BridgeParsers {
             tilingTopology = tilingTopology,
             ratios = ratios,
             windows = windows,
+            stateSeq = stateSeq,
+            taskbarAutoHide = taskbarAutoHide,
         )
     }
 
@@ -41,17 +46,28 @@ object BridgeParsers {
         if (obj == null) return null
         val pkg = (obj["pkg"] as? String).orEmpty()
         if (pkg.isEmpty()) return null
+        val mode = (obj["mode"] as? String)?.takeIf { it.isNotBlank() }
+            ?: BridgeProtocol.LayoutMode.FULLSCREEN
+        val defaultPres = if (mode.equals(BridgeProtocol.LayoutMode.FULLSCREEN, ignoreCase = true)) {
+            BridgeProtocol.WindowPresentation.IMMERSIVE
+        } else {
+            BridgeProtocol.WindowPresentation.FLOATING
+        }
         return ManagedWindowInfo(
             taskId = (obj["taskId"] as? Number)?.toInt() ?: -1,
             pkg = pkg,
-            mode = (obj["mode"] as? String)?.takeIf { it.isNotBlank() }
-                ?: BridgeProtocol.LayoutMode.FULLSCREEN,
+            mode = mode,
             left = (obj["left"] as? Number)?.toInt() ?: 0,
             top = (obj["top"] as? Number)?.toInt() ?: 0,
             right = (obj["right"] as? Number)?.toInt() ?: 0,
             bottom = (obj["bottom"] as? Number)?.toInt() ?: 0,
             focused = parseBooleanOrDefault(obj["focused"], default = false),
             minimized = parseBooleanOrDefault(obj["minimized"], default = false),
+            presentation = (obj["presentation"] as? String)?.takeIf { it.isNotBlank() } ?: defaultPres,
+            restoreLeft = (obj["restoreLeft"] as? Number)?.toInt() ?: 0,
+            restoreTop = (obj["restoreTop"] as? Number)?.toInt() ?: 0,
+            restoreRight = (obj["restoreRight"] as? Number)?.toInt() ?: 0,
+            restoreBottom = (obj["restoreBottom"] as? Number)?.toInt() ?: 0,
         )
     }
 

@@ -135,8 +135,10 @@ public class DaemonConfigTest {
         assertEquals(3840, snap.physW);
         assertEquals("BBQ", snap.renderMode);
         assertEquals(BridgeProtocol.VD_FLAGS_DEX_FIXED, cfg.getVirtualDisplayFlags());
+        assertEquals(0, cfg.getVirtualDisplayFlags() & BridgeProtocol.VD_FLAG_PRESENTATION);
         cfg.fullscreenPolicy = 0;
         assertEquals(BridgeProtocol.VD_FLAGS_COMPAT, cfg.getVirtualDisplayFlags());
+        assertEquals(0, cfg.getVirtualDisplayFlags() & BridgeProtocol.VD_FLAG_PRESENTATION);
     }
 
     @Test

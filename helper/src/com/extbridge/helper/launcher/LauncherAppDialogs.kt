@@ -1,11 +1,12 @@
 package com.extbridge.helper.launcher
 
 import android.app.Activity
-import android.app.AlertDialog
-import android.util.Log
+import android.view.View
 import android.widget.Toast
 import com.extbridge.helper.BridgeClient
 import com.extbridge.helper.BridgeService
+import com.extbridge.helper.HyperUi
+import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.protocol.BridgeLabels
 import com.extbridge.helper.protocol.BridgeProtocol.AppMode
 import com.extbridge.helper.protocol.BridgeProtocol.LayoutMode
@@ -13,127 +14,246 @@ import com.extbridge.helper.protocol.BridgeProtocol.WindowAction
 import com.extbridge.helper.protocol.BridgeProtocol.WindowMode
 
 /**
- * Manages single-instance context dialogs on the DeX desktop (per-app display mode, window launch,
- * DPI reload, and 2/3/4-way multi-tiling assignment), always dismissing any prior dialog to prevent leaks.
+ * Manages single-instance macOS/iOS-style frosted-glass context menus and sheets on the desktop
+ * (per-app display mode, window launch, DPI reload, and 2/3/4-way multi-tiling assignment).
  */
 class LauncherAppDialogs(
     private val activity: Activity,
     private val runIo: (block: suspend () -> Unit) -> Unit,
     private val onAppModesUpdated: (Map<String, Int>) -> Unit,
 ) {
-    companion object {
-        private const val TAG = "ExtLauncherDlg"
-    }
-
-    private var activeDialog: AlertDialog? = null
+    internal val presenter = MacContextMenuPresenter(activity)
 
     val isShowing: Boolean
-        get() = activeDialog?.isShowing == true
+        get() = presenter.isShowing
 
     fun dismissAll() {
-        val dlg = activeDialog
-        activeDialog = null
-        if (dlg != null && dlg.isShowing) {
-            try {
-                dlg.dismiss()
-            } catch (t: Throwable) {
-                Log.d(TAG, "Failed to dismiss active launcher dialog: ${t.message}")
-            }
-        }
-    }
-
-    private fun showManaged(builder: AlertDialog.Builder) {
-        dismissAll()
-        if (activity.isFinishing || activity.isDestroyed) return
-        val dlg = builder.setOnDismissListener { d ->
-            if (activeDialog === d) activeDialog = null
-        }.show()
-        activeDialog = dlg
+        presenter.dismiss(animated = true)
     }
 
     fun showAllAppModesPicker(allApps: List<LauncherAppEntry>, appModes: Map<String, Int>) {
         if (allApps.isEmpty()) {
-            Toast.makeText(activity, "应用列表加载中...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(activity, "应用列表加载中…", Toast.LENGTH_SHORT).show()
             return
         }
         val sorted = allApps.sortedWith(
             compareBy<LauncherAppEntry> { if ((appModes[it.pkg] ?: AppMode.DEFAULT) > 0) 0 else 1 }
                 .thenBy(String.CASE_INSENSITIVE_ORDER) { it.label },
         )
-        val items = Array(sorted.size + 1) { idx ->
-            if (idx == 0) {
-                "全部恢复【跟随系统默认】（清除所有自定义兼容覆盖）"
-            } else {
-                val entry = sorted[idx - 1]
-                val mode = appModes[entry.pkg] ?: AppMode.DEFAULT
-                "${entry.label}  [${BridgeLabels.appModeLabel(mode)}]"
-            }
+        val sheetItems = sorted.map { entry ->
+            val mode = appModes[entry.pkg] ?: AppMode.DEFAULT
+            MacSheetItem(
+                id = entry.pkg,
+                title = entry.label,
+                subtitle = entry.pkg,
+                badge = BridgeLabels.appModeLabel(mode),
+                badgeColor = when (mode) {
+                    AppMode.LAND_FULL -> 0xFF007AFF.toInt()
+                    AppMode.PORT_COMPAT -> 0xFFFF9500.toInt()
+                    else -> 0xFF8E8E93.toInt()
+                },
+                icon = entry.icon,
+            )
         }
-        showManaged(
-            AlertDialog.Builder(activity)
-                .setTitle("分应用显示规则（可在桌面图标长按或鼠标右键设置）")
-                .setItems(items) { _, which ->
-                    if (which == 0) {
-                        runIo {
-                            BridgeClient.resetAllAppModes()
-                            val latest = BridgeClient.getAllAppModes()
-                            activity.runOnUiThread {
-                                onAppModesUpdated(latest)
-                                Toast.makeText(activity, "已全部恢复系统默认模式（重启对应应用生效）", Toast.LENGTH_SHORT).show()
-                            }
-                        }
-                    } else if (which - 1 in sorted.indices) {
-                        val picked = sorted[which - 1]
-                        showAppModeDialog(picked, appModes[picked.pkg] ?: AppMode.DEFAULT)
+        val byPkg = sorted.associateBy { it.pkg }
+        presenter.showListSheet(
+            title = "应用显示规则",
+            subtitle = "点选应用自定义横屏全屏或竖屏兼容，也可在桌面长按/右键图标设置",
+            items = sheetItems,
+            searchable = true,
+            searchHint = "搜索应用名或包名…",
+            topActionLabel = "全部恢复【跟随系统默认】",
+            onTopAction = {
+                runIo {
+                    BridgeClient.resetAllAppModes()
+                    val latest = BridgeClient.getAllAppModes()
+                    activity.runOnUiThread {
+                        onAppModesUpdated(latest)
+                        Toast.makeText(activity, "已全部恢复系统默认模式（重启对应应用生效）", Toast.LENGTH_SHORT).show()
                     }
                 }
-                .setNegativeButton("关闭", null),
+            },
+            onSingleSelect = { picked ->
+                byPkg[picked.id]?.let { entry ->
+                    showAppModeDialog(entry, appModes[entry.pkg] ?: AppMode.DEFAULT)
+                }
+            },
         )
     }
 
-    fun showAppModeDialog(entry: LauncherAppEntry, currentMode: Int) {
-        val labels = arrayOf(
-            "以居中宽幅打开（默认黄金比例）",
-            "以自由窗口打开（可移动与自由缩放）",
-            "加入 2/3/4 分屏…",
-            "重载应用 DPI 并重启（修复字体偏大）",
-            (if (currentMode == AppMode.DEFAULT) "● " else "") + "显示规则：跟随系统默认（推荐微信 / 夸克）",
-            (if (currentMode == AppMode.LAND_FULL) "● " else "") + "显示规则：强制横屏全屏（适合短剧/视频 App）",
-            (if (currentMode == AppMode.PORT_COMPAT) "● " else "") + "显示规则：竖屏居中兼容（适合固定比例竖屏 App）",
+    fun showAppModeDialog(
+        entry: LauncherAppEntry,
+        currentMode: Int,
+        anchorView: View? = null,
+        anchorX: Int? = null,
+        anchorY: Int? = null,
+    ) {
+        val header = MacMenuHeader(
+            title = entry.label,
+            subtitle = entry.pkg,
+            icon = entry.icon,
         )
-        showManaged(
-            AlertDialog.Builder(activity)
-                .setTitle("${entry.label}\n${entry.pkg}")
-                .setItems(labels) { _, which -> handleAppModeChoice(entry, which) }
-                .setNegativeButton("取消", null),
+        val entries = buildAppMenuEntries(entry, currentMode)
+        presenter.showContextMenu(
+            header = header,
+            entries = entries,
+            anchorView = anchorView,
+            anchorX = anchorX,
+            anchorY = anchorY,
+            widthDp = 276f,
+            triggerHaptic = true,
         )
     }
 
-    private fun handleAppModeChoice(entry: LauncherAppEntry, which: Int) {
-        when (which) {
-            0 -> launchInMode(entry, WindowMode.ADAPTIVE_SINGLE, "正在以居中宽幅打开：${entry.label}")
-            1 -> launchInMode(entry, WindowMode.FREEFORM, "正在以自由窗口打开：${entry.label}")
-            2 -> showJoinMultiSplitDialog(entry)
-            3 -> {
-                Toast.makeText(activity, "正在重载 DPI 并重启：${entry.label}", Toast.LENGTH_SHORT).show()
-                runIo {
-                    BridgeClient.windowLifecycleAction(-1, entry.pkg, WindowAction.RELOAD_DPI)
-                    BridgeService.refreshFromReceiver(activity)
-                }
-            }
-            else -> {
-                val chosen = (which - 4).coerceIn(AppMode.DEFAULT, AppMode.PORT_COMPAT)
-                Toast.makeText(
-                    activity,
-                    "正在应用【${BridgeLabels.appModeLabel(chosen)}】并重启应用...",
-                    Toast.LENGTH_SHORT,
-                ).show()
-                runIo {
-                    BridgeClient.setAppMode(entry.pkg, chosen, true)
-                    val latest = BridgeClient.getAllAppModes()
-                    activity.runOnUiThread { onAppModesUpdated(latest) }
-                }
-            }
+    private fun buildAppMenuEntries(entry: LauncherAppEntry, currentMode: Int): List<MacMenuEntry> {
+        val pinned = AppPrefs.isDesktopAppPinned(activity, entry.pkg)
+        val dockPinned = AppPrefs.isDockAppPinned(activity, entry.pkg)
+        return listOf(
+            MacMenuEntry.Action(
+                label = "以自由小窗打开",
+                subtitle = "可自由拖拽移动与缩放",
+                iconKind = HyperUi.ICON_WINDOW,
+                onClick = { launchInMode(entry, WindowMode.FREEFORM, "正在以自由小窗打开：${entry.label}") },
+            ),
+            MacMenuEntry.Action(
+                label = "以居中宽幅打开",
+                iconKind = HyperUi.ICON_RATIO,
+                onClick = { launchInMode(entry, WindowMode.ADAPTIVE_SINGLE, "正在以居中宽幅打开：${entry.label}") },
+            ),
+            MacMenuEntry.Action(
+                label = "加入 2/3/4 分屏",
+                iconKind = HyperUi.ICON_SPLIT,
+                hasSubmenu = true,
+                keepOpen = true,
+                onClick = { showJoinMultiSplitSubmenu(entry, currentMode) },
+            ),
+            MacMenuEntry.Divider,
+            MacMenuEntry.Action(
+                label = if (dockPinned) "从任务栏取消固定" else "常驻固定到任务栏",
+                iconKind = HyperUi.ICON_DEX,
+                onClick = {
+                    val nowPinned = AppPrefs.toggleDockPinnedApp(activity, entry.pkg)
+                    Toast.makeText(activity, if (nowPinned) "已固定到任务栏：${entry.label}" else "已从任务栏取消固定：${entry.label}", Toast.LENGTH_SHORT).show()
+                },
+            ),
+            MacMenuEntry.Action(
+                label = if (pinned) "从桌面移出图标" else "固定到桌面",
+                iconKind = HyperUi.ICON_PIN,
+                destructive = pinned,
+                onClick = {
+                    if (pinned) {
+                        AppPrefs.unpinDesktopApp(activity, entry.pkg)
+                        Toast.makeText(activity, "已从桌面移出：${entry.label}", Toast.LENGTH_SHORT).show()
+                    } else {
+                        AppPrefs.pinDesktopApp(activity, entry.pkg)
+                        Toast.makeText(activity, "已固定到桌面：${entry.label}", Toast.LENGTH_SHORT).show()
+                    }
+                },
+            ),
+            MacMenuEntry.Action(
+                label = "重载应用 DPI 并重启",
+                subtitle = "修复字体或排版偏大",
+                iconKind = HyperUi.ICON_ROTATE,
+                onClick = {
+                    Toast.makeText(activity, "正在重载 DPI 并重启：${entry.label}", Toast.LENGTH_SHORT).show()
+                    runIo {
+                        BridgeClient.windowLifecycleAction(-1, entry.pkg, WindowAction.RELOAD_DPI)
+                        BridgeService.refreshFromReceiver(activity)
+                    }
+                },
+            ),
+            MacMenuEntry.Divider,
+            MacMenuEntry.SectionHeader("显示兼容规则"),
+            MacMenuEntry.Action(
+                label = "跟随系统默认",
+                subtitle = "推荐微信 / 浏览器等日常应用",
+                checked = currentMode == AppMode.DEFAULT,
+                onClick = { applyAppMode(entry, AppMode.DEFAULT) },
+            ),
+            MacMenuEntry.Action(
+                label = "强制横屏全屏",
+                subtitle = "适合短剧 / 视频类应用",
+                checked = currentMode == AppMode.LAND_FULL,
+                onClick = { applyAppMode(entry, AppMode.LAND_FULL) },
+            ),
+            MacMenuEntry.Action(
+                label = "竖屏居中兼容",
+                subtitle = "适合固定竖屏比例应用",
+                checked = currentMode == AppMode.PORT_COMPAT,
+                onClick = { applyAppMode(entry, AppMode.PORT_COMPAT) },
+            ),
+        )
+    }
+
+    private fun showJoinMultiSplitSubmenu(entry: LauncherAppEntry, currentMode: Int) {
+        val dm = activity.resources.displayMetrics
+        val portrait = dm.heightPixels > dm.widthPixels
+        val header = MacMenuHeader(
+            title = "加入分屏 · ${entry.label}",
+            subtitle = "选择目标分屏布局",
+            icon = entry.icon,
+        )
+        val splitEntries = listOf(
+            MacMenuEntry.Action(
+                label = if (portrait) "2 分屏 · 放入上屏" else "2 分屏 · 放入左屏",
+                iconKind = HyperUi.ICON_SPLIT,
+                onClick = {
+                    val side = if (portrait) "上屏" else "左屏"
+                    Toast.makeText(activity, "已放入分屏【$side】：${entry.label}", Toast.LENGTH_SHORT).show()
+                    BridgeService.performAssignSplitFromUi(0, -1, entry.pkg, entry.cls)
+                },
+            ),
+            MacMenuEntry.Action(
+                label = if (portrait) "2 分屏 · 放入下屏" else "2 分屏 · 放入右屏",
+                iconKind = HyperUi.ICON_SPLIT,
+                onClick = {
+                    val side = if (portrait) "下屏" else "右屏"
+                    Toast.makeText(activity, "已放入分屏【$side】：${entry.label}", Toast.LENGTH_SHORT).show()
+                    BridgeService.performAssignSplitFromUi(1, -1, entry.pkg, entry.cls)
+                },
+            ),
+            MacMenuEntry.Divider,
+            MacMenuEntry.Action(
+                label = "1+2 三分屏",
+                subtitle = "左主屏 + 右上下双窗",
+                iconKind = HyperUi.ICON_SIDEBAR,
+                onClick = { joinMultiTilingTopology(entry, LayoutMode.SPLIT_3_MASTER, 3, listOf(50, 50)) },
+            ),
+            MacMenuEntry.Action(
+                label = "三列分屏",
+                subtitle = "左 / 中 / 右三窗并排",
+                iconKind = HyperUi.ICON_SPLIT,
+                onClick = { joinMultiTilingTopology(entry, LayoutMode.SPLIT_3_COLS, 3, listOf(33, 34, 33)) },
+            ),
+            MacMenuEntry.Action(
+                label = "2×2 四宫格",
+                subtitle = "4 应用同屏协作",
+                iconKind = HyperUi.ICON_APPS,
+                onClick = { joinMultiTilingTopology(entry, LayoutMode.GRID_2X2, 4, listOf(50, 50)) },
+            ),
+        )
+        presenter.replaceContextMenu(
+            header = header,
+            entries = splitEntries,
+            backAction = {
+                presenter.replaceContextMenu(
+                    header = MacMenuHeader(entry.label, entry.pkg, entry.icon),
+                    entries = buildAppMenuEntries(entry, currentMode),
+                )
+            },
+        )
+    }
+
+    private fun applyAppMode(entry: LauncherAppEntry, chosen: Int) {
+        Toast.makeText(
+            activity,
+            "正在应用【${BridgeLabels.appModeLabel(chosen)}】并重启应用…",
+            Toast.LENGTH_SHORT,
+        ).show()
+        runIo {
+            BridgeClient.setAppMode(entry.pkg, chosen, true)
+            val latest = BridgeClient.getAllAppModes()
+            activity.runOnUiThread { onAppModesUpdated(latest) }
         }
     }
 
@@ -144,39 +264,6 @@ class LauncherAppDialogs(
             if (!ok) BridgeClient.launchComponent(entry.pkg, entry.cls)
             BridgeService.refreshFromReceiver(activity)
         }
-    }
-
-    private fun showJoinMultiSplitDialog(entry: LauncherAppEntry) {
-        val dm = activity.resources.displayMetrics
-        val portrait = dm.heightPixels > dm.widthPixels
-        val items = arrayOf(
-            if (portrait) "2 分屏：放入上屏" else "2 分屏：放入左屏",
-            if (portrait) "2 分屏：放入下屏" else "2 分屏：放入右屏",
-            "1+2 三分屏（左主 + 右上下）",
-            "三列分屏（左 / 中 / 右）",
-            "2×2 四宫格（4 应用同屏）",
-        )
-        showManaged(
-            AlertDialog.Builder(activity)
-                .setTitle("加入分屏 · ${entry.label}")
-                .setItems(items) { _, which ->
-                    when (which) {
-                        0, 1 -> {
-                            val side = if (portrait) {
-                                if (which == 0) "上屏" else "下屏"
-                            } else {
-                                if (which == 0) "左屏" else "右屏"
-                            }
-                            Toast.makeText(activity, "已放入分屏【$side】：${entry.label}", Toast.LENGTH_SHORT).show()
-                            BridgeService.performAssignSplitFromUi(which, -1, entry.pkg, entry.cls)
-                        }
-                        2 -> joinMultiTilingTopology(entry, LayoutMode.SPLIT_3_MASTER, 3, listOf(50, 50))
-                        3 -> joinMultiTilingTopology(entry, LayoutMode.SPLIT_3_COLS, 3, listOf(33, 34, 33))
-                        4 -> joinMultiTilingTopology(entry, LayoutMode.GRID_2X2, 4, listOf(50, 50))
-                    }
-                }
-                .setNegativeButton("取消", null),
-        )
     }
 
     private fun joinMultiTilingTopology(

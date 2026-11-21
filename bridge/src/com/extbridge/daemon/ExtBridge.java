@@ -54,6 +54,7 @@ public final class ExtBridge implements Runnable {
     private final SystemControlService systemControl;
     private final InputInjector injector;
     private final LocalInputController localInput;
+    private final TaskWindowController taskController;
     private final NativeMirrorController mirrorDisplay;
     private final PhysicalDisplayController physicalDisplay;
     private final RemoteSessionCoordinator remoteCoordinator;
@@ -85,19 +86,23 @@ public final class ExtBridge implements Runnable {
         TaskWindowController taskController = new TaskWindowController(
                 services, config, taskApi, windowManager, compatPolicy,
                 helperBridge, mainHandler, bgIoExec);
+        this.taskController = taskController;
         this.remoteCoordinator = new RemoteSessionCoordinator(
                 services, config, compatPolicy, systemControl, helperBridge,
-                injector, localInput, physicalDisplay, taskController, taskApi, mainHandler, bgIoExec);
+                injector, localInput, physicalDisplay, mirrorDisplay, taskController,
+                taskApi, mainHandler, bgIoExec);
         BridgeBinderService binderService = new BridgeBinderService(
                 config, helperBridge, physicalDisplay, mirrorDisplay, compatPolicy,
                 systemControl, injector, localInput, taskController, remoteCoordinator,
                 this::tick, this::performShutdownCleanup);
 
         localInput.setMirrorController(mirrorDisplay);
+        localInput.setDesktopHooks(taskController::scheduleFastFocusSync, taskController::handleDesktopShortcut);
         helperBridge.setControlBinder(binderService);
         helperBridge.setOnHelperDeath(localInput::releaseStaleMouseDragOnHelperDeath);
         systemControl.setOnDimStateChanged(() -> remoteCoordinator.pushDesktopDeviceState(true));
         taskController.setOnRemoteStateDirty(() -> remoteCoordinator.pushDesktopDeviceState(true));
+        taskController.setOnSendBackKey(() -> localInput.injectKey(android.view.KeyEvent.KEYCODE_BACK, 0));
         physicalDisplay.wireCollaborators(taskController, this::tick, remoteCoordinator::applyDesktopResizeFromConfig);
         remoteCoordinator.wireCallbacks(
                 this::teardownPhysicalForRemoteLocked,
@@ -157,6 +162,7 @@ public final class ExtBridge implements Runnable {
         compatPolicy.maybeScheduleInitialHeal(firstConf);
 
         remoteCoordinator.start();
+        taskController.startTaskStackObserver();
         helperBridge.enqueuePushBinder(true);
         for (long delayMs : new long[]{400L, 1100L, 2400L}) {
             mainHandler.postDelayed(() -> {
@@ -221,6 +227,11 @@ public final class ExtBridge implements Runnable {
     private void performShutdownCleanup() {
         config.shuttingDown = true;
         if (!shutdownCleanupDone.compareAndSet(false, true)) return;
+        try {
+            taskController.stopTaskStackObserver();
+        } catch (RuntimeException e) {
+            System.err.println("EXTBRIDGE_SHUTDOWN_OBSERVER_ERR: " + e.getMessage());
+        }
         try {
             remoteCoordinator.shutdown();
         } catch (RuntimeException e) {

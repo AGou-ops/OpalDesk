@@ -24,28 +24,36 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.extbridge.helper.design.iosglass.GlassTier
+import com.extbridge.helper.design.iosglass.LiquidGlassSurface
+import com.extbridge.helper.design.iosglass.LiquidGlassTheme
+import com.extbridge.helper.design.iosglass.ProvideLiquidGlassTheme
+import com.extbridge.helper.design.iosglass.SquircleShape
 import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.protocol.ConnectionTone
 import top.yukonga.miuix.kmp.basic.*
 import top.yukonga.miuix.kmp.theme.*
-import top.yukonga.miuix.kmp.utils.PressFeedbackType
 
 object ExtThemePrefs {
-    val THEME_LABELS = listOf("跟随系统外观", "澎湃浅色模式", "澎湃深色模式")
+    const val MODE_SYSTEM = 0
+    const val MODE_LIGHT = 1
+    const val MODE_DARK = 2
+
+    val THEME_LABELS = listOf("跟随系统外观", "iOS 冰透浅色", "iOS 曜石深色")
     fun getThemeModeIndex(ctx: Context): Int = AppPrefs.getUiThemeModeIndex(ctx)
     fun setThemeModeIndex(ctx: Context, idx: Int) = AppPrefs.setUiThemeModeIndex(ctx, idx)
     fun toColorSchemeMode(idx: Int): ColorSchemeMode = when (idx) {
-        1 -> ColorSchemeMode.Light
-        2 -> ColorSchemeMode.Dark
+        MODE_LIGHT -> ColorSchemeMode.Light
+        MODE_DARK -> ColorSchemeMode.Dark
         else -> ColorSchemeMode.System
     }
 }
 
-val HyperBlue = Color(0xFF0D84FF)
-val HyperGreen = Color(0xFF28C76F)
+val HyperBlue = Color(0xFF007AFF)
+val HyperGreen = Color(0xFF34C759)
 val HyperAmber = Color(0xFFFF9F0A)
-val HyperRed = Color(0xFFE94634)
-val HyperPurple = Color(0xFF7C5CFA)
+val HyperRed = Color(0xFFFF3B30)
+val HyperPurple = Color(0xFF5856D6)
 
 fun ConnectionTone.toColor(): Color = when (this) {
     ConnectionTone.ERROR -> HyperRed
@@ -56,7 +64,13 @@ fun ConnectionTone.toColor(): Color = when (this) {
 
 @Composable
 fun SectionDivider(horizontalPadding: Dp = 0.dp) {
-    Box(modifier = Modifier.fillMaxWidth().padding(horizontal = horizontalPadding).height(0.6.dp).background(MiuixTheme.colorScheme.dividerLine))
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = horizontalPadding)
+            .height(0.6.dp)
+            .background(LiquidGlassTheme.colors.hairlineDivider),
+    )
 }
 
 @Composable
@@ -78,27 +92,30 @@ fun DangerActionButton(
 
 @Composable
 fun ExtHyperTheme(themeModeIndex: Int, content: @Composable () -> Unit) {
+    val isDark = isEffectiveDark(themeModeIndex)
     val lightScheme = remember {
         lightColorScheme(
-            primary = HyperBlue, primaryVariant = Color(0xFF0070E0),
-            surface = Color(0xFFF4F6FA), background = Color(0xFFF4F6FA),
-            surfaceContainer = Color(0xFFFFFFFF), surfaceVariant = Color(0xFFFFFFFF),
-            secondaryContainer = Color(0xFFEEF1F6), secondaryVariant = Color(0xFFEAECEF),
-            dividerLine = Color(0xFFE5E8EF), outline = Color(0xFFDDE2EC),
+            primary = HyperBlue, primaryVariant = Color(0xFF0062CC),
+            surface = Color(0xFFEEF3FB), background = Color(0xFFEEF3FB),
+            surfaceContainer = Color(0xD6F9FBFF), surfaceVariant = Color(0xE8FFFFFF),
+            secondaryContainer = Color(0xB8EEF2FA), secondaryVariant = Color(0xCCE8EEF8),
+            dividerLine = Color(0x1A0F172A), outline = Color(0x88FFFFFF),
         )
     }
     val darkScheme = remember {
         darkColorScheme(
-            primary = HyperBlue, primaryVariant = Color(0xFF3395FF),
-            surface = Color(0xFF0B0D12), background = Color(0xFF0B0D12),
-            surfaceContainer = Color(0xFF171A21), surfaceVariant = Color(0xFF171A21),
-            secondaryContainer = Color(0xFF222630), secondaryVariant = Color(0xFF252934),
-            dividerLine = Color(0xFF272B36), outline = Color(0xFF2F3442),
+            primary = Color(0xFF0A84FF), primaryVariant = Color(0xFF409CFF),
+            surface = Color(0xFF090C14), background = Color(0xFF090C14),
+            surfaceContainer = Color(0xB8191F2E), surfaceVariant = Color(0xCC1E2536),
+            secondaryContainer = Color(0x99232B3E), secondaryVariant = Color(0xB3283146),
+            dividerLine = Color(0x24FFFFFF), outline = Color(0x44FFFFFF),
         )
     }
     val mode = ExtThemePrefs.toColorSchemeMode(themeModeIndex)
     val controller = remember(mode) { ThemeController(colorSchemeMode = mode, lightColors = lightScheme, darkColors = darkScheme) }
-    MiuixTheme(controller = controller, content = content)
+    ProvideLiquidGlassTheme(darkTheme = isDark) {
+        MiuixTheme(controller = controller, content = content)
+    }
 }
 
 @Composable
@@ -110,8 +127,13 @@ fun isEffectiveDark(themeModeIndex: Int): Boolean = when (themeModeIndex) {
 
 @Composable
 fun StatusPillBadge(label: String, dotColor: Color, modifier: Modifier = Modifier) {
+    val rimColor = dotColor.copy(alpha = 0.28f)
     Row(
-        modifier = modifier.clip(RoundedCornerShape(50)).background(dotColor.copy(alpha = 0.14f)).padding(horizontal = 10.dp, vertical = 4.dp),
+        modifier = modifier
+            .clip(RoundedCornerShape(50))
+            .background(dotColor.copy(alpha = 0.14f))
+            .border(0.8.dp, rimColor, RoundedCornerShape(50))
+            .padding(horizontal = 11.dp, vertical = 4.5.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(dotColor))
@@ -120,7 +142,7 @@ fun StatusPillBadge(label: String, dotColor: Color, modifier: Modifier = Modifie
     }
 }
 
-/** Xiaomi HyperOS Control Center style quick-action Bento tile. */
+/** iOS Control Center Liquid Glass quick-action Bento tile with continuous G2 squircle geometry. */
 @Composable
 fun HyperBentoTile(
     title: String,
@@ -131,19 +153,23 @@ fun HyperBentoTile(
     modifier: Modifier = Modifier,
     activeColor: Color = HyperBlue,
 ) {
-    val containerColor = if (active) activeColor else MiuixTheme.colorScheme.surfaceContainer
-    val titleColor = if (active) Color.White else MiuixTheme.colorScheme.onSurfaceContainer
-    val subColor = if (active) Color.White.copy(alpha = 0.82f) else MiuixTheme.colorScheme.onSurfaceVariantSummary
-    val iconBg = if (active) Color.White.copy(alpha = 0.20f) else MiuixTheme.colorScheme.secondaryContainer
-    val iconTint = if (active) Color.White else MiuixTheme.colorScheme.primary
+    val glass = LiquidGlassTheme.colors
+    val titleColor = if (active) Color.White else glass.textPrimary
+    val subColor = if (active) Color.White.copy(alpha = 0.84f) else glass.textSecondary
+    val iconBg = if (active) Color.White.copy(alpha = 0.24f) else activeColor.copy(alpha = 0.14f)
+    val iconTint = if (active) Color.White else activeColor
 
-    Card(
-        modifier = modifier, cornerRadius = 18.dp, insideMargin = PaddingValues(horizontal = 14.dp, vertical = 13.dp),
-        colors = CardDefaults.defaultColors(color = containerColor, contentColor = titleColor),
-        pressFeedbackType = PressFeedbackType.Sink, showIndication = true, onClick = onClick,
+    LiquidGlassSurface(
+        modifier = modifier,
+        cornerRadius = 22.dp,
+        tier = if (active) GlassTier.Thick else GlassTier.Regular,
+        tintOverlay = if (active) activeColor.copy(alpha = 0.86f) else Color.Transparent,
+        elevation = if (active) 14.dp else 8.dp,
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 13.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Box(modifier = Modifier.size(38.dp).clip(CircleShape).background(iconBg), contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.size(40.dp).clip(CircleShape).background(iconBg), contentAlignment = Alignment.Center) {
                 Icon(icon, title, tint = iconTint, modifier = Modifier.size(20.dp))
             }
             Spacer(Modifier.width(11.dp))
@@ -180,17 +206,22 @@ fun MirrorLayoutSelectorGrid(selectedMode: Int, onSelectMode: (Int) -> Unit, mod
 private fun MirrorLayoutVisualCard(
     mode: Int, title: String, subtitle: String, selected: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier,
 ) {
-    val accent = MiuixTheme.colorScheme.primary
-    val borderMod = Modifier.border(if (selected) 1.8.dp else 1.dp, if (selected) accent else MiuixTheme.colorScheme.dividerLine, RoundedCornerShape(16.dp))
-    val cardBg = if (selected) accent.copy(alpha = 0.10f) else MiuixTheme.colorScheme.surfaceContainer
+    val glass = LiquidGlassTheme.colors
+    val accent = glass.accentBlue
+    val shape = remember { SquircleShape(20.dp) }
+    val selectedMod = if (selected) Modifier.border(1.8.dp, accent, shape) else Modifier
 
-    Card(
-        modifier = modifier.then(borderMod), cornerRadius = 16.dp, insideMargin = PaddingValues(12.dp),
-        colors = CardDefaults.defaultColors(color = cardBg), pressFeedbackType = PressFeedbackType.Sink, showIndication = true, onClick = onClick,
+    LiquidGlassSurface(
+        modifier = modifier.then(selectedMod),
+        cornerRadius = 20.dp,
+        tier = if (selected) GlassTier.Thick else GlassTier.Regular,
+        tintOverlay = if (selected) accent.copy(alpha = 0.12f) else Color.Transparent,
+        onClick = onClick,
+        contentPadding = PaddingValues(13.dp),
     ) {
-        val frameColor = MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.45f)
-        val mainFill = if (selected) accent.copy(alpha = 0.85f) else MiuixTheme.colorScheme.onSurfaceVariantSummary.copy(alpha = 0.35f)
-        val sideFill = if (selected) HyperPurple.copy(alpha = 0.55f) else MiuixTheme.colorScheme.secondaryContainer
+        val frameColor = glass.textSecondary.copy(alpha = 0.48f)
+        val mainFill = if (selected) accent.copy(alpha = 0.88f) else glass.textSecondary.copy(alpha = 0.32f)
+        val sideFill = if (selected) glass.accentIndigo.copy(alpha = 0.58f) else glass.glassPillInactive
 
         Canvas(modifier = Modifier.fillMaxWidth().height(46.dp)) {
             val mw = size.width * 0.78f; val mh = size.height * 0.88f
@@ -212,8 +243,8 @@ private fun MirrorLayoutVisualCard(
             }
         }
         Spacer(Modifier.height(8.dp))
-        Text(title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = if (selected) accent else MiuixTheme.colorScheme.onSurfaceContainer, maxLines = 1)
+        Text(title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = if (selected) accent else glass.textPrimary, maxLines = 1)
         Spacer(Modifier.height(2.dp))
-        Text(subtitle, fontSize = 11.sp, color = MiuixTheme.colorScheme.onSurfaceVariantSummary, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(subtitle, fontSize = 11.sp, color = glass.textSecondary, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }

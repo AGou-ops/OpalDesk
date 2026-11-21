@@ -11,11 +11,13 @@ import android.os.SystemClock;
 import com.extbridge.daemon.BridgeBuildConfig;
 import com.extbridge.daemon.DaemonConfig;
 import com.extbridge.daemon.DaemonConfig.PackagePolicy;
+import com.extbridge.daemon.DisplayGeometryUtil;
 import com.extbridge.daemon.display.CompatPolicyController;
 import com.extbridge.daemon.ipc.BridgeProtocol;
 import com.extbridge.daemon.ipc.HelperClientBridge;
 import com.extbridge.daemon.platform.AndroidServices;
 import com.extbridge.daemon.platform.TaskApiAdapter;
+import com.extbridge.daemon.platform.TaskStackObserver;
 import com.extbridge.daemon.stream.ExtCastProtocol;
 import com.extbridge.daemon.util.ShellCommand;
 import com.extbridge.daemon.window.DesktopWindowManager.ManagedWindow;
@@ -53,10 +55,14 @@ public final class TaskWindowController {
     private final TilingSessionController tiling;
     private final Handler mainHandler;
     private final ExecutorService bgIoExec;
+    private final TaskStackObserver taskStackObserver;
+    private final Runnable fastFocusSyncTask = this::syncFocusFastNow;
 
     private volatile Runnable onRemoteStateDirty;
+    private volatile Runnable onSendBackKey;
     private volatile String pendingFullscreenPkg = "";
     private volatile long pendingFullscreenUntilMs = 0L;
+    private volatile long displayMigrationUntilMs = 0L;
 
     public TaskWindowController(
             AndroidServices services, DaemonConfig config, TaskApiAdapter taskApi,
@@ -73,9 +79,106 @@ public final class TaskWindowController {
                 services, config, taskApi, windowManager, compatPolicy, helperBridge, queries, this, mainHandler);
         this.mainHandler = mainHandler;
         this.bgIoExec = bgIoExec;
+        this.taskStackObserver = new TaskStackObserver(services.iActivityTaskManager, mainHandler, this::onTaskStackDirty);
     }
 
     public void setOnRemoteStateDirty(Runnable cb) { this.onRemoteStateDirty = cb; }
+    public void setOnSendBackKey(Runnable cb) { this.onSendBackKey = cb; }
+    public void startTaskStackObserver() { taskStackObserver.start(); }
+    public void stopTaskStackObserver() {
+        taskStackObserver.stop();
+        if (mainHandler != null) mainHandler.removeCallbacks(fastFocusSyncTask);
+    }
+
+    /** Schedules a 35ms debounced focus & Z-order sync (used on pointer down/up fallback). */
+    public void scheduleFastFocusSync() {
+        if (config.shuttingDown || config.vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX) return;
+        if (mainHandler != null) {
+            mainHandler.removeCallbacks(fastFocusSyncTask);
+            mainHandler.postDelayed(fastFocusSyncTask, 35L);
+        } else {
+            syncFocusFastNow();
+        }
+    }
+
+    private void onTaskStackDirty() {
+        if (config.shuttingDown || config.vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX || isDisplayMigrating()) {
+            return;
+        }
+        syncFocusFastNow();
+    }
+
+    private void syncFocusFastNow() {
+        if (config.shuttingDown || config.vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX || isDisplayMigrating()) {
+            return;
+        }
+        long beforeSeq = windowManager.getStateSeq();
+        syncManagedWindowsWithLiveTasks();
+        long afterSeq = windowManager.getStateSeq();
+        if (afterSeq != beforeSeq) {
+            notifyStateChanged();
+        }
+    }
+
+    public void setDesktopPrefs(boolean taskbarAutoHide, String defaultLaunchMode) {
+        boolean prevAutoHide = windowManager.isTaskbarAutoHide();
+        windowManager.setTaskbarAutoHide(taskbarAutoHide);
+        if (defaultLaunchMode != null && !defaultLaunchMode.trim().isEmpty()) {
+            windowManager.setDefaultLaunchMode(defaultLaunchMode);
+        }
+        if (prevAutoHide != taskbarAutoHide) {
+            relayoutManagedWindowsOnResize();
+        } else {
+            notifyStateChanged();
+        }
+    }
+
+    /** Handles a global DeX desktop keyboard shortcut intercepted by local or remote input bridges. */
+    public boolean handleDesktopShortcut(String action) {
+        if (action == null || action.isEmpty() || config.vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX) {
+            return false;
+        }
+        switch (action) {
+            case BridgeProtocol.SHORTCUT_WINDOW_SWITCHER:
+            case BridgeProtocol.SHORTCUT_APP_DRAWER:
+            case BridgeProtocol.SHORTCUT_SHOW_DESKTOP:
+            case BridgeProtocol.SHORTCUT_DISMISS_OVERLAY:
+                helperBridge.pushDesktopShortcut(action);
+                return true;
+            case BridgeProtocol.SHORTCUT_SNAP_LEFT:
+                return snapFocusedWindowToZone(DesktopWindowManager.SNAP_LEFT_HALF);
+            case BridgeProtocol.SHORTCUT_SNAP_RIGHT:
+                return snapFocusedWindowToZone(DesktopWindowManager.SNAP_RIGHT_HALF);
+            case BridgeProtocol.SHORTCUT_MAXIMIZE_TOGGLE: {
+                ManagedWindow fg = findFocusedNonMinimizedUserWindow();
+                return fg != null && windowLifecycleAction(fg.taskId, fg.pkg, BridgeProtocol.WIN_ACTION_TOGGLE_MAXIMIZE);
+            }
+            case BridgeProtocol.SHORTCUT_MINIMIZE_OR_RESTORE: {
+                ManagedWindow fg = findFocusedNonMinimizedUserWindow();
+                if (fg == null) return false;
+                if (DesktopWindowManager.PRES_MAXIMIZED.equals(fg.presentation)
+                        || !DesktopWindowManager.PRES_FLOATING.equals(fg.presentation)) {
+                    return windowLifecycleAction(fg.taskId, fg.pkg, BridgeProtocol.WIN_ACTION_TOGGLE_MAXIMIZE);
+                }
+                return windowLifecycleAction(fg.taskId, fg.pkg, BridgeProtocol.WIN_ACTION_MINIMIZE);
+            }
+            case BridgeProtocol.SHORTCUT_CLOSE_FOCUSED: {
+                ManagedWindow fg = findFocusedNonMinimizedUserWindow();
+                return fg != null && windowLifecycleAction(fg.taskId, fg.pkg, BridgeProtocol.WIN_ACTION_CLOSE);
+            }
+            default:
+                return false;
+        }
+    }
+
+    private boolean snapFocusedWindowToZone(int snapZone) {
+        ManagedWindow fg = findFocusedNonMinimizedUserWindow();
+        if (fg == null) return false;
+        WindowRect rect = DesktopWindowManager.computeSnapBounds(
+                snapZone, config.virtW, config.virtH, config.virtDpi, windowManager.isTaskbarAutoHide());
+        return updateWindowBounds(fg.taskId, fg.pkg, DesktopWindowManager.INT_MODE_FREEFORM,
+                rect.left, rect.top, rect.right, rect.bottom, false);
+    }
     public DesktopWindowManager getWindowManager() { return windowManager; }
     public TwoSlotSplitSnapshot getTwoSlotSplitSnapshot() { return tiling.getTwoSlotSplitSnapshot(); }
 
@@ -111,6 +214,10 @@ public final class TaskWindowController {
 
     // ---- Shared Single-Window Transition Engine ----
 
+    private int desktopDockInsetPx() {
+        return windowManager.computeActiveTaskbarInsetPx(config.virtH, config.virtDpi);
+    }
+
     void applySingleWindowMode(
             int taskId, String pkg, String requestedMode, WindowRect explicitBounds,
             boolean bringToFront, boolean focused, boolean rememberPref) {
@@ -119,24 +226,33 @@ public final class TaskWindowController {
         int virtW = config.virtW, virtH = config.virtH, virtDpi = config.virtDpi;
         String safePkg = (pkg != null) ? pkg : "";
 
+        ManagedWindow prevWindow = windowManager.getManagedWindow(taskId);
         String mode = requestedMode;
         WindowRect rect;
         if (DesktopWindowManager.MODE_FULLSCREEN.equals(mode)) {
             rect = new WindowRect(0, 0, virtW, virtH);
         } else if (explicitBounds != null && !explicitBounds.isEmpty()) {
-            rect = DesktopWindowManager.clampBoundsToWorkArea(explicitBounds, virtW, Math.max(360, virtH));
+            int effDpi = Math.max(120, virtDpi > 0 ? virtDpi : 240);
+            int minTop = DesktopWindowManager.MODE_FREEFORM.equals(mode)
+                    ? DisplayGeometryUtil.dpToPx(
+                            DisplayGeometryUtil.WORKAREA_TOP_INSET_DP + DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP, effDpi)
+                    : 0;
+            int workBottom = Math.max(360, virtH - desktopDockInsetPx());
+            rect = DesktopWindowManager.clampBoundsToWorkArea(explicitBounds, virtW, workBottom, minTop);
         } else if (DesktopWindowManager.MODE_FREEFORM.equals(mode)) {
-            rect = windowManager.computeNextFreeformBounds(virtW, virtH, virtDpi, 0, safePkg);
+            rect = windowManager.computeNextFreeformBounds(virtW, virtH, virtDpi, desktopDockInsetPx(), safePkg);
         } else {
             mode = DesktopWindowManager.MODE_ADAPTIVE_SINGLE;
-            rect = windowManager.computeAdaptiveSingleBounds(virtW, virtH, virtDpi, 0, safePkg, 0, 0);
+            rect = windowManager.computeAdaptiveSingleBounds(virtW, virtH, virtDpi, desktopDockInsetPx(), safePkg, 0, 0);
         }
         if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(mode) && rect.width() >= virtW - FULLSCREEN_WIDTH_TOLERANCE_PX) {
             mode = DesktopWindowManager.MODE_FULLSCREEN;
             rect = new WindowRect(0, 0, virtW, virtH);
         }
 
-        windowManager.putManagedWindow(taskId, safePkg, mode, rect, focused, -1);
+        String presentation = DesktopWindowManager.classifyPresentation(
+                mode, rect, virtW, virtH, virtDpi, windowManager.isTaskbarAutoHide());
+        windowManager.putManagedWindow(taskId, safePkg, mode, presentation, rect, focused, -1);
         if (DesktopWindowManager.MODE_FULLSCREEN.equals(mode)) {
             if (!safePkg.isEmpty() && config.fullscreenPolicy == 1
                     && config.getAppMode(safePkg) == BridgeProtocol.APP_MODE_DEFAULT
@@ -153,10 +269,24 @@ public final class TaskWindowController {
             }
         } else {
             Rect ar = rect.toAndroidRect();
-            taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
-            if (bringToFront) {
-                bringMultiWindowTaskFront(taskId, ar);
+            // Fast-path pure translation moves (width/height unchanged in active MULTI_WINDOW)
+            // to keep live dragging responsive without redundant WCT/resizeable roundtrips.
+            boolean pureTranslation = !bringToFront
+                    && prevWindow != null
+                    && !prevWindow.minimized
+                    && DesktopWindowManager.MODE_FREEFORM.equals(prevWindow.mode)
+                    && DesktopWindowManager.MODE_FREEFORM.equals(mode)
+                    && prevWindow.bounds != null
+                    && prevWindow.bounds.width() == rect.width()
+                    && prevWindow.bounds.height() == rect.height();
+            if (pureTranslation && taskApi.getTaskWindowingMode(taskId) == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW) {
+                taskApi.resizeTask(taskId, ar);
+            } else {
                 taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
+                if (bringToFront) {
+                    bringMultiWindowTaskFront(taskId, ar);
+                    taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
+                }
             }
             if (rememberPref && !safePkg.isEmpty()) {
                 if (DesktopWindowManager.MODE_FREEFORM.equals(mode)) {
@@ -235,7 +365,7 @@ public final class TaskWindowController {
         WindowRect explicit = (right - left >= 200 && bottom - top >= 200)
                 ? DesktopWindowManager.clampBoundsToWorkArea(new WindowRect(left, top, right, bottom), config.virtW, Math.max(360, config.virtH))
                 : null;
-        int existingTid = findTaskIdForPkg(pkg, false);
+        int existingTid = findTaskIdForPkg(pkg, true);
         if (existingTid > 0 && isTaskAllowedForExtControl(existingTid, pkg, false)) {
             applySingleWindowMode(existingTid, pkg, targetMode, explicit, true, true, false);
             notifyStateChanged();
@@ -243,8 +373,8 @@ public final class TaskWindowController {
         }
         WindowRect rect = DesktopWindowManager.MODE_FULLSCREEN.equals(targetMode) ? new WindowRect(0, 0, config.virtW, config.virtH)
                 : (explicit != null ? explicit : (DesktopWindowManager.MODE_FREEFORM.equals(targetMode)
-                        ? windowManager.computeNextFreeformBounds(config.virtW, config.virtH, config.virtDpi, 0, pkg)
-                        : windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, 0, pkg, 0, 0)));
+                        ? windowManager.computeNextFreeformBounds(config.virtW, config.virtH, config.virtDpi, desktopDockInsetPx(), pkg)
+                        : windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, desktopDockInsetPx(), pkg, 0, 0)));
         if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(targetMode) && rect.width() >= config.virtW - FULLSCREEN_WIDTH_TOLERANCE_PX) {
             targetMode = DesktopWindowManager.MODE_FULLSCREEN;
             rect = new WindowRect(0, 0, config.virtW, config.virtH);
@@ -253,13 +383,6 @@ public final class TaskWindowController {
         if (!useMw) {
             pendingFullscreenPkg = pkg;
             pendingFullscreenUntilMs = SystemClock.uptimeMillis() + PENDING_FULLSCREEN_GRACE_MS;
-            int preTid = findTaskIdForPkg(pkg, true);
-            if (preTid > 0) {
-                int preWm = taskApi.getTaskWindowingMode(preTid);
-                if (preWm != BridgeProtocol.WINDOWING_MODE_FULLSCREEN && preWm != BridgeProtocol.WINDOWING_MODE_UNDEFINED) {
-                    taskApi.detachFreeformAndEnsureFullscreen(preTid, vdId, config.virtW, config.virtH, true, mainHandler);
-                }
-            }
             if (config.fullscreenPolicy == 1 && config.getAppMode(pkg) == BridgeProtocol.APP_MODE_DEFAULT
                     && PackagePolicy.shouldCompatOverridePkg(pkg)) {
                 compatPolicy.applyAppModeCompat(pkg, BridgeProtocol.APP_MODE_LAND_FULL, false);
@@ -273,14 +396,28 @@ public final class TaskWindowController {
             }
             compatPolicy.applyAppModeCompat(pkg, config.getAppMode(pkg), false);
         }
+        if (useMw) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION);
+        }
+        // Launch directly in WINDOWING_MODE_MULTI_WINDOW (6) + setLaunchBounds(rect) so OEM freeform
+        // managers (such as Xiaomi HyperOS MiuiFreeFormManagerService on mode 5) never hijack task
+        // scale, leash position, or inject native OEM white caption headers.
+        int launchWindowingMode = useMw ? BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW : BridgeProtocol.WINDOWING_MODE_FULLSCREEN;
         boolean ok = services.startActivityAsShell(intent, makeLaunchOptions(
-                vdId, useMw ? BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW : BridgeProtocol.WINDOWING_MODE_FULLSCREEN,
+                vdId, launchWindowingMode,
                 useMw ? rect.toAndroidRect() : null).toBundle());
-        if (ok && mainHandler != null) {
+        if (ok) {
             final String fMode = targetMode;
             final WindowRect fRect = rect;
-            for (long delayMs : new long[]{220L, 650L}) {
-                mainHandler.postDelayed(() -> verifyLaunchedWindowAsync(pkg, fMode, fRect, useMw), delayMs);
+            if (useMw) {
+                verifyLaunchedWindowAsync(pkg, fMode, fRect, true, true);
+            }
+            if (mainHandler != null) {
+                long[] delays = useMw ? new long[]{20L, 70L, 180L, 380L} : new long[]{200L, 600L};
+                for (int i = 0; i < delays.length; i++) {
+                    final boolean forceSync = (i <= 1);
+                    mainHandler.postDelayed(() -> verifyLaunchedWindowAsync(pkg, fMode, fRect, useMw, forceSync), delays[i]);
+                }
             }
         }
         notifyStateChanged();
@@ -309,6 +446,9 @@ public final class TaskWindowController {
         WindowRect explicit = (right - left >= 200 && bottom - top >= 200) ? new WindowRect(left, top, right, bottom) : null;
         boolean bringFront = DesktopWindowManager.MODE_FULLSCREEN.equals(mode);
         applySingleWindowMode(tid, safePkg, mode, explicit, bringFront, true, rememberPref);
+        if (DesktopWindowManager.MODE_FREEFORM.equals(mode)) {
+            taskApi.reorderTask(tid, vdId, true);
+        }
         notifyStateChanged();
         return true;
     }
@@ -320,7 +460,7 @@ public final class TaskWindowController {
         if (tid <= 0) return false;
         int pct = DesktopWindowManager.clampWidthPct(widthPct);
         if (pct >= 98) return updateWindowBounds(tid, target, DesktopWindowManager.INT_MODE_FULLSCREEN, 0, 0, config.virtW, config.virtH, remember);
-        WindowRect r = windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, 0, target, pct, 0);
+        WindowRect r = windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, desktopDockInsetPx(), target, pct, 0);
         return updateWindowBounds(tid, target, DesktopWindowManager.INT_MODE_ADAPTIVE_SINGLE, r.left, r.top, r.right, r.bottom, remember);
     }
 
@@ -377,7 +517,7 @@ public final class TaskWindowController {
         int vdId = config.vdId;
         if (vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX) return false;
         if (windowManager.isTilingActive()) exitTilingAndRestore(false);
-        windowManager.minimizeAllSingleWindows();
+        windowManager.minimizeAllWindows();
         int lTid = queries.findExtLauncherTaskId();
         if (lTid > 0) {
             taskApi.detachFreeformAndEnsureFullscreen(lTid, vdId, config.virtW, config.virtH,
@@ -428,12 +568,24 @@ public final class TaskWindowController {
                 notifyStateChanged();
                 return true;
             case BridgeProtocol.WIN_ACTION_MINIMIZE:
-                if (tid > 0) windowManager.setMinimizedTask(tid, true);
-                boolean hasOtherFf = false;
-                for (ManagedWindow m : windowManager.getManagedWindowsSnapshot()) {
-                    if (!m.minimized && m.taskId != tid && DesktopWindowManager.MODE_FREEFORM.equals(m.mode)) { hasOtherFf = true; break; }
+                if (tid > 0) {
+                    windowManager.setMinimizedTask(tid, true);
+                    taskApi.reorderTask(tid, vdId, false);
                 }
-                if (!hasOtherFf) minimizeToExtHome(tid, safePkg);
+                ManagedWindow nextFocus = null;
+                for (ManagedWindow m : windowManager.getManagedWindowsSnapshot()) {
+                    if (!m.minimized && m.taskId != tid && DesktopWindowManager.MODE_FREEFORM.equals(m.mode)) {
+                        nextFocus = m;
+                    }
+                }
+                if (nextFocus == null) {
+                    minimizeToExtHome(tid, safePkg);
+                } else {
+                    // Only focus the next top non-minimized window without thrashing Launcher or
+                    // reordering every remaining task (prevents desktop flash & Z-order scramble).
+                    taskApi.reorderTask(nextFocus.taskId, vdId, true);
+                    windowManager.setFocusedTask(nextFocus.taskId);
+                }
                 notifyStateChanged();
                 return true;
             case BridgeProtocol.WIN_ACTION_CLOSE:
@@ -443,6 +595,30 @@ public final class TaskWindowController {
                 if (safePkg == null || safePkg.isEmpty()) return false;
                 reloadAppDpiOnDesktop(safePkg);
                 return true;
+            case BridgeProtocol.WIN_ACTION_SEND_BACK: {
+                if (tid > 0) {
+                    ManagedWindow target = windowManager.getManagedWindow(tid);
+                    if (target != null && !target.focused) {
+                        windowLifecycleAction(tid, safePkg, BridgeProtocol.WIN_ACTION_FOCUS);
+                        SystemClock.sleep(35L);
+                    }
+                }
+                Runnable sendBack = onSendBackKey;
+                if (sendBack != null) {
+                    sendBack.run();
+                    return true;
+                }
+                return false;
+            }
+            case BridgeProtocol.WIN_ACTION_TOGGLE_MAXIMIZE: {
+                if (tid <= 0) return false;
+                WindowRect nextRect = windowManager.resolveToggleMaximizeTarget(
+                        tid, safePkg, config.virtW, config.virtH, config.virtDpi);
+                applySingleWindowMode(tid, safePkg, DesktopWindowManager.MODE_FREEFORM, nextRect, false, true, false);
+                taskApi.reorderTask(tid, vdId, true);
+                notifyStateChanged();
+                return true;
+            }
             default:
                 return false;
         }
@@ -516,14 +692,49 @@ public final class TaskWindowController {
 
     // ---- Periodic Enforcement, Resize Relayout & Managed Windows JSON ----
 
+    public void beginDisplayMigration() {
+        displayMigrationUntilMs = SystemClock.uptimeMillis() + 1800L;
+    }
+
+    public void endDisplayMigration() {
+        displayMigrationUntilMs = 0L;
+    }
+
+    public boolean isDisplayMigrating() {
+        return SystemClock.uptimeMillis() < displayMigrationUntilMs;
+    }
+
+    public void finishDisplayMigrationAndRelayout(List<ManagedWindow> preserved) {
+        if (preserved != null && !preserved.isEmpty()) {
+            for (ManagedWindow mw : preserved) {
+                if (mw == null || mw.taskId <= 0) continue;
+                windowManager.putManagedWindow(mw.taskId, mw.pkg, mw.mode, mw.bounds, mw.focused, mw.slotIndex);
+                if (mw.minimized) windowManager.setMinimizedTask(mw.taskId, true);
+            }
+        }
+        if (mainHandler == null) {
+            relayoutManagedWindowsOnResize();
+            displayMigrationUntilMs = 0L;
+            return;
+        }
+        mainHandler.postDelayed(this::relayoutManagedWindowsOnResize, 100L);
+        mainHandler.postDelayed(() -> {
+            relayoutManagedWindowsOnResize();
+            displayMigrationUntilMs = 0L;
+            notifyStateChanged();
+        }, 360L);
+    }
+
     public void postAttachLayoutSync() {
+        if (isDisplayMigrating()) return;
         if (windowManager.isTilingActive()) relayoutManagedWindowsOnResize();
         else tiling.ensureLauncherTaskFullscreenInBg();
     }
 
     public void scheduleRelayoutAfterResize() {
         if (mainHandler == null) { relayoutManagedWindowsOnResize(); return; }
-        mainHandler.postDelayed(this::relayoutManagedWindowsOnResize, 300L);
+        mainHandler.postDelayed(this::relayoutManagedWindowsOnResize, 140L);
+        mainHandler.postDelayed(this::relayoutManagedWindowsOnResize, 380L);
         if (getTwoSlotSplitSnapshot().active) {
             mainHandler.postDelayed(this::relayoutManagedWindowsOnResize, 900L);
             mainHandler.postDelayed(this::relayoutManagedWindowsOnResize, 1850L);
@@ -533,21 +744,53 @@ public final class TaskWindowController {
     public void relayoutManagedWindowsOnResize() {
         if (config.vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX) return;
         if (windowManager.isTilingActive()) { tiling.relayoutTilingOnResize(); return; }
-        int workBottom = Math.max(360, config.virtH);
+        int effDpi = Math.max(120, config.virtDpi > 0 ? config.virtDpi : 240);
+        boolean autoHide = windowManager.isTaskbarAutoHide();
+        int workBottom = Math.max(360, config.virtH - desktopDockInsetPx());
+        int headerTop = DisplayGeometryUtil.dpToPx(
+                DisplayGeometryUtil.WORKAREA_TOP_INSET_DP + DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP, effDpi);
+        int minTitleTop = Math.min(Math.max(0, workBottom - 280), headerTop);
         for (ManagedWindow mw : windowManager.getManagedWindowsSnapshot()) {
             if (mw.minimized || mw.taskId <= 0) continue;
             if (DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(mw.mode)) {
                 applySingleWindowMode(mw.taskId, mw.pkg, DesktopWindowManager.MODE_ADAPTIVE_SINGLE, null, false, mw.focused, false);
             } else if (DesktopWindowManager.MODE_FREEFORM.equals(mw.mode) && mw.bounds != null) {
-                applySingleWindowMode(mw.taskId, mw.pkg, DesktopWindowManager.MODE_FREEFORM,
-                        DesktopWindowManager.clampBoundsToWorkArea(mw.bounds, config.virtW, workBottom), false, mw.focused, false);
+                WindowRect target = recomputeBoundsForPresentation(mw.presentation, mw.bounds, config.virtW, config.virtH, effDpi, autoHide, workBottom, minTitleTop);
+                applySingleWindowMode(mw.taskId, mw.pkg, DesktopWindowManager.MODE_FREEFORM, target, false, mw.focused, false);
             }
         }
+        notifyStateChanged();
+    }
+
+    private static WindowRect recomputeBoundsForPresentation(
+            String pres, WindowRect cur, int virtW, int virtH, int dpi, boolean autoHide, int workBottom, int minTitleTop) {
+        if (DesktopWindowManager.PRES_MAXIMIZED.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_MAXIMIZE_WORKAREA, virtW, virtH, dpi, autoHide);
+        }
+        if (DesktopWindowManager.PRES_SNAPPED_LEFT.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_LEFT_HALF, virtW, virtH, dpi, autoHide);
+        }
+        if (DesktopWindowManager.PRES_SNAPPED_RIGHT.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_RIGHT_HALF, virtW, virtH, dpi, autoHide);
+        }
+        if (DesktopWindowManager.PRES_SNAPPED_TL.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_TOP_LEFT, virtW, virtH, dpi, autoHide);
+        }
+        if (DesktopWindowManager.PRES_SNAPPED_TR.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_TOP_RIGHT, virtW, virtH, dpi, autoHide);
+        }
+        if (DesktopWindowManager.PRES_SNAPPED_BL.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_BOTTOM_LEFT, virtW, virtH, dpi, autoHide);
+        }
+        if (DesktopWindowManager.PRES_SNAPPED_BR.equals(pres)) {
+            return DesktopWindowManager.computeSnapBounds(DesktopWindowManager.SNAP_BOTTOM_RIGHT, virtW, virtH, dpi, autoHide);
+        }
+        return DesktopWindowManager.clampBoundsToWorkArea(cur, virtW, workBottom, minTitleTop);
     }
 
     public void enforceRunningExtTasksFullscreen(boolean enforceCompat) {
         int vdId = config.vdId;
-        if (vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX) return;
+        if (vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX || isDisplayMigrating()) return;
         List<?> running = taskApi.getTasks();
         if (running == null) return;
         Set<Integer> liveTids = new HashSet<>();
@@ -577,10 +820,16 @@ public final class TaskWindowController {
             }
             if (!isVis) continue;
             if (tid > 0 && windowManager.isTaskManagedInMultiWindow(tid, pkg)) {
-                if (wm == BridgeProtocol.WINDOWING_MODE_FREEFORM) {
-                    ManagedWindow mw = windowManager.getManagedWindow(tid);
-                    Rect target = (mw != null && mw.bounds != null && !mw.bounds.isEmpty()) ? mw.bounds.toAndroidRect()
-                            : windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, 0, pkg, 0, 0).toAndroidRect();
+                ManagedWindow mw = windowManager.getManagedWindow(tid);
+                Rect target = (mw != null && mw.bounds != null && !mw.bounds.isEmpty()) ? mw.bounds.toAndroidRect()
+                        : windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, 0, pkg, 0, 0).toAndroidRect();
+                Rect liveBounds = taskApi.getTaskBounds(tid, vdId);
+                boolean boundsDrifted = liveBounds == null
+                        || Math.abs(liveBounds.left - target.left) > 2
+                        || Math.abs(liveBounds.top - target.top) > 2
+                        || Math.abs(liveBounds.right - target.right) > 2
+                        || Math.abs(liveBounds.bottom - target.bottom) > 2;
+                if (wm != BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW || boundsDrifted) {
                     taskApi.ensureTaskResizeableAndMultiWindow(tid, vdId, target, true);
                 }
                 continue;
@@ -592,7 +841,8 @@ public final class TaskWindowController {
                         new WindowRect(0, 0, config.virtW, config.virtH), true, -1);
             } else if (tid > 0 && !PackagePolicy.isProtectedSystemTaskPkg(pkg)
                     && windowManager.shouldAutoApplyAdaptiveSingle(tid, pkg)) {
-                applySingleWindowMode(tid, pkg, DesktopWindowManager.MODE_ADAPTIVE_SINGLE, null, false, true, false);
+                String adoptedMode = windowManager.resolveLaunchMode(pkg, DesktopWindowManager.INT_MODE_AUTO);
+                applySingleWindowMode(tid, pkg, adoptedMode, null, false, true, false);
                 continue;
             }
             if (tid > 0 && wm != BridgeProtocol.WINDOWING_MODE_FULLSCREEN && wm != 0) {
@@ -601,6 +851,21 @@ public final class TaskWindowController {
             if (enforceCompat && PackagePolicy.shouldCompatOverridePkg(pkg)) {
                 compatPolicy.applyAppModeCompat(pkg, config.getAppMode(pkg), false);
             }
+        }
+        // Keep focused window synchronized with live top Z-order so clicking anywhere inside a
+        // background desktop window updates Menu Bar & Window Chrome focus state automatically.
+        for (Object t : running) {
+            if (t == null || TaskApiAdapter.readIntField(t, "displayId", -1) != vdId) continue;
+            if (!TaskApiAdapter.readBoolField(t, "isVisible", false)) continue;
+            String p = TaskApiAdapter.extractTaskPkg(t);
+            if (PackagePolicy.shouldSkipTaskPkg(p) || PackagePolicy.isProtectedSystemTaskPkg(p)) continue;
+            int topTid = TaskApiAdapter.extractTaskId(t);
+            ManagedWindow cur = (topTid > 0) ? windowManager.getManagedWindow(topTid) : null;
+            if (cur != null && (!cur.focused || cur.minimized)) {
+                windowManager.setFocusedTask(topTid);
+                notifyStateChanged();
+            }
+            break;
         }
     }
 
@@ -632,23 +897,34 @@ public final class TaskWindowController {
     }
 
     boolean bringMultiWindowTaskFront(int taskId, Rect bounds) {
-        return taskId > 0 && config.vdId > 0
-                && taskApi.startActivityFromRecents(taskId, makeLaunchOptions(config.vdId, BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW, bounds).toBundle());
+        if (taskId <= 0 || config.vdId <= 0) return false;
+        boolean ok = taskApi.startActivityFromRecents(
+                taskId, makeLaunchOptions(config.vdId, BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW, bounds).toBundle());
+        taskApi.reorderTask(taskId, config.vdId, true);
+        return ok;
     }
 
+
     void notifyStateChanged() {
-        helperBridge.notifyHelperSync();
+        helperBridge.pushWindowState(windowManager.toManagedWindowsJson(), windowManager.getStateSeq());
         Runnable cb = onRemoteStateDirty;
         if (cb != null) cb.run();
     }
 
-    private void verifyLaunchedWindowAsync(String pkg, String mode, WindowRect bounds, boolean useMw) {
+    private void verifyLaunchedWindowAsync(String pkg, String mode, WindowRect bounds, boolean useMw, boolean forceSync) {
         if (config.vdId <= 0 || pkg == null || pkg.isEmpty() || windowManager.isTilingActive()) return;
         int tid = findTaskIdForPkg(pkg, false);
         if (tid <= 0) return;
         windowManager.putManagedWindow(tid, pkg, mode, bounds, true, -1);
         if (useMw) {
-            taskApi.ensureTaskResizeableAndMultiWindow(tid, config.vdId, bounds.toAndroidRect(), true);
+            Rect targetRect = bounds.toAndroidRect();
+            int curWm = taskApi.getTaskWindowingMode(tid);
+            Rect curBounds = taskApi.getTaskBounds(tid, config.vdId);
+            boolean alreadyMatched = (curWm == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW)
+                    && curBounds != null && curBounds.equals(targetRect);
+            if (!alreadyMatched || forceSync) {
+                taskApi.ensureTaskResizeableAndMultiWindow(tid, config.vdId, targetRect, forceSync);
+            }
         } else {
             int wm = taskApi.getTaskWindowingMode(tid);
             if (wm != BridgeProtocol.WINDOWING_MODE_FULLSCREEN) {
@@ -662,10 +938,11 @@ public final class TaskWindowController {
 
     private void syncManagedWindowsWithLiveTasks() {
         int vdId = config.vdId;
-        if (vdId <= 0) return;
+        if (vdId <= 0 || isDisplayMigrating()) return;
         List<?> running = taskApi.getTasks();
         if (running == null) return;
         Set<Integer> liveTids = new HashSet<>();
+        Set<Integer> visibleUserTids = new HashSet<>();
         int topTid = -1, topWm = 0;
         String topPkg = null;
         for (Object t : running) {
@@ -673,26 +950,45 @@ public final class TaskWindowController {
             int tid = TaskApiAdapter.extractTaskId(t);
             if (tid <= 0) continue;
             liveTids.add(tid);
-            if (topTid <= 0 && TaskApiAdapter.readBoolField(t, "isVisible", false)) {
+            if (TaskApiAdapter.readBoolField(t, "isVisible", false)) {
                 String p = TaskApiAdapter.extractTaskPkg(t);
                 if (!PackagePolicy.shouldSkipTaskPkg(p) && !PackagePolicy.isProtectedSystemTaskPkg(p)) {
-                    topTid = tid; topPkg = p; topWm = TaskApiAdapter.extractTaskWindowingMode(t);
+                    visibleUserTids.add(tid);
+                    if (topTid <= 0) {
+                        topTid = tid; topPkg = p; topWm = TaskApiAdapter.extractTaskWindowingMode(t);
+                    }
                 }
             }
         }
         windowManager.pruneDeadTasks(liveTids);
+        // Never mark a live freeform window as minimized just because Android reports isVisible=false
+        // (for instance when it is completely covered by a maximized or larger upper window).
+        // Minimized state is owned exclusively by explicit user minimize / show-desktop actions.
         if (topTid > 0) {
-            if (windowManager.getManagedWindow(topTid) != null) {
-                windowManager.setFocusedTask(topTid);
+            ManagedWindow existingTop = windowManager.getManagedWindow(topTid);
+            if (existingTop != null) {
+                if (!existingTop.focused || existingTop.minimized) {
+                    windowManager.setFocusedTask(topTid);
+                }
             } else if (!windowManager.isTilingActive() && topPkg != null) {
                 Rect curB = taskApi.getTaskBounds(topTid, vdId);
                 WindowRect wr = (curB != null && !curB.isEmpty()) ? WindowRect.fromAndroidRect(curB) : new WindowRect(0, 0, config.virtW, config.virtH);
-                String mode = (topWm == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW && wr.width() < config.virtW - FULLSCREEN_WIDTH_TOLERANCE_PX)
-                        ? DesktopWindowManager.MODE_ADAPTIVE_SINGLE : DesktopWindowManager.MODE_FULLSCREEN;
-                windowManager.putManagedWindow(topTid, topPkg, mode, wr, true, -1);
+                String mode;
+                if (topWm == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW && wr.width() < config.virtW - FULLSCREEN_WIDTH_TOLERANCE_PX) {
+                    String prefMode = windowManager.resolveLaunchMode(topPkg, DesktopWindowManager.INT_MODE_AUTO);
+                    mode = DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(prefMode)
+                            ? DesktopWindowManager.MODE_ADAPTIVE_SINGLE : DesktopWindowManager.MODE_FREEFORM;
+                } else {
+                    mode = DesktopWindowManager.MODE_FULLSCREEN;
+                }
+                String pres = DesktopWindowManager.classifyPresentation(
+                        mode, wr, config.virtW, config.virtH, config.virtDpi, windowManager.isTaskbarAutoHide());
+                windowManager.putManagedWindow(topTid, topPkg, mode, pres, wr, true, -1);
             }
         } else if (!windowManager.isTilingActive()) {
-            windowManager.minimizeAllSingleWindows();
+            // Only minimize all when the Launcher is actually topmost on the virtual display
+            // and zero user tasks remain visible.
+            windowManager.minimizeAllWindows();
         }
     }
 

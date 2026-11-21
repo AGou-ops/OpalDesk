@@ -13,6 +13,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.extbridge.helper.BridgeService
 import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.prefs.MirrorThemeCatalog
 import com.extbridge.helper.protocol.BridgeLabels
@@ -98,14 +99,8 @@ fun DexConfigSection(ctrl: MainController) {
         }
     }
 
-    SectionHeader("单应用默认黄金尺寸")
-    AdaptiveSingleSizeCard(
-        enabled = ctrl.adaptiveSingleEnabled, defaultWidthDp = ctrl.defaultSingleWidthDp,
-        daemonConnected = ctrl.daemonStatus.connected,
-        onEnabledChange = { ctrl.applyAdaptiveSingleConfig(it, ctrl.defaultSingleWidthDp, debounce = false, showToast = true) },
-        onSelectPresetWidth = { ctrl.applyAdaptiveSingleConfig(ctrl.adaptiveSingleEnabled, it, debounce = false, showToast = true) },
-        onSliderWidthChange = { ctrl.applyAdaptiveSingleConfig(ctrl.adaptiveSingleEnabled, it, debounce = true, showToast = false) },
-    )
+    SectionHeader("DeX 桌面与窗口偏好")
+    DexDesktopBehaviorCard(ctrl)
 
     SectionHeader("快捷预设与硬件信号")
     Card {
@@ -169,52 +164,81 @@ fun MirrorConfigSection(ctrl: MainController, onOpenSideControl: () -> Unit, onO
 }
 
 @Composable
-fun AdaptiveSingleSizeCard(
-    enabled: Boolean,
-    defaultWidthDp: Int,
-    daemonConnected: Boolean,
-    onEnabledChange: (Boolean) -> Unit,
-    onSelectPresetWidth: (Int) -> Unit,
-    onSliderWidthChange: (Int) -> Unit,
-) {
+fun DexDesktopBehaviorCard(ctrl: MainController) {
+    val ctx = LocalContext.current
     val minDp = DisplayGeometry.UI_MIN_SINGLE_WIDTH_DP
     val maxDp = DisplayGeometry.UI_MAX_SINGLE_WIDTH_DP
-    val clampedDp = DisplayGeometry.clampUiSingleWidthDp(defaultWidthDp)
-    val presets = remember { listOf(460 to "460dp 精致手机", 680 to "680dp 折叠屏", 900 to "900dp 平板双栏") }
+    val clampedDp = DisplayGeometry.clampUiSingleWidthDp(ctrl.defaultSingleWidthDp)
+    val presets = remember { listOf(420 to "420dp 手机", 680 to "680dp 折叠", 900 to "900dp 平板") }
 
     Card {
-        SwitchPreference(
-            title = "单应用默认黄金尺寸",
-            summary = "打开单个应用自动居中精致比例，拖动窗口左右边缘实时重排并分应用记忆宽度",
-            checked = enabled, onCheckedChange = onEnabledChange,
+        OverlayDropdownPreference(
+            title = "默认窗口启动模式",
+            summary = "控制从任务栏、桌面或应用抽屉打开新应用时的初始形态",
+            items = MainController.LAUNCH_MODE_LABELS,
+            selectedIndex = ctrl.dexDefaultLaunchMode.coerceIn(0, MainController.LAUNCH_MODE_LABELS.lastIndex),
+            onSelectedIndexChange = { ctrl.selectDexDefaultLaunchMode(it) },
         )
-        SectionDivider()
+        SectionDivider(16.dp)
+        SwitchPreference(
+            title = "底部 DeX 任务栏自动隐藏",
+            summary = "打开应用时自动收起底部任务栏释放空间，鼠标滑至底边瞬时唤醒",
+            checked = ctrl.dockAutoHide,
+            onCheckedChange = { ctrl.dockAutoHide = it; BridgeService.setDockAutoHideEnabled(ctx, it) },
+        )
+        SectionDivider(16.dp)
+        OverlayDropdownPreference(
+            title = "桌面毛玻璃外观",
+            summary = "实时同步外接屏标题栏、任务栏、应用抽屉与快捷中心的冰透/黑曜质感",
+            items = ExtThemePrefs.THEME_LABELS,
+            selectedIndex = ctrl.themeModeIdx.coerceIn(0, ExtThemePrefs.THEME_LABELS.lastIndex),
+            onSelectedIndexChange = { ctrl.selectGlassThemeMode(it) },
+        )
+        SectionDivider(16.dp)
+        SwitchPreference(
+            title = "应用内鼠标右键透传原生菜单",
+            summary = "开启后在应用内右键触发原生上下文菜单（窗口左上角 ‹ 按钮可随时返回）；关闭后右键模拟返回键",
+            checked = ctrl.rightClickPassthrough,
+            onCheckedChange = { ctrl.setRightClickPassthroughEnabled(it) },
+        )
+        SectionDivider(16.dp)
+        SwitchPreference(
+            title = "桌面图标鼠标双击打开",
+            summary = "开启后鼠标单击选中图标、双击启动应用（触控屏幕仍保持单击启动）",
+            checked = ctrl.desktopDoubleClickLaunch,
+            onCheckedChange = { ctrl.setDesktopDoubleClickEnabled(it) },
+        )
+        SectionDivider(16.dp)
         Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text("黄金宽度快捷预设", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurfaceContainer)
+                Text("新开小窗默认宽度预设", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = MiuixTheme.colorScheme.onSurfaceContainer)
                 StatusPillBadge(
-                    label = if (enabled) BridgeLabels.classifyWidthPresetLabel(clampedDp, false) else "已关闭 (默认全屏)",
-                    dotColor = if (enabled) HyperBlue else MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                    label = BridgeLabels.classifyWidthPresetLabel(clampedDp, false),
+                    dotColor = HyperBlue,
                 )
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 presets.forEach { (wDp, label) ->
-                    val active = enabled && abs(clampedDp - wDp) <= 10
+                    val active = abs(clampedDp - wDp) <= 10
                     TextButton(
-                        text = label, enabled = enabled, onClick = { onSelectPresetWidth(wDp) },
+                        text = label,
+                        onClick = { ctrl.applyAdaptiveSingleConfig(ctrl.dexDefaultLaunchMode != 2, wDp, debounce = false, showToast = true) },
                         colors = if (active) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
                         insideMargin = PaddingValues(horizontal = 6.dp, vertical = 7.dp), modifier = Modifier.weight(1f),
                     )
                 }
             }
         }
-        SectionDivider()
+        SectionDivider(16.dp)
         SliderPreference(
-            title = "默认单应用宽度",
-            summary = if (daemonConnected) "拖动实时同步守护进程（$minDp–${maxDp}dp，双击窗口边缘手柄可一键切换全屏）" else "本地已保存偏好，激活守护进程后自动应用",
+            title = "自定义默认窗口宽度",
+            summary = if (ctrl.daemonStatus.connected) "拖动实时同步守护进程（$minDp–${maxDp}dp，双击窗口标题栏可一键最大化/还原）" else "本地已保存偏好，激活守护进程后自动应用",
             value = clampedDp.toFloat(), valueRange = minDp.toFloat()..maxDp.toFloat(), valueText = "$clampedDp dp",
-            enabled = enabled, showKeyPoints = true, keyPoints = listOf(460f, 680f, 900f),
-            onValueChange = { raw -> onSliderWidthChange(((raw / 10f).roundToInt() * 10).coerceIn(minDp, maxDp)) },
+            showKeyPoints = true, keyPoints = listOf(420f, 680f, 900f),
+            onValueChange = { raw ->
+                val snapped = ((raw / 10f).roundToInt() * 10).coerceIn(minDp, maxDp)
+                ctrl.applyAdaptiveSingleConfig(ctrl.dexDefaultLaunchMode != 2, snapped, debounce = true, showToast = false)
+            },
         )
     }
 }

@@ -42,6 +42,7 @@ class MainController(context: Context) {
         val RES_DROPDOWN_LABELS = RES_PRESETS.map { it.third } + "自定义宽高…"
         val ROT_LABELS = listOf("0° 正常横屏", "90° 顺时针竖屏", "180° 倒置横屏", "270° 逆时针竖屏")
         val DPI_QUICK_PRESETS = listOf(120, 160, 200, 240, 280)
+        val LAUNCH_MODE_LABELS = listOf("自由小窗（DeX 推荐）", "居中黄金比例窗口", "沉浸全屏（隐藏标题栏）")
     }
 
     private val appCtx = context.applicationContext
@@ -105,9 +106,12 @@ class MainController(context: Context) {
     val trustedMacClients = mutableStateListOf<TrustedMacClient>()
     var trustedMacLoading by mutableStateOf(false)
 
-    // Adaptive single-app & input backend
+    // Adaptive single-app, DeX behavior & input backend
     var adaptiveSingleEnabled by mutableStateOf(true)
     var defaultSingleWidthDp by mutableIntStateOf(DisplayGeometry.DEFAULT_SINGLE_WIDTH_DP)
+    var dexDefaultLaunchMode by mutableIntStateOf(0)
+    var rightClickPassthrough by mutableStateOf(true)
+    var desktopDoubleClickLaunch by mutableStateOf(false)
     var inputBackendMode by mutableIntStateOf(InputBackend.AUTO)
 
     // Activation sheet live state
@@ -191,6 +195,9 @@ class MainController(context: Context) {
         remoteAudioEnabled = AppPrefs.isRemoteAudioEnabled(appCtx)
         adaptiveSingleEnabled = AppPrefs.isAdaptiveSingleEnabled(appCtx)
         defaultSingleWidthDp = AppPrefs.getDefaultSingleWidthDp(appCtx)
+        dexDefaultLaunchMode = AppPrefs.getDexDefaultLaunchMode(appCtx)
+        rightClickPassthrough = AppPrefs.isRightClickPassthroughInApps(appCtx)
+        desktopDoubleClickLaunch = AppPrefs.isDesktopDoubleClickLaunch(appCtx)
         inputBackendMode = AppPrefs.getInputBackendMode(appCtx)
         localLanIp = AdbBootstrap.getLocalIpv4()
     }
@@ -431,6 +438,30 @@ class MainController(context: Context) {
                 },
             )
         }
+    }
+
+    fun selectDexDefaultLaunchMode(mode: Int) {
+        val clamped = mode.coerceIn(0, 2)
+        dexDefaultLaunchMode = clamped
+        adaptiveSingleEnabled = clamped != 2
+        BridgeService.setDefaultLaunchModeFromUi(appCtx, clamped)
+        toast("默认窗口模式：${LAUNCH_MODE_LABELS[clamped]}")
+    }
+
+    fun setRightClickPassthroughEnabled(enabled: Boolean) {
+        rightClickPassthrough = enabled
+        AppPrefs.setRightClickPassthroughInApps(appCtx, enabled)
+    }
+
+    fun setDesktopDoubleClickEnabled(enabled: Boolean) {
+        desktopDoubleClickLaunch = enabled
+        AppPrefs.setDesktopDoubleClickLaunch(appCtx, enabled)
+    }
+
+    fun selectGlassThemeMode(idx: Int) {
+        val clamped = idx.coerceIn(0, 2)
+        themeModeIdx = clamped
+        ExtThemePrefs.setThemeModeIndex(appCtx, clamped)
     }
 
     // --- Mac / Remote Streaming ---

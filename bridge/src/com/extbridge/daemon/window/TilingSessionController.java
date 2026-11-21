@@ -86,13 +86,22 @@ final class TilingSessionController {
                 ratios = TilingLayoutEngine.defaultRatiosForTopology(norm);
             }
             if (slotCount == 2 && ratios.length > 0) lastSplitRatioPct = clampSplitPct(ratios[0]);
-            ArrayList<String> chosen = queries.pickTilingApps(reqPkgs, slotCount);
+            boolean preserveEmptySlots = hasExplicitEmptySlot(reqPkgs);
+            ArrayList<String> chosen = queries.pickTilingApps(reqPkgs, slotCount, preserveEmptySlots);
             if (chosen.isEmpty()) return false;
             twoSlotAutoDetachEnabled = false;
             lastSplitActionMs = SystemClock.uptimeMillis();
             applyTilingLayoutLocked(norm, chosen, ratios, null, -1, true);
             return true;
         }
+    }
+
+    private static boolean hasExplicitEmptySlot(List<String> reqPkgs) {
+        if (reqPkgs == null || reqPkgs.isEmpty()) return false;
+        for (String p : reqPkgs) {
+            if (p == null || p.trim().isEmpty()) return true;
+        }
+        return false;
     }
 
     boolean handleSplitAction(int action, int arg, String pkg, String cls) {
@@ -184,12 +193,16 @@ final class TilingSessionController {
         else if (!snap.active) { twoSlotAutoDetachEnabled = false; ensureLauncherTaskFullscreenInBg(); }
     }
 
+    private int dockInsetPx() {
+        return TilingLayoutEngine.computeDefaultDockInsetPx(config.virtH, config.virtDpi);
+    }
+
     void relayoutTilingOnResize() {
         int vdId = config.vdId;
         if (vdId <= 0) return;
         synchronized (tilingOpLock) {
             WindowRect[] slots = TilingLayoutEngine.computeSlots(windowManager.getTilingTopology(),
-                    config.virtW, config.virtH, 0, TilingLayoutEngine.DEFAULT_GAP_PX, windowManager.getTilingRatios());
+                    config.virtW, config.virtH, dockInsetPx(), TilingLayoutEngine.DEFAULT_GAP_PX, windowManager.getTilingRatios());
             String[] pkgs = windowManager.getTilingSlotPkgs();
             int[] tids = windowManager.getTilingSlotTaskIds();
             int empty = getTwoSlotSplitSnapshot().emptySlotIndex();
@@ -241,7 +254,7 @@ final class TilingSessionController {
         int vdId = config.vdId;
         if (!snap.active || emptySlot < 0 || vdId <= 0) return;
         WindowRect[] slots = TilingLayoutEngine.computeSlots(snap.topology, config.virtW, config.virtH,
-                0, TilingLayoutEngine.DEFAULT_GAP_PX, new int[]{snap.ratioPct, 100 - snap.ratioPct});
+                dockInsetPx(), TilingLayoutEngine.DEFAULT_GAP_PX, new int[]{snap.ratioPct, 100 - snap.ratioPct});
         if (emptySlot >= slots.length) return;
         Rect bounds = slots[emptySlot].toAndroidRect();
         int lTid = queries.findExtLauncherTaskId();
@@ -280,7 +293,7 @@ final class TilingSessionController {
     private void applyTilingLayoutLocked(
             String topology, List<String> slotPkgs, int[] ratios, String explicitCls, int explicitSlot, boolean bringFront) {
         int slotCount = TilingLayoutEngine.slotCountForTopology(topology);
-        WindowRect[] slots = TilingLayoutEngine.computeSlots(topology, config.virtW, config.virtH, 0, TilingLayoutEngine.DEFAULT_GAP_PX, ratios);
+        WindowRect[] slots = TilingLayoutEngine.computeSlots(topology, config.virtW, config.virtH, dockInsetPx(), TilingLayoutEngine.DEFAULT_GAP_PX, ratios);
         int[] tids = new int[slotCount];
         Arrays.fill(tids, -1);
         for (int i = 0; i < slotCount && i < slotPkgs.size(); i++) {
