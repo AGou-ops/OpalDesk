@@ -1,3 +1,4 @@
+import AppKit
 import ExtBridgeCore
 import Foundation
 import os
@@ -5,45 +6,6 @@ import os
 // MARK: - Popout Windows, Display Controls & File Transfers
 
 extension AppModel {
-    // MARK: - Standalone Popout Windows
-
-    public func popoutCurrentTopApp() {
-        guard isAuthenticated else { return }
-        let pkg = deviceState.topAppPackage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !pkg.isEmpty else {
-            openQuickLauncher()
-            return
-        }
-        let label = deviceState.topAppLabel.isEmpty ? pkg : deviceState.topAppLabel
-        let matching = remoteApps.first(where: { $0.pkg == pkg })
-        popoutApp(package: pkg, activity: matching?.cls ?? "", label: label, taskId: matching?.taskId ?? -1)
-    }
-
-    public func popoutApp(_ app: RemoteAppInfo) {
-        popoutApp(package: app.pkg, activity: app.cls, label: app.displayLabel, taskId: app.taskId)
-    }
-
-    public func popoutApp(package: String, activity: String = "", label: String = "", taskId: Int = -1) {
-        guard let context = buildPopoutConnectionContext() else {
-            showToast("请先连接并完成手机鉴权后再弹出独立窗口")
-            return
-        }
-        let result = popoutManager.openPopout(
-            appPackage: package,
-            appActivity: activity,
-            appLabel: label.isEmpty ? package : label,
-            taskId: taskId,
-            context: context,
-            trustStore: discovery.trustStore,
-            onFilesDropped: { [weak self] urls in self?.sendFiles(urls) }
-        )
-        switch result {
-        case .opened, .focusedExisting: activeDeXPanel = .none
-        case .invalidPackage: showToast("应用包名无效，无法弹出独立窗口")
-        case .limitReached(let maxCount): showToast("最多同时支持 \(maxCount) 个独立弹出 App 窗口，请先关闭或收回其中一个")
-        }
-    }
-
     // MARK: - Window Layout & Input Engine Controls (`0x2B WINDOW_ACTION`)
 
     public func setAdaptiveSingle(enabled: Bool, defaultWidthDp: Int) {
@@ -66,7 +28,6 @@ extension AppModel {
 
     public func launchApp(_ app: RemoteAppInfo, mode: ExtCastLaunchMode = .adaptive, slot: Int = 0) {
         streamBridge.sendWindowAction(.launchApp(pkg: app.pkg, cls: app.cls, mode: mode, slot: slot), isAuthenticated: isAuthenticated)
-        activeDeXPanel = .none
     }
 
     public func setTilingTopology(_ topology: ExtCastTilingTopology, pkgs: [String] = [], ratios: [Int]? = nil) {
@@ -102,7 +63,7 @@ extension AppModel {
         resizeDebounceTask?.cancel()
         resizeDebounceTask = Task { [weak self] in
             guard await sleepCancellable(nanoseconds: Tuning.resizeDebounceNs), let self else { return }
-            let target = CoordinateMapper.alignedAdaptiveResolution(
+            let target = CoordinateMapper.aspectExactAdaptiveResolution(
                 viewSize: viewSize,
                 backingScale: backingScale,
                 maxLongEdge: self.effectiveAdaptiveMaxLongEdge()
@@ -114,6 +75,7 @@ extension AppModel {
     public func selectResolutionPreset(_ preset: DisplayResolutionPreset) {
         selectedPreset = preset
         preferences.resolutionPreset = preset
+        adaptMainWindowToPresetIfNeeded(preset)
         guard isAuthenticated else { return }
         let target = resolveCurrentTargetDimensions()
         sendResizeIfNeeded(width: target.width, height: target.height, dpi: selectedDPI, force: true)
@@ -195,24 +157,84 @@ extension AppModel {
     // MARK: - Internal Geometry & Sync Helpers
 
     func syncInitialDesktopPreferences() {
-        streamBridge.sendWindowAction(
-            .setAdaptiveSingle(enabled: preferences.adaptiveSingleEnabled, defaultWidthDp: preferences.defaultSingleWidthDp),
-            isAuthenticated: isAuthenticated
-        )
         if preferences.inputBackend != .auto {
             streamBridge.sendWindowAction(.setInputBackend(preferences.inputBackend), isAuthenticated: isAuthenticated)
         }
     }
 
     func syncCanvasSizeAfterAuth() {
-        guard isAuthenticated, selectedPreset == .matchWindow else { return }
+        guard isAuthenticated else { return }
+        if selectedPreset != .matchWindow {
+            adaptMainWindowToPresetIfNeeded(selectedPreset)
+            return
+        }
         guard lastCanvasSize.width >= Tuning.minCanvasDimension, lastCanvasSize.height >= Tuning.minCanvasDimension else { return }
-        let target = CoordinateMapper.alignedAdaptiveResolution(
+        let target = CoordinateMapper.aspectExactAdaptiveResolution(
             viewSize: lastCanvasSize,
             backingScale: lastBackingScale,
             maxLongEdge: effectiveAdaptiveMaxLongEdge()
         )
         sendResizeIfNeeded(width: target.width, height: target.height, dpi: selectedDPI, force: false)
+    }
+
+    func adaptMainWindowToPresetIfNeeded(_ preset: DisplayResolutionPreset) {
+        guard let fixed = preset.fixedSize else { return }
+        guard let window = resolvedMainDisplayWindow(), !window.styleMask.contains(.fullScreen) else { return }
+
+        let visible = (window.screen ?? NSScreen.main)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let edgePadding: CGFloat = 24
+        let currentFrame = window.frame
+        let currentContentRect = window.contentRect(forFrameRect: currentFrame)
+        let titlebarHeight = max(currentFrame.height - currentContentRect.height, 0)
+
+        let minContentSize = CGSize(
+            width: max(window.contentMinSize.width, 680),
+            height: max(window.contentMinSize.height, 480)
+        )
+        let maxContentSize = CGSize(
+            width: max(visible.width - edgePadding * 2, minContentSize.width),
+            height: max(visible.height - edgePadding * 2 - titlebarHeight, minContentSize.height)
+        )
+        let dockTrayHeight = effectiveDockTrayHeight
+        let targetContentSize = CoordinateMapper.adaptedWindowContentSize(
+            currentCanvasSize: lastCanvasSize,
+            targetVideoWidth: fixed.width,
+            targetVideoHeight: fixed.height,
+            taskbarHeight: dockTrayHeight,
+            maxContentSize: maxContentSize,
+            minContentSize: minContentSize
+        )
+        let targetFrameSize = window.frameRect(
+            forContentRect: NSRect(origin: .zero, size: targetContentSize)
+        ).size
+        guard abs(currentFrame.width - targetFrameSize.width) > 2
+            || abs(currentFrame.height - targetFrameSize.height) > 2 else {
+            return
+        }
+
+        var newOrigin = CGPoint(
+            x: currentFrame.midX - targetFrameSize.width * 0.5,
+            y: currentFrame.midY - targetFrameSize.height * 0.5
+        )
+        newOrigin.x = min(max(newOrigin.x, visible.minX + edgePadding), visible.maxX - targetFrameSize.width - edgePadding)
+        newOrigin.y = min(max(newOrigin.y, visible.minY + edgePadding), visible.maxY - targetFrameSize.height - edgePadding)
+
+        window.setFrame(NSRect(origin: newOrigin, size: targetFrameSize), display: true, animate: true)
+        lastCanvasSize = CGSize(
+            width: targetContentSize.width,
+            height: max(targetContentSize.height - dockTrayHeight, 1)
+        )
+        lastBackingScale = window.backingScaleFactor
+    }
+
+    var effectiveDockTrayHeight: CGFloat { 0 }
+
+    private func resolvedMainDisplayWindow() -> NSWindow? {
+        if let mainDisplayWindow { return mainDisplayWindow }
+        return NSApplication.shared.windows.first { win in
+            win.isVisible && (win.identifier?.rawValue.hasPrefix(WindowID.main) == true)
+        }
     }
 
     func effectiveAdaptiveMaxLongEdge() -> Int {
@@ -229,7 +251,7 @@ extension AppModel {
 
     func resolveCurrentTargetDimensions() -> (width: Int, height: Int) {
         if let fixed = selectedPreset.fixedSize { return fixed }
-        return CoordinateMapper.alignedAdaptiveResolution(
+        return CoordinateMapper.aspectExactAdaptiveResolution(
             viewSize: lastCanvasSize,
             backingScale: lastBackingScale,
             maxLongEdge: effectiveAdaptiveMaxLongEdge()
@@ -237,8 +259,8 @@ extension AppModel {
     }
 
     func sendResizeIfNeeded(width: Int, height: Int, dpi: Int, force: Bool = false) {
-        let alignedW = CoordinateMapper.alignTo16(width)
-        let alignedH = CoordinateMapper.alignTo16(height)
+        let alignedW = CoordinateMapper.alignTo8(width)
+        let alignedH = CoordinateMapper.alignTo8(height)
         let fps = preferences.targetFPS
         if !force, let last = lastRequestedConfig,
            last.width == alignedW && last.height == alignedH && last.dpi == dpi && last.fps == fps

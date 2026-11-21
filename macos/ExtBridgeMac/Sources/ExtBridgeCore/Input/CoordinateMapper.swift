@@ -3,6 +3,7 @@ import CoreGraphics
 /// Pure coordinate & resolution mapper between macOS view points and Android virtual display pixels.
 public enum CoordinateMapper {
     public static let alignmentPixels: Int = 16
+    public static let encoderAlignmentPixels: Int = 8
     public static let minimumDimension: Int = 480
     public static let maximumDimension: Int = 3840
     public static let popoutMinDPI: Int = 160
@@ -105,10 +106,46 @@ public enum CoordinateMapper {
         return (width, height)
     }
 
+    /// Computes an 8-pixel aligned virtual display resolution matching Android `DisplayGeometryUtil.alignForEncoder(..., 8)`
+    /// so standard 16:9 (`1920×1080`), 16:10 (`2560×1600`), and 21:9 (`2560×1080`) canvases preserve their exact aspect
+    /// ratio without distorting `1080` into `1088`.
+    public static func aspectExactAdaptiveResolution(
+        viewSize: CGSize,
+        backingScale: CGFloat = 1.0,
+        maxLongEdge: Int = 2560
+    ) -> (width: Int, height: Int) {
+        let effectiveScale = max(backingScale, 1.0)
+        var rawWidth = Double(viewSize.width * effectiveScale)
+        var rawHeight = Double(viewSize.height * effectiveScale)
+
+        guard rawWidth > 0, rawHeight > 0 else {
+            return (1920, 1080)
+        }
+
+        let clampedMax = Double(min(max(maxLongEdge, minimumDimension), maximumDimension))
+        let longEdge = max(rawWidth, rawHeight)
+        if longEdge > clampedMax {
+            let scaleDown = clampedMax / longEdge
+            rawWidth *= scaleDown
+            rawHeight *= scaleDown
+        }
+
+        let width = alignTo8(Int(rawWidth.rounded()))
+        let height = alignTo8(Int(rawHeight.rounded()))
+        return (width, height)
+    }
+
     /// Rounds a pixel dimension to the nearest multiple of 16, clamped to encoder-safe bounds `[480, 3840]`.
     public static func alignTo16(_ value: Int) -> Int {
         let clamped = min(max(value, minimumDimension), maximumDimension)
         let rounded = ((clamped + (alignmentPixels / 2)) / alignmentPixels) * alignmentPixels
+        return min(max(rounded, minimumDimension), maximumDimension)
+    }
+
+    /// Rounds a pixel dimension to the nearest multiple of 8, preserving `1080` (`135 * 8`) exactly.
+    public static func alignTo8(_ value: Int) -> Int {
+        let clamped = min(max(value, minimumDimension), maximumDimension)
+        let rounded = ((clamped + (encoderAlignmentPixels / 2)) / encoderAlignmentPixels) * encoderAlignmentPixels
         return min(max(rounded, minimumDimension), maximumDimension)
     }
 
@@ -150,5 +187,54 @@ public enum CoordinateMapper {
         let dpi = min(max(steppedDpi, popoutMinDPI), popoutMaxDPI)
 
         return PopoutStreamGeometry(width: width, height: height, dpi: dpi)
+    }
+
+    /// Computes a macOS window `contentView` size whose canvas region (above `taskbarHeight`)
+    /// matches `targetVideoWidth : targetVideoHeight` with zero letterbox/pillarbox bars,
+    /// preserving approximate canvas area while clamping to screen bounds and window minimums.
+    public static func adaptedWindowContentSize(
+        currentCanvasSize: CGSize,
+        targetVideoWidth: Int,
+        targetVideoHeight: Int,
+        taskbarHeight: CGFloat,
+        maxContentSize: CGSize,
+        minContentSize: CGSize
+    ) -> CGSize {
+        let safeTaskbar = max(taskbarHeight, 0)
+        let minW = max(minContentSize.width, 200)
+        let minH = max(minContentSize.height - safeTaskbar, 120)
+        let maxW = max(maxContentSize.width, minW)
+        let maxH = max(maxContentSize.height - safeTaskbar, minH)
+
+        guard targetVideoWidth > 0, targetVideoHeight > 0 else {
+            let w = min(max(currentCanvasSize.width.rounded(), minW), maxW)
+            let h = min(max(currentCanvasSize.height.rounded(), minH), maxH)
+            return CGSize(width: w, height: h + safeTaskbar)
+        }
+
+        let aspect = CGFloat(targetVideoWidth) / CGFloat(targetVideoHeight)
+        let fallbackArea: CGFloat = 1120 * 630
+        let curW = max(currentCanvasSize.width, 0)
+        let curH = max(currentCanvasSize.height, 0)
+        let targetArea = max(curW * curH, fallbackArea)
+
+        var canvasW = sqrt(targetArea * aspect)
+        var canvasH = canvasW / aspect
+
+        let downScale = min(1.0, min(maxW / max(canvasW, 1), maxH / max(canvasH, 1)))
+        canvasW *= downScale
+        canvasH *= downScale
+
+        let upScale = max(1.0, max(minW / max(canvasW, 1), minH / max(canvasH, 1)))
+        if upScale > 1.0 {
+            let maxAllowedScale = min(maxW / max(canvasW, 1), maxH / max(canvasH, 1))
+            let appliedScale = min(upScale, max(1.0, maxAllowedScale))
+            canvasW *= appliedScale
+            canvasH *= appliedScale
+        }
+
+        let finalW = min(max(canvasW.rounded(), minW), maxW)
+        let finalH = min(max(canvasH.rounded(), minH), maxH)
+        return CGSize(width: finalW, height: finalH + safeTaskbar)
     }
 }

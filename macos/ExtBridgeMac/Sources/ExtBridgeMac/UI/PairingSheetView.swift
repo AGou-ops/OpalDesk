@@ -58,7 +58,7 @@ public struct PairingSheetView: View {
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 10)
-                .extBridgeCardContainer(cornerRadius: 8, borderOpacity: 0.1)
+                .extBridgeCardContainer(cornerRadius: 16, borderOpacity: 0.18)
 
                 Text("确认与 Android 端「Mac / 无线大屏」页面上的证书指纹一致后，输入下方 \(pinLength) 位一次性配对码。")
                     .font(.caption)

@@ -74,20 +74,7 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
     }
 
     private func handleLocalShortcutIfNeeded(_ event: NSEvent) -> Bool {
-        let mods = event.modifierFlags.intersection([.command, .shift, .control, .option])
-        // ⌘K -> Quick App Launcher
-        if mods == .command && event.keyCode == UInt16(kVK_ANSI_K), let onQuickLauncher = callbacks.onQuickLauncher {
-            consumedShortcutKeyCodes.insert(event.keyCode)
-            onQuickLauncher()
-            return true
-        }
-        // ⌘⇧T -> Toggle Always-on-Top (Popout window)
-        if mods == [.command, .shift] && event.keyCode == UInt16(kVK_ANSI_T), let onTogglePin = callbacks.onTogglePin {
-            consumedShortcutKeyCodes.insert(event.keyCode)
-            onTogglePin()
-            return true
-        }
-        return false
+        false
     }
 
     private func sendHardwareKey(event: NSEvent, action: ExtCastKeyAction) {

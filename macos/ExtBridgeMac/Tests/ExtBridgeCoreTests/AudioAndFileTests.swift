@@ -89,6 +89,33 @@ struct AudioAndFileTests {
         #expect(devices[2].isReady == false)
     }
 
+    @Test("parseDevicesOutput preserves wireless mDNS ADB serials containing spaces")
+    func parseWirelessAdbSerialWithSpaces() {
+        let sampleOutput = """
+        List of devices attached
+        adb-7145c462-cZWI2H (3)._adb-tls-connect._tcp device product:shennong model:23116PN5BC device:shennong transport_id:2
+        adb-8519b872-2oxyq3._adb-tls-connect._tcp device product:PFJM10 model:PFJM10 device:OP5227 transport_id:1
+        0123456789abcdef no permissions (missing udev rules) transport_id:3
+        """
+        let devices = AdbManager.parseDevicesOutput(sampleOutput)
+        #expect(devices.count == 3)
+
+        #expect(devices[0].serial == "adb-7145c462-cZWI2H (3)._adb-tls-connect._tcp")
+        #expect(devices[0].state == .device)
+        #expect(devices[0].isReady == true)
+        #expect(devices[0].isWirelessAdb == true)
+        #expect(devices[0].model == "23116PN5BC")
+        #expect(devices[0].transportId == "2")
+
+        #expect(devices[1].serial == "adb-8519b872-2oxyq3._adb-tls-connect._tcp")
+        #expect(devices[1].state == .device)
+        #expect(devices[1].model == "PFJM10")
+
+        #expect(devices[2].serial == "0123456789abcdef")
+        #expect(devices[2].state == .unknown)
+        #expect(devices[2].isReady == false)
+    }
+
     @Test("FileSender streams file into START, DATA chunks, END and processes ACK")
     func fileSenderStreamingRoundtrip() async throws {
         let tempDir = FileManager.default.temporaryDirectory

@@ -40,13 +40,7 @@ struct ExtBridgeMacApp: App {
         }
         .defaultSize(width: 1180, height: 740)
         .commands {
-            CommandMenu("大屏控制") {
-                Button("应用抽屉") {
-                    model.toggleQuickLauncher()
-                }
-                .keyboardShortcut("k", modifiers: [.command])
-                .disabled(!model.isAuthenticated)
-
+            CommandMenu("投屏控制") {
                 Button("返回") {
                     model.sendAndroidBack()
                 }
@@ -65,18 +59,6 @@ struct ExtBridgeMacApp: App {
                 .disabled(!model.isAuthenticated)
 
                 Divider()
-
-                Button("快捷左右分屏") {
-                    model.startQuickTwoSplit()
-                }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
-                .disabled(!model.isAuthenticated)
-
-                Button("弹出独立窗") {
-                    model.popoutCurrentTopApp()
-                }
-                .keyboardShortcut("p", modifiers: [.command, .shift])
-                .disabled(!model.isAuthenticated)
 
                 Button("重载当前应用 DPI") {
                     model.reloadCurrentAppDPI()
@@ -116,10 +98,16 @@ struct ExtBridgeMacApp: App {
 
                 Divider()
 
-                Button("断开当前连接") {
-                    model.disconnect()
+                Button("断开并返回列表") {
+                    model.forceDisconnectAndReturnHome()
                 }
-                .disabled(model.activeConnection == nil)
+                .keyboardShortcut("w", modifiers: [.command, .shift])
+                .disabled(model.activeConnection == nil && !model.isConnectingFlow)
+
+                Button("强制退出 ExtBridgeMac") {
+                    model.forceTerminateApp()
+                }
+                .keyboardShortcut("q", modifiers: [.command, .option])
             }
         }
 

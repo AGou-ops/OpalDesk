@@ -35,7 +35,23 @@ public struct DeviceHubView: View {
             .frame(maxWidth: 820, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(
+            ZStack {
+                Color(nsColor: .windowBackgroundColor)
+                RadialGradient(
+                    colors: [Color.accentColor.opacity(0.14), Color.clear],
+                    center: .topLeading,
+                    startRadius: 20,
+                    endRadius: 520
+                )
+                RadialGradient(
+                    colors: [Color.indigo.opacity(0.11), Color.clear],
+                    center: .bottomTrailing,
+                    startRadius: 30,
+                    endRadius: 480
+                )
+            }
+        )
         .background(WindowChromeConfigurator(isImmersiveCanvas: false))
         .sheet(item: $model.pairingContext) { ctx in
             PairingSheetView(
@@ -53,7 +69,7 @@ public struct DeviceHubView: View {
 
         return HStack(alignment: .center, spacing: 14) {
             ZStack {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(Color.accentColor.opacity(0.14))
                     .frame(width: 46, height: 46)
                 Image(systemName: "macbook.and.iphone")
@@ -64,7 +80,7 @@ public struct DeviceHubView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("ExtBridge 桌面中心")
                     .font(.title2.weight(.semibold))
-                Text("连接你的 Android 手机，体验桌面级多窗口与无缝分屏")
+                Text("连接 Android 设备，体验与 USB 显示器一致的电脑多窗口与融合镜像")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -73,14 +89,14 @@ public struct DeviceHubView: View {
 
             HStack(spacing: 8) {
                 Picker("模式", selection: $prefs.defaultDisplayMode) {
-                    Text("DeX 桌面").tag(ExtCastDisplayMode.dex)
-                    Text("屏幕镜像").tag(ExtCastDisplayMode.mirror)
+                    Text("电脑桌面").tag(ExtCastDisplayMode.dex)
+                    Text("融合镜像").tag(ExtCastDisplayMode.mirror)
                 }
                 .onChange(of: prefs.defaultDisplayMode) { _, mode in model.displayMode = mode }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 156)
-                .help("选择连接后默认进入扩展桌面 (DeX) 或屏幕镜像")
+                .frame(width: 164)
+                .help("选择连接后默认进入电脑多窗口桌面或融合边栏镜像")
 
                 SettingsLink {
                     Image(systemName: "gearshape").font(.system(size: 14))

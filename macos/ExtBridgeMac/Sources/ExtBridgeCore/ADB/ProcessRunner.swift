@@ -49,6 +49,11 @@ enum ProcessRunner {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
+            var env = ProcessInfo.processInfo.environment
+            if env["ADB_MDNS"] == nil { env["ADB_MDNS"] = "0" }
+            if env["ADB_MDNS_OPENSCREEN"] == nil { env["ADB_MDNS_OPENSCREEN"] = "0" }
+            if env["ADB_MDNS_AUTO_CONNECT"] == nil { env["ADB_MDNS_AUTO_CONNECT"] = "" }
+            process.environment = env
 
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()

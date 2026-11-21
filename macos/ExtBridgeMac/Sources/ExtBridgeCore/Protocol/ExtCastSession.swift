@@ -24,6 +24,7 @@ public enum ExtCastSessionEvent: Sendable {
 /// streaming frame reassembly, ping/pong RTT telemetry, bounded send backpressure, and auto-reconnect.
 public final class ExtCastSession: Sendable {
     private static let heartbeatIntervalNs: UInt64 = 2_000_000_000 // 2 seconds
+    private static let heartbeatTimeoutNs: UInt64 = 8_000_000_000 // 8 seconds
     private static let stalePingCutoffNs: UInt64 = 15_000_000_000 // 15 seconds
     private static let receiveChunkSize: Int = 256 * 1024 // 256 KiB
     private static let maxDroppableInFlightBytes: Int = 4 * 1024 * 1024 // 4 MiB
@@ -48,6 +49,7 @@ public final class ExtCastSession: Sendable {
         var capacityWaiters: [UInt64: CapacityWaiter] = [:]
         var nextPingId: UInt64 = 1
         var pendingPings: [UInt64: UInt64] = [:]
+        var lastInboundActivityNs: UInt64 = 0
         var verifiedFingerprint: String?
         var tlsVerificationError: ExtCastSessionError?
         var reconnectAttempt: Int = 0
@@ -261,7 +263,10 @@ public final class ExtCastSession: Sendable {
 
         switch newState {
         case .ready:
-            state.withLock { $0.reconnectAttempt = 0 }
+            state.withLock {
+                $0.reconnectAttempt = 0
+                $0.lastInboundActivityNs = DispatchTime.now().uptimeNanoseconds
+            }
             transition(to: .connected)
             startHeartbeat()
             receiveNextChunk(from: connection)
@@ -321,7 +326,9 @@ public final class ExtCastSession: Sendable {
     }
 
     private func processIncomingData(_ data: Data) {
+        let nowNs = DispatchTime.now().uptimeNanoseconds
         let result: Result<[ExtCastFrame], Error> = state.withLock { s in
+            s.lastInboundActivityNs = nowNs
             s.decoder.append(data)
             return Result { try s.decoder.decodeAvailableFrames() }
         }
@@ -372,15 +379,36 @@ public final class ExtCastSession: Sendable {
                     break
                 }
                 guard !Task.isCancelled, let self else { break }
-                let pingId: UInt64? = self.state.withLock { s in
-                    guard s.sessionState == .connected else { return nil }
+                let nowNs = DispatchTime.now().uptimeNanoseconds
+                enum HeartbeatDecision {
+                    case sendPing(UInt64)
+                    case timedOut(NWConnection?)
+                    case skip
+                }
+                let decision: HeartbeatDecision = self.state.withLock { s in
+                    guard s.sessionState == .connected else { return .skip }
+                    if s.lastInboundActivityNs > 0,
+                       nowNs >= s.lastInboundActivityNs,
+                       nowNs - s.lastInboundActivityNs > Self.heartbeatTimeoutNs {
+                        return .timedOut(s.connection)
+                    }
                     let id = s.nextPingId
                     s.nextPingId &+= 1
-                    s.pendingPings[id] = DispatchTime.now().uptimeNanoseconds
-                    return id
+                    s.pendingPings[id] = nowNs
+                    return .sendPing(id)
                 }
-                if let pingId {
+                switch decision {
+                case .sendPing(let pingId):
                     self.send(.ping(pingId))
+                case .timedOut(let timedOutConn):
+                    let stillCurrent = self.state.withLock { $0.connection === timedOutConn }
+                    if stillCurrent {
+                        ExtBridgeLog.session.warning("ExtCast heartbeat timeout (>8s without peer traffic)")
+                        self.handleConnectionFailure(error: .posix(.ETIMEDOUT))
+                    }
+                    return
+                case .skip:
+                    break
                 }
             }
         }
@@ -509,6 +537,7 @@ public final class ExtCastSession: Sendable {
                 s.isExplicitDisconnect = true
                 s.reconnectTask = nil
                 s.sessionState = .disconnected
+                s.eventHandler = nil
             }
             return TornDownResources(
                 connection: conn,

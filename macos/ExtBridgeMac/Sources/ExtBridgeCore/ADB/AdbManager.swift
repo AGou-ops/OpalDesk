@@ -116,6 +116,11 @@ public final class AdbManager: Sendable {
         return Self.parseDevicesOutput(result.stdout)
     }
 
+    private static let knownAdbStateTokens: Set<String> = [
+        "device", "unauthorized", "offline", "authorizing",
+        "recovery", "sideload", "bootloader", "connecting"
+    ]
+
     /// Pure parser for `adb devices -l` output (unit-testable without hardware).
     public static func parseDevicesOutput(_ output: String) -> [AdbDevice] {
         var devices: [AdbDevice] = []
@@ -124,17 +129,19 @@ public final class AdbManager: Sendable {
             if line.isEmpty || line.hasPrefix("List of devices") || line.hasPrefix("*") {
                 continue
             }
-            let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
-            guard tokens.count >= 2 else { continue }
-            let serial = tokens[0]
-            let deviceState = AdbDeviceState(rawValue: tokens[1]) ?? .unknown
+            let slices = line.split(omittingEmptySubsequences: true, whereSeparator: \.isWhitespace)
+            guard slices.count >= 2 else { continue }
+
+            let (serial, deviceState, attrSlices) = splitDeviceLine(line: line, slices: slices)
+            guard !serial.isEmpty else { continue }
 
             var product = ""
             var model = ""
             var deviceCode = ""
             var transportId = ""
 
-            for token in tokens.dropFirst(2) {
+            for tokenSlice in attrSlices {
+                let token = String(tokenSlice)
                 guard let eq = token.firstIndex(of: ":") else { continue }
                 let key = String(token[..<eq])
                 let value = String(token[token.index(after: eq)...])
@@ -157,6 +164,30 @@ public final class AdbManager: Sendable {
             ))
         }
         return devices
+    }
+
+    private static func splitDeviceLine(
+        line: String,
+        slices: [Substring]
+    ) -> (serial: String, state: AdbDeviceState, attributes: ArraySlice<Substring>) {
+        // Wireless ADB mDNS serials can include spaces (e.g. "adb-xxxx (3)._adb-tls-connect._tcp"),
+        // so locate the ADB state column rather than splitting blindly at the first whitespace.
+        for idx in 1..<slices.count {
+            let token = String(slices[idx])
+            if knownAdbStateTokens.contains(token),
+               slices.dropFirst(idx + 1).allSatisfy({ $0.contains(":") })
+            {
+                let serial = String(line[line.startIndex..<slices[idx].startIndex])
+                    .trimmingCharacters(in: .whitespaces)
+                return (serial, AdbDeviceState(rawValue: token) ?? .unknown, slices.dropFirst(idx + 1))
+            }
+            if token == "no", idx + 1 < slices.count, slices[idx + 1] == "permissions" {
+                let serial = String(line[line.startIndex..<slices[idx].startIndex])
+                    .trimmingCharacters(in: .whitespaces)
+                return (serial, .unknown, slices.dropFirst(idx + 2))
+            }
+        }
+        return (String(slices[0]), AdbDeviceState(rawValue: String(slices[1])) ?? .unknown, slices.dropFirst(2))
     }
 
     /// Ensures the Android ExtBridge daemon is alive on `serial` (mirroring `start_extbridge.sh` semantics)

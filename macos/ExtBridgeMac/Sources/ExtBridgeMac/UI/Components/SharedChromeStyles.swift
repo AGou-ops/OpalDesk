@@ -48,24 +48,36 @@ struct ToastPillView: View {
 }
 
 extension View {
-    /// Standard macOS native grouped card container chrome.
-    func extBridgeCardContainer(cornerRadius: CGFloat = 12, borderOpacity: Double = 0.08) -> some View {
+    /// iOS / macOS Liquid Glass frosted continuous-squircle card container with 45° specular rim.
+    func extBridgeCardContainer(cornerRadius: CGFloat = 22, borderOpacity: Double = 0.22) -> some View {
         self
             .background(
-                Color(nsColor: .controlBackgroundColor),
+                .regularMaterial,
                 in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(borderOpacity), lineWidth: 1)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [
+                                Color.white.opacity(borderOpacity * 1.8),
+                                Color.white.opacity(borderOpacity * 0.45),
+                                Color.white.opacity(borderOpacity * 1.1),
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: 1
+                    )
             )
+            .shadow(color: Color.black.opacity(0.08), radius: 14, y: 5)
     }
 
-    /// Translucent floating capsule chrome shared by control bars and toast pills.
+    /// Translucent Liquid Glass floating capsule chrome shared by control bars and toast pills.
     func floatingCapsuleChrome(
-        strokeColor: Color = Color.white.opacity(0.16),
-        lineWidth: CGFloat = 0.8,
-        shadowRadius: CGFloat = 14,
+        strokeColor: Color = Color.white.opacity(0.28),
+        lineWidth: CGFloat = 0.95,
+        shadowRadius: CGFloat = 16,
         shadowY: CGFloat = 6,
         shadowOpacity: Double = 0.35
     ) -> some View {
@@ -73,7 +85,14 @@ extension View {
             .background(.ultraThinMaterial, in: Capsule())
             .overlay(
                 Capsule()
-                    .strokeBorder(strokeColor, lineWidth: lineWidth)
+                    .strokeBorder(
+                        LinearGradient(
+                            colors: [strokeColor, strokeColor.opacity(0.32), strokeColor.opacity(0.75)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        lineWidth: lineWidth
+                    )
             )
             .shadow(color: Color.black.opacity(shadowOpacity), radius: shadowRadius, y: shadowY)
     }

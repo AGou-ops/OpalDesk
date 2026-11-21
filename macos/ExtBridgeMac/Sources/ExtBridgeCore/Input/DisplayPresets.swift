@@ -48,7 +48,7 @@ public enum DisplayResolutionPreset: String, Sendable, CaseIterable, Identifiabl
 
     public var title: String {
         switch self {
-        case .matchWindow: return "匹配窗口"
+        case .matchWindow: return "自适应窗口"
         case .fhd1080p: return "1080p (1920×1080)"
         case .qhd2K: return "2K (2560×1440)"
         case .ultrawide21x9: return "21:9 带鱼屏 (2560×1080)"

@@ -98,4 +98,54 @@ struct CoordinateMapperTests {
         // Maximum clamp check
         #expect(CoordinateMapper.alignTo16(9999) == CoordinateMapper.maximumDimension)
     }
+
+    @Test("Adapted window content size preserves 21:9 ultrawide aspect above taskbar within screen bounds")
+    func adaptedWindowContentSizeUltrawide() {
+        let content = CoordinateMapper.adaptedWindowContentSize(
+            currentCanvasSize: CGSize(width: 1242, height: 668),
+            targetVideoWidth: 2560,
+            targetVideoHeight: 1080,
+            taskbarHeight: 46,
+            maxContentSize: CGSize(width: 2400, height: 1320),
+            minContentSize: CGSize(width: 680, height: 480)
+        )
+        let canvasHeight = content.height - 46
+        let canvasAspect = content.width / canvasHeight
+        let targetAspect: CGFloat = 2560.0 / 1080.0
+        #expect(abs(canvasAspect - targetAspect) < 0.02)
+        #expect(content.width >= 680 && content.width <= 2400)
+        #expect(content.height >= 480 && content.height <= 1320)
+    }
+
+    @Test("Adapted window content size respects maximum bounds while maintaining 16:9 aspect")
+    func adaptedWindowContentSizeClamped() {
+        let content = CoordinateMapper.adaptedWindowContentSize(
+            currentCanvasSize: CGSize(width: 2400, height: 1400),
+            targetVideoWidth: 1920,
+            targetVideoHeight: 1080,
+            taskbarHeight: 46,
+            maxContentSize: CGSize(width: 1280, height: 766),
+            minContentSize: CGSize(width: 680, height: 480)
+        )
+        let canvasHeight = content.height - 46
+        #expect(content.width <= 1280)
+        #expect(content.height <= 766)
+        #expect(abs((content.width / canvasHeight) - (1920.0 / 1080.0)) < 0.02)
+    }
+
+    @Test("8-pixel encoder alignment preserves exact 1920x1080 and 2560x1600 without 1088 aspect distortion")
+    func exactEightPixelAlignmentPreserves1080p() {
+        #expect(CoordinateMapper.alignTo8(1920) == 1920)
+        #expect(CoordinateMapper.alignTo8(1080) == 1080)
+        #expect(CoordinateMapper.alignTo8(2560) == 2560)
+        #expect(CoordinateMapper.alignTo8(1600) == 1600)
+
+        let exactFhd = CoordinateMapper.aspectExactAdaptiveResolution(
+            viewSize: CGSize(width: 960, height: 540),
+            backingScale: 2.0,
+            maxLongEdge: 2560
+        )
+        #expect(exactFhd.width == 1920)
+        #expect(exactFhd.height == 1080)
+    }
 }

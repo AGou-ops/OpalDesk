@@ -21,6 +21,8 @@ public final class PreferencesStore {
         static let adaptiveSingleEnabled = "extbridge.pref.adaptiveSingleEnabled"
         static let defaultSingleWidthDp = "extbridge.pref.defaultSingleWidthDp"
         static let inputBackend = "extbridge.pref.inputBackend"
+        static let pinnedDockPackages = "extbridge.pref.pinnedDockPackages"
+        static let dockAutoHide = "extbridge.pref.dockAutoHide"
     }
 
     private let defaults: UserDefaults
@@ -81,6 +83,14 @@ public final class PreferencesStore {
         didSet { defaults.set(inputBackend.rawValue, forKey: Key.inputBackend) }
     }
 
+    public var pinnedDockPackages: [String] {
+        didSet { defaults.set(pinnedDockPackages, forKey: Key.pinnedDockPackages) }
+    }
+
+    public var dockAutoHide: Bool {
+        didSet { defaults.set(dockAutoHide, forKey: Key.dockAutoHide) }
+    }
+
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
 
@@ -124,5 +134,8 @@ public final class PreferencesStore {
 
         let backendRaw = defaults.string(forKey: Key.inputBackend) ?? ExtCastInputBackend.auto.rawValue
         self.inputBackend = ExtCastInputBackend(rawValue: backendRaw) ?? .auto
+
+        self.pinnedDockPackages = defaults.stringArray(forKey: Key.pinnedDockPackages) ?? []
+        self.dockAutoHide = defaults.object(forKey: Key.dockAutoHide) as? Bool ?? false
     }
 }

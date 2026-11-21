@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import ExtBridgeCore
 import Foundation
@@ -27,9 +28,9 @@ public final class AppModel {
         static let remoteDisconnectFlushNs: UInt64 = 60_000_000
         static let appListRefreshThrottleNs: UInt64 = 1_500_000_000
         static let postWindowActionRefreshDelayNs: UInt64 = 650_000_000
-        static let wirelessAdbMaxLongEdge: Int = 1920
+        static let wirelessAdbMaxLongEdge: Int = 2560
         static let defaultMaxLongEdge: Int = 2560
-        static let wirelessAdbMaxBitrateKbps: Int = 10_000
+        static let wirelessAdbMaxBitrateKbps: Int = 16_000
         static let maxVisibleTransfers: Int = 6
         static let defaultCanvasSize = CGSize(width: 1280, height: 720)
     }
@@ -43,7 +44,6 @@ public final class AppModel {
     public let audioPlayer: AudioStreamPlayer
     public let clipboardSync: ClipboardSyncManager
     public let fileSender: FileSender
-    public let popoutManager: PopoutWindowManager
 
     // Active connection & stream state
     public var activeConnection: ActiveConnectionInfo?
@@ -59,43 +59,27 @@ public final class AppModel {
     public var selectedPreset: DisplayResolutionPreset = .matchWindow
     public var selectedDPI: Int = DisplayPresets.defaultDPI
 
-    // DeX overlay panels, split picking, modals, transfers & notifications
-    public var activeDeXPanel: DeXOverlayPanel = .none
-    public var pendingSplitPickSlot: Int? = nil
-    public var pendingSplitSeedSlots: [String] = []
-    public var pendingSplitTargetTopology: ExtCastTilingTopology? = nil
-    public var remoteApps: [RemoteAppInfo] = []
-    public var isLoadingApps: Bool = false
+    // Transfers & notifications
     public var pairingContext: PairingPromptContext?
     public var isProbingManualHost: Bool = false
     public var activeTransfers: [FileTransferProgress] = []
     public var bannerError: String?
     public var statusMessage: String?
     public var toastNotice: String?
+    public var disconnectReason: String?
 
-    /// Computed alias keeping `⌘K` and Menu Bar launcher checks synchronized with `activeDeXPanel`.
-    public var isQuickLauncherPresented: Bool {
-        get { activeDeXPanel == .appDrawer }
-        set {
-            if newValue {
-                activeDeXPanel = .appDrawer
-                pendingSplitPickSlot = nil
-            } else if activeDeXPanel == .appDrawer {
-                activeDeXPanel = .none
-            }
-        }
-    }
+    @ObservationIgnored var isUserInitiatedDisconnect: Bool = false
+    @ObservationIgnored var activeSessionGeneration: UInt64 = 0
 
     @ObservationIgnored var activeAdbForward: AdbForwardHandle?
     @ObservationIgnored var activeSessionEndpoint: ExtCastEndpoint?
     @ObservationIgnored var pendingAuth = PendingConnectionAuth()
     @ObservationIgnored var resizeDebounceTask: Task<Void, Never>?
     @ObservationIgnored var toastClearTask: Task<Void, Never>?
-    @ObservationIgnored var delayedAppListRefreshTask: Task<Void, Never>?
-    @ObservationIgnored var lastAppListRequestNs: UInt64 = 0
     @ObservationIgnored var lastRequestedConfig: (width: Int, height: Int, dpi: Int, fps: Int)?
     @ObservationIgnored var lastCanvasSize: CGSize = Tuning.defaultCanvasSize
     @ObservationIgnored var lastBackingScale: CGFloat = 2.0
+    @ObservationIgnored weak var mainDisplayWindow: NSWindow?
     @ObservationIgnored private var hasCleanedUpOnTerminate: Bool = false
 
     public init() {
@@ -112,11 +96,7 @@ public final class AppModel {
         self.audioPlayer = AudioStreamPlayer()
         self.clipboardSync = ClipboardSyncManager()
         self.fileSender = FileSender()
-        self.popoutManager = PopoutWindowManager()
-        self.deviceState = DeviceStatePayload(
-            adaptiveSingleEnabled: prefs.adaptiveSingleEnabled,
-            defaultSingleWidthDp: prefs.defaultSingleWidthDp
-        )
+        self.deviceState = DeviceStatePayload()
 
         applyInitialSessionPreferences()
         configureCallbacks()
@@ -300,7 +280,27 @@ public final class AppModel {
     }
 
     public func disconnect() {
+        isUserInitiatedDisconnect = true
+        disconnectReason = nil
         Task { await teardownCurrentSession(sendRemoteDisconnect: true) }
+    }
+
+    /// Immediately aborts any ongoing reconnect/stream, disconnects the socket synchronously, and returns to Device Hub.
+    public func forceDisconnectAndReturnHome() {
+        isUserInitiatedDisconnect = true
+        disconnectReason = nil
+        activeSessionGeneration &+= 1
+        session.disconnect()
+        Task { await teardownCurrentSession(sendRemoteDisconnect: false) }
+    }
+
+    /// Force-quits the macOS application even if active modals or streams are hung.
+    public func forceTerminateApp() {
+        cleanupOnTerminate()
+        NSApp.terminate(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            exit(0)
+        }
     }
 
     /// Idempotent synchronous termination teardown (never blocks `@MainActor` with semaphores).
@@ -310,9 +310,7 @@ public final class AppModel {
 
         resizeDebounceTask?.cancel()
         toastClearTask?.cancel()
-        delayedAppListRefreshTask?.cancel()
         discovery.stop()
-        popoutManager.closeAll(sendDisconnect: false)
         clipboardSync.stop()
         audioPlayer.stop()
         videoRenderer.reset()
@@ -337,12 +335,20 @@ public final class AppModel {
     }
 
     func connectSession(to endpoint: ExtCastEndpoint) {
+        activeSessionGeneration &+= 1
+        let generation = activeSessionGeneration
         activeSessionEndpoint = endpoint
         let handler = StreamSessionBridge.makeEventHandler(
             videoRenderer: videoRenderer,
             audioPlayer: audioPlayer,
-            onVideoDisplayMode: { [weak self] mode in self?.displayMode = mode },
-            onControlEvent: { [weak self] event in self?.handleSessionEvent(event) }
+            onVideoDisplayMode: { [weak self] mode in
+                guard let self, self.activeSessionGeneration == generation else { return }
+                self.displayMode = mode
+            },
+            onControlEvent: { [weak self] event in
+                guard let self, self.activeSessionGeneration == generation else { return }
+                self.handleSessionEvent(event)
+            }
         )
         session.connect(to: endpoint, onEvent: handler)
     }
@@ -356,10 +362,6 @@ public final class AppModel {
                 Task { @MainActor [weak self] in self?.videoMetrics = metrics }
             }
         )
-        popoutManager.onControllersChanged = { [weak self] in
-            guard let self else { return }
-            self.wifiUpgrade.releaseUnusedDeferredForwards(adbManager: self.discovery.adbManager, popoutManager: self.popoutManager)
-        }
     }
 
     private func openTrustedWirelessSession(source: PairingPromptContext.Source, trusted: TrustedDevice) {

@@ -11,28 +11,45 @@ extension AppModel {
             sessionState = newState
             switch newState {
             case .connected:
+                disconnectReason = nil
                 sendHelloHandshake()
             case .disconnected:
                 guard !wifiUpgrade.isUpgradingToWifiTls else { return }
+                let hadConn = activeConnection
+                let wasExplicit = isUserInitiatedDisconnect
+                isUserInitiatedDisconnect = false
                 isConnectingFlow = false
                 isAuthenticated = false
                 clipboardSync.stop()
                 audioPlayer.stop()
+                if let hadConn, !wasExplicit {
+                    let msg = "与手机「\(hadConn.deviceName)」的投屏连接已断开"
+                    bannerError = msg
+                    disconnectReason = msg
+                    showToast(msg)
+                    Task { await teardownCurrentSession(sendRemoteDisconnect: false, clearBannerError: false) }
+                }
             case .failed(let message):
                 if wifiUpgrade.isUpgradingToWifiTls {
                     revertFailedWifiUpgradeSilently()
                     return
                 }
+                isUserInitiatedDisconnect = false
                 isConnectingFlow = false
                 isAuthenticated = false
+                disconnectReason = message
                 if var ctx = pairingContext {
                     ctx.isSubmitting = false
                     ctx.errorMessage = message
                     pairingContext = ctx
                 } else {
-                    bannerError = message
+                    bannerError = "投屏连接中断：\(message)"
                     activeConnection = nil
                 }
+            case .reconnecting(let attempt):
+                isAuthenticated = false
+                if disconnectReason == nil { disconnectReason = "网络或手机守护进程无响应" }
+                showToast("连接中断，正在尝试第 \(attempt) 次重连...", durationSeconds: 2.2)
             default:
                 break
             }
@@ -42,40 +59,13 @@ extension AppModel {
         case .rttUpdated(let rtt):
             rttMs = rtt
         case .error(let sessionError):
+            disconnectReason = sessionError.localizedDescription
             if !wifiUpgrade.isUpgradingToWifiTls, case .certificateFingerprintMismatch = sessionError {
                 bannerError = sessionError.localizedDescription
             }
         case .frame(let frame):
             handleControlFrame(frame)
         }
-    }
-
-    func buildPopoutConnectionContext() -> PopoutConnectionContext? {
-        guard isAuthenticated, let conn = activeConnection, let endpoint = activeSessionEndpoint else { return nil }
-        let token: String
-        if case let .wirelessWiFi(_, host, port) = conn.transport {
-            if !pendingAuth.authToken.isEmpty {
-                token = pendingAuth.authToken
-            } else if !conn.fingerprint.isEmpty, let trusted = discovery.trustStore.find(byFingerprint: conn.fingerprint) {
-                token = trusted.authToken
-            } else if let host, let port, let trusted = discovery.trustStore.find(byHost: host, port: port) {
-                token = trusted.authToken
-            } else {
-                token = ""
-            }
-        } else {
-            token = ""
-        }
-        return PopoutConnectionContext(
-            endpoint: endpoint,
-            transportHint: conn.transport.transportHint,
-            clientId: discovery.trustStore.clientId,
-            authToken: token,
-            preferredCodec: preferences.preferredCodec,
-            targetFPS: preferences.targetFPS,
-            bitrateKbps: effectiveBitrateKbps(),
-            mapCommandToCtrl: preferences.mapCommandToCtrl
-        )
     }
 
     private func sendHelloHandshake() {
@@ -108,14 +98,12 @@ extension AppModel {
             guard let state = StreamSessionBridge.decodePayload("DEVICE_STATE", logger: ExtBridgeLog.app, {
                 try DeviceStatePayload.decode(from: frame.payload)
             }) else { return }
-            let previousTopPkg = deviceState.topAppPackage
             deviceState = state
             isBlackoutActive = state.blackout
             if let mode = ExtCastDisplayMode(rawValue: UInt8(clamping: state.displayMode)), mode != .unchanged {
                 displayMode = mode
             }
             if !state.deviceName.isEmpty { activeConnection?.deviceName = state.deviceName }
-            refreshAppListIfForegroundChanged(previousTopPackage: previousTopPkg, newState: state)
 
         case .clipboardPush:
             if (frame.flags & ExtCastProtocol.flagClipboardImagePng) != 0 {
@@ -153,19 +141,6 @@ extension AppModel {
                 handleWifiUpgradeReady(ready)
             }
 
-        case .appList:
-            isLoadingApps = false
-            guard let list = StreamSessionBridge.decodePayload("APP_LIST", logger: ExtBridgeLog.app, {
-                try AppListPayload.decode(from: frame.payload)
-            }) else {
-                showToast("获取手机应用列表失败，请重试")
-                return
-            }
-            remoteApps = list.apps.sorted { lhs, rhs in
-                if lhs.runningOnExt != rhs.runningOnExt { return lhs.runningOnExt && !rhs.runningOnExt }
-                return lhs.displayLabel.localizedCaseInsensitiveCompare(rhs.displayLabel) == .orderedAscending
-            }
-
         default:
             break
         }
@@ -200,11 +175,7 @@ extension AppModel {
         pendingAuth.pinCode = ""
         if !auth.authToken.isEmpty { pendingAuth.authToken = auth.authToken }
 
-        if wifiUpgrade.finalizeUpgradeIfInProgress(
-            adbManager: discovery.adbManager,
-            popoutManager: popoutManager,
-            newPopoutContext: buildPopoutConnectionContext()
-        ) {
+        if wifiUpgrade.finalizeUpgradeIfInProgress(adbManager: discovery.adbManager) {
             activeAdbForward = nil
             showToast("已自动无缝切换至原生 Wi-Fi TLS 直连")
         } else {
@@ -218,21 +189,6 @@ extension AppModel {
         startClipboardSyncIfEnabled()
         syncInitialDesktopPreferences()
         syncCanvasSizeAfterAuth()
-        requestAppList(force: true)
-    }
-
-    private func refreshAppListIfForegroundChanged(previousTopPackage: String, newState: DeviceStatePayload) {
-        let newTopPkg = newState.topAppPackage.trimmingCharacters(in: .whitespacesAndNewlines)
-        let topChangedToUnknownApp = !newTopPkg.isEmpty
-            && newTopPkg != previousTopPackage
-            && !remoteApps.contains(where: { $0.pkg == newTopPkg && $0.runningOnExt })
-        let hasUnknownSplitSlot = newState.tilingSlots.contains { slotPkg in
-            let trimmed = slotPkg.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty && !remoteApps.contains(where: { $0.pkg == trimmed })
-        }
-        if topChangedToUnknownApp || hasUnknownSplitSlot {
-            requestAppListIfNeeded()
-        }
     }
 
     private func handleAuthFailure(_ auth: AuthResultPayload) {
@@ -327,17 +283,9 @@ extension AppModel {
         )
     }
 
-    func teardownCurrentSession(sendRemoteDisconnect: Bool) async {
+    func teardownCurrentSession(sendRemoteDisconnect: Bool, clearBannerError: Bool = true) async {
         resizeDebounceTask?.cancel()
-        delayedAppListRefreshTask?.cancel()
-        activeDeXPanel = .none
-        pendingSplitPickSlot = nil
-        pendingSplitSeedSlots = []
-        pendingSplitTargetTopology = nil
-        lastAppListRequestNs = 0
-        remoteApps.removeAll()
-        isLoadingApps = false
-        popoutManager.closeAll(sendDisconnect: sendRemoteDisconnect)
+        if clearBannerError { bannerError = nil }
 
         if sendRemoteDisconnect && isAuthenticated {
             streamBridge.sendSystemAction(.disconnect, isAuthenticated: true)
@@ -347,7 +295,9 @@ extension AppModel {
         clipboardSync.stop()
         audioPlayer.stop()
         videoRenderer.reset()
+        activeSessionGeneration &+= 1
         session.disconnect()
+        isUserInitiatedDisconnect = false
 
         var forwards = wifiUpgrade.reset()
         if let active = activeAdbForward {
@@ -365,10 +315,7 @@ extension AppModel {
         sessionState = .idle
         rttMs = 0
         videoMetrics = VideoRendererMetrics()
-        deviceState = DeviceStatePayload(
-            adaptiveSingleEnabled: preferences.adaptiveSingleEnabled,
-            defaultSingleWidthDp: preferences.defaultSingleWidthDp
-        )
+        deviceState = DeviceStatePayload()
         lastRequestedConfig = nil
         activeTransfers.removeAll()
     }

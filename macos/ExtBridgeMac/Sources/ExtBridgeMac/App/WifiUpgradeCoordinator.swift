@@ -152,14 +152,9 @@ public final class WifiUpgradeCoordinator {
         }
     }
 
-    /// Finalizes a verified Wi-Fi TLS upgrade: migrates any open popout windows to the new TLS context
-    /// BEFORE removing the obsolete ADB forward (or defers forward removal while any popout still uses it).
+    /// Finalizes a verified Wi-Fi TLS upgrade and removes the obsolete ADB forward tunnel.
     /// Returns `true` when an in-progress Wi-Fi TLS upgrade was finalized.
-    public func finalizeUpgradeIfInProgress(
-        adbManager: AdbManager,
-        popoutManager: PopoutWindowManager,
-        newPopoutContext: PopoutConnectionContext?
-    ) -> Bool {
+    public func finalizeUpgradeIfInProgress(adbManager: AdbManager) -> Bool {
         guard isUpgradingToWifiTls else { return false }
         isUpgradingToWifiTls = false
 
@@ -167,51 +162,12 @@ public final class WifiUpgradeCoordinator {
         fallbackAdbForward = nil
         fallbackAdbTransport = nil
 
-        if let newPopoutContext, !popoutManager.controllers.isEmpty {
-            ExtBridgeLog.app.info(
-                "Migrating \(popoutManager.controllers.count) open popout window(s) to upgraded Wi-Fi TLS endpoint"
-            )
-            popoutManager.migrateConnectionContext(to: newPopoutContext)
-        }
-
         if let oldForward {
-            if popoutManager.hasActiveController(usingLocalPort: oldForward.localPort) {
-                ExtBridgeLog.app.info(
-                    "Deferring removal of ADB forward tcp:\(oldForward.localPort) while popout window still references it"
-                )
-                deferredForwards.append(oldForward)
-            } else {
-                Task { [adbManager] in
-                    await adbManager.removeForward(oldForward)
-                }
+            Task { [adbManager] in
+                await adbManager.removeForward(oldForward)
             }
         }
         return true
-    }
-
-    /// Releases any deferred ADB forwards whose local port is no longer referenced by open popout windows.
-    public func releaseUnusedDeferredForwards(
-        adbManager: AdbManager,
-        popoutManager: PopoutWindowManager
-    ) {
-        guard !deferredForwards.isEmpty else { return }
-        var stillNeeded: [AdbForwardHandle] = []
-        var releasable: [AdbForwardHandle] = []
-
-        for forward in deferredForwards {
-            if popoutManager.hasActiveController(usingLocalPort: forward.localPort) {
-                stillNeeded.append(forward)
-            } else {
-                releasable.append(forward)
-            }
-        }
-        deferredForwards = stillNeeded
-
-        for forward in releasable {
-            Task { [adbManager] in
-                await adbManager.removeForward(forward)
-            }
-        }
     }
 
     /// Reverts a failed Wi-Fi TLS handoff back to the preserved wireless ADB forward tunnel.

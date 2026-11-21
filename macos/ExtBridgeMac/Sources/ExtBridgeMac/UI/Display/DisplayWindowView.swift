@@ -1,44 +1,33 @@
+import AppKit
 import ExtBridgeCore
 import SwiftUI
 
-/// Samsung DeX for Mac main desktop shell: edge-to-edge Android canvas above a permanent 46pt
-/// frosted dark DeX taskbar, with native magnetic split seams, optional top-right telemetry HUD,
-/// and mutually exclusive frosted popovers (App Drawer, Layout Picker, Quick Settings).
+/// Pure ExtBridge casting viewport: edge-to-edge projected Android display canvas,
+/// optional top-right telemetry HUD, hover top-edge quick disconnect/exit pill,
+/// file-drop target, and disconnect/reconnect recovery notices.
 public struct DisplayWindowView: View {
     @Bindable public var model: AppModel
 
     @State private var isDragOverCanvas: Bool = false
     @State private var isInjectWarningDismissed: Bool = false
+    @State private var isHoveringTopEdge: Bool = false
 
     public init(model: AppModel) {
         self.model = model
     }
 
     public var body: some View {
-        VStack(spacing: 0) {
-            canvasStage
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .clipped()
-
-            DeXTaskbarView(model: model)
-        }
-        .background(DeXTheme.canvasBackground)
-        .preferredColorScheme(.dark)
-        .background(WindowChromeConfigurator(isImmersiveCanvas: true))
-        .animation(.easeOut(duration: 0.16), value: model.activeDeXPanel)
-        .animation(.easeOut(duration: 0.16), value: model.pendingSplitPickSlot)
-        .animation(.easeOut(duration: 0.2), value: model.toastNotice)
-        .animation(.easeOut(duration: 0.2), value: model.injectStatus)
-        .onChange(of: model.injectStatus) { _, newStatus in
-            if newStatus != .denied { isInjectWarningDismissed = false }
-        }
-        .onKeyPress(.escape) {
-            if model.activeDeXPanel != .none || model.pendingSplitPickSlot != nil {
-                model.dismissDeXPanels()
-                return .handled
-            }
-            return .ignored
-        }
+        canvasStage
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .clipped()
+            .background(DeXTheme.canvasBackground)
+            .preferredColorScheme(.dark)
+            .background(WindowChromeConfigurator(isImmersiveCanvas: true) { window in
+                model.mainDisplayWindow = window
+            })
+            .animation(.easeOut(duration: 0.2), value: model.toastNotice)
+            .animation(.easeOut(duration: 0.2), value: model.injectStatus)
+            .animation(.easeOut(duration: 0.16), value: isHoveringTopEdge)
     }
 
     // MARK: - Canvas Stage
@@ -61,17 +50,14 @@ public struct DisplayWindowView: View {
                     onDragHoverChange: { hovering in
                         withAnimation(.easeInOut(duration: 0.15)) { isDragOverCanvas = hovering }
                     },
-                    onResize: { size, scale in model.handleCanvasResize(viewSize: size, backingScale: scale) },
-                    onCanvasInteract: {
-                        if model.activeDeXPanel != .none {
-                            model.activeDeXPanel = .none
-                        }
-                    },
-                    onQuickLauncher: { model.toggleQuickLauncher() }
+                    onResize: { size, scale in model.handleCanvasResize(viewSize: size, backingScale: scale) }
                 )
             )
+            .onChange(of: model.injectStatus) { _, newStatus in
+                if newStatus != .denied { isInjectWarningDismissed = false }
+            }
 
-            DeXSplitDividerOverlay(model: model)
+            topHoverControlBar
 
             if model.preferences.showHUDStats && model.isAuthenticated {
                 VStack {
@@ -94,61 +80,77 @@ public struct DisplayWindowView: View {
             }
 
             notificationsOverlay
-
-            if model.activeDeXPanel != .none {
-                dexPopoverOverlay
-            }
         }
     }
 
-    // MARK: - Mutually Exclusive DeX Popovers
+    // MARK: - Hover Top Edge Disconnect / Force Quit Pill
 
-    private var dexPopoverOverlay: some View {
-        ZStack {
-            Color.black.opacity(0.001)
-                .contentShape(Rectangle())
-                .onTapGesture { model.activeDeXPanel = .none }
+    private var topHoverControlBar: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 4) {
+                Color.clear
+                    .frame(height: 18)
+                    .frame(maxWidth: .infinity)
+                    .contentShape(Rectangle())
 
-            switch model.activeDeXPanel {
-            case .appDrawer:
-                VStack {
-                    Spacer()
-                    HStack {
-                        DeXAppDrawerView(model: model)
-                        Spacer()
+                if isHoveringTopEdge {
+                    HStack(spacing: 8) {
+                        if let conn = model.activeConnection {
+                            Text(conn.deviceName)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundStyle(.white.opacity(0.85))
+                                .lineLimit(1)
+                        }
+
+                        Button {
+                            model.toggleDisplayMode()
+                        } label: {
+                            Label(
+                                model.displayMode == .dex ? "切融合镜像" : "切电脑桌面",
+                                systemImage: model.displayMode == .dex ? "rectangle.on.rectangle" : "macwindow.on.rectangle"
+                            )
+                            .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button {
+                            model.toggleBlackout()
+                        } label: {
+                            Label(model.isBlackoutActive ? "亮屏" : "黑屏", systemImage: model.isBlackoutActive ? "sun.max.fill" : "moon.fill")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button {
+                            model.forceDisconnectAndReturnHome()
+                        } label: {
+                            Label("断开连接", systemImage: "rectangle.portrait.and.arrow.right")
+                                .font(.system(size: 11, weight: .medium))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Button(role: .destructive) {
+                            model.forceTerminateApp()
+                        } label: {
+                            Label("强制退出", systemImage: "power")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.red.opacity(0.85))
+                        .controlSize(.small)
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .floatingCapsuleChrome(shadowRadius: 10, shadowY: 4, shadowOpacity: 0.38)
+                    .transition(.move(edge: .top).combined(with: .opacity))
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 10)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-
-            case .quickSettings:
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        DeXQuickSettingsPanel(model: model)
-                    }
-                }
-                .padding(.trailing, 12)
-                .padding(.bottom, 10)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-
-            case .layoutPicker:
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        DeXLayoutPopoverView(model: model)
-                    }
-                }
-                .padding(.trailing, 76)
-                .padding(.bottom, 10)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-
-            case .none:
-                EmptyView()
             }
+            .onHover { isHoveringTopEdge = $0 }
+
+            Spacer()
         }
     }
 
@@ -221,34 +223,65 @@ public struct DisplayWindowView: View {
     }
 
     private var connectionOverlay: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 14) {
             ProgressView().controlSize(.large).tint(.white)
+
             Text(connectionStatusCaption)
                 .font(.headline)
                 .foregroundStyle(.white)
+
+            if let detail = model.disconnectReason, !detail.isEmpty, model.isReconnecting {
+                Text("原因：\(detail)")
+                    .font(.caption)
+                    .foregroundStyle(.orange.opacity(0.95))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 340)
+            }
+
             if let conn = model.activeConnection {
                 Text("\(conn.deviceName) · \(conn.transport.shortBadge)")
                     .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.7))
+                    .foregroundStyle(.white.opacity(0.72))
             }
+
+            HStack(spacing: 10) {
+                Button("断开并返回") {
+                    model.forceDisconnectAndReturnHome()
+                }
+                .buttonStyle(.bordered)
+                .tint(.white)
+
+                Button("强制退出 App", role: .destructive) {
+                    model.forceTerminateApp()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red.opacity(0.88))
+            }
+            .padding(.top, 4)
         }
-        .padding(24)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .padding(26)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 26, style: .continuous)
+                .strokeBorder(.white.opacity(0.24), lineWidth: 1)
+        )
     }
 
     private var connectionStatusCaption: String {
         switch model.sessionState {
         case .connecting: return "正在建立低延迟连接..."
-        case .reconnecting(let attempt): return "连接中断，正在尝试第 \(attempt) 次重连..."
+        case .reconnecting(let attempt): return "投屏连接已中断，正在尝试第 \(attempt)/5 次重连..."
         case .connected: return model.isAuthenticated ? "正在等待 Android 首个关键帧..." : "正在进行握手与身份校验..."
+        case .failed(let msg): return "连接失败：\(msg)"
+        case .disconnected: return "投屏连接已断开"
         default: return "准备显示画面..."
         }
     }
 
     private var fileDropOverlay: some View {
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
+        RoundedRectangle(cornerRadius: 26, style: .continuous)
             .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
-            .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .background(Color.accentColor.opacity(0.12), in: RoundedRectangle(cornerRadius: 26, style: .continuous))
             .overlay {
                 VStack(spacing: 10) {
                     Image(systemName: "arrow.down.doc.fill")

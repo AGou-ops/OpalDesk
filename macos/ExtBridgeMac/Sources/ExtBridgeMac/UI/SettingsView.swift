@@ -68,22 +68,6 @@ public struct SettingsView: View {
                 .onChange(of: prefs.defaultDPI) { _, newDPI in model.selectDPI(newDPI) }
             }
 
-            Section("单应用默认黄金尺寸") {
-                Toggle("开启单应用默认黄金宽度居中排版", isOn: $prefs.adaptiveSingleEnabled)
-                    .onChange(of: prefs.adaptiveSingleEnabled) { _, enabled in
-                        model.setAdaptiveSingle(enabled: enabled, defaultWidthDp: prefs.defaultSingleWidthDp)
-                    }
-
-                steppedSliderRow(
-                    title: "默认单应用宽度",
-                    valueText: "\(prefs.defaultSingleWidthDp) dp",
-                    value: prefs.defaultSingleWidthDp,
-                    range: DisplayPresets.singleWidthDpRange,
-                    step: Self.singleWidthDpStep
-                ) { model.setAdaptiveSingle(enabled: prefs.adaptiveSingleEnabled, defaultWidthDp: $0) }
-                .disabled(!prefs.adaptiveSingleEnabled)
-            }
-
             Section("辅助显示") {
                 Toggle("默认开启手机音频回传", isOn: $prefs.audioEnabled)
                 Toggle("在画面右上角显示实时 FPS / RTT / 码率 / UHID 性能浮标 (HUD)", isOn: $prefs.showHUDStats)
@@ -111,7 +95,7 @@ public struct SettingsView: View {
 
             Section("键盘与触控板快捷键") {
                 Toggle("将 ⌘C / ⌘V / ⌘X / ⌘A / ⌘Z / ⌘W 等自动映射为 Android Ctrl 快捷键", isOn: $prefs.mapCommandToCtrl)
-                Text("内置快捷键：⌘K 打开手机应用快启器 · ⌘⇧T 置顶独立弹出窗 · 触控板三指上滑多任务 / 下滑主页 / 左右滑返回。")
+                Text("快捷键：⌘[ 返回 · ⌘⇧H 桌面 · ⌘⇧B 熄屏 · ⌘⇧M 静音 · ⌘⇧D 切换模式 · 触控板三指手势直达对应操作。")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

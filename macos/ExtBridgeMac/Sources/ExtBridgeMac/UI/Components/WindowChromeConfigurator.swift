@@ -5,26 +5,31 @@ import SwiftUI
 /// (`DisplayWindowView`) and standard native window chrome (`DeviceHubView`).
 struct WindowChromeConfigurator: NSViewRepresentable {
     let isImmersiveCanvas: Bool
+    var onWindowChanged: ((NSWindow?) -> Void)? = nil
 
     func makeNSView(context: Context) -> ChromeConfiguratorNSView {
         let view = ChromeConfiguratorNSView()
         view.isImmersiveCanvas = isImmersiveCanvas
+        view.onWindowChanged = onWindowChanged
         return view
     }
 
     func updateNSView(_ nsView: ChromeConfiguratorNSView, context: Context) {
         nsView.isImmersiveCanvas = isImmersiveCanvas
+        nsView.onWindowChanged = onWindowChanged
         nsView.applyIfNeeded()
     }
 
     @MainActor
     final class ChromeConfiguratorNSView: NSView {
         var isImmersiveCanvas: Bool = false
+        var onWindowChanged: ((NSWindow?) -> Void)?
         private var lastAppliedMode: Bool?
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             lastAppliedMode = nil
+            onWindowChanged?(window)
             applyIfNeeded()
         }
 
@@ -38,8 +43,8 @@ struct WindowChromeConfigurator: NSViewRepresentable {
             if isImmersiveCanvas {
                 window.titlebarAppearsTransparent = true
                 window.titleVisibility = .visible
-                window.backgroundColor = DeXTheme.canvasNSColor
-                window.appearance = NSAppearance(named: .darkAqua)
+                window.backgroundColor = .windowBackgroundColor
+                window.appearance = nil
                 window.isMovableByWindowBackground = false
             } else {
                 window.titlebarAppearsTransparent = false
