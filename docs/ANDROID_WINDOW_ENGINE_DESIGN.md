@@ -16,7 +16,7 @@
 | 标题栏与触摸区域 | 交互期间可以先用预期窗口位置绘制，随后由守护进程快照对齐 | 系统画面尚未移动时，边框可能先到新位置 |
 | HyperOS 多窗适配 | `TaskApiAdapter` 结合窗口事务、`resizeTask` 和重查。已有代码针对任务实际图层未跟上边界的情况再次调整 | 切换耗时取决于系统任务和图层各自的更新时间 |
 
-现状入口见 [工作台排窗与快照 reconciliation](../helper/src/io/github/lengsukq/opaldesk/desktop/state/DesktopShellCoordinator.kt)、[系统窗口适配](../bridge/src/io/github/lengsukq/opaldesk/daemon/platform/TaskApiAdapter.java)。
+现状入口见 [工作台排窗与状态同步](../helper/src/io/github/lengsukq/opaldesk/desktop/state/DesktopShellCoordinator.kt)、[系统窗口适配](../bridge/src/io/github/lengsukq/opaldesk/daemon/platform/TaskApiAdapter.java)。
 
 ## 架构选择
 
@@ -49,7 +49,7 @@ flowchart LR
 1. 拖动时仅更新合成画面的变换和落点预览，应用维持当前逻辑尺寸。取消拖动时恢复上一个已确认布局。
 2. 松手时计算整区或双窗布局。已有应用直接使用当前画面，新启动应用先等待可呈现的首帧。启动失败或首帧超时就保持上一个可用布局。
 3. 合成器在同一帧推进窗口位置、裁剪和标题栏，窗口尺寸确有变化时，动画落位后对各虚拟屏合并提交一次最终尺寸。新尺寸的画面到达前保留上一张有效帧，输入仍以实际显示的尺寸映射。
-4. 在应用进入后台或最低可见状态时暂停不可见画面的合成。关闭会话、Surface 丢失、屏幕旋转和 LocalDeX 退出时，取消相关手势和待提交操作。迁移或结束目标任务后释放虚拟屏，避免遗留显示屏和焦点。 [VirtualDisplay 的尺寸更新与释放行为](https://developer.android.com/reference/android/hardware/display/VirtualDisplay)
+4. 在应用进入后台或最小化时暂停不可见画面的合成。关闭会话、Surface 丢失、屏幕旋转和 LocalDeX 退出时，取消相关手势和待提交操作。迁移或结束目标任务后释放虚拟屏，避免遗留显示屏和焦点。 [VirtualDisplay 的尺寸更新与释放行为](https://developer.android.com/reference/android/hardware/display/VirtualDisplay)
 
 ## 兼容性与降级
 
