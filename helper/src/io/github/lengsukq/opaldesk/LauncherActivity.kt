@@ -85,10 +85,10 @@ class LauncherActivity : Activity() {
         private const val TAG = "ExtLauncher"
         private const val FOCUS_FADE_OUT_MS = 160L
         private const val FOCUS_FADE_IN_MS = 220L
-        private const val FOCUS_CONTENT_SCALE = 0.96f
-        private const val FOCUS_WALLPAPER_SCALE = 1.03f
+        private const val FOCUS_CONTENT_SCALE = 1.0f
+        private const val FOCUS_WALLPAPER_SCALE = 1.0f
         private const val SOFT_SCRIM_ALPHA = 0.0f
-        private const val FOCUS_SCRIM_ALPHA = 0.66f
+        private const val FOCUS_SCRIM_ALPHA = 0.28f
         private const val MAX_INITIAL_PINNED_APPS = 8
 
         private var sPendingQuery = ""
@@ -226,7 +226,10 @@ class LauncherActivity : Activity() {
             if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.updateModes(latest)
             gridAdapter.updateModes(latest)
         }
-        widgetBoard = DesktopWidgetBoardController(this, dialogs.presenter, ::runIo) { pkg ->
+        widgetBoard = DesktopWidgetBoardController(this, dialogs.presenter, ::runIo, onInlineTilesChanged = { tiles ->
+            desktopGridWorkspace.setWidgetTiles(tiles, widgetBoard::showAddWidgetMenu)
+            applyFilter(query)
+        }) { pkg ->
             if (pkg.isNullOrBlank()) ""
             else allApps.firstOrNull { it.pkg == pkg }?.label ?: pkg
         }
@@ -784,9 +787,9 @@ class LauncherActivity : Activity() {
         val dm = resources.displayMetrics
         val winW = if (rootView.width > 0) rootView.width else dm.widthPixels
         val isSplitPicker = mode.presentation == DesktopPresentationMode.PHYSICAL_SPLIT_PICKER
-        val showWidgetBoard = !isSplitPicker && !mode.compact && winW >= dp(640)
+        val wbOn = !isSplitPicker && AppPrefs.isWorkbenchEnabled(this)
+        val showWidgetBoard = !isSplitPicker && !wbOn && !mode.compact && winW >= dp(640)
         val isNarrow = winW < dp(560)
-        val taskbarAutoHide = BridgeService.isDockAutoHideEnabled(this)
 
         splitPickerHeader.visibility = if (isSplitPicker) View.VISIBLE else View.GONE
         pickerSearchWrap.visibility = if (isSplitPicker) View.VISIBLE else View.GONE
@@ -804,10 +807,23 @@ class LauncherActivity : Activity() {
         }
 
         val horizPad = dp(if (isSplitPicker) 8 else if (isNarrow) 12 else 24)
+        // Reserve clean clearance when Workbench Mode is docked on Left or Top so desktop icons
+        // never sit cut in half behind the frosted Workbench rail.
+        val wbPos = if (wbOn) AppPrefs.getWorkbenchPosition(this) else -1
+        val leftPad = if (wbOn && wbPos == AppPrefs.WORKBENCH_POS_LEFT) {
+            dp(218)
+        } else {
+            horizPad
+        }
+        val topPad = if (wbOn && wbPos == AppPrefs.WORKBENCH_POS_TOP) {
+            dp(140)
+        } else {
+            0
+        }
         // On the desktop (isDesktopClear == true) the floating taskbar is always visible even when
         // auto-hide is enabled, so always reserve bottom taskbar clearance for icons & widget board.
         val bottomPad = dp(if (isSplitPicker) 14 else 72)
-        workspaceColumnsRow.setPadding(horizPad, 0, horizPad, bottomPad)
+        workspaceColumnsRow.setPadding(leftPad, topPad, horizPad, bottomPad)
 
         val boardW = if (showWidgetBoard) (winW * 0.30f).roundToInt().coerceIn(dp(276), dp(364)) else 0
         if (showWidgetBoard) {
@@ -820,11 +836,12 @@ class LauncherActivity : Activity() {
             widgetBoard.onAvailableWidthChanged(boardW)
         }
 
-        val leftPaneW = max(dp(220), winW - horizPad * 2 - (if (showWidgetBoard) boardW + dp(18) else 0))
+        val leftPaneW = max(dp(220), winW - leftPad - horizPad - (if (showWidgetBoard) boardW + dp(18) else 0))
         val gridDpW = leftPaneW / max(0.5f, dm.density)
         val cols = LauncherDesktopPolicy.computeGridColumns(gridDpW, mode.compact)
         gridView.numColumns = cols
         if (::desktopGridWorkspace.isInitialized) desktopGridWorkspace.setColumnsAndDensity(cols, mode.compact)
+        if (!isSplitPicker) widgetBoard.setInlineMode(wbOn)
 
         if (compactModeApplied != mode.compact) {
             compactModeApplied = mode.compact

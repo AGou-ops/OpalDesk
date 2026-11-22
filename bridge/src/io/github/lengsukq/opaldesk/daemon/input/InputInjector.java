@@ -224,6 +224,19 @@ public final class InputInjector {
     // ---- Core Input Injection & UHID Auto-Fallback ----
 
     public boolean injectInput(InputEvent ev, int targetDisplayId) {
+        if (ev == null || targetDisplayId < 0) return false;
+        int backend = config.inputBackendMode;
+        if (backend != BridgeProtocol.INPUT_BACKEND_UHID && !uhidAutoActivated && canInject()) {
+            try {
+                if (services.setDisplayIdMethod != null) services.setDisplayIdMethod.invoke(ev, targetDisplayId);
+                Object res = services.injectInputEventMethod.invoke(services.iInputManager, ev, 0);
+                boolean ok = !(res instanceof Boolean) || (Boolean) res;
+                if (ok) updateInjectStatus(BridgeProtocol.INJECT_STATUS_SYSTEM);
+                return ok;
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                // Fall through to full UHID auto-fallback & error-handling path.
+            }
+        }
         return injectInputMode(ev, targetDisplayId, 0);
     }
 

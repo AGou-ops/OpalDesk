@@ -148,7 +148,7 @@ class DesktopGeometryTest {
         assertEquals(2, pair.rightTaskId)
 
         // Drag divider to 60% width (1152px)
-        val (newL, newR) = DesktopGeometry.computePairedSplitResizedBounds(pair, 1152, 1920, 1080, 160, false)
+        val (newL, newR) = DesktopGeometry.computePairedSplitResizedBounds(pair, 1152, 160)
         assertEquals(leftRect.left, newL.left)
         assertEquals(rightRect.right, newR.right)
         assertEquals(8, newR.left - newL.right)
@@ -156,7 +156,7 @@ class DesktopGeometryTest {
         assertEquals(1156, newR.left)
 
         // Dragging divider all the way to left edge clamps left window to MIN_WINDOW_W_DP (320px)
-        val (minL, _) = DesktopGeometry.computePairedSplitResizedBounds(pair, 100, 1920, 1080, 160, false)
+        val (minL, _) = DesktopGeometry.computePairedSplitResizedBounds(pair, 100, 160)
         assertEquals(320, minL.width)
     }
 }

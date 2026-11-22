@@ -369,12 +369,14 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
         }
         if (mode == 1) return
         if (mode == 2) {
-            if (!modeChanged && lastDark == tokens.isDark && pill.text?.toString() == "退出 DeX") return
-            pill.text = "退出 DeX"
-            val fg = Color.WHITE
+            if (!modeChanged && lastDark == tokens.isDark && pill.text?.toString() == "退出") return
+            pill.text = "退出"
+            val fg = tokens.accentRed
+            val fill = if (tokens.isDark) 0x30FF453A else 0x1BFF3B30
+            val stroke = if (tokens.isDark) 0x48FF453A else 0x38FF3B30
             pill.setTextColor(fg)
-            pill.background = roundedBg(tokens.accentRed, ctx.dpF(14f), ctx.dp(0.75f), 0x55FFFFFF)
-            HyperUi.setStartIcon(pill, HyperUi.ICON_CLOSE, fg, 12f, 3.5f)
+            pill.background = roundedBg(fill, ctx.dpF(14f), ctx.dp(0.8f).coerceAtLeast(1), stroke)
+            HyperUi.setStartIcon(pill, HyperUi.ICON_CLOSE, fg, 11.5f, 3.5f)
             return
         }
         if (!modeChanged && lastInputToExt == status.inputToExt && lastDark == tokens.isDark && pill.text.isNotEmpty()) return

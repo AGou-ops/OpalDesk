@@ -91,7 +91,7 @@ internal class PairedSnapDividerController(
                 MotionEvent.ACTION_MOVE -> {
                     val targetX = startDivX + (ev.rawX - downRawX).roundToInt()
                     val (lRect, rRect) = DesktopGeometry.computePairedSplitResizedBounds(
-                        pair, targetX, st.displayW, st.displayH, st.dpi, host.isTaskbarAutoHide,
+                        pair, targetX, st.dpi,
                     )
                     liveLeft = lRect
                     liveRight = rRect

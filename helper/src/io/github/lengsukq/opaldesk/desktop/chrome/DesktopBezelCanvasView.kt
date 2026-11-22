@@ -104,17 +104,20 @@ private class DesktopBezelCanvasView(
 
     private val outerStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 1.4f * density
+        strokeWidth = 1.1f * density
+    }
+    private val shadowRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
     }
     private val innerSpecPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 1.0f * density
+        strokeWidth = 0.85f * density
     }
     private val scrimPaint = Paint().apply { style = Paint.Style.FILL }
     private val previewFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val previewStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 2.2f * density
+        strokeWidth = 1.75f * density
     }
     private val hudBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val hudStrokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -172,8 +175,19 @@ private class DesktopBezelCanvasView(
                 }
             }
             val rad = min(cornerPx, min(r.width, r.height) * 0.35f)
+            // Soft multi-pass ambient outer drop halo gives floating windows natural macOS depth
+            if (f.focused) {
+                shadowRingPaint.color = if (tokens.isDark) 0x26000000 else 0x180F172A
+                shadowRingPaint.strokeWidth = 5.5f * density
+                val sOff = 2.6f * density
+                SquircleMath.buildAndroidPath(
+                    r.left - sOff, r.top - sOff * 0.5f, r.right + sOff, r.bottom + sOff * 1.35f,
+                    SquircleMath.CornerRadiiPx.uniform(rad + sOff), target = outerPath,
+                )
+                canvas.drawPath(outerPath, shadowRingPaint)
+            }
             outerStrokePaint.color = if (f.focused) tokens.bezelFocusedOuter else tokens.bezelUnfocusedOuter
-            outerStrokePaint.strokeWidth = (if (f.focused) 1.75f else 1.15f) * density
+            outerStrokePaint.strokeWidth = (if (f.focused) 1.15f else 0.9f) * density
             val oIn = outerStrokePaint.strokeWidth * 0.5f
             SquircleMath.buildAndroidPath(
                 r.left + oIn, r.top + oIn, r.right - oIn, r.bottom - oIn,
@@ -192,10 +206,12 @@ private class DesktopBezelCanvasView(
             canvas.restoreToCount(save)
         }
 
-        // 2. Draw live 60fps frosted glass snap / resize preview ghost + dimension HUD
+        // 2. Draw live 120fps frosted glass snap / move / resize preview ghost + dimension HUD
         if (preview.active && !preview.outerRect.isEmpty) {
-            scrimPaint.color = tokens.previewScrim
-            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), scrimPaint)
+            if (preview.isSnapped) {
+                scrimPaint.color = tokens.previewScrim
+                canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), scrimPaint)
+            }
 
             drawPreviewBox(canvas, preview.outerRect, preview.isSnapped)
             secondaryPreview?.takeIf { !it.isEmpty }?.let { drawPreviewBox(canvas, it, preview.isSnapped) }

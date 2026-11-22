@@ -637,7 +637,7 @@ object BridgeClient {
     ): Boolean {
         val count = ids.size.coerceIn(0, 10)
         if (count == 0) return false
-        return BinderTransport.transactBool(TxCode.SEND_LOCAL_TOUCH) {
+        return BinderTransport.transactOneWayFast(TxCode.SEND_LOCAL_TOUCH) {
             writeInt(action)
             writeLong(downTime)
             writeLong(eventTime)

@@ -36,6 +36,7 @@ import io.github.lengsukq.opaldesk.desktop.popovers.GlassMenuRow
 import io.github.lengsukq.opaldesk.desktop.taskbar.DeXTaskbarController
 import io.github.lengsukq.opaldesk.desktop.workbench.DeXWorkbenchPickerOverlay
 import io.github.lengsukq.opaldesk.desktop.workbench.DeXWorkbenchRailController
+import io.github.lengsukq.opaldesk.desktop.workbench.WorkbenchDropLayout
 import io.github.lengsukq.opaldesk.ipc.DaemonStateStore
 import io.github.lengsukq.opaldesk.overlay.OverlaySurfaceHost
 import io.github.lengsukq.opaldesk.overlay.PopoverCoordinator
@@ -46,6 +47,7 @@ import io.github.lengsukq.opaldesk.protocol.BridgeProtocol.ShortcutAction
 import io.github.lengsukq.opaldesk.ui.ExtThemePrefs
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.max
 
 /**
@@ -96,7 +98,16 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
 
     companion object {
         private const val TAG = "ExtDeXShell"
+        private const val WORKBENCH_DROP_TIMEOUT_MS = 3500L
     }
+
+    private class PendingWorkbenchDrop(
+        val pkg: String,
+        val layout: WorkbenchDropLayout,
+        val companion: DesktopWindow?,
+        val previous: List<DesktopWindow>,
+        var accepted: Boolean = false,
+    )
 
     override val serviceContext: Context get() = svc.serviceContext
     override val extCtx: Context? get() = svc.extCtx
@@ -135,6 +146,7 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
     private var secondaryPreviewRect: IntRect? = null
     private var draggingTaskId = -1
     private var draggingRect: IntRect? = null
+    private var pendingWorkbenchDrop: PendingWorkbenchDrop? = null
 
     // Dedicated single-flight live-move executor completely isolated from periodic polling/snapshots
     private val moveLock = Any()
@@ -170,7 +182,7 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
     private val windowSwitcher = DeXWindowSwitcherOverlay(this)
     private val snapLayouts = DeXSnapLayoutsPopover(this)
     private val contextMenu = DeXGlassContextMenu(this)
-    private val workbenchRail = DeXWorkbenchRailController(this)
+    private val workbenchRail = DeXWorkbenchRailController(this, ::placeWorkbenchApp)
     private val workbenchPicker = DeXWorkbenchPickerOverlay(this)
 
     // --- Lifecycle ---
@@ -214,6 +226,7 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
 
     fun detach() {
         attached = false
+        pendingWorkbenchDrop = null
         clearPendingMoves()
         previewState = PreviewOverlayState()
         secondaryPreviewRect = null
@@ -236,6 +249,7 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
 
     fun onDisplayBoundsChanged(w: Int, h: Int, dpi: Int) {
         if (!attached) return
+        pendingWorkbenchDrop = null
         val ctx = extCtx ?: return
         state = state.copy(displayW = max(600, w), displayH = max(480, h), dpi = dpi.coerceIn(80, 640))
         bezelCanvas.onDisplayBoundsChanged(state.displayW, state.displayH)
@@ -296,6 +310,7 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
             taskbarAutoHide = isTaskbarAutoHide,
             nowUptimeMs = SystemClock.uptimeMillis(),
         )
+        finishWorkbenchDropIfReady()
         renderAll(volLevel, sys)
         LauncherActivity.notifyOverlayStateChanged()
     }
@@ -323,7 +338,8 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
         renderBezelCanvasOnly()
         headerPool.render(ctx, visibleChrome, state.dpi, tokens)
         resizeEdges.updateForFocusedWindow(ctx, if (focused?.isVisibleChromeWindow == true) focused else null, state.dpi)
-        val paired = DesktopGeometry.detectPairedHorizontalSplit(visibleChrome, state.displayW, state.displayH, state.dpi, isTaskbarAutoHide)
+        val paired = detectWorkbenchPair(visibleChrome)
+            ?: DesktopGeometry.detectPairedHorizontalSplit(visibleChrome, state.displayW, state.displayH, state.dpi, isTaskbarAutoHide)
         pairedDivider.update(ctx, paired, tokens)
         immersiveHandle.update(ctx, immersive, tokens)
         workbenchRail.render(ctx, state, tokens, lastStatus.isLocalDexActive)
@@ -614,6 +630,10 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
     }
 
     override fun toggleAppDrawer(focusSearch: Boolean) = appDrawer.toggle(focusSearch)
+    fun openAppDrawer() {
+        if (!appDrawer.isOpen) appDrawer.open()
+    }
+
     override fun toggleQuickSettings() = quickSettings.toggle()
     override fun toggleWindowSwitcher() = windowSwitcher.toggleOrCycle()
 
@@ -844,11 +864,13 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
 
     override fun setWorkbenchEnabled(enabled: Boolean) {
         isWorkbenchEnabled = enabled
+        if (!enabled) pendingWorkbenchDrop = null
         AppPrefs.setWorkbenchEnabled(serviceContext, enabled)
         if (enabled) seedWorkbenchStarterAppsIfEmpty()
         if (!attached) return
         workbenchRail.invalidateCards()
         renderAll()
+        LauncherActivity.notifyOverlayStateChanged()
         if (enabled) {
             val sideLabel = if (workbenchPosition == AppPrefs.WORKBENCH_POS_TOP) "顶部" else "左侧"
             serviceContext.toast("工作台模式已开启（${sideLabel}卡片栏）")
@@ -870,10 +892,12 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
         val normalized = if (position == AppPrefs.WORKBENCH_POS_TOP) AppPrefs.WORKBENCH_POS_TOP else AppPrefs.WORKBENCH_POS_LEFT
         if (workbenchPosition == normalized && isWorkbenchEnabled) return
         workbenchPosition = normalized
+        pendingWorkbenchDrop = null
         AppPrefs.setWorkbenchPosition(serviceContext, normalized)
         if (!attached) return
         workbenchRail.invalidateCards()
         renderAll()
+        LauncherActivity.notifyOverlayStateChanged()
         if (isWorkbenchEnabled) {
             serviceContext.toast(if (normalized == AppPrefs.WORKBENCH_POS_TOP) "工作台已切至顶部栏" else "工作台已切至左侧栏")
             val fg = state.focusedVisibleWindow
@@ -895,6 +919,89 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
     override fun openWorkbenchAppPicker() {
         if (!attached) return
         workbenchPicker.open()
+    }
+
+    private fun detectWorkbenchPair(windows: List<DesktopWindow>) = if (isWorkbenchEnabled) {
+        DesktopGeometry.detectPairedHorizontalSplit(
+            windows, state.displayW, state.displayH, state.dpi, isTaskbarAutoHide,
+            workArea = workbenchRail.currentStageRect(),
+        )
+    } else null
+
+    private fun placeWorkbenchApp(pkg: String, layout: WorkbenchDropLayout) {
+        if (!attached || !isWorkbenchEnabled || pkg.isBlank()) return
+        if (pendingWorkbenchDrop != null) {
+            serviceContext.toast("正在安排上一个窗口")
+            return
+        }
+        val visible = state.visibleChromeWindows
+        val previous = visible.filter { it.pkg != pkg }
+        val companion = layout.companionBounds?.let { otherHalf ->
+            val pair = detectWorkbenchPair(visible)
+            val oppositeId = if (otherHalf.left < layout.bounds.left) pair?.leftTaskId else pair?.rightTaskId
+            previous.firstOrNull { it.taskId == oppositeId } ?: previous.lastOrNull { it.focused } ?: previous.lastOrNull()
+        }
+        for (window in previous) workbenchRail.captureSnapshotNow(window.taskId, window.pkg)
+        val pending = PendingWorkbenchDrop(pkg, layout, companion, previous)
+        pendingWorkbenchDrop = pending
+        val bounds = layout.bounds
+        safeBgExecute {
+            val launched = BridgeClient.launchInWindowMode(
+                pkg, "", BridgeClient.WIN_MODE_FREEFORM, bounds.left, bounds.top, bounds.right, bounds.bottom,
+            )
+            safePost {
+                if (pendingWorkbenchDrop !== pending) return@safePost
+                if (launched) {
+                    pending.accepted = true
+                    finishWorkbenchDropIfReady()
+                    requestStateRefresh()
+                } else {
+                    pendingWorkbenchDrop = null
+                    serviceContext.toast("应用无法在工作台打开")
+                }
+            }
+        }
+        handler.postDelayed({
+            if (pendingWorkbenchDrop === pending) {
+                pendingWorkbenchDrop = null
+                serviceContext.toast("应用暂未进入目标区域")
+            }
+        }, WORKBENCH_DROP_TIMEOUT_MS)
+    }
+
+    private fun finishWorkbenchDropIfReady() {
+        val pending = pendingWorkbenchDrop ?: return
+        if (!pending.accepted) return
+        if (!isWorkbenchEnabled) {
+            pendingWorkbenchDrop = null
+            return
+        }
+        val bounds = pending.layout.bounds
+        val tolerance = DesktopGeometry.dpToPx(8, state.dpi)
+        val placed = lastSnapshot.windows.lastOrNull {
+            it.pkg == pending.pkg && !it.minimized && it.taskId > 0 &&
+                abs(it.left - bounds.left) <= tolerance && abs(it.right - bounds.right) <= tolerance &&
+                abs(it.top - bounds.top) <= tolerance && abs(it.bottom - bounds.bottom) <= tolerance
+        } ?: return
+        pendingWorkbenchDrop = null
+        val companion = pending.companion
+        val companionBounds = pending.layout.companionBounds
+        val stillVisible = state.visibleChromeWindows.map { it.taskId }.toSet()
+        safeBgExecute {
+            if (companion != null && companionBounds != null && companion.taskId in stillVisible) {
+                val resized = BridgeClient.updateWindowBounds(
+                    companion.taskId, companion.pkg, BridgeClient.WIN_MODE_FREEFORM, companionBounds.toAndroidRect(), false,
+                )
+                if (!resized) return@safeBgExecute
+            }
+            for (window in pending.previous) {
+                if (window.taskId != companion?.taskId && window.taskId in stillVisible) {
+                    BridgeClient.windowLifecycleAction(window.taskId, window.pkg, BridgeClient.WIN_ACTION_MINIMIZE)
+                }
+            }
+            BridgeClient.windowLifecycleAction(placed.taskId, placed.pkg, BridgeClient.WIN_ACTION_FOCUS)
+        }
+        workbenchRail.captureSnapshotNow(placed.taskId, placed.pkg, followUpDelayMs = 650L)
     }
 
     override fun switchToWorkbenchApp(pkg: String, taskId: Int) {
@@ -947,9 +1054,17 @@ class DesktopShellCoordinator(private val svc: ServiceBridgeCallbacks) : Desktop
                     pkg, "", BridgeClient.WIN_MODE_FREEFORM,
                     stage.left, stage.top, stage.right, stage.bottom,
                 )
-                for (prev in prevVisible) {
-                    BridgeClient.windowLifecycleAction(prev.taskId, prev.pkg, BridgeClient.WIN_ACTION_MINIMIZE)
-                }
+            }
+            // Wait briefly for the new app window to materialize before sidelining previous Stage
+            // windows so the transition stays calm with zero desktop-empty blink.
+            if (prevVisible.isNotEmpty()) {
+                handler.postDelayed({
+                    safeBgExecute {
+                        for (prev in prevVisible) {
+                            BridgeClient.windowLifecycleAction(prev.taskId, prev.pkg, BridgeClient.WIN_ACTION_MINIMIZE)
+                        }
+                    }
+                }, 180L)
             }
             // Refresh newly launched app's live card thumbnail once its first frame settles past splash screen
             handler.postDelayed({

@@ -107,8 +107,14 @@ class LauncherDesktopPolicyTest {
         assertFalse(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, emptySnap, isResumed = true, isTopResumed = true, layoutMode = physLayout))
         assertFalse(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, minimizedSnap, isResumed = true, isTopResumed = true, layoutMode = physLayout))
 
-        // Standard onPause() when an app covers desktop -> immediately dimmed!
-        assertTrue(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, emptySnap, isResumed = false, isTopResumed = false, layoutMode = physLayout))
+        // Standard onPause() before WindowStateSnapshot arrives must stay SOFT_BEHIND_FREEFORM (no black launch flash).
+        assertEquals(
+            DesktopBackdropState.SOFT_BEHIND_FREEFORM,
+            LauncherDesktopPolicy.computeBackdropState(physStatus, emptySnap, isResumed = false, isTopResumed = false, layoutMode = physLayout),
+        )
+        assertFalse(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, emptySnap, isResumed = false, isTopResumed = false, layoutMode = physLayout))
+        // Explicit ADAPTIVE_SINGLE covering app when paused -> dimmed cleanly.
+        assertTrue(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, activeAppSnap, isResumed = false, isTopResumed = false, layoutMode = physLayout))
 
         // Android 11+ multi-resume: Launcher stays resumed behind a centered/freeform window, loses top-resumed -> dimmed!
         assertTrue(LauncherDesktopPolicy.shouldDimBackdrop(physStatus, activeAppSnap, isResumed = true, isTopResumed = false, layoutMode = physLayout))

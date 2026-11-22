@@ -87,6 +87,10 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
             sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleAppDrawer(focusSearch) } }
         }
 
+        fun openAppDrawerFromUi() {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.openAppDrawer() } }
+        }
+
         fun toggleWindowSwitcherFromUi() {
             sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleWindowSwitcher() } }
         }

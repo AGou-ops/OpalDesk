@@ -136,6 +136,7 @@ internal class WindowHeaderBarPool(private val host: DesktopShellHost) {
         private val btnMin: ImageView
         private val btnMax: ImageView
         private val btnClose: ImageView
+        private val bottomHairline: View
 
         var boundWindow: DesktopWindow? = null
         var isVisible: Boolean = false
@@ -156,12 +157,12 @@ internal class WindowHeaderBarPool(private val host: DesktopShellHost) {
             innerRow = LinearLayout(ctx).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadDp(6f, 0f, 6f, 0f)
+                setPadDp(9f, 0f, 8f, 0f)
             }
             btnBack = makeCtrlBtn(ctx, "返回上一页") {
                 boundWindow?.let { host.sendBackToWindow(it.taskId, it.pkg) }
             }
-            innerRow.addView(btnBack, ctx.llp(ctx.dp(28f), ctx.dp(28f), rightDp = 4f))
+            innerRow.addView(btnBack, ctx.llp(ctx.dp(28f), ctx.dp(26f), rightDp = 5f))
 
             iconView = ImageView(ctx).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
             innerRow.addView(iconView, ctx.llp(ctx.dp(17f), ctx.dp(17f), rightDp = 7f))
@@ -200,12 +201,17 @@ internal class WindowHeaderBarPool(private val host: DesktopShellHost) {
                 boundWindow?.let { host.closeWindow(it.taskId, it.pkg) }
             }
 
-            innerRow.addView(btnMore, ctx.llp(ctx.dp(28f), ctx.dp(28f), rightDp = 2f))
-            innerRow.addView(btnMin, ctx.llp(ctx.dp(28f), ctx.dp(28f), rightDp = 2f))
-            innerRow.addView(btnMax, ctx.llp(ctx.dp(28f), ctx.dp(28f), rightDp = 2f))
-            innerRow.addView(btnClose, ctx.llp(ctx.dp(28f), ctx.dp(28f)))
+            innerRow.addView(btnMore, ctx.llp(ctx.dp(29f), ctx.dp(26f), rightDp = 3f))
+            innerRow.addView(btnMin, ctx.llp(ctx.dp(29f), ctx.dp(26f), rightDp = 3f))
+            innerRow.addView(btnMax, ctx.llp(ctx.dp(29f), ctx.dp(26f), rightDp = 3f))
+            innerRow.addView(btnClose, ctx.llp(ctx.dp(29f), ctx.dp(26f)))
 
             root.addView(innerRow, ctx.flp(MATCH, headerH, Gravity.TOP or Gravity.LEFT))
+            bottomHairline = View(ctx)
+            root.addView(
+                bottomHairline,
+                FrameLayout.LayoutParams(MATCH, max(1, ctx.dp(0.6f)), Gravity.BOTTOM),
+            )
             lp = OverlayWindowParams.floating(ctx.dp(420f), headerH, host.winType, touchModal = false)
 
             attachDragAndTopResizeListener(ctx)
@@ -314,6 +320,7 @@ internal class WindowHeaderBarPool(private val host: DesktopShellHost) {
 
         private fun applyVisualTheme(ctx: Context, focused: Boolean, maximized: Boolean, tokens: GlassOverlayTokens) {
             root.background = tokens.makeWindowHeaderBackground(ctx, focused)
+            bottomHairline.setBackgroundColor(tokens.divider)
             titleView.setTextColor(if (focused) tokens.textPrimary else tokens.textSecondary)
             val iconColor = if (focused) tokens.textPrimary else tokens.textSecondary
             val hoverBg = tokens.hoverChipFill

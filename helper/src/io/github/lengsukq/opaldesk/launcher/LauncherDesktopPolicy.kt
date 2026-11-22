@@ -89,10 +89,11 @@ internal object LauncherDesktopPolicy {
         if (hasVisibleNonFreeformCoveringApp(status, windowSnapshot)) {
             return if (!isResumed || !isTopResumed) DesktopBackdropState.FULL_DIM else DesktopBackdropState.ACTIVE
         }
-        if (hasVisibleManagedForegroundApp(windowSnapshot)) {
+        if (hasVisibleManagedForegroundApp(windowSnapshot) || !isResumed) {
+            // Keep the desktop cleanly visible without flashing FULL_DIM while onPause() races ahead
+            // of the daemon's incoming WindowStateSnapshot on app launch.
             return DesktopBackdropState.SOFT_BEHIND_FREEFORM
         }
-        if (!isResumed) return DesktopBackdropState.FULL_DIM
         return DesktopBackdropState.ACTIVE
     }
 

@@ -28,13 +28,13 @@ import android.widget.TextView
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
 import android.window.OnBackInvokedDispatcher
+import io.github.lengsukq.opaldesk.desktop.input.CoalescingInputDispatcher
 import io.github.lengsukq.opaldesk.design.iosglass.LiquidGlassDrawable
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
 import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
 
@@ -91,11 +91,12 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
     private val handler = Handler(Looper.getMainLooper())
     private var ioExec: ExecutorService? = null
     private var inputExec: ExecutorService? = null
+    private var inputDispatcher: CoalescingInputDispatcher<QueuedMotion>? = null
 
     private lateinit var rootFrame: FrameLayout
     private lateinit var surfaceView: SurfaceView
     private lateinit var topHandleWrap: FrameLayout
-    private lateinit var topHandlePill: TextView
+    private lateinit var topHandlePill: View
     private lateinit var controlBar: LinearLayout
     private lateinit var statusOverlay: FrameLayout
     private lateinit var statusTitle: TextView
@@ -118,11 +119,6 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
     private var controlBarExpanded = false
     private var backCallback: OnBackInvokedCallback? = null
 
-    // Coalesced move/hover dispatch so 120Hz+ touch streams never back up Binder IPC.
-    private val moveLock = Any()
-    private var pendingMove: QueuedMotion? = null
-    private val moveScheduled = AtomicBoolean(false)
-
     private val binderReadyCb = Runnable {
         runOnUiThread {
             if (!isFinishing && !isDestroyed && surfaceValid) {
@@ -133,7 +129,7 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
 
     private val dimHandleTask = Runnable {
         if (!controlBarExpanded && ::topHandleWrap.isInitialized) {
-            topHandleWrap.animate().alpha(0.55f).setDuration(320L).start()
+            topHandleWrap.animate().alpha(0.6f).setDuration(360L).start()
         }
     }
 
@@ -155,7 +151,9 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
 
         sActiveRef = WeakReference(this)
         ioExec = Executors.newSingleThreadExecutor()
-        inputExec = Executors.newSingleThreadExecutor()
+        inputExec = Executors.newSingleThreadExecutor().also { executor ->
+            inputDispatcher = CoalescingInputDispatcher(executor, ::dispatchMotionBlocking)
+        }
 
         configureImmersiveWindow()
         BridgeService.sUserStopping = false
@@ -210,6 +208,7 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
                 Thread(stopRunner, "ExtLocalDexStop").start()
             }
         }
+        inputDispatcher = null
         inputExec?.shutdownNow()
         inputExec = null
         ioExec?.shutdown()
@@ -275,27 +274,26 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
         )
 
-        // Subtle top-center Liquid Glass menu pill (always recognizable, auto-dims gently)
-        topHandlePill = TextView(this).apply {
-            text = "DeX 菜单"
-            setTextColor(0xF0FFFFFF.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            paint.isFakeBoldText = true
-            isSingleLine = true
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(11f), dp(4f), dp(11f), dp(4f))
-            HyperUi.setStartIcon(this, HyperUi.ICON_DEX, 0xF0FFFFFF.toInt(), 12f, 4f)
+        // Ultra-minimal iPadOS-style frosted top edge grabber (never collides with window title bars)
+        topHandlePill = View(this).apply {
+            elevation = dp(4f).toFloat()
             LiquidGlassDrawable.applyToView(
                 view = this,
-                fillColor = 0xAA0F172A.toInt(),
-                cornerRadiusPx = dp(14f).toFloat(),
-                strokeWidthPx = dp(0.8f).toFloat(),
-                darkMode = true,
+                fillColor = 0xD8F8FAFC.toInt(),
+                cornerRadiusPx = dp(3f).toFloat(),
+                strokeWidthPx = dp(0.6f).toFloat(),
+                darkMode = false,
             )
         }
         topHandleWrap = FrameLayout(this).apply {
-            setPadding(dp(10f), dp(6f), dp(10f), dp(8f))
-            addView(topHandlePill, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER_HORIZONTAL))
+            minimumHeight = dp(36f)
+            setPadding(dp(20f), dp(9f), dp(20f), 0)
+            contentDescription = "打开 DeX 菜单"
+            isFocusable = true
+            addView(
+                topHandlePill,
+                FrameLayout.LayoutParams(dp(54f), dp(4.5f), Gravity.CENTER_HORIZONTAL or Gravity.TOP),
+            )
             setOnClickListener { setControlBarExpanded(true) }
             visibility = View.GONE
         }
@@ -319,20 +317,16 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
                 clipOutline = true,
             )
             addView(makeBarButton("桌面", HyperUi.ICON_HOME_NAV, false) {
-                setControlBarExpanded(false)
-                BridgeService.toggleShowDesktopFromUi()
+                runDesktopOverlayAction { BridgeService.toggleShowDesktopFromUi() }
             })
             addView(makeBarButton("工作台", HyperUi.ICON_SIDEBAR, false) {
-                setControlBarExpanded(false)
-                BridgeService.toggleWorkbenchFromUi()
+                runDesktopOverlayAction { BridgeService.toggleWorkbenchFromUi() }
             })
             addView(makeBarButton("任务栏", HyperUi.ICON_WINDOW, false) {
-                setControlBarExpanded(false)
-                BridgeService.wakeTaskbarFromUi()
+                runDesktopOverlayAction { BridgeService.wakeTaskbarFromUi() }
             })
             addView(makeBarButton("应用", HyperUi.ICON_APPS, false) {
-                setControlBarExpanded(false)
-                BridgeService.toggleAppDrawerFromUi(false)
+                runDesktopOverlayAction { BridgeService.openAppDrawerFromUi() }
             })
             addView(makeBarButton("控制台", HyperUi.ICON_SLIDERS, false) {
                 setControlBarExpanded(false)
@@ -638,6 +632,21 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private fun runDesktopOverlayAction(action: () -> Unit) {
+        setControlBarExpanded(false)
+        when {
+            BridgeService.isDeXShellAttached(activeVdId) -> action()
+            !NavAssistService.isRunning() && !Settings.canDrawOverlays(this) -> {
+                openMainConsole()
+                Toast.makeText(this, "请在控制台开启悬浮窗或无障碍权限后使用桌面控件", Toast.LENGTH_LONG).show()
+            }
+            else -> {
+                BridgeService.refreshFromReceiver(this)
+                Toast.makeText(this, "桌面控件正在连接，请稍后再试", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     private fun exitLocalDexAndFinish() {
         explicitExit = true
         val exec = ioExec
@@ -714,30 +723,9 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
             ys = ys,
             pressures = pressures,
         )
-        enqueueMotionPacket(packet, coalescable = (masked == MotionEvent.ACTION_MOVE || masked == MotionEvent.ACTION_HOVER_MOVE))
+        val coalescingKey = masked.takeIf { it == MotionEvent.ACTION_MOVE || it == MotionEvent.ACTION_HOVER_MOVE }
+        inputDispatcher?.submit(packet, coalescingKey)
         return true
-    }
-
-    private fun enqueueMotionPacket(packet: QueuedMotion, coalescable: Boolean) {
-        val exec = inputExec
-        if (exec == null || exec.isShutdown) return
-        if (coalescable) {
-            synchronized(moveLock) { pendingMove = packet }
-            if (moveScheduled.compareAndSet(false, true)) {
-                exec.execute {
-                    moveScheduled.set(false)
-                    val latest = synchronized(moveLock) { pendingMove.also { pendingMove = null } }
-                    if (latest != null) dispatchMotionBlocking(latest)
-                }
-            }
-            return
-        }
-        // Flush any queued move before discrete DOWN/UP/POINTER/SCROLL transitions to preserve ordering.
-        val flushed = synchronized(moveLock) { pendingMove.also { pendingMove = null } }
-        exec.execute {
-            if (flushed != null) dispatchMotionBlocking(flushed)
-            dispatchMotionBlocking(packet)
-        }
     }
 
     private fun dispatchMotionBlocking(m: QueuedMotion) {
@@ -770,13 +758,13 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
         }
         if (code == KeyEvent.KEYCODE_BACK) {
             if (event.action == KeyEvent.ACTION_UP) {
-                inputExec?.execute { BridgeClient.sendBack() }
+                inputDispatcher?.submit { BridgeClient.sendBack() }
             }
             return true
         }
         if (event.action == KeyEvent.ACTION_DOWN) {
             val meta = event.metaState
-            inputExec?.execute { BridgeClient.sendKey(code, meta) }
+            inputDispatcher?.submit { BridgeClient.sendKey(code, meta) }
         }
         return true
     }
@@ -785,7 +773,7 @@ class LocalDexActivity : Activity(), SurfaceHolder.Callback {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             val cb = OnBackInvokedCallback {
                 if (activeVdId > 0) {
-                    inputExec?.execute { BridgeClient.sendBack() }
+                    inputDispatcher?.submit { BridgeClient.sendBack() }
                 } else {
                     exitLocalDexAndFinish()
                 }

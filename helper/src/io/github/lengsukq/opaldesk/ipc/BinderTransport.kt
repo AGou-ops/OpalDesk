@@ -212,4 +212,29 @@ object BinderTransport {
             data.recycle()
         }
     }
+
+    /**
+     * Ultra-low-latency fire-and-forget Binder path for 120Hz+ local touch/scroll forwarding.
+     * Skips the extra synchronous {@code pingBinder()} roundtrip (relying on {@code linkToDeath}
+     * and {@code DeadObjectException} cleanup) and uses {@code FLAG_ONEWAY} for zero reply wait.
+     */
+    fun transactOneWayFast(code: Int, write: Parcel.() -> Unit = {}): Boolean {
+        val svc = binder ?: return false
+        val data = obtainInterfaceParcel()
+        return try {
+            data.write()
+            svc.transact(code, data, null, IBinder.FLAG_ONEWAY)
+        } catch (e: android.os.DeadObjectException) {
+            if (binder === svc) {
+                binder = null
+                DaemonStateStore.resetDisconnected()
+            }
+            false
+        } catch (t: Throwable) {
+            Log.w(TAG, "Fast one-way binder transact failed for code=$code", t)
+            false
+        } finally {
+            data.recycle()
+        }
+    }
 }

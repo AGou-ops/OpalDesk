@@ -4,6 +4,7 @@ import android.app.ActivityOptions;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.graphics.Rect;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Parcel;
 import android.os.SystemClock;
@@ -46,6 +47,10 @@ public final class TaskWindowController {
 
     private static volatile Method sSetLaunchWindowingModeMethod;
     private static volatile boolean sSetLaunchWindowingModeChecked;
+    private static volatile Method sSetDisableStartingWindowMethod;
+    private static volatile boolean sSetDisableStartingWindowChecked;
+    private static volatile Method sSetTaskAlwaysOnTopMethod;
+    private static volatile boolean sSetTaskAlwaysOnTopChecked;
 
     private final AndroidServices services;
     private final DaemonConfig config;
@@ -212,8 +217,20 @@ public final class TaskWindowController {
         if (displayId > 0) {
             opts.setLaunchBounds(bounds);
             applyLaunchWindowingMode(opts, windowingMode);
+            if (windowingMode == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW) {
+                applyDisableStartingWindow(opts);
+                applyTaskAlwaysOnTop(opts, true);
+            }
         }
         return opts;
+    }
+
+    private static Bundle makeLaunchBundle(int displayId, int windowingMode, Rect bounds) {
+        Bundle b = makeLaunchOptions(displayId, windowingMode, bounds).toBundle();
+        if (displayId > 0 && windowingMode == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW) {
+            b.putBoolean("android.activity.disableStartingWindow", true);
+        }
+        return b;
     }
 
     // ---- Shared Single-Window Transition Engine ----
@@ -286,15 +303,17 @@ public final class TaskWindowController {
             if (pureTranslation && taskApi.getTaskWindowingMode(taskId) == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW) {
                 taskApi.resizeTask(taskId, ar, TaskApiAdapter.RESIZE_MODE_USER);
             } else {
-                taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
+                taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, false);
                 if (bringToFront) {
                     bringMultiWindowTaskFront(taskId, ar);
+                    // Always sync SurfaceFlinger Task leash after bringMultiWindowTaskFront so
+                    // HyperOS never leaves a newly migrated task's surface anchored at (0, 0).
                     taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
                     if (mainHandler != null) {
                         final int fTid = taskId;
                         final int fVd = vdId;
                         final Rect fAr = new Rect(ar);
-                        for (long delay : new long[]{80L, 240L}) {
+                        for (long delay : new long[]{100L, 260L}) {
                             mainHandler.postDelayed(() -> {
                                 if (config.vdId != fVd || config.shuttingDown) return;
                                 ManagedWindow curMw = windowManager.getManagedWindow(fTid);
@@ -387,7 +406,7 @@ public final class TaskWindowController {
         WindowRect explicit = (right - left >= 200 && bottom - top >= 200)
                 ? DesktopWindowManager.clampBoundsToWorkArea(new WindowRect(left, top, right, bottom), config.virtW, Math.max(360, config.virtH))
                 : null;
-        int existingTid = findTaskIdForPkg(pkg, true);
+        int existingTid = findTaskIdForPkg(pkg, false);
         if (existingTid > 0 && isTaskAllowedForExtControl(existingTid, pkg, false)) {
             applySingleWindowMode(existingTid, pkg, targetMode, explicit, true, true, false);
             notifyStateChanged();
@@ -425,9 +444,9 @@ public final class TaskWindowController {
         // managers (such as Xiaomi HyperOS MiuiFreeFormManagerService on mode 5) never hijack task
         // scale, leash position, or inject native OEM white caption headers.
         int launchWindowingMode = useMw ? BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW : BridgeProtocol.WINDOWING_MODE_FULLSCREEN;
-        boolean ok = services.startActivityAsShell(intent, makeLaunchOptions(
+        boolean ok = services.startActivityAsShell(intent, makeLaunchBundle(
                 vdId, launchWindowingMode,
-                useMw ? rect.toAndroidRect() : null).toBundle());
+                useMw ? rect.toAndroidRect() : null));
         if (ok) {
             final String fMode = targetMode;
             final WindowRect fRect = rect;
@@ -435,10 +454,10 @@ public final class TaskWindowController {
                 verifyLaunchedWindowAsync(pkg, fMode, fRect, true, true);
             }
             if (mainHandler != null) {
-                long[] delays = useMw ? new long[]{20L, 70L, 180L, 380L} : new long[]{200L, 600L};
-                for (int i = 0; i < delays.length; i++) {
-                    final boolean forceSync = (i <= 1);
-                    mainHandler.postDelayed(() -> verifyLaunchedWindowAsync(pkg, fMode, fRect, useMw, forceSync), delays[i]);
+                long[] delays = useMw ? new long[]{40L, 140L, 340L} : new long[]{200L, 600L};
+                for (long delay : delays) {
+                    boolean firstPin = useMw && delay == 40L;
+                    mainHandler.postDelayed(() -> verifyLaunchedWindowAsync(pkg, fMode, fRect, useMw, firstPin), delay);
                 }
             }
         }
@@ -584,16 +603,27 @@ public final class TaskWindowController {
         int vdId = config.vdId;
         if (vdId <= 0 || config.mirrorMode != BridgeProtocol.MIRROR_MODE_DEX) return false;
         if (windowManager.isTilingActive()) exitTilingAndRestore(false);
-        windowManager.minimizeAllWindows();
-        int lTid = queries.findExtLauncherTaskId();
-        if (lTid > 0) {
-            taskApi.detachFreeformAndEnsureFullscreen(lTid, vdId, config.virtW, config.virtH,
-                    taskApi.getTaskWindowingMode(lTid) != BridgeProtocol.WINDOWING_MODE_FULLSCREEN, mainHandler);
-            if (taskApi.startActivityFromRecents(lTid, makeLaunchOptions(vdId, BridgeProtocol.WINDOWING_MODE_FULLSCREEN, null).toBundle())) {
-                if (mainHandler != null) mainHandler.postDelayed(() -> enforceRunningExtTasksFullscreen(config.fullscreenPolicy == 1), 180L);
-                notifyStateChanged();
-                return true;
+        // Atomically drop all visible floating/fullscreen user tasks behind LauncherActivity
+        // without violently relaunching LauncherActivity (which causes a full-screen transition flash).
+        LinkedHashSet<Integer> toHide = new LinkedHashSet<>(collectExtUserTaskIds(vdId));
+        for (ManagedWindow mw : windowManager.getManagedWindowsSnapshot()) {
+            if (mw != null && mw.taskId > 0 && !BridgeBuildConfig.HELPER_PACKAGE.equals(mw.pkg)) {
+                toHide.add(mw.taskId);
             }
+        }
+        int lTid = queries.findExtLauncherTaskId();
+        if (lTid > 0) toHide.remove(lTid);
+        windowManager.minimizeAllWindows();
+        for (int tid : toHide) {
+            taskApi.sendTaskBehindDesktop(tid, vdId);
+        }
+        if (lTid > 0) {
+            if (taskApi.getTaskWindowingMode(lTid) != BridgeProtocol.WINDOWING_MODE_FULLSCREEN) {
+                taskApi.detachFreeformAndEnsureFullscreen(lTid, vdId, config.virtW, config.virtH, true, mainHandler);
+            }
+            taskApi.reorderTask(lTid, vdId, true);
+            notifyStateChanged();
+            return true;
         }
         boolean ok = launchComponentOnVd(BridgeBuildConfig.HELPER_PACKAGE, BridgeProtocol.HELPER_LAUNCHER_CLASS);
         if (ok) notifyStateChanged();
@@ -637,7 +667,7 @@ public final class TaskWindowController {
             case BridgeProtocol.WIN_ACTION_MINIMIZE:
                 if (tid > 0) {
                     windowManager.setMinimizedTask(tid, true);
-                    taskApi.reorderTask(tid, vdId, false);
+                    taskApi.sendTaskBehindDesktop(tid, vdId);
                 }
                 ManagedWindow nextFocus = null;
                 for (ManagedWindow m : windowManager.getManagedWindowsSnapshot()) {
@@ -646,7 +676,10 @@ public final class TaskWindowController {
                     }
                 }
                 if (nextFocus == null) {
-                    minimizeToExtHome(tid, safePkg);
+                    int lTid = queries.findExtLauncherTaskId();
+                    if (lTid <= 0) {
+                        minimizeToExtHome(tid, safePkg);
+                    }
                 } else {
                     // Only focus the next top non-minimized window without thrashing Launcher or
                     // reordering every remaining task (prevents desktop flash & Z-order scramble).
@@ -814,13 +847,13 @@ public final class TaskWindowController {
             }
         }
         if (hadVisibleUserTask) {
+            for (int tid : userTids) {
+                taskApi.sendTaskBehindDesktop(tid, displayId);
+            }
             if (launcherTid > 0) {
                 taskApi.startActivityFromRecents(
                         launcherTid, makeLaunchOptions(displayId, BridgeProtocol.WINDOWING_MODE_FULLSCREEN, null).toBundle());
                 taskApi.reorderTask(launcherTid, displayId, true);
-            }
-            for (int tid : userTids) {
-                taskApi.reorderTask(tid, displayId, false);
             }
             SystemClock.sleep(180L);
         }
@@ -1121,7 +1154,7 @@ public final class TaskWindowController {
     boolean bringMultiWindowTaskFront(int taskId, Rect bounds) {
         if (taskId <= 0 || config.vdId <= 0) return false;
         boolean ok = taskApi.startActivityFromRecents(
-                taskId, makeLaunchOptions(config.vdId, BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW, bounds).toBundle());
+                taskId, makeLaunchBundle(config.vdId, BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW, bounds));
         taskApi.reorderTask(taskId, config.vdId, true);
         return ok;
     }
@@ -1233,6 +1266,30 @@ public final class TaskWindowController {
             // and zero user tasks remain visible.
             windowManager.minimizeAllWindows();
         }
+    }
+
+    private static void applyTaskAlwaysOnTop(ActivityOptions opts, boolean alwaysOnTop) {
+        if (!sSetTaskAlwaysOnTopChecked) {
+            try { sSetTaskAlwaysOnTopMethod = ActivityOptions.class.getMethod("setTaskAlwaysOnTop", boolean.class); }
+            catch (NoSuchMethodException ignored) { sSetTaskAlwaysOnTopMethod = null; }
+            finally { sSetTaskAlwaysOnTopChecked = true; }
+        }
+        Method m = sSetTaskAlwaysOnTopMethod;
+        if (m == null) return;
+        try { m.invoke(opts, alwaysOnTop); }
+        catch (ReflectiveOperationException | RuntimeException ignored) {}
+    }
+
+    private static void applyDisableStartingWindow(ActivityOptions opts) {
+        if (!sSetDisableStartingWindowChecked) {
+            try { sSetDisableStartingWindowMethod = ActivityOptions.class.getMethod("setDisableStartingWindow", boolean.class); }
+            catch (NoSuchMethodException ignored) { sSetDisableStartingWindowMethod = null; }
+            finally { sSetDisableStartingWindowChecked = true; }
+        }
+        Method m = sSetDisableStartingWindowMethod;
+        if (m == null) return;
+        try { m.invoke(opts, true); }
+        catch (ReflectiveOperationException | RuntimeException ignored) {}
     }
 
     private static void applyLaunchWindowingMode(ActivityOptions opts, int windowingMode) {

@@ -1,8 +1,10 @@
 package io.github.lengsukq.opaldesk.ui
 
+import android.provider.Settings
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -10,10 +12,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.lengsukq.opaldesk.BridgeService
+import io.github.lengsukq.opaldesk.NavAssistService
 import io.github.lengsukq.opaldesk.design.iosglass.GlassTier
 import io.github.lengsukq.opaldesk.design.iosglass.LiquidGlassSegmentedTabs
 import io.github.lengsukq.opaldesk.design.iosglass.LiquidGlassSurface
@@ -43,51 +49,60 @@ fun DashboardPage(
     onOpenSideControl: () -> Unit,
     onOpenWidgetSlot: (Int) -> Unit,
 ) {
-    if (isWide) {
-        Row(modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            LazyColumn(
-                modifier = Modifier.weight(1f).fillMaxHeight().clipToBounds(),
-                contentPadding = PaddingValues(top = 10.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                item {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        DashboardPrimaryColumn(
-                            ctrl, allPermsOk, showJumpCard = false,
-                            onOpenPermDialog, onOpenLocalDex, onOpenTouchpad, onOpenSideControl,
-                        )
-                    }
-                }
-            }
-            LazyColumn(
-                modifier = Modifier.weight(1.08f).fillMaxHeight().clipToBounds(),
-                contentPadding = PaddingValues(top = 10.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                item {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        if (ctrl.daemonStatus.mirrorMode == MirrorMode.MIRROR) MirrorConfigSection(ctrl, onOpenSideControl, onOpenWidgetSlot)
-                        else DexConfigSection(ctrl)
-                    }
-                }
-            }
-        }
-    } else {
-        LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    DashboardPrimaryColumn(
-                        ctrl, allPermsOk, showJumpCard = true,
+    val fontScale = LocalDensity.current.fontScale.coerceAtLeast(1f)
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        // The rail already takes part of the window width. Choose the layout using the
+        // remaining content width so a portrait tablet doesn't squeeze both columns.
+        if (isWide && maxWidth >= 880.dp * fontScale) {
+            Row(modifier = Modifier.fillMaxSize().padding(horizontal = 20.dp), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                LazyColumn(
+                    modifier = Modifier.weight(1f).fillMaxHeight().clipToBounds(),
+                    contentPadding = PaddingValues(top = 10.dp, bottom = 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    dashboardPrimaryItems(
+                        ctrl, allPermsOk, showJumpCard = false,
                         onOpenPermDialog, onOpenLocalDex, onOpenTouchpad, onOpenSideControl,
                     )
                 }
+                LazyColumn(
+                    modifier = Modifier.weight(1.08f).fillMaxHeight().clipToBounds(),
+                    contentPadding = PaddingValues(top = 10.dp, bottom = 24.dp),
+                ) { dashboardConfigItem(ctrl, onOpenSideControl, onOpenWidgetSlot) }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = contentPadding,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                dashboardPrimaryItems(
+                    ctrl, allPermsOk, showJumpCard = !isWide,
+                    onOpenPermDialog, onOpenLocalDex, onOpenTouchpad, onOpenSideControl,
+                )
+                if (isWide) dashboardConfigItem(ctrl, onOpenSideControl, onOpenWidgetSlot)
             }
         }
     }
 }
 
-@Composable
-private fun DashboardPrimaryColumn(
+private fun LazyListScope.dashboardConfigItem(
+    ctrl: MainController,
+    onOpenSideControl: () -> Unit,
+    onOpenWidgetSlot: (Int) -> Unit,
+) {
+    item(key = "displayConfig") {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (!ctrl.daemonStatus.isLocalDexActive && ctrl.daemonStatus.mirrorMode == MirrorMode.MIRROR) {
+                MirrorConfigSection(ctrl, onOpenSideControl, onOpenWidgetSlot)
+            } else {
+                DexConfigSection(ctrl)
+            }
+        }
+    }
+}
+
+private fun LazyListScope.dashboardPrimaryItems(
     ctrl: MainController,
     allPermsOk: Boolean,
     showJumpCard: Boolean,
@@ -99,49 +114,68 @@ private fun DashboardPrimaryColumn(
     val st = ctrl.daemonStatus
     val connSummary = BridgeLabels.classifyConnectionSummary(st, ctrl.localLanIp)
 
-    if (!allPermsOk) PermissionWarningCard(onOpenPermDialog)
+    if (!allPermsOk) item(key = "permissions") { PermissionWarningCard(onOpenPermDialog) }
     if (st.connected && !st.isLocalDexActive && (st.vdId > 0 || st.extId > 0 || st.isRemoteSink)) {
-        ContinuityTrackpadBanner(
-            targetLabel = if (st.isRemoteSink) (st.remotePeerName.ifBlank { "Mac 远程屏" }) else "USB-C 外接屏",
-            resolution = "${st.virtW}×${st.virtH}",
-            onOpenTouchpad = onOpenTouchpad,
-        )
+        item(key = "trackpad") {
+            ContinuityTrackpadBanner(
+                targetLabel = if (st.isRemoteSink) st.remotePeerName.ifBlank { "Mac 远程屏" } else "USB-C 外接屏",
+                resolution = "${st.virtW}×${st.virtH}",
+                onOpenTouchpad = onOpenTouchpad,
+            )
+        }
     }
 
-    HeroConnectionCard(
-        status = st, summary = connSummary,
-        onOpenActivation = { ctrl.openActivationSheet() },
-        onOpenDiag = { ctrl.showDiagSheet = true },
-        onSwitchToUhid = { ctrl.applyInputBackendMode(InputBackend.UHID) },
-        onDisconnectRemote = { ctrl.disconnectRemoteMac() },
-        onOpenLocalDex = onOpenLocalDex,
-        onStopLocalDex = { ctrl.stopLocalDex() },
-        onRebuild = { ctrl.rebuildRenderPipeline("已重建扩展渲染管线") },
-    )
+    item(key = "connection") {
+        HeroConnectionCard(
+            status = st, summary = connSummary,
+            onOpenActivation = { ctrl.openActivationSheet() },
+            onOpenDiag = { ctrl.showDiagSheet = true },
+            onSwitchToUhid = { ctrl.applyInputBackendMode(InputBackend.UHID) },
+            onDisconnectRemote = { ctrl.disconnectRemoteMac() },
+            onOpenLocalDex = onOpenLocalDex,
+            onStopLocalDex = { ctrl.stopLocalDex() },
+            onRebuild = { ctrl.rebuildRenderPipeline("已重建扩展渲染管线") },
+        )
+    }
 
     if (!st.isLocalDexActive) {
-        SectionHeader("本机免外接屏")
-        LocalDexEntryCard(status = st, onClick = onOpenLocalDex)
-
-        SectionHeader("Mac / 无线大屏")
-        RemoteMacSummaryCard(st, connSummary, ctrl.localLanIp) { ctrl.openRemoteMacSheet() }
-
-        SectionHeader("输出模式")
-        LiquidGlassSegmentedTabs(
-            items = listOf("电脑桌面模式", "融合边栏镜像"),
-            selectedIndex = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0,
-            onSelect = { ctrl.switchOutputMode(if (it == 1) MirrorMode.MIRROR else MirrorMode.DEX) },
-            modifier = Modifier.fillMaxWidth(),
-        )
+        item(key = "localDexHeader") { SectionHeader("本机免外接屏") }
+        item(key = "localDex") { LocalDexEntryCard(status = st, onClick = onOpenLocalDex) }
+        item(key = "remoteHeader") { SectionHeader("Mac / 无线大屏") }
+        item(key = "remote") { RemoteMacSummaryCard(st, connSummary, ctrl.localLanIp) { ctrl.openRemoteMacSheet() } }
+        item(key = "outputHeader") { SectionHeader("输出模式") }
+        item(key = "output") {
+            LiquidGlassSegmentedTabs(
+                items = listOf("电脑桌面模式", "融合边栏镜像"),
+                selectedIndex = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0,
+                onSelect = { ctrl.switchOutputMode(if (it == 1) MirrorMode.MIRROR else MirrorMode.DEX) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
     }
 
-    SectionHeader("快捷控制")
-    QuickControlBentoGrid(
-        st, ctrl.screenDimmed, { ctrl.toggleInputRouting() }, onOpenTouchpad,
-        { ctrl.toggleBlackout() }, onOpenSideControl, onOpenLocalDex, { ctrl.stopLocalDex() }, { ctrl.relaunchExtLauncher() },
-    )
+    item(key = "shortcutsHeader") { SectionHeader("快捷控制") }
+    item(key = "shortcuts") {
+        val context = LocalContext.current
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            QuickControlBentoGrid(
+                st, ctrl.screenDimmed, { ctrl.toggleInputRouting() }, onOpenTouchpad,
+                { ctrl.toggleBlackout() }, onOpenSideControl, onOpenLocalDex, { ctrl.relaunchExtLauncher() },
+                onOpenAllApps = {
+                    when {
+                        BridgeService.isDeXShellAttached(st.vdId) -> {
+                            onOpenLocalDex()
+                            BridgeService.openAppDrawerFromUi()
+                        }
+                        !NavAssistService.isRunning() && !Settings.canDrawOverlays(context) -> onOpenPermDialog()
+                        else -> ctrl.toast("桌面控件正在连接，请稍后再试")
+                    }
+                },
+            )
+        }
+    }
 
-    if (showJumpCard) {
+    if (showJumpCard) item(key = "settingsShortcut") {
         val isMirror = !st.isLocalDexActive && st.mirrorMode == MirrorMode.MIRROR
         LiquidGlassSurface(cornerRadius = 22.dp, contentPadding = PaddingValues(4.dp)) {
             ArrowPreference(
@@ -237,7 +271,7 @@ private fun HeroConnectionCard(
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text(
                 summary.headline, fontSize = 17.sp, fontWeight = FontWeight.Bold,
-                color = glass.textPrimary, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 8.dp),
+                color = glass.textPrimary, maxLines = 2, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f).padding(end = 8.dp),
             )
             StatusPillBadge(summary.badgeLabel, summary.tone.toColor())
         }
@@ -273,10 +307,11 @@ private fun HeroConnectionCard(
         if (!status.connected) {
             TextButton("立即激活后台服务", onOpenActivation, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.fillMaxWidth())
         } else if (status.isLocalDexActive) {
+            TextButton("返回 DeX", onOpenLocalDex, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton("返回 DeX", onOpenLocalDex, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.weight(1.1f))
                 DangerActionButton("退出 DeX", onStopLocalDex, Modifier.weight(1f))
-                TextButton("诊断", onOpenDiag, modifier = Modifier.weight(0.8f))
+                TextButton("诊断", onOpenDiag, modifier = Modifier.weight(1f))
             }
         } else {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -385,18 +420,18 @@ private fun QuickControlBentoGrid(
     onToggleBlackout: () -> Unit,
     onOpenSideControl: () -> Unit,
     onOpenLocalDex: () -> Unit,
-    onStopLocalDex: () -> Unit,
     onRelaunchLauncher: () -> Unit,
+    onOpenAllApps: () -> Unit,
 ) {
     if (status.isLocalDexActive) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             HyperBentoTile(
-                "回到 DeX 桌面", "最小化所有窗口并进入桌面", ExtVectorIcons.MonitorDex, false,
+                "显示桌面", "最小化所有窗口", ExtVectorIcons.MonitorDex, false,
                 { onRelaunchLauncher(); onOpenLocalDex() }, Modifier.weight(1f), HyperBlue,
             )
             HyperBentoTile(
-                "打开全部应用", "进入本机 DeX 并展开应用抽屉", ExtVectorIcons.AppRules, false,
-                { onOpenLocalDex(); io.github.lengsukq.opaldesk.BridgeService.toggleAppDrawerFromUi(false) },
+                "全部应用", "打开应用抽屉", ExtVectorIcons.AppRules, false,
+                onOpenAllApps,
                 Modifier.weight(1f), HyperPurple,
             )
         }

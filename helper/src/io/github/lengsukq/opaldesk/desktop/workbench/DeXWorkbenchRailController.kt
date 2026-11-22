@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.SystemClock
 import android.text.TextUtils
@@ -12,6 +13,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.PointerIcon
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -40,6 +42,7 @@ import io.github.lengsukq.opaldesk.overlay.llp
 import io.github.lengsukq.opaldesk.overlay.roundedBg
 import io.github.lengsukq.opaldesk.overlay.setPadDp
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
+import kotlin.math.abs
 import kotlin.math.max
 
 /**
@@ -51,14 +54,18 @@ import kotlin.math.max
  * one-tap Left/Top rail toggle, and an in-DeX `+ 添加` app picker.
  */
 @SuppressLint("ClickableViewAccessibility")
-internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
+internal class DeXWorkbenchRailController(
+    private val host: DesktopShellHost,
+    private val onDrop: (String, WorkbenchDropLayout) -> Unit,
+) {
 
     companion object {
         private const val SURFACE_KEY = "dex_workbench_rail"
+        private const val DROP_PREVIEW_KEY = "dex_workbench_drop"
         const val LEFT_RAIL_WIDTH_DP = 196f
         const val TOP_RAIL_HEIGHT_DP = 120f
         private const val RAIL_EDGE_MARGIN_DP = 10f
-        private const val LOCAL_DEX_TOP_CLEARANCE_DP = 34f
+        private const val LOCAL_DEX_TOP_CLEARANCE_DP = 16f
         private const val SNAPSHOT_REFRESH_MS = 4500L
         private const val MAX_CACHED_SNAPSHOTS = 14
     }
@@ -88,6 +95,8 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
     private var btnFlipPos: TextView? = null
     private var btnAdd: TextView? = null
     private var btnClose: ImageView? = null
+    private var dragPreview: WorkbenchDragPreview? = null
+    private var draggedCard: View? = null
 
     private var lastBuiltPosition = -1
     private var lastBuiltDark: Boolean? = null
@@ -121,13 +130,24 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
         railShell = shell
         railLp = lp
         host.surfaceHost.register(OverlaySurfaceHost.SurfaceEntry(SURFACE_KEY, OverlayLayer.DOCK, shell, lp))
+        val preview = WorkbenchDragPreview(ctx, host).apply { visibility = View.GONE }
+        dragPreview = preview
+        host.surfaceHost.register(
+            OverlaySurfaceHost.SurfaceEntry(
+                DROP_PREVIEW_KEY, OverlayLayer.SWITCHER, preview,
+                OverlayWindowParams.fullscreenNonTouchable(MATCH, MATCH, host.winType),
+            ),
+        )
         rebuildInnerLayoutForPosition(ctx, host.workbenchPosition)
     }
 
     fun detach() {
+        endCardDrag()
         host.handler.removeCallbacks(periodicSnapshotTask)
         lastVisible = false
         host.surfaceHost.unregister(SURFACE_KEY, host.extWm)
+        host.surfaceHost.unregister(DROP_PREVIEW_KEY, host.extWm)
+        dragPreview = null
         railShell = null
         railRoot = null
         railLp = null
@@ -144,6 +164,7 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
 
     fun onDisplayBoundsChanged(ctx: Context) {
         if (railShell == null) return
+        endCardDrag()
         updateLayoutGeometry(ctx)
     }
 
@@ -191,6 +212,10 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
         }
     }
 
+    fun currentStageRect(): IntRect = host.state.let {
+        computeStageRect(it.displayW, it.displayH, it.dpi, host.isTaskbarAutoHide, host.lastStatus.isLocalDexActive)
+    }
+
     fun render(
         ctx: Context,
         state: DesktopState,
@@ -205,11 +230,13 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
         lastIsLocalDex = isLocalDex
 
         if (posChanged) {
+            endCardDrag()
             rebuildInnerLayoutForPosition(ctx, pos)
             updateLayoutGeometry(ctx)
         }
 
         if (!shouldShow) {
+            endCardDrag()
             if (lastVisible || shell.visibility != View.GONE) {
                 lastVisible = false
                 shell.visibility = View.GONE
@@ -229,10 +256,17 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
         }
         if (!lastVisible || shell.visibility != View.VISIBLE) {
             lastVisible = true
+            shell.animate().cancel()
+            shell.alpha = 0f
+            shell.translationX = if (pos == AppPrefs.WORKBENCH_POS_LEFT) -ctx.dpF(12f) else 0f
+            shell.translationY = if (pos == AppPrefs.WORKBENCH_POS_TOP) -ctx.dpF(12f) else 0f
             shell.visibility = View.VISIBLE
+            shell.animate().alpha(1f).translationX(0f).translationY(0f).setDuration(180L).start()
             host.handler.removeCallbacks(periodicSnapshotTask)
             host.handler.postDelayed(periodicSnapshotTask, 650L)
         }
+
+        if (draggedCard != null) return
 
         val models = buildCardModels(state)
         val sig = buildString {
@@ -349,17 +383,17 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
         }
         titleLabel = TextView(ctx).apply {
             text = "工作台"
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12.5f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13f)
             paint.isFakeBoldText = true
             isSingleLine = true
         }.also { topRow.addView(it, ctx.llp(WRAP, WRAP, rightDp = 5f)) }
 
         countBadge = TextView(ctx).apply {
             text = "0"
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10f)
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.8f)
             paint.isFakeBoldText = true
             gravity = Gravity.CENTER
-            setPadDp(6f, 1.5f)
+            setPadDp(5.5f, 1.2f)
         }.also { topRow.addView(it, ctx.llp(WRAP, WRAP)) }
 
         topRow.addView(View(ctx), ctx.llp(0, 1, 1f))
@@ -372,19 +406,19 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
             setOnClickListener { host.setWorkbenchEnabled(false) }
         }.also { topRow.addView(it, ctx.llp(ctx.dp(24f), ctx.dp(24f), leftDp = 4f)) }
 
-        bar.addView(topRow, ctx.llp(if (isTop) ctx.dp(112f) else MATCH, WRAP, bottomDp = 6f))
+        bar.addView(topRow, ctx.llp(if (isTop) ctx.dp(116f) else MATCH, WRAP, bottomDp = 7f))
 
         val actionsRow = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         btnFlipPos = TextView(ctx).apply {
-            text = if (isTop) "切左侧" else "切顶部"
+            text = if (isTop) "左侧" else "顶部"
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 10.5f)
             paint.isFakeBoldText = true
             gravity = Gravity.CENTER
             isSingleLine = true
-            setPadDp(8f, 5f)
+            setPadDp(8f, 5.5f)
             pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_HAND)
             OverlayUiUtils.attachTactilePress(this, 0.92f)
             setOnClickListener {
@@ -395,7 +429,7 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
                 }
                 host.setWorkbenchPosition(next)
             }
-        }.also { actionsRow.addView(it, ctx.llp(0, WRAP, 1f, rightDp = 5f)) }
+        }.also { actionsRow.addView(it, ctx.llp(0, WRAP, 1f, rightDp = 6f)) }
 
         btnAdd = TextView(ctx).apply {
             text = "+ 添加"
@@ -403,13 +437,13 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
             paint.isFakeBoldText = true
             gravity = Gravity.CENTER
             isSingleLine = true
-            setPadDp(8f, 5f)
+            setPadDp(8f, 5.5f)
             pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_HAND)
             OverlayUiUtils.attachTactilePress(this, 0.92f)
             setOnClickListener { host.openWorkbenchAppPicker() }
         }.also { actionsRow.addView(it, ctx.llp(0, WRAP, 1f)) }
 
-        bar.addView(actionsRow, ctx.llp(if (isTop) ctx.dp(112f) else MATCH, WRAP))
+        bar.addView(actionsRow, ctx.llp(if (isTop) ctx.dp(116f) else MATCH, WRAP))
         return bar
     }
 
@@ -448,16 +482,21 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
     }
 
     private fun applyRailTheme(ctx: Context, tokens: GlassOverlayTokens) {
-        railRoot?.let { tokens.applyGlassBackground(it, tokens.taskbarFill, cornerRadiusDp = 24f, strokeWidthDp = 1f) }
+        railRoot?.let { tokens.applyGlassBackground(it, tokens.taskbarFill, cornerRadiusDp = 22f, strokeWidthDp = 0.95f) }
         titleLabel?.setTextColor(tokens.textPrimary)
-        countBadge?.setTextColor(tokens.accentBlue)
-        countBadge?.background = roundedBg((tokens.accentBlue and 0x00FFFFFF) or 0x22000000, ctx.dpF(9f))
+        countBadge?.setTextColor(tokens.textSecondary)
+        countBadge?.background = roundedBg(tokens.hoverChipFill, ctx.dpF(8f))
         btnFlipPos?.setTextColor(tokens.textPrimary)
-        btnFlipPos?.background = OverlayUiUtils.makeStateListBg(ctx, tokens.cardInnerFill, tokens.activeChipFill, 10f)
-        btnAdd?.setTextColor(Color.WHITE)
-        btnAdd?.background = roundedBg(tokens.accentBlue, ctx.dpF(10f))
+        btnFlipPos?.background = OverlayUiUtils.makeStateListBg(ctx, tokens.cardInnerFill, tokens.hoverChipFill, 10f)
+        btnAdd?.setTextColor(tokens.accentBlue)
+        btnAdd?.background = OverlayUiUtils.makeStateListBg(
+            ctx,
+            (tokens.accentBlue and 0x00FFFFFF) or 0x1A000000,
+            (tokens.accentBlue and 0x00FFFFFF) or 0x2E000000,
+            10f,
+        )
         btnClose?.setImageDrawable(HyperUi.icon(ctx, HyperUi.ICON_CLOSE, tokens.textSecondary, 12f))
-        btnClose?.background = OverlayUiUtils.makeStateListBg(ctx, 0x00000000, tokens.cardInnerFill, 9f)
+        btnClose?.background = OverlayUiUtils.makeStateListBg(ctx, 0x00000000, tokens.hoverChipFill, 9f)
     }
 
     private fun rebuildCards(ctx: Context, models: List<CardModel>, tokens: GlassOverlayTokens) {
@@ -513,33 +552,22 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
             orientation = LinearLayout.VERTICAL
             setPadDp(6f, 6f, 6f, 5f)
             pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_HAND)
-            OverlayUiUtils.attachTactilePress(this, 0.96f)
-            val strokeColor = if (model.focused) tokens.accentBlue else tokens.divider
+            val strokeColor = if (model.focused) {
+                (tokens.accentBlue and 0x00FFFFFF) or 0xCC000000.toInt()
+            } else {
+                tokens.divider
+            }
             val fillColor = if (model.focused) {
-                (tokens.accentBlue and 0x00FFFFFF) or 0x26000000
+                if (tokens.isDark) 0x380A84FF else 0x1A007AFF
             } else {
                 tokens.cardInnerFill
             }
             background = roundedBg(
                 fillColor,
-                ctx.dpF(16f),
-                ctx.dp(if (model.focused) 1.8f else 0.8f).coerceAtLeast(1),
+                ctx.dpF(15f),
+                ctx.dp(if (model.focused) 1.35f else 0.75f).coerceAtLeast(1),
                 strokeColor,
             )
-            setOnClickListener { host.switchToWorkbenchApp(model.pkg, model.taskId) }
-            setOnLongClickListener { v ->
-                val loc = IntArray(2)
-                v.getLocationOnScreen(loc)
-                host.openWorkbenchCardMenu(model.pkg, model.taskId, model.pinned, loc[0] + v.width / 2, loc[1] + v.height / 2)
-                true
-            }
-            setOnTouchListener { v, ev ->
-                if (ev?.actionMasked == MotionEvent.ACTION_DOWN && (ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
-                    host.openWorkbenchCardMenu(model.pkg, model.taskId, model.pinned, ev.rawX.toInt(), ev.rawY.toInt())
-                    return@setOnTouchListener true
-                }
-                false
-            }
         }
 
         // Top Visual Preview Box (shows real live TaskSnapshot when running, or frosted icon card on standby)
@@ -573,25 +601,46 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
             thumbImg.visibility = View.VISIBLE
         }
 
-        // Status Pill Badge ("● 当前" / "● 运行中" / "待命")
-        val (statusText, statusBg) = when {
-            model.focused -> "● 当前" to tokens.accentBlue
-            model.running -> "● 运行中" to 0xDD1FA958.toInt()
-            else -> "待命" to 0xAA334155.toInt()
+        // Restrained frosted status chip (monochrome glass + semantic status dot per Liquid Glass craft)
+        val dotColor = when {
+            model.focused -> tokens.accentBlue
+            model.running -> tokens.accentGreen
+            else -> tokens.textTertiary
         }
-        val statusPill = TextView(ctx).apply {
-            text = statusText
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 8.8f)
-            paint.isFakeBoldText = true
-            setPadDp(6f, 1.5f)
-            background = roundedBg(statusBg, ctx.dpF(7f))
+        val statusText = when {
+            model.focused -> "当前"
+            model.running -> "运行"
+            else -> "待命"
         }
+        val statusChip = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadDp(5.5f, 2f)
+            background = roundedBg(
+                if (tokens.isDark) 0xB0111827.toInt() else 0xCCF8FAFC.toInt(),
+                ctx.dpF(7f),
+                1,
+                if (tokens.isDark) 0x26FFFFFF else 0x1E0F172A,
+            )
+        }
+        statusChip.addView(
+            View(ctx).apply { background = roundedBg(dotColor, ctx.dpF(3f)) },
+            ctx.llp(ctx.dp(5.5f), ctx.dp(5.5f), rightDp = 3.5f),
+        )
+        statusChip.addView(
+            TextView(ctx).apply {
+                text = statusText
+                setTextColor(if (tokens.isDark) 0xF2F8FAFC.toInt() else 0xFF1E293B.toInt())
+                setTextSize(TypedValue.COMPLEX_UNIT_DIP, 8.6f)
+                paint.isFakeBoldText = true
+            },
+            ctx.llp(WRAP, WRAP),
+        )
         previewBox.addView(
-            statusPill,
+            statusChip,
             FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.END).apply {
-                topMargin = ctx.dp(4f)
-                rightMargin = ctx.dp(4f)
+                topMargin = ctx.dp(5f)
+                rightMargin = ctx.dp(5f)
             },
         )
 
@@ -634,7 +683,87 @@ internal class DeXWorkbenchRailController(private val host: DesktopShellHost) {
             ctx.llp(WRAP, WRAP, leftDp = 2f),
         )
         card.addView(footer, ctx.llp(MATCH, WRAP))
+        bindCardGestures(card, model, label, icon, isTop)
         return card
+    }
+
+    private fun bindCardGestures(card: View, model: CardModel, label: String, icon: Drawable?, isTop: Boolean) {
+        val slop = ViewConfiguration.get(card.context).scaledTouchSlop
+        var downX = 0f
+        var downY = 0f
+        var tracking = false
+        var ownsGesture = false
+        card.setOnClickListener { host.switchToWorkbenchApp(model.pkg, model.taskId) }
+        card.setOnLongClickListener { v ->
+            tracking = false
+            val loc = IntArray(2)
+            v.getLocationOnScreen(loc)
+            host.openWorkbenchCardMenu(model.pkg, model.taskId, model.pinned, loc[0] + v.width / 2, loc[1] + v.height / 2)
+            true
+        }
+        card.setOnTouchListener { view, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = ev.rawX
+                    downY = ev.rawY
+                    ownsGesture = (ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0
+                    tracking = !ownsGesture
+                    if (ownsGesture) {
+                        host.openWorkbenchCardMenu(model.pkg, model.taskId, model.pinned, downX.toInt(), downY.toInt())
+                    } else {
+                        view.parent?.requestDisallowInterceptTouchEvent(true)
+                        view.animate().scaleX(0.97f).scaleY(0.97f).setDuration(75L).start()
+                    }
+                    ownsGesture
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    if (tracking) {
+                        val dx = abs(ev.rawX - downX)
+                        val dy = abs(ev.rawY - downY)
+                        val alongRail = if (isTop) dx else dy
+                        val acrossRail = if (isTop) dy else dx
+                        if (max(alongRail, acrossRail) > slop) {
+                            tracking = false
+                            view.cancelLongPress()
+                            if (acrossRail >= alongRail && draggedCard == null && lastVisible) {
+                                ownsGesture = true
+                                draggedCard = view
+                                view.isPressed = false
+                                view.animate().alpha(0.52f).scaleX(1f).scaleY(1f).setDuration(110L).start()
+                                host.popovers.dismissAll()
+                                dragPreview?.start(label, icon)
+                            } else {
+                                view.parent?.requestDisallowInterceptTouchEvent(false)
+                            }
+                        }
+                    }
+                    if (draggedCard === view) dragPreview?.move(ev.rawX, ev.rawY, dropLayoutAt(ev))
+                    ownsGesture
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_POINTER_DOWN -> {
+                    val wasDragging = draggedCard === view
+                    val layout = if (wasDragging && ev.actionMasked == MotionEvent.ACTION_UP) dropLayoutAt(ev) else null
+                    tracking = false
+                    val handled = ownsGesture
+                    if (ev.actionMasked != MotionEvent.ACTION_POINTER_DOWN) ownsGesture = false
+                    view.parent?.requestDisallowInterceptTouchEvent(false)
+                    if (wasDragging) endCardDrag(placed = layout != null)
+                    else view.animate().scaleX(1f).scaleY(1f).setDuration(125L).start()
+                    layout?.let { onDrop(model.pkg, it) }
+                    handled
+                }
+                else -> ownsGesture
+            }
+        }
+    }
+
+    private fun dropLayoutAt(ev: MotionEvent): WorkbenchDropLayout? =
+        WorkbenchDropLayout.at(currentStageRect(), host.state.dpi, ev.rawX, ev.rawY)
+
+    private fun endCardDrag(placed: Boolean = false) {
+        draggedCard?.animate()?.alpha(1f)?.scaleX(1f)?.scaleY(1f)?.setDuration(125L)?.start()
+        draggedCard = null
+        if (placed) dragPreview?.finish() else dragPreview?.clear()
     }
 
     private fun refreshRunningSnapshots(forceAll: Boolean) {

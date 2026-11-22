@@ -500,31 +500,63 @@ public final class TaskApiAdapter {
     }
 
     /**
-     * Places a task onto {@code displayId} in native {@code MULTI_WINDOW (6)} with {@code bounds},
-     * cleanly escaping MIUI {@code FREEFORM (5)} scaling without spurious focus yanks.
+     * Atomically clears {@code alwaysOnTop} and reorders {@code taskId} to the bottom of its display
+     * in a single {@code WindowContainerTransaction} so minimizing or hiding a floating window
+     * drops cleanly behind {@code LauncherActivity} with zero flash or spurious front-raise.
+     */
+    public boolean sendTaskBehindDesktop(int taskId, int preferredDisplayId) {
+        if (taskId <= 0 || atm == null) return false;
+        try {
+            Object tok = findRootTaskToken(taskId, preferredDisplayId);
+            if (tok == null) return false;
+            Object wo = atm.getClass().getMethod("getWindowOrganizerController").invoke(atm);
+            if (wo == null) return false;
+            Class<?> wctCls = Class.forName("android.window.WindowContainerTransaction");
+            Class<?> tokCls = Class.forName("android.window.WindowContainerToken");
+            Object wct = wctCls.getConstructor().newInstance();
+            wctCls.getMethod("setAlwaysOnTop", tokCls, boolean.class).invoke(wct, tok, false);
+            wctCls.getMethod("reorder", tokCls, boolean.class).invoke(wct, tok, false);
+            wo.getClass().getMethod("applyTransaction", wctCls).invoke(wo, wct);
+            return true;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_SEND_BEHIND_ERR tid=" + taskId + ": " + e.getMessage());
+            clearTaskAlwaysOnTop(taskId, preferredDisplayId);
+            return reorderTask(taskId, preferredDisplayId, false);
+        }
+    }
+
+    /**
+     * Places a task onto {@code displayId} in native {@code MULTI_WINDOW (6)} with {@code bounds}
+     * and {@code alwaysOnTop = true} so floating desktop windows stay above {@code LauncherActivity}
+     * even when the user taps the desktop wallpaper, icons, or widgets.
      */
     public boolean ensureTaskResizeableAndMultiWindow(
             int taskId, int displayId, Rect bounds, boolean forceSyncIfEqual) {
         if (taskId <= 0 || displayId <= 0 || atm == null) return false;
-        moveRootTaskToDisplay(taskId, displayId);
         setTaskResizeable(taskId, 2);
 
         int curWm = getTaskWindowingMode(taskId);
         boolean modeChanged = (curWm != WINDOWING_MODE_MULTI_WINDOW);
         Rect initBounds = (bounds != null && !bounds.isEmpty()) ? bounds : null;
         if (curWm == WINDOWING_MODE_FREEFORM) {
-            // Atomically hand off FREEFORM (5) -> MULTI_WINDOW (6) at the exact same bounds in ONE WCT
-            // so the task never passes through an intermediate FULLSCREEN state or flashes full-screen.
-            if (applyWctForTask(taskId, displayId, Boolean.FALSE, WINDOWING_MODE_MULTI_WINDOW, initBounds)) {
+            if (applyWctForTask(taskId, -1, Boolean.FALSE, WINDOWING_MODE_MULTI_WINDOW, initBounds)) {
                 curWm = WINDOWING_MODE_MULTI_WINDOW;
-            } else {
-                clearTaskAlwaysOnTop(taskId, displayId);
-                forceTaskWindowingMode(taskId, displayId, WINDOWING_MODE_MULTI_WINDOW);
+            }
+        } else if (curWm != WINDOWING_MODE_MULTI_WINDOW) {
+            if (applyWctForTask(taskId, -1, null, WINDOWING_MODE_MULTI_WINDOW, initBounds)) {
                 curWm = WINDOWING_MODE_MULTI_WINDOW;
             }
         }
-        if (curWm != WINDOWING_MODE_MULTI_WINDOW) {
-            if (!applyWctForTask(taskId, displayId, null, WINDOWING_MODE_MULTI_WINDOW, initBounds)) {
+
+        moveRootTaskToDisplay(taskId, displayId);
+
+        // Pin visible floating MULTI_WINDOW tasks in the alwaysOnTop Z-tier on displayId so
+        // tapping LauncherActivity (desktop) never raises the wallpaper above open windows.
+        // Pass null bounds here so the subsequent resizeTaskBoundsOnly() sees the real delta
+        // and updates HyperOS's SurfaceFlinger Task leash (WCT.setBounds alone does not).
+        if (!applyWctForTask(taskId, displayId, Boolean.TRUE, WINDOWING_MODE_MULTI_WINDOW, null)) {
+            curWm = getTaskWindowingMode(taskId);
+            if (curWm != WINDOWING_MODE_MULTI_WINDOW) {
                 forceTaskWindowingMode(taskId, displayId, WINDOWING_MODE_MULTI_WINDOW);
             }
         }
@@ -536,16 +568,15 @@ public final class TaskApiAdapter {
 
     /**
      * Escapes MIUI {@code FREEFORM (5)} or {@code MULTI_WINDOW (6)} back to {@code FULLSCREEN (1)},
-     * resetting SurfaceFlinger Task leash position via a full-screen resize + 55ms commit settle
-     * before applying empty fullscreen bounds.
+     * clearing {@code alwaysOnTop} and resetting SurfaceFlinger Task leash position via a
+     * full-screen resize + 55ms commit settle before applying empty fullscreen bounds.
      */
     public void detachFreeformAndEnsureFullscreen(
             int taskId, int preferredDisplayId, int dispW, int dispH, boolean syncFullBounds, Handler mainHandler) {
         if (taskId <= 0 || atm == null) return;
         int curWm = getTaskWindowingMode(taskId);
-        // Only clear alwaysOnTop when leaving MIUI FREEFORM (5); calling setAlwaysOnTop(false)
-        // on non-freeform tasks triggers spurious moveTaskToFront on Android 16+.
-        Boolean clearAot = (curWm == WINDOWING_MODE_FREEFORM) ? Boolean.FALSE : null;
+        Boolean clearAot = (curWm == WINDOWING_MODE_FREEFORM || curWm == WINDOWING_MODE_MULTI_WINDOW)
+                ? Boolean.FALSE : null;
         if (syncFullBounds && curWm != WINDOWING_MODE_FULLSCREEN) {
             Rect fullBounds = new Rect(0, 0, Math.max(480, dispW), Math.max(480, dispH));
             if (curWm != WINDOWING_MODE_MULTI_WINDOW) {
@@ -556,7 +587,8 @@ public final class TaskApiAdapter {
             }
             resizeTaskBoundsOnly(taskId, preferredDisplayId, fullBounds, true);
             Runnable finishFullscreen = () -> {
-                if (!applyWctForTask(taskId, preferredDisplayId, null, WINDOWING_MODE_FULLSCREEN, new Rect())) {
+                if (!applyWctForTask(taskId, preferredDisplayId, clearAot, WINDOWING_MODE_FULLSCREEN, new Rect())) {
+                    if (clearAot != null) clearTaskAlwaysOnTop(taskId, preferredDisplayId);
                     forceTaskWindowingMode(taskId, preferredDisplayId, WINDOWING_MODE_FULLSCREEN);
                 }
             };

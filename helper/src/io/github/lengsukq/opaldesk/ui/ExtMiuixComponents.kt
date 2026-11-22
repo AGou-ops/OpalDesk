@@ -181,9 +181,9 @@ fun HyperBentoTile(
             }
             Spacer(Modifier.width(11.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(title, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = titleColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(title, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold, color = titleColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Spacer(Modifier.height(2.dp))
-                Text(subtitle, fontSize = 11.5.sp, color = subColor, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(subtitle, fontSize = 11.5.sp, color = subColor, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
         }
     }

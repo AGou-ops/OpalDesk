@@ -207,12 +207,14 @@ internal class DeXAppDrawerOverlay(private val host: DesktopShellHost) : Overlay
         isOpen = true
         applyTheme(ctx, host.tokens)
 
-        val dispW = max(600, host.state.displayW)
-        val dispH = max(480, host.state.displayH)
-        val w = (dispW * 0.56f).toInt().coerceIn(ctx.dp(420f), min(dispW - ctx.dp(24f), ctx.dp(780f)))
-        val h = (dispH * 0.64f).toInt().coerceIn(ctx.dp(340f), min(dispH - ctx.dp(92f), ctx.dp(560f)))
+        val dispW = host.state.displayW.takeIf { it > 0 } ?: ctx.resources.displayMetrics.widthPixels
+        val dispH = host.state.displayH.takeIf { it > 0 } ?: ctx.resources.displayMetrics.heightPixels
         val margin = ctx.dp(14f)
         val bottomPad = ctx.dp(74f)
+        val maxWidth = min((dispW - 2 * margin).coerceAtLeast(1), ctx.dp(780f))
+        val maxHeight = min((dispH - margin - bottomPad).coerceAtLeast(1), ctx.dp(560f))
+        val w = (dispW * 0.56f).toInt().coerceAtLeast(ctx.dp(420f)).coerceAtMost(maxWidth)
+        val h = (dispH * 0.64f).toInt().coerceAtLeast(ctx.dp(340f)).coerceAtMost(maxHeight)
 
         wmLp.width = w
         wmLp.height = h
@@ -222,7 +224,7 @@ internal class DeXAppDrawerOverlay(private val host: DesktopShellHost) : Overlay
         wmLp.flags = wmLp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
 
         val gridDp = (w - ctx.dp(44f)) / max(0.5f, ctx.resources.displayMetrics.density)
-        gridView?.numColumns = (gridDp / 108f).toInt().coerceIn(4, 7)
+        gridView?.numColumns = (gridDp / 108f).toInt().coerceIn(2, 7)
 
         if (!appsLoaded) loadAppsAsync() else applyFilter(query)
 

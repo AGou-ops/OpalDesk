@@ -67,21 +67,25 @@ fun DexConfigSection(ctrl: MainController) {
             SliderPreference(
                 title = "界面缩放密度 (DPI)",
                 summary = "等效最小宽度 sw${swDp}dp · ${if (swDp >= 600) "平板大屏布局 (sw≥600dp)" else "紧凑布局（调低 DPI 可获得更大桌面视野）"}",
-                value = dpi.toFloat(), valueRange = 160f..440f, valueText = "$dpi dpi",
+                value = dpi.toFloat(), valueRange = 160f..480f,
+                valueText = if (ctrl.hasLocalDexDpiDraft) "$dpi dpi · 待应用" else "$dpi dpi",
                 showKeyPoints = true, keyPoints = listOf(220f, 260f, 300f, 348f, 400f),
-                onValueChange = { v -> ctrl.localDexDpi = ((v / 4f).roundToInt() * 4).coerceIn(160, 440) },
+                onValueChange = { v -> ctrl.setLocalDexDpiDraft((v / 4f).roundToInt() * 4) },
             )
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 localPresets.forEach { d ->
                     TextButton(
-                        text = "$d", onClick = { ctrl.localDexDpi = d },
+                        text = "$d", onClick = { ctrl.setLocalDexDpiDraft(d) },
                         colors = if (dpi == d) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
                         insideMargin = PaddingValues(6.dp), modifier = Modifier.weight(1f),
                     )
                 }
             }
             Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                TextButton("应用缩放密度", { ctrl.applyLocalDexDpi(dpi) }, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.weight(1.25f))
+                TextButton(
+                    if (ctrl.localDexDpiApplying) "正在应用…" else "应用缩放密度",
+                    { ctrl.applyLocalDexDpi() }, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.weight(1.25f),
+                )
                 TextButton("恢复本机推荐", { ctrl.resetLocalDexRecommendedDpi() }, modifier = Modifier.weight(1f))
             }
         }

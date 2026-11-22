@@ -326,9 +326,9 @@ object DesktopGeometry {
         displayH: Int,
         dpi: Int,
         taskbarAutoHide: Boolean,
+        workArea: IntRect = computeWorkArea(displayW, displayH, dpi, taskbarAutoHide),
     ): PairedSplitPair? {
         if (visibleWindows.size < 2) return null
-        val wa = computeWorkArea(displayW, displayH, dpi, taskbarAutoHide)
         val maxGap = dpToPx(24, dpi)
         val edgeTol = dpToPx(28, dpi)
         val topTol = dpToPx(28, dpi)
@@ -344,8 +344,8 @@ object DesktopGeometry {
                 if (gap < -edgeTol || gap > maxGap) continue
                 if (abs(leftW.bounds.top - rightW.bounds.top) > topTol) continue
                 if (abs(leftW.bounds.bottom - rightW.bounds.bottom) > topTol) continue
-                if (leftW.bounds.left > wa.left + edgeTol) continue
-                if (rightW.bounds.right < wa.right - edgeTol) continue
+                if (abs(leftW.bounds.left - workArea.left) > edgeTol) continue
+                if (abs(rightW.bounds.right - workArea.right) > edgeTol) continue
                 val divX = (leftW.bounds.right + rightW.bounds.left) / 2
                 val topY = min(leftW.bounds.top, rightW.bounds.top)
                 val botY = max(leftW.bounds.bottom, rightW.bounds.bottom)
@@ -368,20 +368,17 @@ object DesktopGeometry {
     fun computePairedSplitResizedBounds(
         pair: PairedSplitPair,
         newDividerCenterX: Int,
-        displayW: Int,
-        displayH: Int,
         dpi: Int,
-        taskbarAutoHide: Boolean,
     ): Pair<IntRect, IntRect> {
-        val wa = computeWorkArea(displayW, displayH, dpi, taskbarAutoHide)
         val gap = max(4, dpToPx(SNAP_GAP_DP, dpi))
         val halfGap = gap / 2
-        val minW = dpToPx(MIN_WINDOW_W_DP, dpi)
-        val minDivX = wa.left + minW + halfGap
-        val maxDivX = max(minDivX, wa.right - minW - halfGap)
+        val available = pair.rightBounds.right - pair.leftBounds.left - gap
+        val minW = min(dpToPx(MIN_WINDOW_W_DP, dpi), max(0, available / 2))
+        val minDivX = pair.leftBounds.left + minW + halfGap
+        val maxDivX = max(minDivX, pair.rightBounds.right - minW - (gap - halfGap))
         val clampedX = newDividerCenterX.coerceIn(minDivX, maxDivX)
         val leftRect = IntRect(pair.leftBounds.left, pair.leftBounds.top, clampedX - halfGap, pair.leftBounds.bottom)
-        val rightRect = IntRect(clampedX + halfGap, pair.rightBounds.top, pair.rightBounds.right, pair.rightBounds.bottom)
+        val rightRect = IntRect(clampedX + gap - halfGap, pair.rightBounds.top, pair.rightBounds.right, pair.rightBounds.bottom)
         return leftRect to rightRect
     }
 

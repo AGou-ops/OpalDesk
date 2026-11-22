@@ -9,6 +9,7 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -54,6 +55,7 @@ internal class DesktopWidgetBoardController(
     private val activity: Activity,
     private val presenter: MacContextMenuPresenter,
     private val runIo: (block: suspend () -> Unit) -> Unit,
+    private val onInlineTilesChanged: (List<DesktopWidgetTile>) -> Unit,
     private val resolvePkgLabel: (String?) -> String,
 ) {
     companion object {
@@ -72,6 +74,7 @@ internal class DesktopWidgetBoardController(
     private var appWidgetMgr: AppWidgetManager? = null
     private var listening = false
     private var lastBoardWidthPx = 0
+    private var inlineMode = false
 
     private var pendingWidgetId = -1
     private var structuralSignature = ""
@@ -84,9 +87,9 @@ internal class DesktopWidgetBoardController(
 
     private val liveTicker = object : Runnable {
         override fun run() {
-            if (activity.isFinishing || activity.isDestroyed || rootView.visibility != View.VISIBLE) return
+            if (activity.isFinishing || activity.isDestroyed || (!inlineMode && rootView.visibility != View.VISIBLE)) return
             refreshLiveStateAsync()
-            mainHandler.postDelayed(this, 2200L)
+            mainHandler.postDelayed(this, 6000L)
         }
     }
 
@@ -216,6 +219,16 @@ internal class DesktopWidgetBoardController(
         }
     }
 
+    fun setInlineMode(enabled: Boolean) {
+        if (inlineMode == enabled) return
+        inlineMode = enabled
+        rebuildBoard(force = true)
+        if (listening) {
+            mainHandler.removeCallbacks(liveTicker)
+            mainHandler.post(liveTicker)
+        }
+    }
+
     fun rebuildBoard(force: Boolean = false) {
         if (activity.isFinishing || activity.isDestroyed) return
         ensureHosts()
@@ -229,7 +242,7 @@ internal class DesktopWidgetBoardController(
         val theme = AppPrefs.getActiveMirrorTheme(activity)
         val desktopTheme = toDesktopGlassTheme(theme)
 
-        val sig = "$isLocalDex|$syncMirror|$mirrorL,$mirrorR|${customIds.joinToString(",")}|${presets.joinToString(",")}|${theme.id}|$lastBoardWidthPx"
+        val sig = "$inlineMode|$isLocalDex|$syncMirror|$mirrorL,$mirrorR|${customIds.joinToString(",")}|${presets.joinToString(",")}|${theme.id}|$lastBoardWidthPx"
         if (!force && sig == structuralSignature) return
         structuralSignature = sig
 
@@ -238,6 +251,7 @@ internal class DesktopWidgetBoardController(
 
         val boardW = (if (lastBoardWidthPx > 0) lastBoardWidthPx else activity.dp(320f)) - activity.dp(24f)
         val mgr = appWidgetMgr
+        val inlineTiles = ArrayList<DesktopWidgetTile>()
 
         // 1) Synced & Custom Android System AppWidgets
         val allSysWidgets = buildList {
@@ -253,21 +267,30 @@ internal class DesktopWidgetBoardController(
                     clipChildren = true
                     clipToPadding = true
                 }
-                val widgetH = activity.dp(168f)
-                contentContainer.addView(box, activity.llp(MATCH, widgetH, bottomDp = 10f))
-                MirrorWingLayoutBuilder.mountAppWidget(
-                    ctx = activity,
-                    box = box,
-                    widgetId = wid,
-                    slot = 0,
-                    availW = boardW.coerceAtLeast(activity.dp(200f)),
-                    availH = widgetH,
-                    compact = true,
-                    theme = desktopTheme,
-                    mgr = mgr,
-                    wHost = host,
-                    ratioFn = { 4 },
-                )
+                val surface = FrameLayout(activity).apply { addView(box, FrameLayout.LayoutParams(MATCH, MATCH)) }
+                fun mount(widthPx: Int, heightPx: Int) {
+                    MirrorWingLayoutBuilder.mountAppWidget(
+                        ctx = activity, box = box, widgetId = wid, slot = 0,
+                        availW = widthPx, availH = heightPx, compact = true,
+                        theme = desktopTheme, mgr = mgr, wHost = host, ratioFn = { 4 },
+                    )
+                }
+                if (inlineMode) {
+                    val info = mgr?.getAppWidgetInfo(wid)
+                    val title = info?.loadLabel(activity.packageManager).orEmpty().ifBlank { "系统小组件" }
+                    val spanX = if (Build.VERSION.SDK_INT >= 31) info?.targetCellWidth?.takeIf { it > 0 } else null
+                    val spanY = if (Build.VERSION.SDK_INT >= 31) info?.targetCellHeight?.takeIf { it > 0 } else null
+                    inlineTiles += DesktopWidgetTile(
+                        DesktopItem.Widget("system:$wid", (spanX ?: 3).coerceIn(2, 4), (spanY ?: 2).coerceIn(1, 3)), title, surface,
+                    )
+                    box.addOnLayoutChangeListener { _, l, t, r, b, ol, ot, or, ob ->
+                        if (r > l && b > t && (r - l != or - ol || b - t != ob - ot)) mount(r - l, b - t)
+                    }
+                } else {
+                    val widgetH = activity.dp(168f)
+                    contentContainer.addView(surface, activity.llp(MATCH, widgetH, bottomDp = 10f))
+                    mount(boardW.coerceAtLeast(activity.dp(200f)), widgetH)
+                }
                 if (!fromMirror) {
                     val removeBtn = TextView(activity).apply {
                         text = "×"
@@ -280,7 +303,7 @@ internal class DesktopWidgetBoardController(
                             rebuildBoard(force = true)
                         }
                     }
-                    box.addView(
+                    surface.addView(
                         removeBtn,
                         FrameLayout.LayoutParams(activity.dp(22f), activity.dp(22f), Gravity.TOP or Gravity.END).apply {
                             topMargin = activity.dp(6f)
@@ -289,7 +312,7 @@ internal class DesktopWidgetBoardController(
                     )
                 }
             }
-        } else {
+        } else if (!inlineMode) {
             val hintCard = TextView(activity).apply {
                 text = if (isLocalDex) {
                     "点击右上角【+ 编辑】添加系统天气 / 日历 / 音乐小组件"
@@ -310,8 +333,21 @@ internal class DesktopWidgetBoardController(
         presets.forEach { key ->
             val card = MirrorPresetCardFactory.build(activity, key, compact = true, theme = desktopTheme, actions = cardActions)
             activeCards += card
-            contentContainer.addView(card.view, activity.llp(MATCH, WRAP, bottomDp = 10f))
+            if (inlineMode) {
+                val roomy = when (key) {
+                    "audio", "media", "perf", "memo", "pomodoro" -> true
+                    else -> false
+                }
+                inlineTiles += DesktopWidgetTile(
+                    DesktopItem.Widget("preset:$key", if (roomy) 3 else 2, if (roomy) 2 else 1),
+                    MirrorThemeCatalog.mirrorPresetTitle(key),
+                    card.view,
+                )
+            } else {
+                contentContainer.addView(card.view, activity.llp(MATCH, WRAP, bottomDp = 10f))
+            }
         }
+        onInlineTilesChanged(inlineTiles)
         refreshLiveStateAsync()
     }
 
@@ -430,7 +466,7 @@ internal class DesktopWidgetBoardController(
         }
         presenter.showListSheet(
             title = "内置桌面信息卡片",
-            subtitle = "勾选要显示在桌面右侧小组件面板的卡片",
+            subtitle = if (inlineMode) "勾选要和桌面图标一起排列的卡片" else "勾选要显示在右侧小组件面板的卡片",
             items = sheetItems,
             searchable = false,
             multiSelect = true,

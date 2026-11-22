@@ -66,7 +66,13 @@ class MainController(context: Context) {
     var selW by mutableIntStateOf(2560)
     var selH by mutableIntStateOf(1440)
     var selDpi by mutableIntStateOf(240)
-    var localDexDpi by mutableIntStateOf(320)
+    private var localDexDpiDraft by mutableStateOf<Int?>(null)
+    val localDexDpi: Int
+        get() = localDexDpiDraft ?: daemonStatus.virtDpi.takeIf { it > 0 }?.coerceIn(160, 480) ?: 320
+    val hasLocalDexDpiDraft: Boolean
+        get() = localDexDpiDraft != null && localDexDpi != daemonStatus.virtDpi
+    var localDexDpiApplying by mutableStateOf(false)
+        private set
     var selFps by mutableFloatStateOf(60f)
     var selRot by mutableIntStateOf(0)
     var selPhysModeId by mutableIntStateOf(-1)
@@ -288,6 +294,7 @@ class MainController(context: Context) {
         val wasConnected = daemonStatus.connected
         daemonStatus = st
         if (!st.connected) return
+        if (!st.isLocalDexActive || st.virtDpi == localDexDpiDraft) localDexDpiDraft = null
 
         userSkippedActivation = false
         if (showActivationSheet) {
@@ -299,14 +306,10 @@ class MainController(context: Context) {
         val syncAllowed = SystemClock.uptimeMillis() >= suppressDaemonSyncUntilMs
         if ((syncFromDaemon && !initedFromDaemon) || !wasConnected) {
             initedFromDaemon = true
-            if (st.isLocalDexActive) {
-                localDexDpi = st.virtDpi.coerceIn(160, 480)
-            } else {
+            if (!st.isLocalDexActive) {
                 selW = st.virtW; selH = st.virtH; selDpi = st.virtDpi; selFps = st.virtFps; selRot = st.virtRot
             }
             displaySubTab = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0
-        } else if (syncAllowed && st.isLocalDexActive && st.virtDpi > 0) {
-            localDexDpi = st.virtDpi.coerceIn(160, 480)
         } else if (syncAllowed && !st.isLocalDexActive && selRot != st.virtRot) {
             selW = st.virtW; selH = st.virtH; selRot = st.virtRot
         }
@@ -422,15 +425,23 @@ class MainController(context: Context) {
         }
     }
 
+    fun setLocalDexDpiDraft(dpi: Int) {
+        if (localDexDpiApplying) return
+        localDexDpiDraft = dpi.coerceIn(160, 480).takeUnless { it == daemonStatus.virtDpi }
+    }
+
     fun applyLocalDexDpi(dpi: Int = localDexDpi) {
         val st = daemonStatus
-        if (!st.isLocalDexActive || st.virtW <= 0 || st.virtH <= 0) return
+        if (localDexDpiApplying || !st.isLocalDexActive || st.virtW <= 0 || st.virtH <= 0) return
         val clamped = dpi.coerceIn(160, 480)
-        localDexDpi = clamped
-        suppressDaemonSyncUntilMs = SystemClock.uptimeMillis() + 2500L
-        runDaemonAction("applyLocalDexDpi", refreshAfter = true, block = {
-            BridgeClient.applyConfigDetailed(st.virtW, st.virtH, clamped, st.virtFps, -1, 0)
-        }) { res ->
+        setLocalDexDpiDraft(clamped)
+        localDexDpiApplying = true
+        runDaemonAction(
+            "applyLocalDexDpi",
+            refreshAfter = true,
+            onFinally = { localDexDpiApplying = false },
+            block = { BridgeClient.applyConfigDetailed(st.virtW, st.virtH, clamped, st.virtFps, -1, 0) },
+        ) { res ->
             if (res.ok) toast("已更新本机 DeX 缩放：${clamped} dpi")
             else toast("应用失败：请确认本机 DeX 处于运行状态")
         }

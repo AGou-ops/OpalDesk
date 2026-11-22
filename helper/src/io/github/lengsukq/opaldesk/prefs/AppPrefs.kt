@@ -299,7 +299,7 @@ object AppPrefs {
     // --- opaldesk_core_prefs: Dock & Mirror Sidebar ---
 
     fun isDockAutoHide(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DOCK_AUTO_HIDE, true) } ?: true
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DOCK_AUTO_HIDE, false) } ?: false
 
     fun setDockAutoHide(ctx: Context?, enabled: Boolean) {
         ctx ?: return

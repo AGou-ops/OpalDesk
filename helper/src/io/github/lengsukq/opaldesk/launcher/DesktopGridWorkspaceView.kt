@@ -38,8 +38,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Persistent item on the OpalDesk desktop grid: either a single 1×1 app shortcut or
- * a folder supporting seamless toggling between 1×1 compact folders and 2×2 large folders.
+ * Persistent item on the OpalDesk desktop grid, including widgets in Workbench Mode.
  */
 sealed class DesktopItem {
     abstract val id: String
@@ -61,7 +60,13 @@ sealed class DesktopItem {
         override val spanX: Int get() = if (large) 2 else 1
         override val spanY: Int get() = if (large) 2 else 1
     }
+
+    data class Widget(val key: String, override val spanX: Int = 2, override val spanY: Int = 1) : DesktopItem() {
+        override val id: String get() = "widget:$key"
+    }
 }
+
+internal data class DesktopWidgetTile(val item: DesktopItem.Widget, val title: String, val content: View)
 
 internal object DesktopLayoutStore {
     fun loadItems(ctx: Context, installedByPkg: Map<String, LauncherAppEntry>): MutableList<DesktopItem> {
@@ -101,6 +106,10 @@ internal object DesktopLayoutStore {
                                 pkgs.size == 1 -> result.add(DesktopItem.AppShortcut(pkgs[0]))
                             }
                         }
+                        "widget" -> {
+                            val key = o.optString("key")
+                            if (key.isNotBlank() && result.none { it.id == "widget:$key" }) result.add(DesktopItem.Widget(key))
+                        }
                     }
                 }
             } catch (_: Throwable) {
@@ -129,6 +138,7 @@ internal object DesktopLayoutStore {
                             kept.size == 1 -> cleaned.add(DesktopItem.AppShortcut(kept[0]))
                         }
                     }
+                    is DesktopItem.Widget -> cleaned.add(item)
                 }
             }
             return cleaned
@@ -161,6 +171,7 @@ internal object DesktopLayoutStore {
                             .put("pkgs", pArr),
                     )
                 }
+                is DesktopItem.Widget -> arr.put(JSONObject().put("t", "widget").put("key", item.key))
             }
         }
         AppPrefs.setDesktopLayoutJson(ctx, arr.toString(), notify = false)
@@ -212,6 +223,8 @@ internal class DesktopGridWorkspaceView(
     private var installedByPkg: Map<String, LauncherAppEntry> = emptyMap()
     private var appModes: Map<String, Int> = emptyMap()
     private var items: MutableList<DesktopItem> = ArrayList()
+    private var widgetTiles: Map<String, DesktopWidgetTile> = emptyMap()
+    private var widgetMenu: ((View) -> Unit)? = null
     private val viewById = HashMap<String, View>()
     private var placedCells: List<PlacedCell> = emptyList()
     private var numColumns: Int = 5
@@ -225,6 +238,9 @@ internal class DesktopGridWorkspaceView(
     private var dragStartRawY = 0f
     private var dragOrigViewX = 0f
     private var dragOrigViewY = 0f
+    private var dragGrabOffsetX = 0f
+    private var dragGrabOffsetY = 0f
+    private var dragOriginalOrder: List<DesktopItem>? = null
     private var dragHoverMergeTargetId: String? = null
     private var lastSecondaryMs = 0L
     private var selectedItemId: String? = null
@@ -314,6 +330,7 @@ internal class DesktopGridWorkspaceView(
         installedByPkg = allApps.associateBy { it.pkg }
         appModes = modes
         items = DesktopLayoutStore.loadItems(ctx, installedByPkg)
+        addNewWidgets()
         rebuildAllViews(animate = false)
         openFolderId?.let { fid ->
             val folder = items.filterIsInstance<DesktopItem.AppFolder>().firstOrNull { it.id == fid }
@@ -329,10 +346,25 @@ internal class DesktopGridWorkspaceView(
     fun reloadFromPrefs() {
         if (installedByPkg.isEmpty()) return
         items = DesktopLayoutStore.loadItems(ctx, installedByPkg)
+        addNewWidgets()
         rebuildAllViews(animate = true)
     }
 
-    fun hasItems(): Boolean = items.isNotEmpty()
+    fun hasItems(): Boolean = placedCells.isNotEmpty()
+
+    fun setWidgetTiles(tiles: List<DesktopWidgetTile>, openWidgetMenu: (View) -> Unit) {
+        if (tiles.isEmpty() && widgetTiles.isEmpty()) return
+        widgetTiles = tiles.associateBy { it.item.id }
+        widgetMenu = openWidgetMenu
+        addNewWidgets()
+        rebuildAllViews(animate = isShown)
+    }
+
+    private fun addNewWidgets() {
+        for (tile in widgetTiles.values) {
+            if (items.none { it.id == tile.item.id }) items.add(tile.item)
+        }
+    }
 
     fun isPointInTile(screenX: Int, screenY: Int): Boolean {
         if (visibility != View.VISIBLE) return false
@@ -659,8 +691,9 @@ internal class DesktopGridWorkspaceView(
         val placed = ArrayList<PlacedCell>(items.size)
         var maxRowUsed = 0
         for (item in items) {
-            val sx = min(item.spanX, numColumns)
-            val sy = item.spanY
+            val visibleItem = if (item is DesktopItem.Widget) widgetTiles[item.id]?.item ?: continue else item
+            val sx = min(visibleItem.spanX, numColumns)
+            val sy = visibleItem.spanY
             var foundC = 0
             var foundR = 0
             outer@ for (r in 0..64) {
@@ -677,14 +710,13 @@ internal class DesktopGridWorkspaceView(
             val top = padTop + foundR * (cellH + gapY)
             val w = sx * cellW + (sx - 1) * gapX
             val h = sy * cellH + (sy - 1) * gapY
-            placed.add(PlacedCell(item, foundC, foundR, Rect(left, top, left + w, top + h)))
+            placed.add(PlacedCell(visibleItem, foundC, foundR, Rect(left, top, left + w, top + h)))
         }
         val totalH = padTop + max(1, maxRowUsed) * (cellH + gapY) + dp(if (compactMode) 64 else 96)
         return placed to totalH
     }
 
     private fun rebuildAllViews(animate: Boolean) {
-        val activeIds = items.map { it.id }.toHashSet()
         val oldPositions = HashMap<String, Pair<Float, Float>>()
         viewById.forEach { (id, v) -> oldPositions[id] = v.x to v.y }
 
@@ -699,6 +731,7 @@ internal class DesktopGridWorkspaceView(
             val v = when (val item = cell.item) {
                 is DesktopItem.AppShortcut -> buildAppTile(item)
                 is DesktopItem.AppFolder -> if (item.large) buildLargeFolderTile(item) else buildSmallFolderTile(item)
+                is DesktopItem.Widget -> buildWidgetTile(widgetTiles.getValue(item.id))
             }
             viewById[cell.item.id] = v
             val lp = LayoutParams(cell.rect.width(), cell.rect.height())
@@ -741,6 +774,35 @@ internal class DesktopGridWorkspaceView(
     }
 
     // ---- Tile Builders (1×1 App, 1×1 Small Folder, 2×2 Large Folder) ----
+
+    private fun buildWidgetTile(tile: DesktopWidgetTile): View {
+        val handle = TextView(ctx).apply {
+            text = "⠿  ${tile.title}"
+            contentDescription = "${tile.title}，拖动调整位置"
+            setTextColor(HyperUi.TEXT_PRIMARY)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), 0, dp(10), 0)
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+            pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_GRAB)
+        }
+        (tile.content.parent as? ViewGroup)?.removeView(tile.content)
+        val wrapper = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(0xEAF8FAFC.toInt())
+                cornerRadius = dpF(16f)
+            }
+            clipToOutline = true
+            addView(handle, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(22)))
+            addView(tile.content, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
+        }
+        val edit = { widgetMenu?.invoke(handle); Unit }
+        handle.setOnClickListener { edit() }
+        attachTileInteractions(handle, handle, tile.item, edit, edit, dragView = wrapper)
+        return wrapper
+    }
 
     private fun buildAppTile(item: DesktopItem.AppShortcut): View {
         val entry = installedByPkg[item.pkg]
@@ -996,6 +1058,7 @@ internal class DesktopGridWorkspaceView(
         item: DesktopItem,
         onClick: () -> Unit,
         onSecondary: () -> Unit,
+        dragView: View = tileView,
     ) {
         val touchSlop = dp(10)
         var downRawX = 0f
@@ -1034,7 +1097,7 @@ internal class DesktopGridWorkspaceView(
             } else false
         }
 
-        tileView.setOnTouchListener { v, ev ->
+        tileView.setOnTouchListener { _, ev ->
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     if ((ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
@@ -1044,7 +1107,8 @@ internal class DesktopGridWorkspaceView(
                     downRawX = ev.rawX; downRawY = ev.rawY
                     isMouse = ev.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE
                     dragging = false; longPressFired = false
-                    v.animate().scaleX(0.93f).scaleY(0.93f).setDuration(75L).start()
+                    if (dragView !== tileView) scrollView.requestDisallowInterceptTouchEvent(true)
+                    dragView.animate().scaleX(0.93f).scaleY(0.93f).setDuration(75L).start()
                     if (!isMouse) handler.postDelayed(longPressRunnable, LONG_PRESS_MS)
                     true
                 }
@@ -1055,11 +1119,11 @@ internal class DesktopGridWorkspaceView(
                         handler.removeCallbacks(longPressRunnable)
                         if (longPressFired) menuPresenter.dismiss(animated = false)
                         dragging = true
-                        beginDrag(item, v, downRawX, downRawY)
+                        beginDrag(item, dragView, downRawX, downRawY)
                     }
                     if (dragging) {
                         scrollView.requestDisallowInterceptTouchEvent(true)
-                        updateDrag(item, v, ev.rawX, ev.rawY)
+                        updateDrag(item, dragView, ev.rawX, ev.rawY)
                     }
                     true
                 }
@@ -1067,11 +1131,11 @@ internal class DesktopGridWorkspaceView(
                     handler.removeCallbacks(longPressRunnable)
                     scrollView.requestDisallowInterceptTouchEvent(false)
                     if (dragging) {
-                        endDrag(item, v, commit = ev.actionMasked == MotionEvent.ACTION_UP)
+                        endDrag(item, dragView, commit = ev.actionMasked == MotionEvent.ACTION_UP)
                     } else {
-                        v.animate().scaleX(1f).scaleY(1f).setDuration(150L).setInterpolator(OvershootInterpolator(1.3f)).start()
+                        dragView.animate().scaleX(1f).scaleY(1f).setDuration(150L).setInterpolator(OvershootInterpolator(1.3f)).start()
                         if (!longPressFired && ev.actionMasked == MotionEvent.ACTION_UP) {
-                            if (isMouse && AppPrefs.isDesktopDoubleClickLaunch(ctx)) {
+                            if (item !is DesktopItem.Widget && isMouse && AppPrefs.isDesktopDoubleClickLaunch(ctx)) {
                                 val now = SystemClock.uptimeMillis()
                                 if (lastClickItemId == item.id && now - lastClickMs <= DOUBLE_CLICK_MS) {
                                     lastClickItemId = null
@@ -1104,6 +1168,11 @@ internal class DesktopGridWorkspaceView(
         dragStartRawY = rawY
         dragOrigViewX = view.x
         dragOrigViewY = view.y
+        val canvasOnScreen = IntArray(2)
+        canvasLayout.getLocationOnScreen(canvasOnScreen)
+        dragGrabOffsetX = rawX - canvasOnScreen[0] - dragOrigViewX
+        dragGrabOffsetY = rawY - canvasOnScreen[1] - dragOrigViewY
+        dragOriginalOrder = items.toList()
         dragHoverMergeTargetId = null
         view.bringToFront()
         view.animate().cancel()
@@ -1117,23 +1186,22 @@ internal class DesktopGridWorkspaceView(
         view.x = nx
         view.y = ny
 
-        val cx = (nx + view.width * 0.5f).roundToInt()
-        val cy = (ny + view.height * 0.5f).roundToInt()
+        val cx = (nx + if (item is DesktopItem.Widget) dragGrabOffsetX else view.width * 0.5f).roundToInt()
+        val cy = (ny + if (item is DesktopItem.Widget) dragGrabOffsetY else view.height * 0.5f).roundToInt()
 
         // Check center hit on another item (merge into folder if dragging a single app)
         var mergeTarget: PlacedCell? = null
         var swapTargetIdx = -1
-        for (idx in placedCells.indices) {
-            val cell = placedCells[idx]
+        for (cell in placedCells) {
             if (cell.item.id == item.id) continue
             if (cell.rect.contains(cx, cy)) {
                 val insetX = (cell.rect.width() * (1f - MERGE_RATIO) * 0.5f).roundToInt()
                 val insetY = (cell.rect.height() * (1f - MERGE_RATIO) * 0.5f).roundToInt()
                 val core = Rect(cell.rect.left + insetX, cell.rect.top + insetY, cell.rect.right - insetX, cell.rect.bottom - insetY)
-                if (item is DesktopItem.AppShortcut && core.contains(cx, cy)) {
+                if (item is DesktopItem.AppShortcut && cell.item !is DesktopItem.Widget && core.contains(cx, cy)) {
                     mergeTarget = cell
                 } else {
-                    swapTargetIdx = idx
+                    swapTargetIdx = items.indexOfFirst { it.id == cell.item.id }
                 }
                 break
             }
@@ -1182,6 +1250,8 @@ internal class DesktopGridWorkspaceView(
         setMergeHighlight(null)
         draggingId = null
         draggingView = null
+        if (!commit) dragOriginalOrder?.let { items = it.toMutableList() }
+        dragOriginalOrder = null
         view.animate().scaleX(1f).scaleY(1f).alpha(1f).setDuration(150L).start()
 
         if (commit && mergeId != null && item is DesktopItem.AppShortcut) {
@@ -1197,6 +1267,7 @@ internal class DesktopGridWorkspaceView(
                         pkgs = listOf(dst.pkg, item.pkg),
                     )
                     is DesktopItem.AppFolder -> if (!dst.pkgs.contains(item.pkg)) dst.copy(pkgs = dst.pkgs + item.pkg) else dst
+                    is DesktopItem.Widget -> null
                 }
                 if (merged != null) {
                     items[dstIdx] = merged
