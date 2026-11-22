@@ -25,6 +25,7 @@ import android.widget.TextView
 import android.widget.Toast
 import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.HyperUi
+import io.github.lengsukq.opaldesk.desktop.model.GlassOverlayTokens
 import io.github.lengsukq.opaldesk.ipc.DaemonStateStore
 import io.github.lengsukq.opaldesk.overlay.MATCH
 import io.github.lengsukq.opaldesk.overlay.WRAP
@@ -240,9 +241,10 @@ internal class DesktopWidgetBoardController(
         val customIds = AppPrefs.getDesktopCustomWidgetIds(activity)
         val presets = AppPrefs.getDesktopPresetCards(activity)
         val theme = AppPrefs.getActiveMirrorTheme(activity)
-        val desktopTheme = toDesktopGlassTheme(theme)
+        val glassTokens = GlassOverlayTokens.resolve(activity)
+        val desktopTheme = toDesktopGlassTheme(theme, glassTokens)
 
-        val sig = "$inlineMode|$isLocalDex|$syncMirror|$mirrorL,$mirrorR|${customIds.joinToString(",")}|${presets.joinToString(",")}|${theme.id}|$lastBoardWidthPx"
+        val sig = "$inlineMode|${glassTokens.isDark}|$isLocalDex|$syncMirror|$mirrorL,$mirrorR|${customIds.joinToString(",")}|${presets.joinToString(",")}|${theme.id}|$lastBoardWidthPx"
         if (!force && sig == structuralSignature) return
         structuralSignature = sig
 
@@ -334,12 +336,13 @@ internal class DesktopWidgetBoardController(
             val card = MirrorPresetCardFactory.build(activity, key, compact = true, theme = desktopTheme, actions = cardActions)
             activeCards += card
             if (inlineMode) {
-                val roomy = when (key) {
-                    "audio", "media", "perf", "memo", "pomodoro" -> true
-                    else -> false
+                val (spanX, spanY) = when (key) {
+                    "audio", "media", "perf" -> 3 to 1
+                    "calendar", "memo" -> 3 to 2
+                    else -> 2 to 1
                 }
                 inlineTiles += DesktopWidgetTile(
-                    DesktopItem.Widget("preset:$key", if (roomy) 3 else 2, if (roomy) 2 else 1),
+                    DesktopItem.Widget("preset:$key", spanX, spanY),
                     MirrorThemeCatalog.mirrorPresetTitle(key),
                     card.view,
                 )
@@ -351,22 +354,42 @@ internal class DesktopWidgetBoardController(
         refreshLiveStateAsync()
     }
 
-    private fun toDesktopGlassTheme(src: io.github.lengsukq.opaldesk.prefs.MirrorTheme): BridgeClient.MirrorTheme =
+    private fun toDesktopGlassTheme(
+        src: io.github.lengsukq.opaldesk.prefs.MirrorTheme,
+        tokens: GlassOverlayTokens = GlassOverlayTokens.resolve(activity),
+    ): BridgeClient.MirrorTheme = if (tokens.isDark) {
         BridgeClient.MirrorTheme(
             id = src.id,
             name = src.name,
-            bgColor = 0xCCF5F7FA.toInt(),
-            headerBgColor = 0xE6FFFFFF.toInt(),
-            cardBgColor = 0xE6FFFFFF.toInt(),
-            cardStrokeColor = 0x16000000,
-            widgetBgColor = 0xDCFFFFFF.toInt(),
-            pillBgColor = 0x10000000,
-            accentBtnColor = HyperUi.HYPER_BLUE,
-            titleColor = HyperUi.TEXT_PRIMARY,
-            subColor = HyperUi.TEXT_SECONDARY,
-            accentColor = HyperUi.HYPER_BLUE,
+            bgColor = 0xB4131926.toInt(),
+            headerBgColor = 0xC6182032.toInt(),
+            cardBgColor = 0xB8141B2B.toInt(),
+            cardStrokeColor = 0x32FFFFFF,
+            widgetBgColor = 0xB8141B2B.toInt(),
+            pillBgColor = 0x22FFFFFF,
+            accentBtnColor = tokens.accentBlue,
+            titleColor = tokens.textPrimary,
+            subColor = tokens.textSecondary,
+            accentColor = tokens.accentBlue,
+            lightMode = false,
+        )
+    } else {
+        BridgeClient.MirrorTheme(
+            id = src.id,
+            name = src.name,
+            bgColor = 0xB8F6F9FF.toInt(),
+            headerBgColor = 0xCCF8FAFF.toInt(),
+            cardBgColor = 0xC4F7FAFF.toInt(),
+            cardStrokeColor = 0xC8FFFFFF.toInt(),
+            widgetBgColor = 0xC4F7FAFF.toInt(),
+            pillBgColor = 0x140F172A,
+            accentBtnColor = tokens.accentBlue,
+            titleColor = tokens.textPrimary,
+            subColor = tokens.textSecondary,
+            accentColor = tokens.accentBlue,
             lightMode = true,
         )
+    }
 
     private fun refreshLiveStateAsync() {
         if (activeCards.isEmpty()) return

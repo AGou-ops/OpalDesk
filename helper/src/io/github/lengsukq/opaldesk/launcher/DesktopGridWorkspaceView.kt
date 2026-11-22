@@ -362,7 +362,17 @@ internal class DesktopGridWorkspaceView(
 
     private fun addNewWidgets() {
         for (tile in widgetTiles.values) {
-            if (items.none { it.id == tile.item.id }) items.add(tile.item)
+            val idx = items.indexOfFirst { it.id == tile.item.id }
+            if (idx < 0) {
+                items.add(tile.item)
+            } else {
+                val existing = items[idx]
+                if (existing is DesktopItem.Widget &&
+                    (existing.spanX != tile.item.spanX || existing.spanY != tile.item.spanY)
+                ) {
+                    items[idx] = tile.item
+                }
+            }
         }
     }
 
@@ -776,31 +786,147 @@ internal class DesktopGridWorkspaceView(
     // ---- Tile Builders (1×1 App, 1×1 Small Folder, 2×2 Large Folder) ----
 
     private fun buildWidgetTile(tile: DesktopWidgetTile): View {
-        val handle = TextView(ctx).apply {
-            text = "⠿  ${tile.title}"
-            contentDescription = "${tile.title}，拖动调整位置"
-            setTextColor(HyperUi.TEXT_PRIMARY)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), 0, dp(10), 0)
-            isSingleLine = true
-            ellipsize = TextUtils.TruncateAt.END
-            pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_GRAB)
-        }
         (tile.content.parent as? ViewGroup)?.removeView(tile.content)
-        val wrapper = LinearLayout(ctx).apply {
-            orientation = LinearLayout.VERTICAL
-            background = GradientDrawable().apply {
-                setColor(0xEAF8FAFC.toInt())
-                cornerRadius = dpF(16f)
+        val editMenu = { anchor: View -> widgetMenu?.invoke(anchor); Unit }
+        val touchSlop = dp(10)
+
+        val wrapper = object : FrameLayout(ctx) {
+            private var downRawX = 0f
+            private var downRawY = 0f
+            private var dragging = false
+            private var longPressFired = false
+            private var isMouse = false
+            private val longPressTask = Runnable {
+                if (!dragging) {
+                    longPressFired = true
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                    editMenu(this)
+                }
             }
-            clipToOutline = true
-            addView(handle, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, dp(22)))
-            addView(tile.content, LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f))
+
+            override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        if ((ev.buttonState and MotionEvent.BUTTON_SECONDARY) != 0) {
+                            editMenu(this)
+                            return true
+                        }
+                        downRawX = ev.rawX
+                        downRawY = ev.rawY
+                        isMouse = ev.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE
+                        dragging = false
+                        longPressFired = false
+                        if (!isMouse) handler?.postDelayed(longPressTask, LONG_PRESS_MS)
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = ev.rawX - downRawX
+                        val dy = ev.rawY - downRawY
+                        if (!dragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                            handler?.removeCallbacks(longPressTask)
+                            if (longPressFired) menuPresenter.dismiss(animated = false)
+                            dragging = true
+                            scrollView.requestDisallowInterceptTouchEvent(true)
+                            beginDrag(tile.item, this, downRawX, downRawY)
+                            return true
+                        }
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        handler?.removeCallbacks(longPressTask)
+                        if (longPressFired) return true
+                    }
+                }
+                return false
+            }
+
+            override fun onTouchEvent(ev: MotionEvent): Boolean {
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> return true
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = ev.rawX - downRawX
+                        val dy = ev.rawY - downRawY
+                        if (!dragging && (abs(dx) > touchSlop || abs(dy) > touchSlop)) {
+                            handler?.removeCallbacks(longPressTask)
+                            if (longPressFired) menuPresenter.dismiss(animated = false)
+                            dragging = true
+                            scrollView.requestDisallowInterceptTouchEvent(true)
+                            beginDrag(tile.item, this, downRawX, downRawY)
+                        }
+                        if (dragging) {
+                            updateDrag(tile.item, this, ev.rawX, ev.rawY)
+                        }
+                        return true
+                    }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                        handler?.removeCallbacks(longPressTask)
+                        scrollView.requestDisallowInterceptTouchEvent(false)
+                        if (dragging) {
+                            endDrag(tile.item, this, commit = ev.actionMasked == MotionEvent.ACTION_UP)
+                        }
+                        dragging = false
+                        return true
+                    }
+                }
+                return super.onTouchEvent(ev)
+            }
+        }.apply {
+            clipChildren = false
+            clipToPadding = false
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+            contentDescription = "${tile.title}，拖动调整位置"
+            pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_GRAB)
+            setOnGenericMotionListener { v, ev ->
+                if (ev?.actionMasked == MotionEvent.ACTION_BUTTON_PRESS && ev.actionButton == MotionEvent.BUTTON_SECONDARY) {
+                    editMenu(v)
+                    true
+                } else false
+            }
+            setOnHoverListener { v, ev ->
+                if (draggingId != null) return@setOnHoverListener false
+                when (ev.actionMasked) {
+                    MotionEvent.ACTION_HOVER_ENTER -> v.animate().scaleX(1.018f).scaleY(1.018f).setDuration(120L).setInterpolator(DecelerateInterpolator()).start()
+                    MotionEvent.ACTION_HOVER_EXIT -> v.animate().scaleX(1f).scaleY(1f).setDuration(130L).setInterpolator(DecelerateInterpolator()).start()
+                }
+                false
+            }
         }
-        val edit = { widgetMenu?.invoke(handle); Unit }
-        handle.setOnClickListener { edit() }
-        attachTileInteractions(handle, handle, tile.item, edit, edit, dragView = wrapper)
+
+        // Seamless single-surface widget card (zero nested boxes or clunky title bars)
+        wrapper.addView(tile.content, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+
+        // Hover-revealed subtle corner "⋯" button (zero resting clutter; touch uses long-press)
+        val moreBtn = ImageView(ctx).apply {
+            setImageDrawable(HyperUi.icon(ctx, HyperUi.ICON_MORE, 0xFF64748B.toInt(), 12f))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            alpha = 0f
+            background = GradientDrawable().apply {
+                setColor(0xD8FFFFFF.toInt())
+                cornerRadius = dpF(11f)
+            }
+            pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_HAND)
+            contentDescription = "编辑小组件"
+            setOnClickListener { editMenu(it) }
+        }
+        wrapper.setOnHoverListener { v, ev ->
+            if (draggingId != null) return@setOnHoverListener false
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER -> {
+                    v.animate().scaleX(1.016f).scaleY(1.016f).setDuration(120L).setInterpolator(DecelerateInterpolator()).start()
+                    moreBtn.animate().alpha(0.92f).setDuration(120L).start()
+                }
+                MotionEvent.ACTION_HOVER_EXIT -> {
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(130L).setInterpolator(DecelerateInterpolator()).start()
+                    moreBtn.animate().alpha(0f).setDuration(130L).start()
+                }
+            }
+            false
+        }
+        wrapper.addView(
+            moreBtn,
+            LayoutParams(dp(22), dp(22), Gravity.TOP or Gravity.END).apply {
+                topMargin = dp(8)
+                rightMargin = dp(8)
+            },
+        )
         return wrapper
     }
 
