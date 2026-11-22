@@ -3,11 +3,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-KEYSTORE_PATH="$ROOT_DIR/exthelper.p12"
-ALIAS="extbridge"
-DEFAULT_PASSWORD="extbridge"
+KEYSTORE_PATH="$ROOT_DIR/opaldesk.p12"
+ALIAS="opaldesk"
+DEFAULT_PASSWORD="opaldesk"
 FORCE=0
-PASSWORD="${EXTBRIDGE_KEYSTORE_PASS:-}"
+PASSWORD="${OPALDESK_KEYSTORE_PASS:-}"
 
 usage() {
   cat <<EOF
@@ -17,8 +17,8 @@ Generates a permanent (100-year) PKCS#12 release signing keystore at:
   $KEYSTORE_PATH (alias: $ALIAS)
 
 Options:
-  -p, --password <pass>  Keystore password (or set EXTBRIDGE_KEYSTORE_PASS)
-  -f, --force            Overwrite existing exthelper.p12
+  -p, --password <pass>  Keystore password (or set OPALDESK_KEYSTORE_PASS)
+  -f, --force            Overwrite existing opaldesk.p12
   -h, --help             Show this help message
 EOF
 }
@@ -105,7 +105,7 @@ if [[ -z "$PASSWORD" ]]; then
       PASSWORD="$DEFAULT_PASSWORD"
     fi
   else
-    echo "WARNING: Non-interactive shell with no password provided (-p / EXTBRIDGE_KEYSTORE_PASS); defaulting to '${DEFAULT_PASSWORD}'." >&2
+    echo "WARNING: Non-interactive shell with no password provided (-p / OPALDESK_KEYSTORE_PASS); defaulting to '${DEFAULT_PASSWORD}'." >&2
     PASSWORD="$DEFAULT_PASSWORD"
   fi
 fi
@@ -120,7 +120,7 @@ if [[ -f "$KEYSTORE_PATH" ]]; then
 fi
 
 # Pass keystore password via scoped environment variable so it never appears in process argv (ps).
-EXTBRIDGE_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -genkeypair \
+OPALDESK_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -genkeypair \
   -storetype PKCS12 \
   -keystore "$KEYSTORE_PATH" \
   -alias "$ALIAS" \
@@ -128,18 +128,18 @@ EXTBRIDGE_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -genkeypair \
   -keysize 4096 \
   -sigalg SHA256withRSA \
   -validity 36500 \
-  -dname "CN=ExtBridge, OU=ExtBridge, O=ExtBridge, L=Local, ST=Local, C=US" \
-  -storepass:env EXTBRIDGE_KEYTOOL_PASS \
-  -keypass:env EXTBRIDGE_KEYTOOL_PASS
+  -dname "CN=OpalDesk, OU=OpalDesk, O=OpalDesk, L=Local, ST=Local, C=US" \
+  -storepass:env OPALDESK_KEYTOOL_PASS \
+  -keypass:env OPALDESK_KEYTOOL_PASS
 
 chmod 600 "$KEYSTORE_PATH"
 
 CERT_SHA256="$(
-  EXTBRIDGE_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -exportcert \
+  OPALDESK_KEYTOOL_PASS="$PASSWORD" "$KEYTOOL" -exportcert \
     -keystore "$KEYSTORE_PATH" \
     -storetype PKCS12 \
     -alias "$ALIAS" \
-    -storepass:env EXTBRIDGE_KEYTOOL_PASS \
+    -storepass:env OPALDESK_KEYTOOL_PASS \
     | sha256_stdin
 )"
 if [[ -z "$CERT_SHA256" ]]; then
@@ -152,7 +152,7 @@ KEYSTORE_B64="$(base64 < "$KEYSTORE_PATH" | tr -d '\r\n')"
 cat <<EOF
 
 ========================================================================
-ExtBridge Signing Certificate Generated
+OpalDesk Signing Certificate Generated
 ========================================================================
 Keystore Path : $KEYSTORE_PATH
 Store Type    : PKCS12
@@ -160,12 +160,12 @@ Key Alias     : $ALIAS
 SHA-256 (hex) : $CERT_SHA256
 
 Local Gradle builds (:bridge & :helper) will automatically detect
-exthelper.p12 and embed this SHA-256 into BridgeBuildConfig.
+opaldesk.p12 and embed this SHA-256 into BridgeBuildConfig.
 
 For GitHub Actions Secrets (Settings -> Secrets and variables -> Actions):
-  EXTBRIDGE_KEYSTORE_PASS        = <the password you entered>
-  EXTBRIDGE_EXPECTED_CERT_SHA256 = $CERT_SHA256 (optional strict pin)
-  EXTBRIDGE_KEYSTORE_BASE64      =
+  OPALDESK_KEYSTORE_PASS        = <the password you entered>
+  OPALDESK_EXPECTED_CERT_SHA256 = $CERT_SHA256 (optional strict pin)
+  OPALDESK_KEYSTORE_BASE64      =
 $KEYSTORE_B64
 ========================================================================
 EOF

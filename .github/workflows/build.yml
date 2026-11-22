@@ -1,18 +1,16 @@
-name: Build ExtBridge
+name: Build OpalDesk
 
 on:
   push:
     branches:
       - main
       - master
-      - lite
     tags:
       - 'v*'
   pull_request:
     branches:
       - main
       - master
-      - lite
   workflow_dispatch:
     inputs:
       create_release:
@@ -71,24 +69,23 @@ jobs:
       - name: Stage signing keystore file (never export password to GITHUB_ENV)
         shell: bash
         env:
-          KS_B64_PRIMARY: ${{ secrets.EXTBRIDGE_KEYSTORE_BASE64 }}
-          KS_B64_ALT: ${{ secrets.EXTBRIDGEBASE64 }}
-          HAS_KEYSTORE_PASS: ${{ (secrets.EXTBRIDGE_KEYSTORE_PASS != '' || secrets.EXTBRIDGE != '') && '1' || '0' }}
+          KS_B64_PRIMARY: ${{ secrets.OPALDESK_KEYSTORE_BASE64 }}
+          HAS_KEYSTORE_PASS: ${{ secrets.OPALDESK_KEYSTORE_PASS != '' && '1' || '0' }}
           IS_RELEASE_PUBLISH: ${{ (startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true' && github.ref == 'refs/heads/main')) && '1' || '0' }}
         run: |
-          RAW_B64="${KS_B64_PRIMARY:-$KS_B64_ALT}"
+          RAW_B64="${KS_B64_PRIMARY}"
           if [ "$IS_RELEASE_PUBLISH" = "1" ]; then
-            echo "EXTBRIDGE_REQUIRE_RELEASE_KEY=1" >> "$GITHUB_ENV"
+            echo "OPALDESK_REQUIRE_RELEASE_KEY=1" >> "$GITHUB_ENV"
             if [ -z "$RAW_B64" ] || [ "$HAS_KEYSTORE_PASS" != "1" ]; then
-              echo "::error title=Missing Release Signing Secrets::请在仓库 Settings -> Secrets and variables -> Actions 中配置 EXTBRIDGE_KEYSTORE_BASE64 (或 EXTBRIDGEBASE64) 与 EXTBRIDGE_KEYSTORE_PASS (或 EXTBRIDGE) 后再触发正式发版。"
+              echo "::error title=Missing Release Signing Secrets::请在仓库 Settings -> Secrets and variables -> Actions 中配置 OPALDESK_KEYSTORE_BASE64 与 OPALDESK_KEYSTORE_PASS 后再触发正式发版。"
               exit 1
             fi
           fi
           if [ -n "$RAW_B64" ] && [ "$HAS_KEYSTORE_PASS" = "1" ]; then
-            KS_PATH="$RUNNER_TEMP/exthelper.p12"
+            KS_PATH="$RUNNER_TEMP/opaldesk.p12"
             if python3 - "$KS_PATH" <<'PY'
           import base64, os, re, sys
-          raw = os.environ.get("KS_B64_PRIMARY") or os.environ.get("KS_B64_ALT") or ""
+          raw = os.environ.get("KS_B64_PRIMARY") or ""
           m = re.search(r"MII[A-Za-z0-9+/=\s\-_]{400,}", raw)
           cand = m.group(0) if m else raw
           clean = re.sub(r"\s+", "", cand).replace("-", "+").replace("_", "/").strip("\"'")
@@ -106,18 +103,18 @@ jobs:
           print(f"Staged release keystore from GitHub Secrets ({len(data)} bytes).")
           PY
             then
-              echo "EXTBRIDGE_KEYSTORE=$KS_PATH" >> "$GITHUB_ENV"
+              echo "OPALDESK_KEYSTORE=$KS_PATH" >> "$GITHUB_ENV"
             else
               if [ "$IS_RELEASE_PUBLISH" = "1" ]; then
-                echo "::error title=Invalid Keystore Secret::Failed to decode EXTBRIDGE_KEYSTORE_BASE64 / EXTBRIDGEBASE64."
+                echo "::error title=Invalid Keystore Secret::Failed to decode OPALDESK_KEYSTORE_BASE64."
                 exit 1
               else
                 echo "::warning title=Invalid Keystore Secret::Keystore decode failed; falling back to unsigned CI verification build."
-                echo "EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1" >> "$GITHUB_ENV"
+                echo "OPALDESK_ALLOW_UNSIGNED_RELEASE=1" >> "$GITHUB_ENV"
               fi
             fi
           else
-            echo "EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1" >> "$GITHUB_ENV"
+            echo "OPALDESK_ALLOW_UNSIGNED_RELEASE=1" >> "$GITHUB_ENV"
             echo "No keystore secrets configured; non-release CI will produce unsigned verification APK only."
           fi
 
@@ -125,11 +122,9 @@ jobs:
         id: build_apk
         shell: bash
         env:
-          KS_PASS_PRIMARY: ${{ secrets.EXTBRIDGE_KEYSTORE_PASS }}
-          KS_PASS_ALT: ${{ secrets.EXTBRIDGE }}
-          EXTBRIDGE_EXPECTED_CERT_SHA256: ${{ secrets.EXTBRIDGE_EXPECTED_CERT_SHA256 }}
+          OPALDESK_KEYSTORE_PASS: ${{ secrets.OPALDESK_KEYSTORE_PASS }}
+          OPALDESK_EXPECTED_CERT_SHA256: ${{ secrets.OPALDESK_EXPECTED_CERT_SHA256 }}
         run: |
-          export EXTBRIDGE_KEYSTORE_PASS="${KS_PASS_PRIMARY:-$KS_PASS_ALT}"
           chmod +x ./gradlew
           GRADLE_ARGS=(
             :bridge:dexBridgeJar
@@ -139,32 +134,32 @@ jobs:
             --no-daemon
             --console=plain
           )
-          if [ "${EXTBRIDGE_ALLOW_UNSIGNED_RELEASE:-0}" = "1" ]; then
+          if [ "${OPALDESK_ALLOW_UNSIGNED_RELEASE:-0}" = "1" ]; then
             GRADLE_ARGS+=(-PallowUnsignedRelease=true)
           fi
           ./gradlew "${GRADLE_ARGS[@]}"
 
           VER="$(sed -nE 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' helper/build.gradle.kts | head -n 1)"
-          VER="${VER:-3.5.3}"
+          VER="${VER:-0.0.1}"
 
           mkdir -p build/out
-          cp -f bridge/build/libs/extbridge.jar build/out/extbridge.jar
+          cp -f bridge/build/libs/opaldesk.jar build/out/opaldesk.jar
 
           SIGNED_APK="$(find helper/build/outputs/apk/release -maxdepth 1 -name '*-release.apk' | head -n 1 || true)"
           UNSIGNED_APK="$(find helper/build/outputs/apk/release -maxdepth 1 -name '*-unsigned.apk' | head -n 1 || true)"
 
           if [ -n "$SIGNED_APK" ] && [ -f "$SIGNED_APK" ]; then
-            APK_NAME="ExtBridge_v${VER}.apk"
+            APK_NAME="OpalDesk_v${VER}.apk"
             cp -f "$SIGNED_APK" "build/out/$APK_NAME"
             echo "APK_PATH=build/out/$APK_NAME" >> "$GITHUB_ENV"
             echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
             echo "is_signed=true" >> "$GITHUB_OUTPUT"
           elif [ -n "$UNSIGNED_APK" ] && [ -f "$UNSIGNED_APK" ]; then
-            if [ "${EXTBRIDGE_REQUIRE_RELEASE_KEY:-0}" = "1" ]; then
+            if [ "${OPALDESK_REQUIRE_RELEASE_KEY:-0}" = "1" ]; then
               echo "::error::Release publish requires signed APK, but only unsigned APK was produced!"
               exit 1
             fi
-            APK_NAME="ExtBridge_v${VER}-unsigned.apk"
+            APK_NAME="OpalDesk_v${VER}-unsigned.apk"
             cp -f "$UNSIGNED_APK" "build/out/$APK_NAME"
             echo "APK_PATH=build/out/$APK_NAME" >> "$GITHUB_ENV"
             echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
@@ -182,20 +177,20 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -f "$RUNNER_TEMP/exthelper.p12"
+          rm -f "$RUNNER_TEMP/opaldesk.p12"
 
       - name: Upload Android Build Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ExtBridge-Android_v${{ steps.build_apk.outputs.app_version }}
+          name: OpalDesk-Android_v${{ steps.build_apk.outputs.app_version }}
           path: |
             ${{ env.APK_PATH }}
-            build/out/extbridge.jar
+            build/out/opaldesk.jar
           if-no-files-found: error
           retention-days: 90
 
   build-macos:
-    name: Build & Test macOS Client (ExtBridgeMac)
+    name: Build & Test macOS Client (OpalDesk)
     runs-on: macos-latest
     outputs:
       macos_archive_name: ${{ steps.package_macos.outputs.macos_archive_name }}
@@ -205,27 +200,27 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Build, Test & Package ExtBridgeMac
+      - name: Build, Test & Package OpalDesk.app
         id: package_macos
         shell: bash
         run: |
           VER="$(sed -nE 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' helper/build.gradle.kts | head -n 1)"
-          VER="${VER:-3.5.3}"
+          VER="${VER:-0.0.1}"
 
           chmod +x scripts/build-macos-app.sh
           (
-            cd macos/ExtBridgeMac
+            cd macos/OpalDeskMac
             swift test
             swift build -c release
             ../../scripts/build-macos-app.sh --skip-build
           )
 
-          ARCHIVE_NAME="ExtBridgeMac_v${VER}-macos.zip"
-          if [ ! -d "build/out/ExtBridgeMac.app" ]; then
-            echo "::error::scripts/build-macos-app.sh did not produce build/out/ExtBridgeMac.app"
+          ARCHIVE_NAME="OpalDesk_v${VER}-macos.zip"
+          if [ ! -d "build/out/OpalDesk.app" ]; then
+            echo "::error::scripts/build-macos-app.sh did not produce build/out/OpalDesk.app"
             exit 1
           fi
-          ditto -c -k --sequesterRsrc --keepParent "build/out/ExtBridgeMac.app" "build/out/$ARCHIVE_NAME"
+          ditto -c -k --sequesterRsrc --keepParent "build/out/OpalDesk.app" "build/out/$ARCHIVE_NAME"
           echo "MACOS_ARCHIVE_PATH=build/out/$ARCHIVE_NAME" >> "$GITHUB_ENV"
           echo "macos_archive_name=$ARCHIVE_NAME" >> "$GITHUB_OUTPUT"
           echo "app_version=$VER" >> "$GITHUB_OUTPUT"
@@ -234,7 +229,7 @@ jobs:
       - name: Upload macOS Build Artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ExtBridge-macOS_v${{ steps.package_macos.outputs.app_version }}
+          name: OpalDesk-macOS_v${{ steps.package_macos.outputs.app_version }}
           path: ${{ env.MACOS_ARCHIVE_PATH }}
           if-no-files-found: error
           retention-days: 90
@@ -273,24 +268,24 @@ jobs:
       - name: Download Verified Android Release Artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ExtBridge-Android_v${{ needs.build-android.outputs.app_version }}
+          name: OpalDesk-Android_v${{ needs.build-android.outputs.app_version }}
           path: dist
 
       - name: Download Verified macOS Release Artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: ExtBridge-macOS_v${{ needs.build-macos.outputs.app_version }}
+          name: OpalDesk-macOS_v${{ needs.build-macos.outputs.app_version }}
           path: dist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', needs.build-android.outputs.app_version) }}
-          name: ExtBridge v${{ needs.build-android.outputs.app_version }}
+          name: OpalDesk v${{ needs.build-android.outputs.app_version }}
           generate_release_notes: true
           prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
           fail_on_unmatched_files: true
           files: |
             dist/${{ needs.build-android.outputs.apk_name }}
-            dist/extbridge.jar
+            dist/opaldesk.jar
             dist/${{ needs.build-macos.outputs.macos_archive_name }}

@@ -1,154 +1,145 @@
-# ExtBridge (`v3.5.3`) — Android 免 Root Type-C 类 DeX 扩展桌面与增强镜像副屏系统
+# OpalDesk (`v0.0.1`)
 
-> **无需 Root · 单个 APK 自激活 · Xiaomi HyperOS 原生澎湃视觉 (`Compose + Miuix`) · 支持「DeX 独立扩展桌面」与「增强原生镜像信息副屏」双工作模式 · [📖 完整图文使用说明书](docs/USER_GUIDE.md) · [📝 v3.5.3 更新文档](docs/RELEASE_v3.5.3.md)**
+> **免 Root Android 跨端桌面工作站引擎 · Liquid Glass × 类 DeX 自由多窗与平铺引擎 · 本机零拷贝桌面 / macOS 原生低延迟串流 / Type-C 物理外接屏三位一体**
 
-许多 Android 手机与平板（如小米 / REDMI 在 HyperOS 下）连接 Type-C 显示器时，默认仅提供画面受限的**屏幕镜像（Mirroring）**，主屏与副屏比例割裂且两侧留下大片空白黑边。**ExtBridge** 通过 Shell 权限守护进程接管外接物理屏，不仅能够呈现类似 Samsung DeX 的**独立扩展桌面、自由分屏与一键主屏黑屏省电**，还能将传统镜像模式下多出的黑边改造为**支持主题换肤、系统桌面小组件、交互控制与外置鼠标自由跨屏的增强信息侧边栏**。
+**OpalDesk** 将 Android 手机或平板转化为完整的桌面级工作站：由一个轻量级 Shell 权限守护进程（`OpalDeskDaemon`）统一驱动 **Liquid Glass 自由多窗、多槽平铺布局与工作台侧边栏**，并无缝输出到三种显示载体：
 
----
-
-## ✨ 核心特性 & 新增功能全览 (`v3.5.3`)
-
-### 0. 🎨 全新 Xiaomi HyperOS 原生澎湃界面重构、舞台动效与全周边联动 (`v3.5.3`)
-- **主控台与大触摸板 (`Jetpack Compose + Miuix 0.9.4`)**：彻底告别单页臃肿堆砌与彩虹按钮，支持 **平板横屏左侧 `NavigationRail` 双栏工作台** 与 **手机竖屏可折叠大标题 `TopAppBar` + 底部四栏 `NavigationBar`** 自适应切换，内置**跟随系统 / 澎湃浅色 / 澎湃深色**三态外观；提供 `2×2` 控制中心快捷磁贴、可视化镜像布局示意图、关键点吸附 DPI 滑块与独立一级「分应用显示规则」搜索页。
-- **HyperOS 2.0 级窗口最小化/恢复与分屏过渡动画 (`StageTransitionView`)**：新增跨进程零拷贝 `HardwareBuffer` `TaskSnapshot` 快照通道，支持点击 Dock 图标退回后台微弧收缩形变、后台应用弹簧展开、分屏比例切换双窗同步形变与左右/上下互换立体交叉动画。
-- **全周边界面线性矢量联动（零 Emoji）**：外接屏 DeX 底部 Dock、HyperOS 风格 `#0D84FF` 快捷控制中心浮窗、自由分屏比例菜单、扩展桌面启动器顶栏、`SideControlActivity` 副屏直控以及镜像边栏全部 14 款预设信息卡片均统一采用抗锯齿线性矢量图标与澎湃圆角卡片视觉。
-
-### 1. 🖥️ 增强原生镜像模式：把黑边改造成「信息副屏 + 小组件工作台」
-针对 `16:10` / `3:2` 平板或手机镜像至 `16:9` 显示器产生的左右黑边，ExtBridge 原生镜像模式现已全面重塑为**可定制、可交互的信息扩展副屏**：
-- **4 种画面布局与黑边合并**：支持 **关闭侧边栏 (`0`)**、**镜像右移 · 左侧合并宽边栏 (`1`)**、**镜像左移 · 右侧合并宽边栏 (`2`)** 及 **镜像居中 · 左右双翼对称侧边栏 (`3`)**；可一键将双侧窄黑边合并到单侧，为信息卡片与桌面小组件留出完整宽裕空间，并自动适配不同屏幕分辨率与宽高比。
-- **14 款可自由替换与排序的预设信息组件**：
-  - `🕒 大数字时钟`（高对比超大字号时间与星期日期） / `📅 日历与近期日程`
-  - `🔋 电池温压详情`（电量、充放电功耗、温度与电压） / `⚡ 内存与系统负载`（可用 RAM 与系统运行负载）
-  - `📶 Wi-Fi 与信号`（SSID、实时速率与 `dBm` 强度） / `🌐 实时网速监控`（每秒上行/下行吞吐速率）
-  - `🎧 蓝牙与外设`（耳机/键鼠连接状态） / `💾 存储与亮度信息`（机身可用空间与当前亮度）
-  - `🔊 音频通道与音量`（显示 `HDMI / DP 外接音频` 等路由通道，支持直接点按 `➖ / 🔇 / ➕`）
-  - `🎵 媒体播放与切歌`（当前播放曲目/App，支持点按 `⏮ / ⏯ / ⏭` 切歌控制）
-  - `⏱ 专注番茄钟`（25 分钟倒计时，边栏直接启停/重置） / `📝 快捷桌面便签`（随手显示待办备忘）
-  - `🎛 镜像快捷控制台`（一键切回 DeX / 切换对齐方位 / 切换键鼠 / 极暗） / `🌙 主屏最低亮度`（一键压低主屏背光至硬件最低 `1`，再点恢复）
-- **系统桌面小组件 (`AppWidget`) 接入与防拉伸保护**：
-  - 支持在镜像副屏左/右槽位绑定任意系统/第三方 App 小组件（如音乐播放器、天气、日程），并针对小组件在非标准侧边栏中容易被异常拉长变形的问题，内置 **5 档显示比例约束**（`自动原比例` / `方形 1:1` / `竖屏 3:4` / `宽屏 16:9` / `铺满槽位`），保持比例协调不失真。
-- **6 款视觉主题 + 自定义纯色底纹**：
-  - 支持 **`极夜深蓝`**、**`OLED纯黑`**、**`晨雾浅白`**、**`赛博紫青`**、**`翡翠墨绿`**、**`暖暮琥珀`** 及 **`自定义颜色`**，大字号高对比排版适应各种观影与办公环境。
-- **外置鼠标无缝跨屏 & 无键鼠「副屏直控」**：
-  - **外置鼠标外屏显示与跨屏自由点按**：外接实体鼠标不仅能在镜像模式下正常显示于外接屏，将鼠标指针滑向镜像区左右边缘即可无缝跨入黑边侧边栏点按、滚轮或右键操作小组件（已修复边缘碰触误弹出 ExtBridge 主界面的问题与捕获重入保护）。
-  - **5 档副屏光标灵敏度调节**：针对镜像侧边栏与不同分辨率显示器提供 **`0.9x 精细`** / **`1.4x 标准`** / **`1.9x 流畅`** / **`2.6x 极速`** / **`3.4x 飞快`** 五档指针倍速及 DPI 自适应缩放，解决低/高分辨率屏幕下鼠标过慢或过飘问题。
-  - **App 内「副屏直控」(`SideControlActivity`) + 触控板互操**：没有外置键鼠时，可在主控制台或虚拟触摸板一键打开 **`副屏直控`**，直接在平板/手机主屏手指点选滑动镜像侧边栏（也可通过虚拟触控板直接点按操作已添加的小组件）；同步保留**平板桌面布局保护**，不破坏原主屏桌面排版。
-
-### 2. 🖥️ DeX 独立扩展桌面模式 + 21:9 带鱼屏自适应 + 一键主屏黑屏省电
-- 自动探测外接物理显示器 (`Display.TYPE_EXTERNAL`) 并通过 `SurfaceControl` 投射独立的 `VirtualDisplay`（首次接入自动从 EDID 优先识别最高原生宽屏/高刷物理分辨率与适配 DPI，避免 3:2 平板默认回落到 4:3/16:9 留黑边）。
-- **独立「桌面渲染分辨率」调节与四向旋转（`0° / 90° / 180° / 270°`）**：内置 `3840×2160 (4K)`、**`3440×1440 (21:9 准4K带鱼)`**、`2560×1600`、`2560×1440`、**`2560×1080 (21:9 带鱼)`**、`1920×1200`、`1920×1080`、`1600×900`、`1280×720` 预设及自定义宽高比，「恢复推荐默认」自动匹配当前显示器最佳原生 EDID 分辨率。
-- **自适应自动隐藏 Dock 栏 & Win11 风格控制浮窗 (`BridgeService`)**：进入应用闲置约 `2.6s` 自动收起为底边触控条（鼠标悬停底边唤醒）。
-- **🌙 一键黑屏（平板/手机主屏最低亮度熄屏护眼）**：在 Dock 快捷控制浮窗点击 **「🌙 一键黑屏 (平板最低亮度)」**，主屏立即叠加纯黑防误触遮罩（支持 `NavAssistService` 无障碍层级兜底）并将背光精准降至硬件最低 `1`；**双击主屏任意位置**、关闭服务或断开外接屏时均自动精确恢复进入前的亮度。
-
-### 3. ◫ DeX 自由分屏模式 & 分应用显示兼容策略（含防工作台小窗劫持保护）
-- **横屏自动左右分屏 / 竖屏自动上下分屏**：Dock 一键分屏或桌面图标长按/右键放入左/右/上/下屏；中央高对比度拖拽分割条支持 **`25% ~ 75%`** 实时调节比例与快捷预设（`3:7 / 4:6 / 5:5 / 6:4 / 7:3`、`⇄/⇅ 互换`、`✕ 退出`）。
-- **三档分应用兼容策略 + 防悬浮小窗劫持**：支持 *跟随系统默认 / 强制横屏全屏 / 竖屏居中兼容*（配置持久化于 `/data/local/tmp/extbridge_apps.conf`），同时针对开启了小米「工作台模式（无界桌面）」或系统「强制桌面模式」的设备自动锁定扩展屏 `WINDOWING_MODE_FULLSCREEN` 容器，防止桌面与应用被系统误塞进鼠标无法拖拽的 `•••` 悬浮小窗。
-
-### 4. 📱 虚拟触摸板与键盘输入转发 + 单 APK 三模自激活
-- **增强虚拟触摸板 (`TouchpadActivity`)**：支持单指移动、轻触左键、双指右键、双指/右边缘滚动、拖拽锁定开关、`0.6x ~ 2.4x` 指针灵敏度调节、一键直达「副屏直控」，以及呼出主屏软键盘将输入文字/回车/退格转发给外接屏焦点应用。
-- **单 APK 三模自激活**：APK 内置 `arm64-v8a` 原生 `adb` (`libadb.so`) 与 `extbridge.jar`，支持 **免 Root 本机无线调试通知栏填码激活**、**电脑 ADB 一键激活** 与 **已 Root 设备静默降权激活 (`uid=2000 shell`)**。
+1. **本机零拷贝桌面（LocalDeX）**：无需外接显示器或电脑，直接在平板/手机内屏以零拷贝 `SurfaceView` 全屏进入桌面工作环境，支持触控、手写笔、外接键鼠与桌面快捷方式一键直达。
+2. **macOS 原生远程桌面（`OpalDesk.app`）**：基于 **Swift 6 + SwiftUI + VideoToolbox + AudioToolbox** 构建的原生 macOS 14+ 客户端，通过 **USB 抽象 Socket / Wi-Fi TLS 1.3 (TOFU) + Bonjour (`_opaldesk._tcp`)** 低延迟串流 Android 完整桌面或单应用独立窗口，支持 H.264 / HEVC 硬解、音频回传、UHID 虚拟键鼠、双向文字/图片剪贴板同步与文件传输。
+3. **Type-C / HDMI 物理外接屏 & 增强镜像副屏**：支持物理显示器独立扩展桌面、EDID 宽屏/21:9 带鱼屏自适应、四向旋转、主屏一键黑屏省电，以及将原生镜像黑边改造为支持系统小组件与鼠标无缝跨屏的信息副屏。
 
 ---
 
-## 📸 实机功能效果展示（更多细节见 [使用说明书](docs/USER_GUIDE.md)）
+## ✨ 核心特性 (`v0.0.1`)
 
-| DeX 独立扩展桌面 & Dock | Win11 快捷浮窗 & 一键黑屏入口 | 主屏一键黑屏最低亮度保护 |
-| :---: | :---: | :---: |
-| ![ExtBridge 扩展桌面](docs/images/ext-desktop.png) | ![Dock 快捷浮窗](docs/images/ext-flyout.png) | ![主屏一键黑屏](docs/images/dex-blackout.png) |
+### 1. Liquid Glass × 桌面窗口引擎
+- **自由多窗与实时拖拽**：支持窗口标题栏实时拖动、边缘缩放、最大化/最小化/关闭、沉浸顶栏与快捷窗口切换器。
+- **多拓扑平铺 & 分屏**：内置居中黄金比例单窗、左右/上下二分屏、1+2 主从三分屏、三列分屏及 2×2 四宫格，支持拖拽分割条实时调比。
+- **底部任务栏与工作台侧边栏（Workbench Rail）**：自适应自动隐藏任务栏、快捷设置浮窗、应用抽屉、桌面小组件面板，以及支持实时缩略图快照（`TaskSnapshot`）切换的左侧/顶部工作台应用栏。
+- **分应用显示规则 & 防小窗劫持**：为单个 App 定制默认 / 强制横屏全屏 / 竖屏居中兼容策略，自动规避 OEM 工作台模式强制套壳悬浮窗。
 
-| 短剧等应用强制横屏全屏 | DeX 50/50 自由分屏模式 | 手机/平板端增强虚拟触摸板 |
-| :---: | :---: | :---: |
-| ![强制横屏全屏](docs/images/ext-fullscreen.png) | ![自由分屏](docs/images/ext-split.png) | ![虚拟触摸板](docs/images/touchpad-portrait.png) |
+### 2. 三栖显示输出
+| 模式 | 适用场景 | 核心能力 |
+| :--- | :--- | :--- |
+| **本机 LocalDeX** | 平板/折叠屏随时办公 | 零拷贝本地 `SurfaceView` 承载、独立 DPI 调节、多指触控/手写笔/外设直通、桌面图标长按快捷入口 |
+| **macOS 原生串流** | 手机/平板协同 Mac 办公 | USB 有线即插即用 & 局域网 TLS 1.3 + 6 位 PIN 配对、VideoToolbox 硬解、AAC-LC 音频回传、UHID/系统注入双输入引擎、剪贴板文字/PNG 互传、拖拽传文件 |
+| **Type-C 物理外接屏** | 直连便携屏/桌面显示器 | 4K / 21:9 带鱼屏自适应、0°/90°/180°/270° 旋转、增强原生镜像信息侧边栏（14 款预设卡片 + 系统 AppWidget）、外置鼠标无缝跨屏、一键主屏极暗熄屏 |
 
-| 增强镜像 · 统一左侧信息栏 + 小组件 | 增强镜像 · 左右双翼侧边栏 | 无键鼠时主屏「副屏直控」小组件 |
-| :---: | :---: | :---: |
-| ![镜像统一侧边栏](docs/images/mirror-unified.png) | ![镜像双翼侧边栏](docs/images/mirror-dual.png) | ![副屏直控](docs/images/side-control.png) |
+### 3. 单 APK 四通道免 Root 激活
+- **内置无线调试（零电脑、零第三方依赖）**：APK 内置 `arm64-v8a` `libadb.so`，采用 **Tier 1 `adb push` 直传 → Tier 2 stdin 管道写入 → Tier 3 多用户分包 `pm path`** 三级释放管线，彻底兼容 Android 11–17（无旧版 Toybox `unzip -tq` 故障），支持通知栏直接回复 6 位配对码。
+- **Shizuku / Sui 一键秒激活**：自动检测运行中的 Shizuku（ADB `uid=2000`）与 Sui（Root `uid=0` 自动降权），支持启动时自动静默激活。
+- **Root 静默降权激活**：兼容 Magisk / KernelSU / APatch，仅用 Root 完成哈希校验后强制降权至 `uid=2000` (`u:r:shell:s0`) 运行。
+- **电脑 ADB 一键激活**：跨 Bash / Zsh / PowerShell / CMD 通用单行命令。
 
 ---
 
-## 🏗️ 整体架构与目录结构
+## 🏗️ 项目架构
 
 ```text
-├── bridge/                                  # Shell 权限后台守护进程（app_process 启动）
-│   └── src/com/extbridge/daemon/
-│       └── ExtBridge.java                   # 物理屏接管、VirtualDisplay/SurfaceControl 投射、
-│                                            # Binder IPC (UID ACL 鉴权)、分屏/键鼠跨屏注入、亮度管理
-├── helper/                                  # Android 客户端 App (com.extbridge.helper · Kotlin + Compose + Miuix)
-│   ├── build.gradle.kts                     # AGP 9 + Compose + Miuix 0.9.4 + R8 瘦身配置 (v3.5.3 / code 25)
-│   ├── AndroidManifest.xml                  # 清单声明与 ControlReceiver 契约
-│   ├── jniLibs/arm64-v8a/libadb.so          # 内置 arm64 adb 二进制，供免电脑无线调试自激活使用
-│   ├── res/
-│   └── src/com/extbridge/helper/
-│       ├── MainActivity.kt                  # HyperOS 澎湃风格主控台（响应式双栏/底栏、Miuix 抽屉与分应用规则）
-│       ├── TouchpadActivity.kt              # HyperOS 风格大触摸板与远程输入法转发
-│       ├── ui/                              # ExtVectorIcons 线性图标库、ExtHyperTheme 与 Miuix 弹窗组件
-│       ├── overlay/                         # 悬浮层组件（Dock、快捷浮窗、镜像边栏、光标与黑屏遮罩）
-│       ├── HyperUi.kt                       # 原生 View 浮层共享线性矢量图标与澎湃色彩引擎
-│       ├── StageTransitionView.kt           # HyperOS 2.0 级窗口最小化/恢复与分屏舞台过渡动效引擎
-│       ├── LauncherActivity.kt              # 外接屏独立桌面启动器（壁纸同步、拼音检索、分屏/兼容菜单）
-│       ├── BridgeService.kt                 # 核心前台服务（澎湃 Dock、控制中心浮窗、黑屏遮罩、镜像信息栏、光标）
-│       ├── SideControlActivity.kt           # 主屏镜像「副屏直控」交互页面（无键鼠手指点选侧边栏）
-│       ├── SideMouseCaptureActivity.kt      # 镜像边缘物理鼠标捕获与跨屏边界协同
-│       ├── BridgeClient.kt                  # Binder IPC 客户端封装、主题/预设/比例模型与自动重连
-│       ├── BridgeProvider.kt                # 零延迟安全分发 Binder 句柄（UID 白名单鉴权）
-│       ├── ControlReceiver.kt               # `goAsync()` 异步后台广播控制接收器（含发送方 UID 鉴权）
-│       ├── NavAssistService.kt              # 无障碍辅助服务（高优先级黑屏遮罩、边缘叠加、手势穿透）
-│       ├── AdbBootstrap.kt                  # mDNS 自动发现、无线调试配对连接、守护进程拉起
-│       └── AdbPairingReceiver.kt            # 通知栏 6 位配对码快捷响应
-├── docs/
-│   ├── USER_GUIDE.md                        # 完整图文使用说明书
-│   ├── RELEASE_v3.5.3.md                    # v3.5.3 版本发布与更新说明
-│   └── images/                              # GitHub 文档实机截图素材
-├── scripts/                                 # 本地签名初始化、macOS 打包与 ADB 开发部署脚本
-├── .github/workflows/build.yml              # GitHub Actions 云端自动编译打包与 Release 工作流（SHA 锁定与最小权限）
-├── THIRD_PARTY_NOTICES.md                   # 第三方开源组件与内置 libadb.so 来源、哈希及许可证声明
-├── gradlew / gradlew.bat                    # Gradle 统一构建入口（自动构建 :bridge:dexBridgeJar 与 :helper Release APK）
-└── start_extbridge.sh                       # 手机/ADB 手动启动守护进程脚本
+├── bridge/                                       # Shell 权限后台守护进程（打包为 opaldesk.jar）
+│   └── src/io/github/lengsukq/opaldesk/daemon/
+│       ├── OpalDeskDaemon.java                   # 守护进程入口、生命周期调度与 --verify-helper / --stop
+│       ├── display/                              # PhysicalDisplay / LocalDex / NativeMirror / CompatPolicy
+│       ├── window/                               # DesktopWindowManager / TilingLayoutEngine / TaskWindowController
+│       ├── stream/                               # OpalCastProtocol / RemoteStreamServer / UHID / Audio / Clipboard / FileTransfer
+│       ├── security/                             # TLS 1.3 自签证书生成与 TOFU 信任库
+│       ├── input/                                # InputInjector / LocalInputController / 快捷键匹配
+│       └── ipc/                                  # Binder IPC (UID + 签名证书双校验) 与单实例 LocalSocket
+├── helper/                                       # Android 客户端（io.github.lengsukq.opaldesk · 100% Kotlin + Compose + Miuix）
+│   ├── src/io/github/lengsukq/opaldesk/
+│   │   ├── MainActivity.kt / LocalDexActivity.kt / LauncherActivity.kt / TouchpadActivity.kt
+│   │   ├── BridgeService.kt / BridgeClient.kt / AdbBootstrap.kt
+│   │   ├── adb/                                  # 三级无线 ADB 投递、mDNS 发现与 ShizukuBootstrap
+│   │   ├── desktop/                              # Liquid Glass 窗口标题栏、任务栏、工作台侧边栏与浮窗
+│   │   ├── design/iosglass/                      # Liquid Glass 材质、Squircle 几何与跨窗模糊
+│   │   └── ui/                                   # 响应式主控台、OpalTextField 与四通道激活抽屉
+│   └── jniLibs/arm64-v8a/libadb.so               # 内置 arm64 adb 可执行程序（子进程调用）
+├── macos/OpalDeskMac/                            # macOS 14+ 原生客户端（Swift 6 / SwiftPM）
+│   ├── Sources/OpalDeskCore/                     # OpalCast 协议、TLS TOFU、Bonjour、VideoToolbox、AudioToolbox、ADB 启动器
+│   ├── Sources/OpalDeskMac/                      # SwiftUI 界面、交互画布、菜单栏常驻与偏好设置
+│   └── Tests/OpalDeskCoreTests/                  # 68 项 Swift Testing 单元测试
+├── scripts/                                      # init-signing.sh / build-macos-app.sh / dev-deploy.sh / generate-macos-icon.swift
+├── start_opaldesk.sh                             # 设备端手动激活守护进程脚本
+└── docs/USER_GUIDE.md                            # 详细使用与排障指南
 ```
 
 ---
 
 ## 🚀 快速上手
 
-详细图文步骤与各模式操作说明请阅读 **[📖 docs/USER_GUIDE.md](docs/USER_GUIDE.md)**。
+更多操作细节请阅读 **[📖 docs/USER_GUIDE.md](docs/USER_GUIDE.md)**。
 
-### 核心 3 步：
-1. 安装 `ExtBridge_v3.5.3.apk`，首次打开按提示授予 **通知**、**悬浮窗** 与 **无障碍服务 (`ExtBridge 平板辅助手势`)** 权限（小米等设备建议在开发者选项开启「USB 调试（安全设置）」以允许点击注入）。
-2. 在激活弹窗中任选其一启动守护进程：
-   - **免 Root 本机无线调试**：打开系统无线调试后在通知栏直接填 6 位配对码自激活；
-   - **电脑 ADB 一键命令**（零宿主变量展开，兼容 Windows CMD / PowerShell 与 Linux / macOS Bash / Zsh）：
+### Android 端激活
+1. 安装 `OpalDesk_v0.0.1.apk`，首次打开按引导授予 **通知**、**悬浮窗** 与 **无障碍服务 (`OpalDesk 平板辅助手势`)** 权限。
+2. 在激活弹窗中任选以下任一方式拉起守护进程：
+   - **无线调试**（免电脑）：开启系统无线调试后在通知栏或弹窗填入 6 位配对码；
+   - **Shizuku / Sui**：已启动 Shizuku 时一键授权秒激活；
+   - **Root**：Magisk / KernelSU / APatch 一键授权并自动降权至 `shell` 身份；
+   - **电脑 ADB 单行命令**（支持 Bash / Zsh / PowerShell / CMD）：
      ```bash
-     adb shell "rm -f /data/local/tmp/extb_src.apk /data/local/tmp/extbridge.jar.new && pm path com.extbridge.helper | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/extb_src.apk && test -s /data/local/tmp/extb_src.apk && unzip -p /data/local/tmp/extb_src.apk assets/extbridge.jar > /data/local/tmp/extbridge.jar.new && rm -f /data/local/tmp/extb_src.apk && test -s /data/local/tmp/extbridge.jar.new && unzip -tq /data/local/tmp/extbridge.jar.new >/dev/null 2>&1 && chmod 644 /data/local/tmp/extbridge.jar.new && timeout 6 env CLASSPATH=/data/local/tmp/extbridge.jar.new app_process /data/local/tmp com.extbridge.daemon.ExtBridge --verify-helper >/dev/null 2>&1 && (timeout 8 env CLASSPATH=/data/local/tmp/extbridge.jar.new app_process /data/local/tmp com.extbridge.daemon.ExtBridge --stop >/dev/null 2>&1 || true) && (pgrep -f '^app_process.*ExtBridge' >/dev/null 2>&1 && (pkill -f '^app_process.*ExtBridge' 2>/dev/null || true) && sleep 1 && (pkill -f -l KILL '^app_process.*ExtBridge' 2>/dev/null || true) || true) && rm -f /data/local/tmp/extbridge.jar && mv -f /data/local/tmp/extbridge.jar.new /data/local/tmp/extbridge.jar && test -s /data/local/tmp/extbridge.jar && appops set com.extbridge.helper SYSTEM_ALERT_WINDOW allow && appops set com.extbridge.helper RUN_ANY_IN_BACKGROUND allow && (appops set com.extbridge.helper 10021 allow 2>/dev/null || true) && (appops set com.extbridge.helper ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null || true) && (pm grant com.extbridge.helper android.permission.POST_NOTIFICATIONS 2>/dev/null || true) && (dumpsys deviceidle whitelist +com.extbridge.helper >/dev/null 2>&1 || true) && (CLASSPATH=/data/local/tmp/extbridge.jar nohup app_process /data/local/tmp com.extbridge.daemon.ExtBridge >/data/local/tmp/extbridge.log 2>&1 </dev/null &)"
+     adb shell "rm -f /data/local/tmp/opd_src.apk /data/local/tmp/opaldesk.jar.new && pm path io.github.lengsukq.opaldesk | grep '^package:' | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/opd_src.apk && test -s /data/local/tmp/opd_src.apk && unzip -p /data/local/tmp/opd_src.apk assets/opaldesk.jar > /data/local/tmp/opaldesk.jar.new && rm -f /data/local/tmp/opd_src.apk && test -s /data/local/tmp/opaldesk.jar.new && chmod 644 /data/local/tmp/opaldesk.jar.new && timeout 6 env CLASSPATH=/data/local/tmp/opaldesk.jar.new app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon --verify-helper >/dev/null 2>&1 && (timeout 8 env CLASSPATH=/data/local/tmp/opaldesk.jar.new app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon --stop >/dev/null 2>&1 || true) && ((pgrep -f '^app_process.*OpalDeskDaemon' >/dev/null 2>&1 || pgrep -f '^/system/bin/app_process.*OpalDeskDaemon' >/dev/null 2>&1) && (pkill -f '^app_process.*OpalDeskDaemon' 2>/dev/null; pkill -f '^/system/bin/app_process.*OpalDeskDaemon' 2>/dev/null; true) && sleep 1 && (pkill -f -l KILL '^app_process.*OpalDeskDaemon' 2>/dev/null; pkill -f -l KILL '^/system/bin/app_process.*OpalDeskDaemon' 2>/dev/null; true) || true) && rm -f /data/local/tmp/opaldesk.jar && mv -f /data/local/tmp/opaldesk.jar.new /data/local/tmp/opaldesk.jar && test -s /data/local/tmp/opaldesk.jar && (appops set io.github.lengsukq.opaldesk SYSTEM_ALERT_WINDOW allow 2>/dev/null || true) && (appops set io.github.lengsukq.opaldesk RUN_ANY_IN_BACKGROUND allow 2>/dev/null || true) && (appops set io.github.lengsukq.opaldesk 10021 allow 2>/dev/null || true) && (appops set io.github.lengsukq.opaldesk ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null || true) && (pm grant io.github.lengsukq.opaldesk android.permission.POST_NOTIFICATIONS 2>/dev/null || true) && (pm grant io.github.lengsukq.opaldesk android.permission.ACCESS_LOCAL_NETWORK 2>/dev/null || true) && (dumpsys deviceidle whitelist +io.github.lengsukq.opaldesk >/dev/null 2>&1 || true) && (CLASSPATH=/data/local/tmp/opaldesk.jar nohup app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon >/data/local/tmp/opaldesk.log 2>&1 </dev/null &)"
      ```
-   - **已 Root 设备**：一键授权后先切至 `shell (uid=2000)` 校验哈希与证书，守护进程强制降权运行（失败即中止退出）。
-3. 插上 Type-C 显示器即可在控制台或快捷栏随时切换 **DeX 独立桌面 / 自由分屏 / 增强原生镜像 / 一键黑屏省电**。
+
+### macOS 端连接
+1. 运行 `OpalDesk.app`（macOS 14+，支持 Apple Silicon / Intel）。
+2. **有线 USB**：用数据线连接已开启 USB 调试的 Android 设备，OpalDesk 会自动检测并按需拉起守护进程建立低延迟通道。
+3. **局域网无线**：在 Android 端打开「Mac / 无线大屏」开关后，macOS 端通过 Bonjour（`_opaldesk._tcp`）自动发现设备，首次连接核对 TLS 证书指纹并输入 6 位 PIN 完成配对信任。
 
 ---
 
 ## 🛠️ 从源码编译
 
-具备 **JDK 21**（或 JDK 17+，Gradle Toolchain 会自动匹配）与 **Android SDK (`build-tools/37.0.0` + `platforms/android-37.0`)** 后，直接使用 Gradle Wrapper 即可跨平台一键编译（会自动执行 `:bridge:dexBridgeJar` 并将 `extbridge.jar` 打入 APK）：
+### Android（APK + Daemon JAR）
+需要 **JDK 21** 与 **Android SDK**（`build-tools/37.0.0` + `platforms/android-37.0`）：
 
 ```bash
-# Linux / macOS
+# 1. 首次本地编译前生成独立签名证书（会创建 opaldesk.p12，已被 .gitignore 忽略）
+./scripts/init-signing.sh
+
+# 2. 编译 Release APK（自动执行 :bridge:dexBridgeJar 并嵌入 opaldesk.jar）
 ./gradlew :helper:assembleRelease
+
+# 无密钥验证构建（仅输出未签名 APK）
+./gradlew :helper:assembleRelease -PallowUnsignedRelease=true
+
+# 运行 Android 全量单元测试
+./gradlew :bridge:test :helper:testDebugUnitTest
 ```
 
-```powershell
-# Windows
-.\gradlew.bat :helper:assembleRelease
-```
+### macOS 客户端（`OpalDesk.app` / `.dmg`）
+需要 **macOS 14+** 与 **Xcode 16+ / Swift 6**：
 
-输出产物位于 `bridge/build/libs/extbridge.jar` 与 `helper/build/outputs/apk/release/`（Release 构建默认要求签名证书 `exthelper.p12` / `EXTBRIDGE_KEYSTORE`，可先运行 `./scripts/init-signing.sh` 生成，绝不回退 Debug 签名；如需无密钥可复现构建校验，可附加 `-PallowUnsignedRelease=true` 或设置 `EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1` 生成未签名 APK）。完整版本更新历史请见 [CHANGELOG.md](CHANGELOG.md)。
+```bash
+# 运行 Swift 单元测试
+(cd macos/OpalDeskMac && swift test)
+
+# 编译并打包 OpalDesk.app（追加 --dmg 可同步生成安装包）
+./scripts/build-macos-app.sh --dmg
+```
 
 ---
 
-## 📖 关于「桌面渲染分辨率」与免 Root 定位
+## 🛡️ 独立标识、签名验真与并行共存说明
 
-1. **桌面渲染分辨率 (`VirtualDisplay`) vs 外接物理输出 (`EDID`)**：部分设备（如 Xiaomi HyperOS 正式版固件）由系统 `DisplayModeDirectorImpl` / `SurfaceFlinger` 锁死物理输出档位，显示器 OSD 菜单仍显示 `1080p@60` 或 `2K@60`；但 ExtBridge 控制台调节的 **`VirtualDisplay` 实际画布分辨率** 在所有机型上 100% 生效，可真实实现 **720p 降载稳帧省电**、**4K 超采样锐化**、**自由宽高比** 与 **90°/270° 竖屏满铺**。
-2. **坚持免 Root 路线**：ExtBridge 不改写系统分区，也不会提供用于 Hook 系统框架或 `SurfaceFlinger` 的 Zygisk/LSPosed Root 模块；如需彻底重置单应用 `am compat` 策略，请在控制台「分应用显示模式」点击 **「↺ 全部重置为默认」**，或执行 `adb shell am compat reset-all <packageName>`。
+- **官方发布仓库**：[`https://github.com/lengsukq/OpalDesk`](https://github.com/lengsukq/OpalDesk)（GitHub Releases）
+- **Android 包名**：`io.github.lengsukq.opaldesk`（独立起始版本线 `v0.0.1`）
+- **正式发布 APK 签名证书 SHA-256 指纹**：
+  ```text
+  46f8a5294387afa67269cd374589a25f8f228d15b9746a3438c8b8ca4a48467b
+  ```
+- **macOS Bundle ID**：`io.github.lengsukq.opaldesk.mac`
+- **隔离的运行时命名空间**：独立守护进程类名 `OpalDeskDaemon`、独立 `/data/local/tmp/opaldesk.*` 配置/日志/证书文件、独立抽象 Socket（`opaldesk_stream` / `io.github.lengsukq.opaldesk.daemon.ctl`）及 Bonjour 服务（`_opaldesk._tcp`），**可与原版 ExtBridge 在同一台设备上完全并行安装与共存，互不冲突**。
 
 ---
 
-## ⚠️ 开源协议与第三方声明
-基于 [MIT License](LICENSE) 开源；内置原生 `libadb.so` 及第三方开源库来源、哈希与许可证详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+## 🙏 致谢与来源声明（Acknowledgments）
+
+- **OpalDesk** 最初源自并深度演化自开源项目 **[duppjuzo/ExtBridge](https://github.com/duppjuzo/ExtBridge)**（[MIT License](LICENSE)）。衷心感谢原作者 **duppjuzo** 在 Android 免 Root Type-C 外接屏守护进程、增强原生镜像信息副屏、免电脑无线 ADB 自激活与 Shizuku 激活实践方面的开创性工作与开源贡献！
+- 由于本项目后续独立重写了 Liquid Glass × 类 DeX 桌面窗口引擎、本机 LocalDeX 模式、工作台侧边栏以及 macOS 原生低延迟串流客户端，现作为独立项目 **OpalDesk** 进行维护，使用独立包名、独立图标、独立签名与从 `v0.0.1` 起算的独立版本号，避免与上游 ExtBridge 主仓产生任何混淆或签名冲突。
+- 其他内置可执行程序与第三方开源依赖清单见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+---
+
+## 📄 开源协议
+
+基于 [MIT License](LICENSE) 开源。

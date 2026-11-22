@@ -26,6 +26,7 @@
         <intent>
             <action android:name="android.settings.SETTINGS" />
         </intent>
+        <package android:name="moe.shizuku.privileged.api" />
     </queries>
 
     <application
@@ -33,7 +34,7 @@
         android:enableOnBackInvokedCallback="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
-        android:label="ExtBridge"
+        android:label="OpalDesk"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
 
         <property
@@ -43,9 +44,9 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="ExtBridge"
+            android:label="OpalDesk"
             android:launchMode="singleTask"
-            android:taskAffinity="com.extbridge.helper.tablet"
+            android:taskAffinity="io.github.lengsukq.opaldesk.tablet"
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode">
             <intent-filter>
@@ -60,9 +61,9 @@
         <activity
             android:name=".LocalDexActivity"
             android:exported="true"
-            android:label="ExtBridge 本机 DeX"
+            android:label="OpalDesk 本机 DeX"
             android:launchMode="singleTask"
-            android:taskAffinity="com.extbridge.helper.localdex"
+            android:taskAffinity="io.github.lengsukq.opaldesk.localdex"
             android:screenOrientation="sensorLandscape"
             android:resizeableActivity="true"
             android:windowSoftInputMode="adjustNothing|stateHidden"
@@ -72,9 +73,9 @@
         <activity
             android:name=".TouchpadActivity"
             android:exported="false"
-            android:label="ExtBridge 触摸板"
+            android:label="OpalDesk 触摸板"
             android:launchMode="singleTask"
-            android:taskAffinity="com.extbridge.helper.tablet"
+            android:taskAffinity="io.github.lengsukq.opaldesk.tablet"
             android:resizeableActivity="true"
             android:windowSoftInputMode="adjustResize|stateHidden"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
@@ -82,9 +83,9 @@
         <activity
             android:name=".SideControlActivity"
             android:exported="false"
-            android:label="ExtBridge 副屏直控"
+            android:label="OpalDesk 副屏直控"
             android:launchMode="singleTask"
-            android:taskAffinity="com.extbridge.helper.tablet"
+            android:taskAffinity="io.github.lengsukq.opaldesk.tablet"
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
@@ -96,15 +97,15 @@
             android:resizeableActivity="false"
             android:launchMode="singleInstance"
             android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen"
-            android:taskAffinity="com.extbridge.helper.capture"
+            android:taskAffinity="io.github.lengsukq.opaldesk.capture"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
 
         <activity
             android:name=".LauncherActivity"
             android:exported="true"
-            android:label="ExtBridge 桌面"
+            android:label="OpalDesk 桌面"
             android:launchMode="singleTask"
-            android:taskAffinity="com.extbridge.helper.extdesktop"
+            android:taskAffinity="io.github.lengsukq.opaldesk.extdesktop"
             android:resizeableActivity="true"
             android:windowSoftInputMode="stateAlwaysHidden|adjustNothing"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
@@ -122,7 +123,7 @@
         <service
             android:name=".NavAssistService"
             android:exported="true"
-            android:label="ExtBridge 平板辅助手势"
+            android:label="OpalDesk 平板辅助手势"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
@@ -137,18 +138,18 @@
             android:exported="true"
             android:permission="android.permission.INJECT_EVENTS">
             <intent-filter>
-                <action android:name="com.extbridge.helper.BINDER_PUSH" />
-                <action android:name="com.extbridge.helper.TOGGLE_INPUT" />
-                <action android:name="com.extbridge.helper.STATE_SYNC" />
-                <action android:name="com.extbridge.helper.REBUILD" />
-                <action android:name="com.extbridge.helper.LAUNCH_EXT_HOME" />
-                <action android:name="com.extbridge.helper.TOGGLE_MIRROR" />
-                <action android:name="com.extbridge.helper.SET_MIRROR_SIDE_MODE" />
-                <action android:name="com.extbridge.helper.SPLIT_ACTION" />
-                <action android:name="com.extbridge.helper.SET_ROTATION" />
-                <action android:name="com.extbridge.helper.SET_DOCK_AUTO_HIDE" />
-                <action android:name="com.extbridge.helper.STOP_LOCAL_DEX" />
-                <action android:name="com.extbridge.helper.EXIT_ALL" />
+                <action android:name="io.github.lengsukq.opaldesk.BINDER_PUSH" />
+                <action android:name="io.github.lengsukq.opaldesk.TOGGLE_INPUT" />
+                <action android:name="io.github.lengsukq.opaldesk.STATE_SYNC" />
+                <action android:name="io.github.lengsukq.opaldesk.REBUILD" />
+                <action android:name="io.github.lengsukq.opaldesk.LAUNCH_EXT_HOME" />
+                <action android:name="io.github.lengsukq.opaldesk.TOGGLE_MIRROR" />
+                <action android:name="io.github.lengsukq.opaldesk.SET_MIRROR_SIDE_MODE" />
+                <action android:name="io.github.lengsukq.opaldesk.SPLIT_ACTION" />
+                <action android:name="io.github.lengsukq.opaldesk.SET_ROTATION" />
+                <action android:name="io.github.lengsukq.opaldesk.SET_DOCK_AUTO_HIDE" />
+                <action android:name="io.github.lengsukq.opaldesk.STOP_LOCAL_DEX" />
+                <action android:name="io.github.lengsukq.opaldesk.EXIT_ALL" />
             </intent-filter>
         </receiver>
 
@@ -162,7 +163,15 @@
 
         <provider
             android:name=".BridgeProvider"
-            android:authorities="com.extbridge.helper.provider"
+            android:authorities="io.github.lengsukq.opaldesk.provider"
             android:exported="true" />
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
     </application>
 </manifest>

@@ -1,6 +1,12 @@
--keep class com.extbridge.** { *; }
--keep interface com.extbridge.** { *; }
+-keep class io.github.lengsukq.opaldesk.** { *; }
+-keep interface io.github.lengsukq.opaldesk.** { *; }
+-keep class rikka.shizuku.** { *; }
+-keep interface rikka.shizuku.** { *; }
+-keep class moe.shizuku.** { *; }
+-keep interface moe.shizuku.** { *; }
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
--dontwarn com.extbridge.**
+-dontwarn io.github.lengsukq.opaldesk.**
+-dontwarn rikka.shizuku.**
+-dontwarn moe.shizuku.**
 -dontwarn android.**
 -dontwarn dalvik.**

@@ -8,7 +8,7 @@
         android:shortcutLongLabel="@string/shortcut_local_dex_long">
         <intent
             android:action="android.intent.action.VIEW"
-            android:targetPackage="com.extbridge.helper"
-            android:targetClass="com.extbridge.helper.LocalDexActivity" />
+            android:targetPackage="io.github.lengsukq.opaldesk"
+            android:targetClass="io.github.lengsukq.opaldesk.LocalDexActivity" />
     </shortcut>
 </shortcuts>

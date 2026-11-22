@@ -13,14 +13,14 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
 
-Builds and installs ExtBridge Helper (+ embedded extbridge.jar daemon),
-pushes and runs start_extbridge.sh via ADB, and optionally tails dual logs.
+Builds and installs OpalDesk Helper (+ embedded opaldesk.jar daemon),
+pushes and runs start_opaldesk.sh via ADB, and optionally tails dual logs.
 
 Options:
   -s, --serial <id>   Target ADB device serial
       --release       Build & install release variant instead of debug
-      --skip-build    Skip Gradle build/install; only push & run start_extbridge.sh
-  -l, --logs          Tail both daemon log (/data/local/tmp/extbridge.log) and logcat
+      --skip-build    Skip Gradle build/install; only push & run start_opaldesk.sh
+  -l, --logs          Tail both daemon log (/data/local/tmp/opaldesk.log) and logcat
   -h, --help          Show this help message
 EOF
 }
@@ -142,7 +142,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   if [[ "$BUILD_VARIANT" == "release" ]]; then
     INSTALL_TASK=":helper:installRelease"
   fi
-  echo "==> Running ./gradlew $INSTALL_TASK (auto-builds :bridge:dexBridgeJar & embeds extbridge.jar)"
+  echo "==> Running ./gradlew $INSTALL_TASK (auto-builds :bridge:dexBridgeJar & embeds opaldesk.jar)"
   (
     cd "$ROOT_DIR"
     if [[ -n "$SERIAL" ]]; then
@@ -152,15 +152,15 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   )
 fi
 
-echo "==> Pushing start_extbridge.sh to /data/local/tmp/start_extbridge.sh"
-"${ADB_CMD[@]}" push "$ROOT_DIR/start_extbridge.sh" /data/local/tmp/start_extbridge.sh >/dev/null
-"${ADB_CMD[@]}" shell "chmod 755 /data/local/tmp/start_extbridge.sh"
+echo "==> Pushing start_opaldesk.sh to /data/local/tmp/start_opaldesk.sh"
+"${ADB_CMD[@]}" push "$ROOT_DIR/start_opaldesk.sh" /data/local/tmp/start_opaldesk.sh >/dev/null
+"${ADB_CMD[@]}" shell "chmod 755 /data/local/tmp/start_opaldesk.sh"
 
-echo "==> Starting ExtBridge daemon on device..."
-"${ADB_CMD[@]}" shell "sh /data/local/tmp/start_extbridge.sh"
+echo "==> Starting OpalDesk daemon on device..."
+"${ADB_CMD[@]}" shell "sh /data/local/tmp/start_opaldesk.sh"
 
 echo "==> Checking daemon process status:"
-"${ADB_CMD[@]}" shell "pgrep -af 'app_process.*ExtBridge' || true"
+"${ADB_CMD[@]}" shell "pgrep -af 'app_process.*OpalDeskDaemon' || true"
 
 if [[ "$TAIL_LOGS" -eq 1 ]]; then
   echo "==> Tailing daemon log & logcat (press Ctrl+C to stop)..."
@@ -179,9 +179,9 @@ if [[ "$TAIL_LOGS" -eq 1 ]]; then
   trap cleanup EXIT
 
   # Run each pipeline in a subshell so cleanup kills both adb and sed without leaving orphan processes.
-  ( "${ADB_CMD[@]}" shell "tail -F /data/local/tmp/extbridge.log 2>/dev/null" | sed 's/^/[daemon] /' ) &
+  ( "${ADB_CMD[@]}" shell "tail -F /data/local/tmp/opaldesk.log 2>/dev/null" | sed 's/^/[daemon] /' ) &
   PIDS+=($!)
-  ( "${ADB_CMD[@]}" logcat -v time ExtBridge:V ExtBridgeHelper:V AndroidRuntime:E '*:S' | sed 's/^/[helper] /' ) &
+  ( "${ADB_CMD[@]}" logcat -v time OpalDesk:V OpalDeskApp:V AndroidRuntime:E '*:S' | sed 's/^/[helper] /' ) &
   PIDS+=($!)
 
   wait

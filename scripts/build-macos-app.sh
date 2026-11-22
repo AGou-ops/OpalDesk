@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build and package ExtBridgeMac.app (and optionally .dmg) for macOS 14+ (Apple Silicon / Universal).
-# Safe to invoke from any working directory (repo root or macos/ExtBridgeMac).
+# Build and package OpalDesk.app (and optionally .dmg) for macOS 14+ (Apple Silicon / Universal).
+# Safe to invoke from any working directory (repo root or macos/OpalDeskMac).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-PKG_DIR="$REPO_ROOT/macos/ExtBridgeMac"
+PKG_DIR="$REPO_ROOT/macos/OpalDeskMac"
 OUT_DIR="$REPO_ROOT/build/out"
 ICON_GENERATOR="$SCRIPT_DIR/generate-macos-icon.swift"
-APP_NAME="ExtBridgeMac"
-BUNDLE_ID="com.extbridge.mac"
+APP_NAME="OpalDesk"
+BUNDLE_ID="io.github.lengsukq.opaldesk.mac"
 APP_BUNDLE="$OUT_DIR/${APP_NAME}.app"
 
 CREATE_DMG=0
 SKIP_BUILD=0
-SIGN_IDENTITY="${EXTBRIDGE_MAC_SIGN_IDENTITY:--}"
+SIGN_IDENTITY="${OPALDESK_MAC_SIGN_IDENTITY:--}"
 ICON_TMP=""
 DMG_STAGE=""
 
@@ -32,8 +32,8 @@ Options:
   -h, --help                  Show this help message
 
 Environment overrides:
-  EXTBRIDGE_MAC_SIGN_IDENTITY  Code-signing identity (defaults to ad-hoc "-")
-  EXTBRIDGE_MAC_VERSION        Bundle version override (defaults to helper/build.gradle.kts versionName)
+  OPALDESK_MAC_SIGN_IDENTITY  Code-signing identity (defaults to ad-hoc "-")
+  OPALDESK_MAC_VERSION        Bundle version override (defaults to helper/build.gradle.kts versionName)
 EOF
 }
 
@@ -78,11 +78,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-VERSION="${EXTBRIDGE_MAC_VERSION:-}"
+VERSION="${OPALDESK_MAC_VERSION:-}"
 if [[ -z "$VERSION" && -f "$REPO_ROOT/helper/build.gradle.kts" ]]; then
     VERSION="$(sed -nE 's/.*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$REPO_ROOT/helper/build.gradle.kts" | head -n 1 || true)"
 fi
-VERSION="${VERSION:-3.5.3}"
+VERSION="${VERSION:-0.0.1}"
 
 echo "==> Packaging ${APP_NAME}.app (v${VERSION})"
 
@@ -113,7 +113,7 @@ if command -v iconutil >/dev/null 2>&1 && command -v swift >/dev/null 2>&1; then
         echo "ERROR: Icon generator script not found at $ICON_GENERATOR" >&2
         exit 1
     fi
-    ICON_TMP="$(mktemp -d "${TMPDIR:-/tmp}/extbridge-icon.XXXXXX")"
+    ICON_TMP="$(mktemp -d "${TMPDIR:-/tmp}/opaldesk-icon.XXXXXX")"
     ICONSET_DIR="$ICON_TMP/AppIcon.iconset"
     mkdir -p "$ICONSET_DIR"
     echo "==> Generating AppIcon.icns..."
@@ -160,12 +160,12 @@ ${ICON_KEY_XML}
     <string>14.0</string>
     <key>NSBonjourServices</key>
     <array>
-        <string>_extbridge._tcp</string>
+        <string>_opaldesk._tcp</string>
     </array>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>ExtBridgeMac 需要访问局域网以通过 Bonjour 自动发现并低延迟连接同网络下的 Android 手机大屏服务。</string>
+    <string>OpalDesk 需要访问局域网以通过 Bonjour 自动发现并低延迟连接同网络下的 Android 桌面服务。</string>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
 </dict>
@@ -188,7 +188,7 @@ echo "==> Created app bundle: $APP_BUNDLE"
 
 if [[ "$CREATE_DMG" -eq 1 ]]; then
     DMG_PATH="$OUT_DIR/${APP_NAME}_v${VERSION}.dmg"
-    DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/extbridge-dmg.XXXXXX")"
+    DMG_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/opaldesk-dmg.XXXXXX")"
     cp -R "$APP_BUNDLE" "$DMG_STAGE/"
     ln -s /Applications "$DMG_STAGE/Applications"
     rm -f "$DMG_PATH"

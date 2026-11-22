@@ -1,7 +1,7 @@
 # Build artifacts
 build/
 helper/build/
-helper/assets/extbridge.jar
+helper/assets/opaldesk.jar
 out/
 *.apk
 *.idsig

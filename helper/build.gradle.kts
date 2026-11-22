@@ -7,13 +7,13 @@ kotlin {
     jvmToolchain(21)
 }
 
-val resolvedSdkDir = (rootProject.extra["extBridgeAndroidSdkDir"] as? String).orEmpty()
+val resolvedSdkDir = (rootProject.extra["opalDeskAndroidSdkDir"] as? String).orEmpty()
 val hasAndroid37Minor2 = resolvedSdkDir.isNotBlank() &&
     file("$resolvedSdkDir/platforms/android-37.2/android.jar").isFile
 
 @Suppress("UnstableApiUsage")
 android {
-    namespace = "com.extbridge.helper"
+    namespace = "io.github.lengsukq.opaldesk"
     buildToolsVersion = "37.0.0"
     compileSdk {
         version = release(37) {
@@ -22,11 +22,11 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.extbridge.helper"
+        applicationId = "io.github.lengsukq.opaldesk"
         minSdk = 30
         targetSdk = 37
-        versionCode = 26
-        versionName = "4.0.0"
+        versionCode = 1
+        versionName = "0.0.1"
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -58,29 +58,33 @@ android {
         compose = true
     }
 
+    androidResources {
+        noCompress += "jar"
+    }
+
     testOptions {
         unitTests.isReturnDefaultValues = true
     }
 
-    val activeKsPath = (rootProject.extra["extBridgeSigningKeystorePath"] as? String).orEmpty()
+    val activeKsPath = (rootProject.extra["opalDeskSigningKeystorePath"] as? String).orEmpty()
     val activeKs = activeKsPath.takeIf { it.isNotBlank() }?.let { file(it) }
-    val signingPass = (rootProject.extra["extBridgeSigningPassword"] as? String).orEmpty()
-    val signingAlias = (rootProject.extra["extBridgeSigningAlias"] as? String).orEmpty().ifBlank { "extbridge" }
+    val signingPass = (rootProject.extra["opalDeskSigningPassword"] as? String).orEmpty()
+    val signingAlias = (rootProject.extra["opalDeskSigningAlias"] as? String).orEmpty().ifBlank { "opaldesk" }
 
-    val requireReleaseKey = (System.getenv("EXTBRIDGE_REQUIRE_RELEASE_KEY") == "1")
+    val requireReleaseKey = (System.getenv("OPALDESK_REQUIRE_RELEASE_KEY") == "1")
         || (project.findProperty("requireReleaseKey")?.toString()?.equals("true", ignoreCase = true) == true)
         || (System.getenv("GITHUB_REF")?.startsWith("refs/tags/v") == true)
     val allowUnsignedRelease = !requireReleaseKey && (
-        (System.getenv("EXTBRIDGE_ALLOW_UNSIGNED_RELEASE") == "1")
+        (System.getenv("OPALDESK_ALLOW_UNSIGNED_RELEASE") == "1")
             || (project.findProperty("allowUnsignedRelease")?.toString()?.equals("true", ignoreCase = true) == true)
         )
     val isReleaseTaskRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
 
     if ((requireReleaseKey || (isReleaseTaskRequested && !allowUnsignedRelease)) && activeKs == null) {
         throw GradleException(
-            "Release build requires EXTBRIDGE_KEYSTORE (or local exthelper.p12). " +
+            "Release build requires OPALDESK_KEYSTORE (or local opaldesk.p12). " +
                 "Run ./scripts/init-signing.sh to generate a local signing certificate, or for keyless CI verification " +
-                "pass -PallowUnsignedRelease=true (or EXTBRIDGE_ALLOW_UNSIGNED_RELEASE=1)."
+                "pass -PallowUnsignedRelease=true (or OPALDESK_ALLOW_UNSIGNED_RELEASE=1)."
         )
     }
 
@@ -155,21 +159,24 @@ dependencies {
     implementation("top.yukonga.miuix.kmp:miuix-preference:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-icons:0.9.4")
     implementation("top.yukonga.miuix.kmp:miuix-squircle:0.9.4")
+    implementation("dev.rikka.shizuku:aidl:13.1.5")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     testImplementation("junit:junit:4.13.2")
 }
 
 val syncBridgeDaemonAsset = tasks.register<Copy>("syncBridgeDaemonAsset") {
     group = "build"
-    description = "Builds :bridge:dexBridgeJar and copies extbridge.jar into helper/assets/."
+    description = "Builds :bridge:dexBridgeJar and copies opaldesk.jar into helper/assets/."
     val dexTask = project(":bridge").tasks.named("dexBridgeJar")
     dependsOn(dexTask)
-    from(project(":bridge").layout.buildDirectory.file("libs/extbridge.jar"))
+    from(project(":bridge").layout.buildDirectory.file("libs/opaldesk.jar"))
     into(layout.projectDirectory.dir("assets"))
-    rename { "extbridge.jar" }
+    rename { "opaldesk.jar" }
 }
 
-val helperAssetsJar = layout.projectDirectory.file("assets/extbridge.jar")
+val helperAssetsJar = layout.projectDirectory.file("assets/opaldesk.jar")
 
 tasks.named("preBuild") {
     dependsOn(syncBridgeDaemonAsset)
@@ -177,7 +184,7 @@ tasks.named("preBuild") {
         val jar = helperAssetsJar.asFile
         if (!jar.exists() || jar.length() < 4096L) {
             throw GradleException(
-                "Missing or empty helper/assets/extbridge.jar after :helper:syncBridgeDaemonAsset!"
+                "Missing or empty helper/assets/opaldesk.jar after :helper:syncBridgeDaemonAsset!"
             )
         }
     }
