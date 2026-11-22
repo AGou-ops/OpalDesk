@@ -7,6 +7,7 @@ import android.graphics.Rect;
 import android.os.Handler;
 import android.os.Parcel;
 import android.os.SystemClock;
+import android.view.Display;
 
 import com.extbridge.daemon.BridgeBuildConfig;
 import com.extbridge.daemon.DaemonConfig;
@@ -28,6 +29,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -63,6 +65,8 @@ public final class TaskWindowController {
     private volatile String pendingFullscreenPkg = "";
     private volatile long pendingFullscreenUntilMs = 0L;
     private volatile long displayMigrationUntilMs = 0L;
+    private volatile int lastLiveMoveTaskId = -1;
+    private volatile long lastLiveMoveMs = 0L;
 
     public TaskWindowController(
             AndroidServices services, DaemonConfig config, TaskApiAdapter taskApi,
@@ -280,12 +284,30 @@ public final class TaskWindowController {
                     && prevWindow.bounds.width() == rect.width()
                     && prevWindow.bounds.height() == rect.height();
             if (pureTranslation && taskApi.getTaskWindowingMode(taskId) == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW) {
-                taskApi.resizeTask(taskId, ar);
+                taskApi.resizeTask(taskId, ar, TaskApiAdapter.RESIZE_MODE_USER);
             } else {
                 taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
                 if (bringToFront) {
                     bringMultiWindowTaskFront(taskId, ar);
                     taskApi.ensureTaskResizeableAndMultiWindow(taskId, vdId, ar, true);
+                    if (mainHandler != null) {
+                        final int fTid = taskId;
+                        final int fVd = vdId;
+                        final Rect fAr = new Rect(ar);
+                        for (long delay : new long[]{80L, 240L}) {
+                            mainHandler.postDelayed(() -> {
+                                if (config.vdId != fVd || config.shuttingDown) return;
+                                ManagedWindow curMw = windowManager.getManagedWindow(fTid);
+                                if (curMw == null || curMw.minimized || DesktopWindowManager.MODE_FULLSCREEN.equals(curMw.mode)) return;
+                                int curWm = taskApi.getTaskWindowingMode(fTid);
+                                Rect curB = taskApi.getTaskBounds(fTid, fVd);
+                                if (curWm != BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW || curB == null || !curB.equals(fAr)) {
+                                    taskApi.ensureTaskResizeableAndMultiWindow(fTid, fVd, fAr, true);
+                                    notifyStateChanged();
+                                }
+                            }, delay);
+                        }
+                    }
                 }
             }
             if (rememberPref && !safePkg.isEmpty()) {
@@ -424,18 +446,55 @@ public final class TaskWindowController {
         return ok;
     }
 
+    /**
+     * Ultra-low-latency live drag path: updates managed bounds in RAM and invokes cached
+     * {@code ATMS.resizeTask(..., RESIZE_MODE_USER)} directly with zero {@code getTasks()},
+     * zero {@code WCT.reorder}, and zero state-push IPC roundtrips per frame.
+     */
+    public boolean moveWindowLive(int taskId, int left, int top, int right, int bottom) {
+        int vdId = config.vdId;
+        if (vdId <= 0 || taskId <= 0 || right - left < 200 || bottom - top < 200) return false;
+        ManagedWindow prev = windowManager.getManagedWindow(taskId);
+        if (prev == null || prev.minimized) return false;
+
+        int virtW = config.virtW, virtH = config.virtH, virtDpi = config.virtDpi;
+        int effDpi = Math.max(120, virtDpi > 0 ? virtDpi : 240);
+        int minTop = DisplayGeometryUtil.dpToPx(
+                DisplayGeometryUtil.WORKAREA_TOP_INSET_DP + DisplayGeometryUtil.WINDOW_HEADER_HEIGHT_DP, effDpi);
+        int workBottom = Math.max(360, virtH - desktopDockInsetPx());
+        WindowRect rect = DesktopWindowManager.clampBoundsToWorkArea(
+                new WindowRect(left, top, right, bottom), virtW, workBottom, minTop);
+
+        lastLiveMoveTaskId = taskId;
+        lastLiveMoveMs = SystemClock.uptimeMillis();
+
+        // If the task wasn't in FREEFORM yet (e.g. first drag frame out of ADAPTIVE_SINGLE/FULLSCREEN),
+        // transition it cleanly once; all subsequent drag frames stay on the 1-IPC fast path.
+        if (!DesktopWindowManager.MODE_FREEFORM.equals(prev.mode)) {
+            tiling.clearTilingIfActive();
+            applySingleWindowMode(taskId, prev.pkg, DesktopWindowManager.MODE_FREEFORM, rect, false, true, false);
+            return true;
+        }
+
+        String presentation = DesktopWindowManager.classifyPresentation(
+                DesktopWindowManager.MODE_FREEFORM, rect, virtW, virtH, virtDpi, windowManager.isTaskbarAutoHide());
+        windowManager.putManagedWindow(taskId, prev.pkg, DesktopWindowManager.MODE_FREEFORM, presentation, rect, true, -1);
+        taskApi.resizeTask(taskId, rect.toAndroidRect(), TaskApiAdapter.RESIZE_MODE_USER);
+        return true;
+    }
+
     public boolean updateWindowBounds(
             int taskId, String pkg, int modeInt, int left, int top, int right, int bottom, boolean rememberPref) {
         int vdId = config.vdId;
         if (vdId <= 0) return false;
         String safePkg = PackagePolicy.isValidPackageName(pkg) ? pkg : null;
-        int tid = (taskId > 0 && isTaskAllowedForExtControl(taskId, safePkg, false))
-                ? taskId : (safePkg != null ? findTaskIdForPkg(safePkg, true) : -1);
+        boolean directAllowed = taskId > 0 && isTaskAllowedForExtControl(taskId, safePkg, false);
+        int tid = directAllowed ? taskId : (safePkg != null ? findTaskIdForPkg(safePkg, true) : -1);
         if (tid <= 0) {
             String topPkg = findTopUserAppOnDisplay(vdId)[0];
             if (!topPkg.isEmpty()) { safePkg = topPkg; tid = findTaskIdForPkg(safePkg, true); }
         }
-        if (tid <= 0 || !isTaskAllowedForExtControl(tid, safePkg, false)) return false;
+        if (tid <= 0 || (!directAllowed && !isTaskAllowedForExtControl(tid, safePkg, false))) return false;
         if (safePkg == null) {
             ManagedWindow mw = windowManager.getManagedWindow(tid);
             if (mw != null && !mw.pkg.isEmpty()) safePkg = mw.pkg;
@@ -445,8 +504,13 @@ public final class TaskWindowController {
                 : (modeInt == DesktopWindowManager.INT_MODE_FREEFORM ? DesktopWindowManager.MODE_FREEFORM : DesktopWindowManager.MODE_ADAPTIVE_SINGLE);
         WindowRect explicit = (right - left >= 200 && bottom - top >= 200) ? new WindowRect(left, top, right, bottom) : null;
         boolean bringFront = DesktopWindowManager.MODE_FULLSCREEN.equals(mode);
+        ManagedWindow beforeCommit = windowManager.getManagedWindow(tid);
+        boolean alreadyFocusedFreeform = beforeCommit != null
+                && !beforeCommit.minimized
+                && beforeCommit.focused
+                && DesktopWindowManager.MODE_FREEFORM.equals(beforeCommit.mode);
         applySingleWindowMode(tid, safePkg, mode, explicit, bringFront, true, rememberPref);
-        if (DesktopWindowManager.MODE_FREEFORM.equals(mode)) {
+        if (DesktopWindowManager.MODE_FREEFORM.equals(mode) && !alreadyFocusedFreeform) {
             taskApi.reorderTask(tid, vdId, true);
         }
         notifyStateChanged();
@@ -506,6 +570,9 @@ public final class TaskWindowController {
             }
             notifyStateChanged();
             return true;
+        }
+        if (safePkg != null && !BridgeBuildConfig.HELPER_PACKAGE.equals(safePkg) && !windowManager.isTilingActive()) {
+            return launchInWindowMode(safePkg, "", DesktopWindowManager.INT_MODE_AUTO, 0, 0, 0, 0);
         }
         Intent li = (safePkg != null && services.context != null) ? services.context.getPackageManager().getLaunchIntentForPackage(safePkg) : null;
         if (li == null) return false;
@@ -704,6 +771,158 @@ public final class TaskWindowController {
         return SystemClock.uptimeMillis() < displayMigrationUntilMs;
     }
 
+    /**
+     * Restores every user task on {@code displayId} back to fullscreen with cleared freeform bounds
+     * while paused behind {@code LauncherActivity} BEFORE {@code vd.release()}, preventing active
+     * multi-window SurfaceFlinger leashes or half-screen bounds from carrying over onto Display 0.
+     *
+     * <p>Returns the restored user task IDs (plus any virtual launcher task ID encoded as negative
+     * {@code -launcherTid} at the tail so post-teardown cleanup removes it after {@code vd.release()}).
+     */
+    public List<Integer> restoreDisplayTasksForTeardown(int displayId, int dispW, int dispH) {
+        if (displayId <= 0) return Collections.emptyList();
+        LinkedHashSet<Integer> userTids = new LinkedHashSet<>(collectExtUserTaskIds(displayId));
+        for (ManagedWindow mw : windowManager.getManagedWindowsSnapshot()) {
+            if (mw != null && mw.taskId > 0
+                    && !BridgeBuildConfig.HELPER_PACKAGE.equals(mw.pkg)
+                    && !PackagePolicy.isProtectedSystemTaskPkg(mw.pkg)) {
+                userTids.add(mw.taskId);
+            }
+        }
+        int launcherTid = queries.findExtLauncherTaskId();
+        if (launcherTid > 0) {
+            userTids.remove(launcherTid);
+        }
+        if (userTids.isEmpty()) {
+            if (launcherTid > 0) taskApi.removeTask(launcherTid);
+            return Collections.emptyList();
+        }
+
+        // Step 1: Bring LauncherActivity to the front of displayId so every visible user task
+        // genuinely transitions to visible=false / paused BEFORE vd.release() (destroying HyperOS
+        // active multi-window SurfaceFlinger animation leashes & letterbox crops).
+        boolean hadVisibleUserTask = false;
+        List<?> runningBefore = taskApi.getTasks();
+        if (runningBefore != null) {
+            for (Object t : runningBefore) {
+                if (t == null || TaskApiAdapter.readIntField(t, "displayId", -1) != displayId) continue;
+                int tid = TaskApiAdapter.extractTaskId(t);
+                if (userTids.contains(tid) && TaskApiAdapter.readBoolField(t, "isVisible", false)) {
+                    hadVisibleUserTask = true;
+                    break;
+                }
+            }
+        }
+        if (hadVisibleUserTask) {
+            if (launcherTid > 0) {
+                taskApi.startActivityFromRecents(
+                        launcherTid, makeLaunchOptions(displayId, BridgeProtocol.WINDOWING_MODE_FULLSCREEN, null).toBundle());
+                taskApi.reorderTask(launcherTid, displayId, true);
+            }
+            for (int tid : userTids) {
+                taskApi.reorderTask(tid, displayId, false);
+            }
+            SystemClock.sleep(180L);
+        }
+
+        // Step 2: Reset every paused user task's SurfaceFlinger position to (0, 0) via full-screen
+        // resizeTask while invisible (no 350ms spring animation when hidden!), then switch to FULLSCREEN + empty bounds.
+        int[] d0 = readDefaultDisplaySize(dispW, dispH);
+        Rect fullBounds = new Rect(0, 0, Math.max(480, Math.max(dispW, d0[0])), Math.max(480, Math.max(dispH, d0[1])));
+        for (int tid : userTids) {
+            taskApi.resizeTask(tid, fullBounds);
+        }
+        SystemClock.sleep(60L);
+        Rect emptyBounds = new Rect();
+        for (int tid : userTids) {
+            if (!taskApi.applyWctForTask(tid, displayId, Boolean.FALSE, TaskApiAdapter.WINDOWING_MODE_FULLSCREEN, emptyBounds)) {
+                taskApi.clearTaskAlwaysOnTop(tid, displayId);
+                taskApi.forceTaskWindowingMode(tid, displayId, TaskApiAdapter.WINDOWING_MODE_FULLSCREEN);
+            }
+        }
+        SystemClock.sleep(60L);
+
+        // Keep launcherTid alive on top during vd.release() so migrated user tasks land behind the
+        // foreground on Display 0; post-teardown cleanup removes launcherTid immediately afterwards.
+        ArrayList<Integer> out = new ArrayList<>(userTids);
+        if (launcherTid > 0) {
+            out.add(-launcherTid);
+        }
+        return out;
+    }
+
+    /**
+     * Post-teardown safety sweep on Display 0: removes any leftover virtual Launcher task and
+     * ensures migrated user tasks did not retain stale MULTI_WINDOW / FREEFORM bounds on Display 0.
+     */
+    public void schedulePostTeardownDisplay0Sanitize(List<Integer> userTaskIds) {
+        if (userTaskIds == null || userTaskIds.isEmpty()) return;
+        int launcherToRemove = -1;
+        ArrayList<Integer> snapshot = new ArrayList<>();
+        for (int v : userTaskIds) {
+            if (v < 0) launcherToRemove = -v;
+            else if (v > 0) snapshot.add(v);
+        }
+        final int fLauncherTid = launcherToRemove;
+        Runnable removeLauncher = () -> {
+            if (fLauncherTid > 0) taskApi.removeTask(fLauncherTid);
+        };
+        Runnable sweep = () -> {
+            if (fLauncherTid > 0) taskApi.removeTask(fLauncherTid);
+            sanitizeMigratedTasksOnDisplay0(snapshot);
+        };
+        if (mainHandler != null) {
+            if (fLauncherTid > 0) mainHandler.postDelayed(removeLauncher, 60L);
+            mainHandler.postDelayed(sweep, 240L);
+            mainHandler.postDelayed(sweep, 700L);
+        } else {
+            bgIoExec.execute(sweep);
+        }
+    }
+
+    private void sanitizeMigratedTasksOnDisplay0(List<Integer> userTaskIds) {
+        if (userTaskIds == null || userTaskIds.isEmpty() || config.shuttingDown) return;
+        List<?> running = taskApi.getTasks();
+        if (running == null || running.isEmpty()) return;
+        int[] d0 = readDefaultDisplaySize(config.virtW, config.virtH);
+        int d0W = d0[0], d0H = d0[1];
+        Set<Integer> targetSet = new HashSet<>(userTaskIds);
+        for (Object t : running) {
+            if (t == null) continue;
+            int tid = TaskApiAdapter.extractTaskId(t);
+            if (!targetSet.contains(tid)) continue;
+            if (TaskApiAdapter.readIntField(t, "displayId", -1) != Display.DEFAULT_DISPLAY) continue;
+            int wm = TaskApiAdapter.extractTaskWindowingMode(t);
+            Rect curB = taskApi.getTaskBounds(tid, Display.DEFAULT_DISPLAY);
+            boolean staleBounds = curB != null && !curB.isEmpty()
+                    && (curB.left != 0 || curB.top != 0
+                    || curB.width() < Math.min(d0W, d0H) - FULLSCREEN_WIDTH_TOLERANCE_PX
+                    || curB.height() < Math.min(d0W, d0H) - FULLSCREEN_WIDTH_TOLERANCE_PX);
+            if ((wm != TaskApiAdapter.WINDOWING_MODE_FULLSCREEN && wm != 0) || staleBounds) {
+                taskApi.detachFreeformAndEnsureFullscreen(tid, Display.DEFAULT_DISPLAY, d0W, d0H, true, mainHandler);
+            }
+        }
+    }
+
+    private int[] readDefaultDisplaySize(int fallbackW, int fallbackH) {
+        int w = Math.max(480, fallbackW);
+        int h = Math.max(480, fallbackH);
+        try {
+            if (services.displayManager != null) {
+                Display d0 = services.displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+                if (d0 != null) {
+                    Display.Mode mode = d0.getMode();
+                    if (mode != null && mode.getPhysicalWidth() > 0 && mode.getPhysicalHeight() > 0) {
+                        w = mode.getPhysicalWidth();
+                        h = mode.getPhysicalHeight();
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return new int[]{w, h};
+    }
+
     public void finishDisplayMigrationAndRelayout(List<ManagedWindow> preserved) {
         if (preserved != null && !preserved.isEmpty()) {
             for (ManagedWindow mw : preserved) {
@@ -800,7 +1019,7 @@ public final class TaskWindowController {
                 if (tid > 0) liveTids.add(tid);
             }
         }
-        windowManager.pruneDeadTasks(liveTids);
+        windowManager.pruneDeadTasks(liveTids, 1800L);
 
         TwoSlotSplitSnapshot split = getTwoSlotSplitSnapshot();
         if (tiling.maybeDetachHiddenTwoSlotTasks(running, vdId, split)) return;
@@ -820,6 +1039,9 @@ public final class TaskWindowController {
             }
             if (!isVis) continue;
             if (tid > 0 && windowManager.isTaskManagedInMultiWindow(tid, pkg)) {
+                if (tid == lastLiveMoveTaskId && (SystemClock.uptimeMillis() - lastLiveMoveMs) < 600L) {
+                    continue;
+                }
                 ManagedWindow mw = windowManager.getManagedWindow(tid);
                 Rect target = (mw != null && mw.bounds != null && !mw.bounds.isEmpty()) ? mw.bounds.toAndroidRect()
                         : windowManager.computeAdaptiveSingleBounds(config.virtW, config.virtH, config.virtDpi, 0, pkg, 0, 0).toAndroidRect();
@@ -942,7 +1164,8 @@ public final class TaskWindowController {
         List<?> running = taskApi.getTasks();
         if (running == null) return;
         Set<Integer> liveTids = new HashSet<>();
-        Set<Integer> visibleUserTids = new HashSet<>();
+        Set<Integer> occludedBehindLauncher = new HashSet<>();
+        boolean seenVisibleLauncher = false;
         int topTid = -1, topWm = 0;
         String topPkg = null;
         for (Object t : running) {
@@ -950,20 +1173,33 @@ public final class TaskWindowController {
             int tid = TaskApiAdapter.extractTaskId(t);
             if (tid <= 0) continue;
             liveTids.add(tid);
-            if (TaskApiAdapter.readBoolField(t, "isVisible", false)) {
-                String p = TaskApiAdapter.extractTaskPkg(t);
-                if (!PackagePolicy.shouldSkipTaskPkg(p) && !PackagePolicy.isProtectedSystemTaskPkg(p)) {
-                    visibleUserTids.add(tid);
-                    if (topTid <= 0) {
-                        topTid = tid; topPkg = p; topWm = TaskApiAdapter.extractTaskWindowingMode(t);
-                    }
+            boolean isVis = TaskApiAdapter.readBoolField(t, "isVisible", false);
+            if (TaskQueryService.isLauncherTaskInfo(t)) {
+                if (isVis) seenVisibleLauncher = true;
+                continue;
+            }
+            String p = TaskApiAdapter.extractTaskPkg(t);
+            if (PackagePolicy.shouldSkipTaskPkg(p) || PackagePolicy.isProtectedSystemTaskPkg(p)) continue;
+            if (isVis) {
+                if (topTid <= 0) {
+                    topTid = tid; topPkg = p; topWm = TaskApiAdapter.extractTaskWindowingMode(t);
+                }
+            } else if (seenVisibleLauncher) {
+                occludedBehindLauncher.add(tid);
+            }
+        }
+        windowManager.pruneDeadTasks(liveTids, 1800L);
+        if (!occludedBehindLauncher.isEmpty()) {
+            long nowMs = System.currentTimeMillis();
+            for (int tid : occludedBehindLauncher) {
+                ManagedWindow mw = windowManager.getManagedWindow(tid);
+                if (mw != null && !mw.minimized && (nowMs - mw.updatedAtMs) >= 800L) {
+                    windowManager.setMinimizedTask(tid, true);
                 }
             }
         }
-        windowManager.pruneDeadTasks(liveTids);
-        // Never mark a live freeform window as minimized just because Android reports isVisible=false
-        // (for instance when it is completely covered by a maximized or larger upper window).
-        // Minimized state is owned exclusively by explicit user minimize / show-desktop actions.
+        // Never mark a live freeform window as minimized just because another floating window covers it;
+        // only tasks physically pushed behind a visible LauncherActivity above are marked minimized.
         if (topTid > 0) {
             ManagedWindow existingTop = windowManager.getManagedWindow(topTid);
             if (existingTop != null) {
@@ -971,19 +1207,26 @@ public final class TaskWindowController {
                     windowManager.setFocusedTask(topTid);
                 }
             } else if (!windowManager.isTilingActive() && topPkg != null) {
-                Rect curB = taskApi.getTaskBounds(topTid, vdId);
-                WindowRect wr = (curB != null && !curB.isEmpty()) ? WindowRect.fromAndroidRect(curB) : new WindowRect(0, 0, config.virtW, config.virtH);
-                String mode;
-                if (topWm == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW && wr.width() < config.virtW - FULLSCREEN_WIDTH_TOLERANCE_PX) {
-                    String prefMode = windowManager.resolveLaunchMode(topPkg, DesktopWindowManager.INT_MODE_AUTO);
-                    mode = DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(prefMode)
-                            ? DesktopWindowManager.MODE_ADAPTIVE_SINGLE : DesktopWindowManager.MODE_FREEFORM;
+                boolean isPendingFullscreen = topPkg.equals(pendingFullscreenPkg)
+                        && SystemClock.uptimeMillis() <= pendingFullscreenUntilMs;
+                if (!isPendingFullscreen && windowManager.shouldAutoApplyAdaptiveSingle(topTid, topPkg)) {
+                    String adoptedMode = windowManager.resolveLaunchMode(topPkg, DesktopWindowManager.INT_MODE_AUTO);
+                    applySingleWindowMode(topTid, topPkg, adoptedMode, null, false, true, false);
                 } else {
-                    mode = DesktopWindowManager.MODE_FULLSCREEN;
+                    Rect curB = taskApi.getTaskBounds(topTid, vdId);
+                    WindowRect wr = (curB != null && !curB.isEmpty()) ? WindowRect.fromAndroidRect(curB) : new WindowRect(0, 0, config.virtW, config.virtH);
+                    String mode;
+                    if (topWm == BridgeProtocol.WINDOWING_MODE_MULTI_WINDOW && wr.width() < config.virtW - FULLSCREEN_WIDTH_TOLERANCE_PX) {
+                        String prefMode = windowManager.resolveLaunchMode(topPkg, DesktopWindowManager.INT_MODE_AUTO);
+                        mode = DesktopWindowManager.MODE_ADAPTIVE_SINGLE.equals(prefMode)
+                                ? DesktopWindowManager.MODE_ADAPTIVE_SINGLE : DesktopWindowManager.MODE_FREEFORM;
+                    } else {
+                        mode = DesktopWindowManager.MODE_FULLSCREEN;
+                    }
+                    String pres = DesktopWindowManager.classifyPresentation(
+                            mode, wr, config.virtW, config.virtH, config.virtDpi, windowManager.isTaskbarAutoHide());
+                    windowManager.putManagedWindow(topTid, topPkg, mode, pres, wr, true, -1);
                 }
-                String pres = DesktopWindowManager.classifyPresentation(
-                        mode, wr, config.virtW, config.virtH, config.virtDpi, windowManager.isTaskbarAutoHide());
-                windowManager.putManagedWindow(topTid, topPkg, mode, pres, wr, true, -1);
             }
         } else if (!windowManager.isTilingActive()) {
             // Only minimize all when the Launcher is actually topmost on the virtual display

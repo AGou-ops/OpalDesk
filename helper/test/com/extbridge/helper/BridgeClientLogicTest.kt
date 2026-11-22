@@ -120,7 +120,37 @@ class BridgeClientLogicTest {
         assertEquals("Mac 无线 ADB 大屏", BridgeClient.sinkTypeLabel(BridgeClient.SINK_REMOTE_WIFI_ADB))
         assertEquals("Mac 无线 Wi-Fi 大屏", BridgeClient.sinkTypeLabel(BridgeClient.SINK_REMOTE_WIFI))
         assertEquals("物理外接显示器", BridgeClient.sinkTypeLabel(BridgeClient.SINK_PHYSICAL))
+        assertEquals("本机 DeX 桌面", BridgeClient.sinkTypeLabel(BridgeClient.SINK_LOCAL))
         assertEquals("未连接输出", BridgeClient.sinkTypeLabel(BridgeClient.SINK_NONE))
+    }
+
+    @Test
+    fun localDexStatusSummaryAndDpiHelpers() {
+        val stLocal = BridgeClient.Status(
+            connected = true,
+            vdId = 7,
+            virtW = 2400,
+            virtH = 1080,
+            virtDpi = 240,
+            virtFps = 120f,
+            sinkType = BridgeClient.SINK_LOCAL,
+            renderMode = "LOCAL_DEX",
+        )
+        assertTrue(stLocal.isLocalDexActive)
+        assertFalse(stLocal.isRemoteSink)
+        assertTrue(BridgeClient.isLocalDexSink(BridgeClient.SINK_LOCAL))
+
+        val summary = com.extbridge.helper.protocol.BridgeLabels.classifyConnectionSummary(stLocal)
+        assertEquals(com.extbridge.helper.protocol.ConnectionKind.LOCAL_DEX, summary.kind)
+        assertEquals("本机 DeX", summary.badgeLabel)
+        assertTrue(summary.headline.contains("Display #7"))
+
+        // Phone 2400x1080 (sw=411dp) -> 240dpi (sw=720dp)
+        assertEquals(240, BridgeClient.computeLocalDexDpi(2400, 1080, 411))
+        // Phone 2712x1220 (sw=411dp) -> 268dpi (sw=728dp >= 720dp)
+        assertEquals(268, BridgeClient.computeLocalDexDpi(2712, 1220, 411))
+        // Tablet 2560x1600 (sw=800dp) -> 304dpi (sw=842dp)
+        assertEquals(304, BridgeClient.computeLocalDexDpi(2560, 1600, 800))
     }
 
     @Test

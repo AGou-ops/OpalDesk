@@ -34,13 +34,17 @@ fun DisplayAndSidebarPage(
     LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                TabRowWithContour(
-                    tabs = listOf("DeX 扩展参数", "原生镜像与边栏"),
-                    selectedTabIndex = ctrl.displaySubTab,
-                    onTabSelected = { ctrl.displaySubTab = it },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                if (ctrl.displaySubTab == 0) DexConfigSection(ctrl) else MirrorConfigSection(ctrl, onOpenSideControl, onOpenWidgetSlot)
+                if (ctrl.daemonStatus.isLocalDexActive) {
+                    DexConfigSection(ctrl)
+                } else {
+                    TabRowWithContour(
+                        tabs = listOf("DeX 扩展参数", "原生镜像与边栏"),
+                        selectedTabIndex = ctrl.displaySubTab,
+                        onTabSelected = { ctrl.displaySubTab = it },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (ctrl.displaySubTab == 0) DexConfigSection(ctrl) else MirrorConfigSection(ctrl, onOpenSideControl, onOpenWidgetSlot)
+                }
             }
         }
     }
@@ -48,6 +52,45 @@ fun DisplayAndSidebarPage(
 
 @Composable
 fun DexConfigSection(ctrl: MainController) {
+    val st = ctrl.daemonStatus
+    if (st.isLocalDexActive) {
+        val dpi = ctrl.localDexDpi.coerceIn(160, 480)
+        val swDp = DisplayGeometry.computeSmallestWidthDp(st.virtW, st.virtH, dpi)
+        val localPresets = remember { listOf(220, 260, 300, 348, 400) }
+        SectionHeader("本机 DeX 画面与缩放")
+        Card {
+            BasicComponent(
+                title = "原生屏幕画布",
+                summary = "${st.virtW} × ${st.virtH} · ${st.virtFps.toInt()} Hz（自动贴合本机屏幕比例，无需外接显示器）",
+            )
+            SectionDivider(16.dp)
+            SliderPreference(
+                title = "界面缩放密度 (DPI)",
+                summary = "等效最小宽度 sw${swDp}dp · ${if (swDp >= 600) "平板大屏布局 (sw≥600dp)" else "紧凑布局（调低 DPI 可获得更大桌面视野）"}",
+                value = dpi.toFloat(), valueRange = 160f..440f, valueText = "$dpi dpi",
+                showKeyPoints = true, keyPoints = listOf(220f, 260f, 300f, 348f, 400f),
+                onValueChange = { v -> ctrl.localDexDpi = ((v / 4f).roundToInt() * 4).coerceIn(160, 440) },
+            )
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                localPresets.forEach { d ->
+                    TextButton(
+                        text = "$d", onClick = { ctrl.localDexDpi = d },
+                        colors = if (dpi == d) ButtonDefaults.textButtonColorsPrimary() else ButtonDefaults.textButtonColors(),
+                        insideMargin = PaddingValues(6.dp), modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+            Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TextButton("应用缩放密度", { ctrl.applyLocalDexDpi(dpi) }, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.weight(1.25f))
+                TextButton("恢复本机推荐", { ctrl.resetLocalDexRecommendedDpi() }, modifier = Modifier.weight(1f))
+            }
+        }
+
+        SectionHeader("DeX 桌面与窗口偏好")
+        DexDesktopBehaviorCard(ctrl)
+        return
+    }
+
     val presetIdx = remember(ctrl.selW, ctrl.selH) {
         MainController.RES_PRESETS.indexOfFirst { (pw, ph, _) -> (pw == ctrl.selW && ph == ctrl.selH) || (pw == ctrl.selH && ph == ctrl.selW) }
             .takeIf { it >= 0 } ?: MainController.RES_DROPDOWN_LABELS.lastIndex
@@ -64,12 +107,14 @@ fun DexConfigSection(ctrl: MainController) {
         )
         SectionDivider(16.dp)
         ArrowPreference(title = "自定义宽高与横竖对调", summary = "${ctrl.selW} × ${ctrl.selH} px", onClick = { ctrl.showCustomResDialog = true })
-        SectionDivider(16.dp)
-        OverlayDropdownPreference(
-            title = "输出桌面旋转方向", summary = "竖置显示器选 90° 或 270°",
-            items = MainController.ROT_LABELS, selectedIndex = ctrl.selRot.coerceIn(0, 3),
-            onSelectedIndexChange = { ctrl.selectRotation(it) },
-        )
+        if (!ctrl.daemonStatus.isLocalDexActive) {
+            SectionDivider(16.dp)
+            OverlayDropdownPreference(
+                title = "输出桌面旋转方向", summary = "竖置显示器选 90° 或 270°",
+                items = MainController.ROT_LABELS, selectedIndex = ctrl.selRot.coerceIn(0, 3),
+                onSelectedIndexChange = { ctrl.selectRotation(it) },
+            )
+        }
         SectionDivider(16.dp)
         SliderPreference(
             title = "界面缩放密度 (DPI)",
@@ -102,19 +147,21 @@ fun DexConfigSection(ctrl: MainController) {
     SectionHeader("DeX 桌面与窗口偏好")
     DexDesktopBehaviorCard(ctrl)
 
-    SectionHeader("快捷预设与硬件信号")
-    Card {
-        ArrowPreference(
-            title = "手机外接推荐：1080p 横屏平板预设",
-            summary = "一键设为 1920×1080 @ 240dpi (sw540~600dp 轻量稳帧)",
-            onClick = { ctrl.apply1080pPhonePreset() },
-        )
-        SectionDivider(16.dp)
-        ArrowPreference(
-            title = "外接物理信号与目标刷新率",
-            summary = "目标 ${ctrl.selFps.toInt()} Hz · 查看显示器 EDID 硬件档位",
-            onClick = { ctrl.showEdidSheet = true },
-        )
+    if (!ctrl.daemonStatus.isLocalDexActive) {
+        SectionHeader("快捷预设与硬件信号")
+        Card {
+            ArrowPreference(
+                title = "手机外接推荐：1080p 横屏平板预设",
+                summary = "一键设为 1920×1080 @ 240dpi (sw540~600dp 轻量稳帧)",
+                onClick = { ctrl.apply1080pPhonePreset() },
+            )
+            SectionDivider(16.dp)
+            ArrowPreference(
+                title = "外接物理信号与目标刷新率",
+                summary = "目标 ${ctrl.selFps.toInt()} Hz · 查看显示器 EDID 硬件档位",
+                onClick = { ctrl.showEdidSheet = true },
+            )
+        }
     }
 }
 
@@ -186,6 +233,29 @@ fun DexDesktopBehaviorCard(ctrl: MainController) {
             checked = ctrl.dockAutoHide,
             onCheckedChange = { ctrl.dockAutoHide = it; BridgeService.setDockAutoHideEnabled(ctx, it) },
         )
+        SectionDivider(16.dp)
+        SwitchPreference(
+            title = "工作台模式（应用实时卡片栏）",
+            summary = "在左侧或顶部常驻展示已添加应用的实时预览卡片，随时查看状态并一键切换",
+            checked = ctrl.workbenchEnabled,
+            onCheckedChange = {
+                ctrl.workbenchEnabled = it
+                BridgeService.setWorkbenchEnabledFromUi(ctx, it)
+            },
+        )
+        if (ctrl.workbenchEnabled) {
+            SectionDivider(16.dp)
+            OverlayDropdownPreference(
+                title = "工作台卡片栏位置",
+                summary = "选择左侧竖向卡片栏或顶部横向卡片栏（工作台内亦可一键切换）",
+                items = listOf("左侧卡片栏（推荐）", "顶部卡片栏"),
+                selectedIndex = ctrl.workbenchPosition.coerceIn(0, 1),
+                onSelectedIndexChange = { pos ->
+                    ctrl.workbenchPosition = pos
+                    BridgeService.setWorkbenchPositionFromUi(ctx, pos)
+                },
+            )
+        }
         SectionDivider(16.dp)
         OverlayDropdownPreference(
             title = "桌面毛玻璃外观",

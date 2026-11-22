@@ -837,12 +837,24 @@ public final class DesktopWindowManager {
      * Prunes managed windows whose taskIds are no longer alive on the virtual display.
      */
     public void pruneDeadTasks(Set<Integer> liveTaskIdsOnDisplay) {
+        pruneDeadTasks(liveTaskIdsOnDisplay, 0L);
+    }
+
+    /**
+     * Prunes managed windows whose taskIds are not on the virtual display, protecting entries
+     * updated within {@code launchGraceMs} so cold/migrating tasks are not evicted mid-launch.
+     */
+    public void pruneDeadTasks(Set<Integer> liveTaskIdsOnDisplay, long launchGraceMs) {
         if (liveTaskIdsOnDisplay == null) return;
+        long nowMs = (launchGraceMs > 0L) ? System.currentTimeMillis() : 0L;
         synchronized (lock) {
             Iterator<Map.Entry<Integer, ManagedWindow>> it = managedWindows.entrySet().iterator();
             while (it.hasNext()) {
                 ManagedWindow mw = it.next().getValue();
                 if (!liveTaskIdsOnDisplay.contains(mw.taskId)) {
+                    if (launchGraceMs > 0L && (nowMs - mw.updatedAtMs) < launchGraceMs) {
+                        continue;
+                    }
                     it.remove();
                 }
             }

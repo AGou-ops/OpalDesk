@@ -286,6 +286,13 @@ class MainActivity : ComponentActivity() {
             0 -> DashboardPage(
                 ctrl, perms.allCoreGranted, isWide, contentPadding,
                 onOpenPermDialog = { perms.openPermDialog(false) },
+                onOpenLocalDex = {
+                    when {
+                        !ctrl.daemonStatus.connected -> ctrl.openActivationSheet()
+                        ctrl.daemonStatus.isRemoteSink -> ctrl.toast("Mac 远程大屏运行中，请先断开 Mac 连接")
+                        else -> openActivityOnDisplay0(LocalDexActivity::class.java)
+                    }
+                },
                 onOpenTouchpad = { openActivityOnDisplay0(TouchpadActivity::class.java) },
                 onOpenSideControl = { openActivityOnDisplay0(SideControlActivity::class.java) },
                 onOpenWidgetSlot = ::openWidgetSlot,

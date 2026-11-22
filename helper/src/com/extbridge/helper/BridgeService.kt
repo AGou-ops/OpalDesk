@@ -95,6 +95,24 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
             sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleShowDesktop() } }
         }
 
+        fun wakeTaskbarFromUi() {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.wakeTaskbar() } }
+        }
+
+        fun toggleWorkbenchFromUi() {
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.toggleWorkbench() } }
+        }
+
+        fun setWorkbenchEnabledFromUi(ctx: Context, enabled: Boolean) {
+            AppPrefs.setWorkbenchEnabled(ctx, enabled)
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.setWorkbenchEnabled(enabled) } }
+        }
+
+        fun setWorkbenchPositionFromUi(ctx: Context, position: Int) {
+            AppPrefs.setWorkbenchPosition(ctx, position)
+            sInstance?.let { svc -> runOnMain(svc.handler) { svc.desktopShell.setWorkbenchPosition(position) } }
+        }
+
         fun onPushedWindowSnapshot(winJson: String, stateSeq: Long) {
             if (sUserStopping || winJson.isEmpty()) return
             sInstance?.let { svc ->
@@ -221,6 +239,7 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
         fun stopAllAndExit(ctx: Context?) {
             sUserStopping = true
             SideMouseCaptureActivity.finishActiveIfAny()
+            LocalDexActivity.finishActiveIfAny()
             val appCtx: Context? = ctx?.applicationContext ?: sInstance
             AdbBootstrap.killLocalAdbServerAsync(appCtx)
             val svc = sInstance
@@ -332,7 +351,7 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
     private val themeChangedHook: (Context) -> Unit = { safePost { desktopShell.refreshTheme() } }
 
     private val a11ySyncTask = Runnable {
-        if (isDestroyed || attachedVdId <= 0) return@Runnable
+        if (isDestroyed || attachedVdId <= 0 || desktopShell.isActivelyDragging()) return@Runnable
         safeBgExecute {
             val snap = BridgeClient.getManagedWindows()
             safePost { desktopShell.onFastWindowSnapshot(snap) }
@@ -456,6 +475,7 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
         blackout.restoreAndDestroy()
         isDestroyed = true; sInstance = null
         detachExtOverlays(false)
+        desktopShell.destroy()
         mirrorController.detachAll()
         SideMouseCaptureActivity.finishActiveIfAny()
         MirrorSidebarController.resetCapturedMouseMoveState()
@@ -639,6 +659,10 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
 
     override fun toggleBlackout() {
         val st = lastStatus
+        if (st.isLocalDexActive) {
+            Toast.makeText(this, "本机 DeX 模式下无需熄灭主屏", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (st.connected && st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR) {
             if (blackout.isBlackoutActive) blackout.setDexBlackout(false)
             execSysAndRefresh(BridgeClient.SYS_SCREEN_DIM, -1, null)
@@ -693,6 +717,15 @@ class BridgeService : Service(), OverlayHost, ServiceBridgeCallbacks {
     override fun openTabletTouchpad() {
         popovers.dismissAll()
         DisplayLaunchHelper.launchOnDisplay0(this, Intent(this, TouchpadActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+
+    override fun exitLocalDex() {
+        popovers.dismissAll()
+        LocalDexActivity.finishActiveIfAny()
+        safeBgExecute {
+            BridgeClient.stopLocalDex(releaseDisplay = true)
+            safePost { pollRemoteStateAsync() }
+        }
     }
 
     override fun execSysAndRefresh(act: Int, arg: Int, str: String?) {

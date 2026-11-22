@@ -804,7 +804,9 @@ class LauncherActivity : Activity() {
         }
 
         val horizPad = dp(if (isSplitPicker) 8 else if (isNarrow) 12 else 24)
-        val bottomPad = dp(if (isSplitPicker || taskbarAutoHide) 14 else 72)
+        // On the desktop (isDesktopClear == true) the floating taskbar is always visible even when
+        // auto-hide is enabled, so always reserve bottom taskbar clearance for icons & widget board.
+        val bottomPad = dp(if (isSplitPicker) 14 else 72)
         workspaceColumnsRow.setPadding(horizPad, 0, horizPad, bottomPad)
 
         val boardW = if (showWidgetBoard) (winW * 0.30f).roundToInt().coerceIn(dp(276), dp(364)) else 0
@@ -837,9 +839,13 @@ class LauncherActivity : Activity() {
     }
 
     private fun applyStatus(status: DaemonStatus, windowSnapshot: WindowStateSnapshot) {
+        val localModeChanged = cachedStatus.isLocalDexActive != status.isLocalDexActive
         cachedStatus = status
         cachedWindowSnapshot = windowSnapshot
         val layoutMode = syncDesktopLayout()
+        if (localModeChanged && ::widgetBoard.isInitialized) {
+            widgetBoard.rebuildBoard(force = false)
+        }
         syncBackdropFocusMode(layoutMode)
     }
 

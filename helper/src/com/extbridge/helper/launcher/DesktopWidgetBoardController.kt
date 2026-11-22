@@ -24,6 +24,7 @@ import android.widget.TextView
 import android.widget.Toast
 import com.extbridge.helper.BridgeClient
 import com.extbridge.helper.HyperUi
+import com.extbridge.helper.ipc.DaemonStateStore
 import com.extbridge.helper.overlay.MATCH
 import com.extbridge.helper.overlay.WRAP
 import com.extbridge.helper.overlay.dp
@@ -170,6 +171,9 @@ internal class DesktopWidgetBoardController(
     }
 
     private fun updateSyncChip() {
+        val isLocalDex = DaemonStateStore.status.value.isLocalDexActive
+        syncChip.visibility = if (isLocalDex) View.GONE else View.VISIBLE
+        if (isLocalDex) return
         val syncing = AppPrefs.isDesktopSyncMirrorWidgets(activity)
         syncChip.text = if (syncing) "同步开" else "仅桌面"
         syncChip.setTextColor(if (syncing) HyperUi.HYPER_BLUE else HyperUi.TEXT_PRIMARY)
@@ -216,7 +220,8 @@ internal class DesktopWidgetBoardController(
         if (activity.isFinishing || activity.isDestroyed) return
         ensureHosts()
         updateSyncChip()
-        val syncMirror = AppPrefs.isDesktopSyncMirrorWidgets(activity)
+        val isLocalDex = DaemonStateStore.status.value.isLocalDexActive
+        val syncMirror = !isLocalDex && AppPrefs.isDesktopSyncMirrorWidgets(activity)
         val mirrorL = if (syncMirror) AppPrefs.getMirrorWidgetId(activity, 0) else -1
         val mirrorR = if (syncMirror) AppPrefs.getMirrorWidgetId(activity, 1) else -1
         val customIds = AppPrefs.getDesktopCustomWidgetIds(activity)
@@ -224,7 +229,7 @@ internal class DesktopWidgetBoardController(
         val theme = AppPrefs.getActiveMirrorTheme(activity)
         val desktopTheme = toDesktopGlassTheme(theme)
 
-        val sig = "$syncMirror|$mirrorL,$mirrorR|${customIds.joinToString(",")}|${presets.joinToString(",")}|${theme.id}|$lastBoardWidthPx"
+        val sig = "$isLocalDex|$syncMirror|$mirrorL,$mirrorR|${customIds.joinToString(",")}|${presets.joinToString(",")}|${theme.id}|$lastBoardWidthPx"
         if (!force && sig == structuralSignature) return
         structuralSignature = sig
 
@@ -286,7 +291,11 @@ internal class DesktopWidgetBoardController(
             }
         } else {
             val hintCard = TextView(activity).apply {
-                text = "点击右上角【+ 编辑】添加系统天气 / 日历 / 音乐小组件\n开启同步后将自动带出镜像模式绑定的小组件"
+                text = if (isLocalDex) {
+                    "点击右上角【+ 编辑】添加系统天气 / 日历 / 音乐小组件"
+                } else {
+                    "点击右上角【+ 编辑】添加系统天气 / 日历 / 音乐小组件\n开启同步后将自动带出镜像模式绑定的小组件"
+                }
                 setTextColor(HyperUi.TEXT_SECONDARY)
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f)
                 gravity = Gravity.CENTER

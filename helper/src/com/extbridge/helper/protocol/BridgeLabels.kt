@@ -9,6 +9,7 @@ enum class ConnectionKind {
     REMOTE_USB,
     REMOTE_WIFI_ADB,
     REMOTE_WIFI,
+    LOCAL_DEX,
     PHYSICAL_MIRROR,
     DEX_ACTIVE,
     WIFI_LISTENING,
@@ -44,6 +45,7 @@ object BridgeLabels {
         BridgeProtocol.SinkType.REMOTE_USB -> "Mac 有线大屏 (USB)"
         BridgeProtocol.SinkType.REMOTE_WIFI_ADB -> "Mac 无线 ADB 大屏"
         BridgeProtocol.SinkType.REMOTE_WIFI -> "Mac 无线 Wi-Fi 大屏"
+        BridgeProtocol.SinkType.LOCAL -> "本机 DeX 桌面"
         else -> "未连接输出"
     }
 
@@ -209,6 +211,20 @@ object BridgeLabels {
                 notificationTitle = "ExtBridge $channel · $peerShort",
                 notificationBody = "$peerShort · $fpsStr · $brStr | $modeLbl ${status.virtW}×${status.virtH}",
                 toggleActionLabel = "断开 Mac",
+            )
+        }
+
+        if (status.isLocalDexActive) {
+            return ConnectionSummary(
+                kind = ConnectionKind.LOCAL_DEX,
+                tone = ConnectionTone.SUCCESS,
+                badgeLabel = "本机 DeX",
+                headline = "本机 DeX 桌面 · Display #${status.vdId}",
+                detail = "免外接屏运行 · ${status.virtW}×${status.virtH} @ ${status.virtDpi}dpi · ${status.virtFps.roundToInt()}Hz",
+                shortSubtitle = "本机 DeX ${status.virtW}×${status.virtH}",
+                notificationTitle = "ExtBridge 本机 DeX 运行中 · ${status.virtW}×${status.virtH}",
+                notificationBody = "无需外接显示器 · 点击返回本机 DeX 桌面，或点右侧按钮退出",
+                toggleActionLabel = "退出本机 DeX",
             )
         }
 

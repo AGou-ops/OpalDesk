@@ -210,7 +210,7 @@ class DesktopStateTest {
         assertTrue(allMinimized.isDesktopClear)
         val (minAllAgain, idsToRestore) = DesktopStateReducer.planShowDesktopToggle(allMinimized)
         assertFalse(minAllAgain)
-        assertEquals(listOf(1, 2), idsToRestore)
+        assertTrue(idsToRestore.isEmpty())
     }
 
     @Test

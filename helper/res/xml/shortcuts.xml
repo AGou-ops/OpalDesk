@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="local_dex"
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutShortLabel="@string/shortcut_local_dex_short"
+        android:shortcutLongLabel="@string/shortcut_local_dex_long">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetPackage="com.extbridge.helper"
+            android:targetClass="com.extbridge.helper.LocalDexActivity" />
+    </shortcut>
+</shortcuts>

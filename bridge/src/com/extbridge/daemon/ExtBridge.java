@@ -10,6 +10,7 @@ import android.os.Looper;
 import android.os.SystemClock;
 
 import com.extbridge.daemon.display.CompatPolicyController;
+import com.extbridge.daemon.display.LocalDexController;
 import com.extbridge.daemon.display.NativeMirrorController;
 import com.extbridge.daemon.display.PhysicalDisplayController;
 import com.extbridge.daemon.display.SystemControlService;
@@ -57,6 +58,7 @@ public final class ExtBridge implements Runnable {
     private final TaskWindowController taskController;
     private final NativeMirrorController mirrorDisplay;
     private final PhysicalDisplayController physicalDisplay;
+    private final LocalDexController localDex;
     private final RemoteSessionCoordinator remoteCoordinator;
 
     private final AtomicBoolean shutdownCleanupDone = new AtomicBoolean(false);
@@ -83,6 +85,9 @@ public final class ExtBridge implements Runnable {
         this.physicalDisplay = new PhysicalDisplayController(
                 services, config, compatPolicy, systemControl, mirrorDisplay,
                 helperBridge, injector, localInput, taskApi, mainHandler, bgIoExec);
+        this.localDex = new LocalDexController(
+                services, config, compatPolicy, helperBridge, injector, localInput,
+                taskApi, mainHandler, bgIoExec);
         TaskWindowController taskController = new TaskWindowController(
                 services, config, taskApi, windowManager, compatPolicy,
                 helperBridge, mainHandler, bgIoExec);
@@ -92,18 +97,28 @@ public final class ExtBridge implements Runnable {
                 injector, localInput, physicalDisplay, mirrorDisplay, taskController,
                 taskApi, mainHandler, bgIoExec);
         BridgeBinderService binderService = new BridgeBinderService(
-                config, helperBridge, physicalDisplay, mirrorDisplay, compatPolicy,
+                config, helperBridge, physicalDisplay, localDex, mirrorDisplay, compatPolicy,
                 systemControl, injector, localInput, taskController, remoteCoordinator,
                 this::tick, this::performShutdownCleanup);
 
         localInput.setMirrorController(mirrorDisplay);
         localInput.setDesktopHooks(taskController::scheduleFastFocusSync, taskController::handleDesktopShortcut);
         helperBridge.setControlBinder(binderService);
-        helperBridge.setOnHelperDeath(localInput::releaseStaleMouseDragOnHelperDeath);
+        helperBridge.setOnHelperDeath(() -> {
+            localInput.releaseStaleMouseDragOnHelperDeath();
+            if (localDex.isActive()) localDex.stop();
+        });
         systemControl.setOnDimStateChanged(() -> remoteCoordinator.pushDesktopDeviceState(true));
         taskController.setOnRemoteStateDirty(() -> remoteCoordinator.pushDesktopDeviceState(true));
         taskController.setOnSendBackKey(() -> localInput.injectKey(android.view.KeyEvent.KEYCODE_BACK, 0));
-        physicalDisplay.wireCollaborators(taskController, this::tick, remoteCoordinator::applyDesktopResizeFromConfig);
+        physicalDisplay.wireCollaborators(
+                taskController, this::tick,
+                remoteCoordinator::applyDesktopResizeFromConfig,
+                localDex::resizeFromConfigLocked);
+        localDex.wireCollaborators(
+                taskController,
+                remoteCoordinator::isDesktopSessionActive,
+                this::teardownPhysicalForLocalLocked);
         remoteCoordinator.wireCallbacks(
                 this::teardownPhysicalForRemoteLocked,
                 () -> physicalDisplay.cleanupDisplayLocked(false, false),
@@ -202,7 +217,7 @@ public final class ExtBridge implements Runnable {
         helperBridge.maybePushBinderOnTick(nowMs);
         compatPolicy.maybeScheduleHomeSanitize(nowMs, config.vdId, mirrorDisplay.getSideVdId(), config.extId);
 
-        if (!config.shuttingDown && !remoteCoordinator.isDesktopSessionActive()) {
+        if (!config.shuttingDown && !remoteCoordinator.isDesktopSessionActive() && !localDex.isActive()) {
             // Promote native EDID mode strictly OUTSIDE displayLock (avoids sleeping under lock).
             physicalDisplay.maybePromoteNativeEdidBeforeLock(physicalDisplay.findExternalDisplay());
         }
@@ -212,13 +227,25 @@ public final class ExtBridge implements Runnable {
             if (remoteCoordinator.isDesktopSessionActive()) {
                 physicalDisplay.resetLastPushedExtId();
                 remoteCoordinator.tickRemoteLocked();
+            } else if (localDex.isActive()) {
+                physicalDisplay.resetLastPushedExtId();
+                localDex.tickLocalLocked();
             } else {
                 physicalDisplay.tickPhysicalLocked();
             }
         }
     }
 
+    private void teardownPhysicalForLocalLocked() {
+        if (config.extId >= 0 || physicalDisplay.hasActiveDisplay() || mirrorDisplay.hasActiveResources()) {
+            physicalDisplay.cleanupDisplayLocked(false, true);
+        }
+    }
+
     private void teardownPhysicalForRemoteLocked() {
+        if (localDex.isActive()) {
+            localDex.stopLocked(false);
+        }
         if (config.extId >= 0 || physicalDisplay.hasActiveDisplay() || mirrorDisplay.hasActiveResources()) {
             physicalDisplay.cleanupDisplayLocked(false, true);
         }
@@ -238,6 +265,7 @@ public final class ExtBridge implements Runnable {
             System.err.println("EXTBRIDGE_SHUTDOWN_REMOTE_ERR: " + e.getMessage());
         }
         synchronized (config.displayLock) {
+            localDex.stopLocked(false);
             physicalDisplay.cleanupDisplayLocked(true, false);
         }
     }

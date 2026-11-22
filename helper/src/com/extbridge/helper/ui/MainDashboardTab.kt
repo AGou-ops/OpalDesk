@@ -38,6 +38,7 @@ fun DashboardPage(
     isWide: Boolean,
     contentPadding: PaddingValues,
     onOpenPermDialog: () -> Unit,
+    onOpenLocalDex: () -> Unit,
     onOpenTouchpad: () -> Unit,
     onOpenSideControl: () -> Unit,
     onOpenWidgetSlot: (Int) -> Unit,
@@ -51,7 +52,10 @@ fun DashboardPage(
             ) {
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        DashboardPrimaryColumn(ctrl, allPermsOk, showJumpCard = false, onOpenPermDialog, onOpenTouchpad, onOpenSideControl)
+                        DashboardPrimaryColumn(
+                            ctrl, allPermsOk, showJumpCard = false,
+                            onOpenPermDialog, onOpenLocalDex, onOpenTouchpad, onOpenSideControl,
+                        )
                     }
                 }
             }
@@ -72,7 +76,10 @@ fun DashboardPage(
         LazyColumn(modifier = Modifier.fillMaxSize(), contentPadding = contentPadding, verticalArrangement = Arrangement.spacedBy(12.dp)) {
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    DashboardPrimaryColumn(ctrl, allPermsOk, showJumpCard = true, onOpenPermDialog, onOpenTouchpad, onOpenSideControl)
+                    DashboardPrimaryColumn(
+                        ctrl, allPermsOk, showJumpCard = true,
+                        onOpenPermDialog, onOpenLocalDex, onOpenTouchpad, onOpenSideControl,
+                    )
                 }
             }
         }
@@ -85,6 +92,7 @@ private fun DashboardPrimaryColumn(
     allPermsOk: Boolean,
     showJumpCard: Boolean,
     onOpenPermDialog: () -> Unit,
+    onOpenLocalDex: () -> Unit,
     onOpenTouchpad: () -> Unit,
     onOpenSideControl: () -> Unit,
 ) {
@@ -92,7 +100,7 @@ private fun DashboardPrimaryColumn(
     val connSummary = BridgeLabels.classifyConnectionSummary(st, ctrl.localLanIp)
 
     if (!allPermsOk) PermissionWarningCard(onOpenPermDialog)
-    if (st.connected && (st.vdId > 0 || st.extId > 0 || st.isRemoteSink)) {
+    if (st.connected && !st.isLocalDexActive && (st.vdId > 0 || st.extId > 0 || st.isRemoteSink)) {
         ContinuityTrackpadBanner(
             targetLabel = if (st.isRemoteSink) (st.remotePeerName.ifBlank { "Mac 远程屏" }) else "USB-C 外接屏",
             resolution = "${st.virtW}×${st.virtH}",
@@ -106,35 +114,46 @@ private fun DashboardPrimaryColumn(
         onOpenDiag = { ctrl.showDiagSheet = true },
         onSwitchToUhid = { ctrl.applyInputBackendMode(InputBackend.UHID) },
         onDisconnectRemote = { ctrl.disconnectRemoteMac() },
+        onOpenLocalDex = onOpenLocalDex,
+        onStopLocalDex = { ctrl.stopLocalDex() },
         onRebuild = { ctrl.rebuildRenderPipeline("已重建扩展渲染管线") },
     )
 
-    SectionHeader("Mac / 无线大屏")
-    RemoteMacSummaryCard(st, connSummary, ctrl.localLanIp) { ctrl.openRemoteMacSheet() }
+    if (!st.isLocalDexActive) {
+        SectionHeader("本机免外接屏")
+        LocalDexEntryCard(status = st, onClick = onOpenLocalDex)
 
-    SectionHeader("输出模式")
-    LiquidGlassSegmentedTabs(
-        items = listOf("电脑桌面模式", "融合边栏镜像"),
-        selectedIndex = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0,
-        onSelect = { ctrl.switchOutputMode(if (it == 1) MirrorMode.MIRROR else MirrorMode.DEX) },
-        modifier = Modifier.fillMaxWidth(),
-    )
+        SectionHeader("Mac / 无线大屏")
+        RemoteMacSummaryCard(st, connSummary, ctrl.localLanIp) { ctrl.openRemoteMacSheet() }
+
+        SectionHeader("输出模式")
+        LiquidGlassSegmentedTabs(
+            items = listOf("电脑桌面模式", "融合边栏镜像"),
+            selectedIndex = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0,
+            onSelect = { ctrl.switchOutputMode(if (it == 1) MirrorMode.MIRROR else MirrorMode.DEX) },
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
 
     SectionHeader("快捷控制")
     QuickControlBentoGrid(
         st, ctrl.screenDimmed, { ctrl.toggleInputRouting() }, onOpenTouchpad,
-        { ctrl.toggleBlackout() }, onOpenSideControl, { ctrl.relaunchExtLauncher() },
+        { ctrl.toggleBlackout() }, onOpenSideControl, onOpenLocalDex, { ctrl.stopLocalDex() }, { ctrl.relaunchExtLauncher() },
     )
 
     if (showJumpCard) {
-        val isMirror = st.mirrorMode == MirrorMode.MIRROR
+        val isMirror = !st.isLocalDexActive && st.mirrorMode == MirrorMode.MIRROR
         LiquidGlassSurface(cornerRadius = 22.dp, contentPadding = PaddingValues(4.dp)) {
             ArrowPreference(
-                title = if (isMirror) "配置镜像布局与融合边栏" else "调节分辨率、DPI 与旋转方向",
-                summary = if (isMirror) {
-                    "${BridgeLabels.mirrorSideModeLabel(ctrl.mirrorSideMode)} · 已启用 ${ctrl.mirrorPresets.size} 张信息卡"
-                } else {
-                    "画布 ${ctrl.selW}×${ctrl.selH} · ${ctrl.selDpi}dpi · ${BridgeLabels.rotationLabel(ctrl.selRot)}"
+                title = when {
+                    st.isLocalDexActive -> "调节本机 DeX 缩放密度与窗口偏好"
+                    isMirror -> "配置镜像布局与融合边栏"
+                    else -> "调节分辨率、DPI 与旋转方向"
+                },
+                summary = when {
+                    st.isLocalDexActive -> "原生画布 ${st.virtW}×${st.virtH} · ${st.virtDpi}dpi · 窗口与任务栏偏好"
+                    isMirror -> "${BridgeLabels.mirrorSideModeLabel(ctrl.mirrorSideMode)} · 已启用 ${ctrl.mirrorPresets.size} 张信息卡"
+                    else -> "画布 ${ctrl.selW}×${ctrl.selH} · ${ctrl.selDpi}dpi · ${BridgeLabels.rotationLabel(ctrl.selRot)}"
                 },
                 onClick = { ctrl.displaySubTab = if (isMirror) 1 else 0; ctrl.navTab = 1 },
             )
@@ -203,6 +222,8 @@ private fun HeroConnectionCard(
     onOpenDiag: () -> Unit,
     onSwitchToUhid: () -> Unit,
     onDisconnectRemote: () -> Unit,
+    onOpenLocalDex: () -> Unit,
+    onStopLocalDex: () -> Unit,
     onRebuild: () -> Unit,
 ) {
     val glass = LiquidGlassTheme.colors
@@ -251,12 +272,64 @@ private fun HeroConnectionCard(
         Spacer(Modifier.height(14.dp))
         if (!status.connected) {
             TextButton("立即激活后台服务", onOpenActivation, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.fillMaxWidth())
+        } else if (status.isLocalDexActive) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                TextButton("返回 DeX", onOpenLocalDex, colors = ButtonDefaults.textButtonColorsPrimary(), modifier = Modifier.weight(1.1f))
+                DangerActionButton("退出 DeX", onStopLocalDex, Modifier.weight(1f))
+                TextButton("诊断", onOpenDiag, modifier = Modifier.weight(0.8f))
+            }
         } else {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 if (status.isRemoteSink) DangerActionButton("断开 Mac", onDisconnectRemote, Modifier.weight(1f))
                 TextButton("连接诊断", onOpenDiag, modifier = Modifier.weight(1f))
                 TextButton("刷新渲染", onRebuild, modifier = Modifier.weight(1f))
             }
+        }
+    }
+}
+
+@Composable
+private fun LocalDexEntryCard(status: DaemonStatus, onClick: () -> Unit) {
+    val glass = LiquidGlassTheme.colors
+    val (badgeLabel, badgeColor) = when {
+        !status.connected -> "需激活" to HyperAmber
+        status.isLocalDexActive -> "运行中" to HyperGreen
+        status.isRemoteSink -> "Mac 占用" to HyperAmber
+        else -> "直接进入" to HyperBlue
+    }
+    val detail = when {
+        !status.connected -> "激活核心服务后，无需外接显示器即可在手机/平板屏幕上直接开启 DeX 多窗口桌面"
+        status.isLocalDexActive -> "免外接屏运行中 · ${status.virtW}×${status.virtH} @ ${status.virtDpi}dpi · 点击立即返回桌面"
+        status.isRemoteSink -> "当前正在投屏到 ${status.remotePeerName.ifBlank { "Mac" }}，断开后可切换至本机 DeX 模式"
+        else -> "无需外接显示器或连接电脑，直接在当前设备上全屏体验多窗口 DeX 桌面"
+    }
+    LiquidGlassSurface(
+        cornerRadius = 24.dp,
+        tier = GlassTier.Thick,
+        tintOverlay = if (status.isLocalDexActive) HyperGreen.copy(alpha = 0.12f) else glass.accentBlue.copy(alpha = 0.10f),
+        onClick = onClick,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier.size(42.dp).clip(SquircleShape(14.dp))
+                    .background(if (status.isLocalDexActive) HyperGreen else glass.accentBlue),
+                contentAlignment = Alignment.Center,
+            ) { Icon(ExtVectorIcons.MonitorDex, "本机 DeX 模式", tint = Color.White, modifier = Modifier.size(22.dp)) }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                Text(
+                    if (status.isLocalDexActive) "返回本机 DeX 桌面" else "直接打开本机 DeX 模式",
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = glass.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(detail, fontSize = 12.sp, color = glass.textSecondary, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+            StatusPillBadge(badgeLabel, badgeColor)
         }
     }
 }
@@ -311,8 +384,24 @@ private fun QuickControlBentoGrid(
     onOpenTouchpad: () -> Unit,
     onToggleBlackout: () -> Unit,
     onOpenSideControl: () -> Unit,
+    onOpenLocalDex: () -> Unit,
+    onStopLocalDex: () -> Unit,
     onRelaunchLauncher: () -> Unit,
 ) {
+    if (status.isLocalDexActive) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            HyperBentoTile(
+                "回到 DeX 桌面", "最小化所有窗口并进入桌面", ExtVectorIcons.MonitorDex, false,
+                { onRelaunchLauncher(); onOpenLocalDex() }, Modifier.weight(1f), HyperBlue,
+            )
+            HyperBentoTile(
+                "打开全部应用", "进入本机 DeX 并展开应用抽屉", ExtVectorIcons.AppRules, false,
+                { onOpenLocalDex(); com.extbridge.helper.BridgeService.toggleAppDrawerFromUi(false) },
+                Modifier.weight(1f), HyperPurple,
+            )
+        }
+        return
+    }
     val routeExt = status.connected && status.inputToExt == 1
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         HyperBentoTile(
@@ -329,8 +418,10 @@ private fun QuickControlBentoGrid(
         )
         if (status.mirrorMode == MirrorMode.MIRROR) {
             HyperBentoTile("副屏直控", "触控操作镜像边栏", ExtVectorIcons.SidePanel, false, onOpenSideControl, Modifier.weight(1f), HyperPurple)
-        } else {
+        } else if (status.connected && status.vdId > 0) {
             HyperBentoTile("打开扩展桌面", "唤起外接屏启动器", ExtVectorIcons.MonitorDex, false, onRelaunchLauncher, Modifier.weight(1f))
+        } else {
+            HyperBentoTile("进入本机 DeX", "免外接屏直开桌面", ExtVectorIcons.MonitorDex, false, onOpenLocalDex, Modifier.weight(1f))
         }
     }
 }

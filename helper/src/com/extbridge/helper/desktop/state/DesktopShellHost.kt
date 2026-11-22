@@ -42,6 +42,8 @@ interface DesktopShellHost {
     val batteryCharging: Boolean
     val isBlackoutActive: Boolean
     val isTaskbarAutoHide: Boolean
+    val isWorkbenchEnabled: Boolean
+    val workbenchPosition: Int
 
     fun safeBgExecute(r: Runnable)
     fun safeInputExecute(r: Runnable)
@@ -90,7 +92,17 @@ interface DesktopShellHost {
     fun openTabletMain()
     fun openTabletTouchpad()
     fun openExtSettings(action: String)
+    fun exitLocalDex()
     fun notifyHardwareChanged()
     fun requestStateRefresh()
     fun updateTaskbarPinnedApps()
+
+    // Workbench Mode (Stage Manager / App Card Rail)
+    fun toggleWorkbench()
+    fun setWorkbenchEnabled(enabled: Boolean)
+    fun setWorkbenchPosition(position: Int)
+    fun openWorkbenchAppPicker()
+    fun switchToWorkbenchApp(pkg: String, taskId: Int)
+    fun openWorkbenchCardMenu(pkg: String, taskId: Int, pinned: Boolean, anchorX: Int, anchorY: Int)
+    fun updateWorkbenchApps()
 }

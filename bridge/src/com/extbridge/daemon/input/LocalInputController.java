@@ -1,6 +1,7 @@
 package com.extbridge.daemon.input;
 
 import android.os.SystemClock;
+import android.view.InputDevice;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -9,6 +10,7 @@ import com.extbridge.daemon.BridgeBuildConfig;
 import com.extbridge.daemon.DaemonConfig;
 import com.extbridge.daemon.display.NativeMirrorController;
 import com.extbridge.daemon.ipc.BridgeProtocol;
+import com.extbridge.daemon.platform.AndroidServices;
 import com.extbridge.daemon.platform.TaskApiAdapter;
 import com.extbridge.daemon.util.ShellCommand;
 
@@ -249,6 +251,72 @@ public final class LocalInputController {
             if (cb != null) cb.run();
         }
         if (triggerBack) injectKey(KeyEvent.KEYCODE_BACK, 0);
+    }
+
+    /**
+     * Injects a multi-touch, stylus, or mouse {@link MotionEvent} forwarded directly from
+     * on-device {@code LocalDexActivity} into the active Local DeX VirtualDisplay.
+     */
+    public boolean injectLocalMotionEvent(
+            int action, long downTime, long eventTime, int source, int buttonState,
+            int actionButton, float hScroll, float vScroll,
+            int[] ids, int[] toolTypes, float[] xs, float[] ys, float[] pressures) {
+        int dispId = config.vdId;
+        if (dispId <= 0 || !injector.canInject() || ids == null || ids.length == 0) return false;
+        int count = Math.min(ids.length, 10);
+        if (toolTypes == null || xs == null || ys == null || pressures == null
+                || toolTypes.length < count || xs.length < count
+                || ys.length < count || pressures.length < count) {
+            return false;
+        }
+        float maxX = Math.max(1f, config.virtW - 1f);
+        float maxY = Math.max(1f, config.virtH - 1f);
+        MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[count];
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[count];
+        int masked = action & MotionEvent.ACTION_MASK;
+        for (int i = 0; i < count; i++) {
+            float px = Float.isFinite(xs[i]) ? clamp(xs[i], maxX) : 0f;
+            float py = Float.isFinite(ys[i]) ? clamp(ys[i], maxY) : 0f;
+            float pr = Float.isFinite(pressures[i]) ? Math.max(0f, Math.min(1f, pressures[i])) : 1f;
+            MotionEvent.PointerProperties p = new MotionEvent.PointerProperties();
+            p.id = ids[i];
+            p.toolType = toolTypes[i];
+            props[i] = p;
+            MotionEvent.PointerCoords c = new MotionEvent.PointerCoords();
+            c.x = px;
+            c.y = py;
+            c.pressure = (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL
+                    || masked == MotionEvent.ACTION_HOVER_MOVE || masked == MotionEvent.ACTION_HOVER_EXIT) ? 0f : Math.max(0.05f, pr);
+            c.size = 1.0f;
+            if (i == 0 && masked == MotionEvent.ACTION_SCROLL) {
+                c.setAxisValue(MotionEvent.AXIS_HSCROLL, Float.isFinite(hScroll) ? hScroll : 0f);
+                c.setAxisValue(MotionEvent.AXIS_VSCROLL, Float.isFinite(vScroll) ? vScroll : 0f);
+            }
+            coords[i] = c;
+        }
+        long now = SystemClock.uptimeMillis();
+        long effEvent = (eventTime > 0L) ? eventTime : now;
+        long effDown = (downTime > 0L && downTime <= effEvent) ? downTime : effEvent;
+        int effSource = (source != 0) ? source : InputDevice.SOURCE_TOUCHSCREEN;
+        MotionEvent ev = MotionEvent.obtain(effDown, effEvent, action, count, props, coords,
+                0, buttonState, 1.0f, 1.0f, 0, 0, effSource, 0);
+        if (actionButton != 0) AndroidServices.setActionButton(ev, actionButton);
+        boolean ok;
+        try {
+            ok = injector.injectInput(ev, dispId);
+        } finally {
+            ev.recycle();
+        }
+        synchronized (cursorLock) {
+            cursorX = coords[0].x;
+            cursorY = coords[0].y;
+        }
+        if (masked == MotionEvent.ACTION_DOWN || masked == MotionEvent.ACTION_UP
+                || masked == MotionEvent.ACTION_POINTER_UP || masked == MotionEvent.ACTION_BUTTON_PRESS) {
+            Runnable cb = onExtPointerActivity;
+            if (cb != null) cb.run();
+        }
+        return ok;
     }
 
     private void dispatchMoveLocked(NativeMirrorController mir, boolean mirror, long now) {

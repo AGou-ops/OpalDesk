@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.view.Display
 import com.extbridge.helper.ControlReceiver
+import com.extbridge.helper.LocalDexActivity
 import com.extbridge.helper.MainActivity
 import com.extbridge.helper.R
 import com.extbridge.helper.SideControlActivity
@@ -39,6 +40,8 @@ class BridgeNotificationBuilder(
         private const val REQ_EXIT_ALL = 6
         private const val REQ_SIDE_CTRL = 7
         private const val REQ_DISCONNECT_REMOTE = 8
+        private const val REQ_LOCAL_DEX = 9
+        private const val REQ_STOP_LOCAL_DEX = 10
 
         private const val PI_FLAGS = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
     }
@@ -128,6 +131,11 @@ class BridgeNotificationBuilder(
                 third,
             )
         }
+        ConnectionKind.LOCAL_DEX -> listOf(
+            "返回 DeX" to activityPendingIntent(REQ_LOCAL_DEX, LocalDexActivity::class.java),
+            "回扩展桌面" to internalBroadcastPendingIntent(REQ_EXT_HOME, BridgeProtocol.HelperActions.LAUNCH_EXT_HOME),
+            "退出本机 DeX" to internalBroadcastPendingIntent(REQ_STOP_LOCAL_DEX, BridgeProtocol.HelperActions.STOP_LOCAL_DEX),
+        )
         ConnectionKind.PHYSICAL_MIRROR -> listOf(
             "切回 DeX" to exitMirrorPendingIntent(),
             "大触摸板" to activityPendingIntent(REQ_TOUCHPAD, TouchpadActivity::class.java),

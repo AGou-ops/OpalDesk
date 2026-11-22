@@ -11,6 +11,7 @@ import androidx.compose.runtime.*
 import com.extbridge.helper.AdbBootstrap
 import com.extbridge.helper.BridgeClient
 import com.extbridge.helper.BridgeService
+import com.extbridge.helper.LocalDexActivity
 import com.extbridge.helper.ipc.DaemonStateStore
 import com.extbridge.helper.prefs.AppPrefs
 import com.extbridge.helper.protocol.*
@@ -57,11 +58,14 @@ class MainController(context: Context) {
     var screenDimmed by mutableStateOf(false)
         private set
     var dockAutoHide by mutableStateOf(false)
+    var workbenchEnabled by mutableStateOf(AppPrefs.isWorkbenchEnabled(appCtx))
+    var workbenchPosition by mutableIntStateOf(AppPrefs.getWorkbenchPosition(appCtx))
 
     // DeX canvas editing state
     var selW by mutableIntStateOf(2560)
     var selH by mutableIntStateOf(1440)
     var selDpi by mutableIntStateOf(240)
+    var localDexDpi by mutableIntStateOf(320)
     var selFps by mutableFloatStateOf(60f)
     var selRot by mutableIntStateOf(0)
     var selPhysModeId by mutableIntStateOf(-1)
@@ -242,6 +246,8 @@ class MainController(context: Context) {
 
     fun refreshStatusNow(syncFromDaemon: Boolean) {
         dockAutoHide = BridgeService.isDockAutoHideEnabled(appCtx)
+        workbenchEnabled = AppPrefs.isWorkbenchEnabled(appCtx)
+        workbenchPosition = AppPrefs.getWorkbenchPosition(appCtx)
         runDaemonAction(
             label = "pollStatus",
             block = {
@@ -271,9 +277,15 @@ class MainController(context: Context) {
         val syncAllowed = SystemClock.uptimeMillis() >= suppressDaemonSyncUntilMs
         if ((syncFromDaemon && !initedFromDaemon) || !wasConnected) {
             initedFromDaemon = true
-            selW = st.virtW; selH = st.virtH; selDpi = st.virtDpi; selFps = st.virtFps; selRot = st.virtRot
+            if (st.isLocalDexActive) {
+                localDexDpi = st.virtDpi.coerceIn(160, 480)
+            } else {
+                selW = st.virtW; selH = st.virtH; selDpi = st.virtDpi; selFps = st.virtFps; selRot = st.virtRot
+            }
             displaySubTab = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0
-        } else if (syncAllowed && selRot != st.virtRot) {
+        } else if (syncAllowed && st.isLocalDexActive && st.virtDpi > 0) {
+            localDexDpi = st.virtDpi.coerceIn(160, 480)
+        } else if (syncAllowed && !st.isLocalDexActive && selRot != st.virtRot) {
             selW = st.virtW; selH = st.virtH; selRot = st.virtRot
         }
         if (prevMode != st.mirrorMode) displaySubTab = if (st.mirrorMode == MirrorMode.MIRROR) 1 else 0
@@ -290,21 +302,36 @@ class MainController(context: Context) {
     // --- Dashboard & Display Actions ---
 
     fun switchOutputMode(mode: Int) {
+        if (daemonStatus.isLocalDexActive && mode == MirrorMode.MIRROR) return
         displaySubTab = if (mode == MirrorMode.MIRROR) 1 else 0
         runDaemonAction("setMirrorMode", refreshAfter = true, block = { BridgeClient.setMirrorMode(mode) }) { applied ->
             toast("已切换为：${BridgeLabels.mirrorModeLabel(if (applied >= 0) applied else mode)}")
         }
     }
 
-    fun toggleInputRouting() = runDaemonAction("toggleInput", refreshAfter = true, block = { BridgeClient.toggleInput() }) { next ->
-        if (next >= 0) toast(if (next == 1) "键鼠已切至：扩展屏" else "键鼠已切至：本机内屏")
+    fun toggleInputRouting() {
+        if (daemonStatus.isLocalDexActive) return
+        runDaemonAction("toggleInput", refreshAfter = true, block = { BridgeClient.toggleInput() }) { next ->
+            if (next >= 0) toast(if (next == 1) "键鼠已切至：扩展屏" else "键鼠已切至：本机内屏")
+        }
     }
 
     fun rebuildRenderPipeline(toastMsg: String) = runDaemonAction("rebuild", refreshAfter = true, block = { BridgeClient.rebuild() }) { toast(toastMsg) }
     fun relaunchExtLauncher() = runDaemonAction("relaunchLauncher", block = { BridgeClient.relaunchLauncher() })
+    fun stopLocalDex() = runDaemonAction(
+        label = "stopLocalDex",
+        refreshAfter = true,
+        block = {
+            LocalDexActivity.finishActiveIfAny()
+            BridgeClient.stopLocalDex(releaseDisplay = true)
+        },
+    ) { ok ->
+        toast(if (ok) "已退出本机 DeX 模式" else "当前未处于本机 DeX 模式")
+    }
     fun setFullscreenPolicy(enabled: Boolean) = runDaemonAction("setFullscreenPolicy", refreshAfter = true, block = { BridgeClient.setFullscreenPolicy(if (enabled) 1 else 0) })
 
     fun toggleBlackout() {
+        if (daemonStatus.isLocalDexActive) return
         BridgeService.toggleBlackoutFromUi(appCtx)
         scope.launch { delay(160L); refreshStatusNow(syncFromDaemon = false) }
     }
@@ -318,6 +345,7 @@ class MainController(context: Context) {
     }
 
     fun selectRotation(nextRot: Int) {
+        if (daemonStatus.isLocalDexActive) return
         suppressDaemonSyncUntilMs = SystemClock.uptimeMillis() + 2500L
         selRot = nextRot
         val wantPortrait = (nextRot and 1) == 1
@@ -370,6 +398,28 @@ class MainController(context: Context) {
                 }
             }
         }
+    }
+
+    fun applyLocalDexDpi(dpi: Int = localDexDpi) {
+        val st = daemonStatus
+        if (!st.isLocalDexActive || st.virtW <= 0 || st.virtH <= 0) return
+        val clamped = dpi.coerceIn(160, 480)
+        localDexDpi = clamped
+        suppressDaemonSyncUntilMs = SystemClock.uptimeMillis() + 2500L
+        runDaemonAction("applyLocalDexDpi", refreshAfter = true, block = {
+            BridgeClient.applyConfigDetailed(st.virtW, st.virtH, clamped, st.virtFps, -1, 0)
+        }) { res ->
+            if (res.ok) toast("已更新本机 DeX 缩放：${clamped} dpi")
+            else toast("应用失败：请确认本机 DeX 处于运行状态")
+        }
+    }
+
+    fun resetLocalDexRecommendedDpi() {
+        val st = daemonStatus
+        if (!st.isLocalDexActive || st.virtW <= 0 || st.virtH <= 0) return
+        val nativeDpi = appCtx.resources.displayMetrics.densityDpi.coerceAtLeast(160)
+        val rec = DisplayGeometry.computeLocalDexDpi(st.virtW, st.virtH, nativeDpi)
+        applyLocalDexDpi(rec)
     }
 
     fun applyMonitorRecommendedDefault() {

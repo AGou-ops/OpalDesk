@@ -115,6 +115,7 @@ open class ControlReceiver : BroadcastReceiver() {
     private fun handleAsyncAction(appCtx: Context, act: String, copy: Intent) {
         when (act) {
             HelperActions.TOGGLE_INPUT -> {
+                if (BridgeClient.getStatus().isLocalDexActive) return
                 val mode = BridgeClient.toggleInput()
                 if (mode >= 0) {
                     toastAsync(appCtx, if (mode == 1) "键鼠已切换至：扩展屏" else "键鼠已切换至：平板内屏")
@@ -130,6 +131,7 @@ open class ControlReceiver : BroadcastReceiver() {
                 toastAsync(appCtx, "已返回扩展屏桌面")
             }
             HelperActions.TOGGLE_MIRROR -> {
+                if (BridgeClient.getStatus().isLocalDexActive) return
                 val sideMode = copy.getIntExtra("side_mode", -1)
                 if (sideMode >= 0) {
                     BridgeClient.setMirrorSideMode(sideMode)
@@ -143,6 +145,7 @@ open class ControlReceiver : BroadcastReceiver() {
                 )
             }
             HelperActions.SET_MIRROR_SIDE_MODE -> {
+                if (BridgeClient.getStatus().isLocalDexActive) return
                 val sideMode = if (copy.hasExtra("side_mode")) {
                     copy.getIntExtra("side_mode", -1)
                 } else {
@@ -161,6 +164,7 @@ open class ControlReceiver : BroadcastReceiver() {
                 BridgeService.refreshFromReceiver(appCtx)
             }
             HelperActions.SET_ROTATION -> {
+                if (BridgeClient.getStatus().isLocalDexActive) return
                 val rawRot = if (copy.hasExtra("rot")) {
                     copy.getIntExtra("rot", -1)
                 } else {
@@ -179,6 +183,12 @@ open class ControlReceiver : BroadcastReceiver() {
                 val ok = BridgeClient.disconnectRemoteClient()
                 BridgeService.refreshFromReceiver(appCtx)
                 toastAsync(appCtx, if (ok) "已断开 Mac 大屏连接" else "当前无活跃的 Mac 连接")
+            }
+            HelperActions.STOP_LOCAL_DEX -> {
+                LocalDexActivity.finishActiveIfAny()
+                val ok = BridgeClient.stopLocalDex(releaseDisplay = true)
+                BridgeService.refreshFromReceiver(appCtx)
+                toastAsync(appCtx, if (ok) "已退出本机 DeX 模式" else "当前未处于本机 DeX 模式")
             }
         }
     }

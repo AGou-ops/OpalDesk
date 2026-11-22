@@ -63,6 +63,7 @@ public final class PhysicalDisplayController {
     private volatile TaskWindowController taskController;
     private volatile Runnable tickTrigger;
     private volatile Runnable remoteResizeTrigger;
+    private volatile Runnable localResizeTrigger;
 
     public PhysicalDisplayController(
             AndroidServices services, DaemonConfig config, CompatPolicyController compatPolicy,
@@ -82,10 +83,13 @@ public final class PhysicalDisplayController {
         this.bgIoExec = bgIoExec;
     }
 
-    public void wireCollaborators(TaskWindowController tc, Runnable tickTrigger, Runnable remoteResizeTrigger) {
+    public void wireCollaborators(
+            TaskWindowController tc, Runnable tickTrigger,
+            Runnable remoteResizeTrigger, Runnable localResizeTrigger) {
         this.taskController = tc;
         this.tickTrigger = tickTrigger;
         this.remoteResizeTrigger = remoteResizeTrigger;
+        this.localResizeTrigger = localResizeTrigger;
     }
 
     public int getLastPhysResult() { return lastPhysResult; }
@@ -251,8 +255,16 @@ public final class PhysicalDisplayController {
         if (unbindWm || config.shuttingDown || noActiveSink) systemControl.restoreDimIfActive();
         // 2. Unbind external input associations before VirtualDisplay release.
         injector.unbindInput();
-        // 3. Release physical DeX and native mirror SurfaceControls & VirtualDisplays.
+        // 3. Restore DeX user tasks before releasing the VirtualDisplay, then release layers.
         int prevVdId = config.vdId;
+        java.util.List<Integer> restoredTids = java.util.Collections.emptyList();
+        boolean fullTeardown = unbindWm || config.shuttingDown || config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR || noActiveSink;
+        if (fullTeardown && taskController != null && prevVdId > 0 && physVd != null) {
+            if (taskController.getWindowManager().isTilingActive()) {
+                taskController.exitTilingAndRestore(false);
+            }
+            restoredTids = taskController.restoreDisplayTasksForTeardown(prevVdId, config.virtW, config.virtH);
+        }
         teardownDexLayers(unbindWm);
         mirrorDisplay.teardown(unbindWm);
         config.extId = -1;
@@ -262,12 +274,15 @@ public final class PhysicalDisplayController {
             config.renderMode = "NONE";
         }
         // 4. Exit tiling, clear managed windows & reset compat overrides last.
-        if (unbindWm || config.shuttingDown || config.mirrorMode == BridgeProtocol.MIRROR_MODE_MIRROR || noActiveSink) {
+        if (fullTeardown) {
             if (taskController != null) {
                 if (taskController.getWindowManager().isTilingActive() && prevVdId > 0) {
                     taskController.exitTilingAndRestore(false);
                 }
                 taskController.getWindowManager().clearAllManagedWindows();
+                if (!restoredTids.isEmpty()) {
+                    taskController.schedulePostTeardownDisplay0Sanitize(restoredTids);
+                }
             }
         }
         if (unbindWm || config.shuttingDown || noActiveSink) {
@@ -406,6 +421,13 @@ public final class PhysicalDisplayController {
         int targetExtId = -1;
         synchronized (config.displayLock) {
             lastPhysResult = 0;
+            if ("LOCAL_DEX".equals(config.renderMode) && localResizeTrigger != null) {
+                // Local DeX keeps the device's native Surface dimensions and never clobbers the
+                // saved external-monitor extbridge.conf; apply DPI scaling only.
+                config.virtDpi = DisplayGeometryUtil.clampDpi(reqDpi, config.virtW, config.virtH);
+                localResizeTrigger.run();
+                return true;
+            }
             float fps = (reqFpsX100 > 0) ? DisplayGeometryUtil.clampFps(reqFpsX100 / 100.0f, config.virtFps) : config.virtFps;
             config.virtW = reqW; config.virtH = reqH; config.virtDpi = reqDpi; config.virtFps = fps;
             if (reqRot >= 0) config.virtRot = DisplayGeometryUtil.normalizeRotation(reqRot);
@@ -481,6 +503,10 @@ public final class PhysicalDisplayController {
     }
 
     private void liveResizeOrRebuild() {
+        if (localResizeTrigger != null && "LOCAL_DEX".equals(config.renderMode)) {
+            localResizeTrigger.run();
+            return;
+        }
         if (remoteResizeTrigger != null && (config.renderMode.startsWith("REMOTE_") || (physVd == null && config.extId < 0))) {
             remoteResizeTrigger.run();
             return;

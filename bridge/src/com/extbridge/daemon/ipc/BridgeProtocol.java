@@ -73,6 +73,10 @@ public final class BridgeProtocol {
     public static final int TX_SET_ADAPTIVE_SINGLE_CONFIG = 55;
     public static final int TX_SET_INPUT_BACKEND = 56;
     public static final int TX_SET_DESKTOP_PREFS = 57;
+    public static final int TX_START_LOCAL_DEX = 58;
+    public static final int TX_STOP_LOCAL_DEX = 59;
+    public static final int TX_SEND_LOCAL_TOUCH = 60;
+    public static final int TX_MOVE_WINDOW_LIVE = 61;
     public static final int TX_SHUTDOWN = 99;
 
     // ---- Push-Sync Bundle Extras (PROVIDER_METHOD_SYNC_STATE) ----

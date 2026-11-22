@@ -6,10 +6,12 @@ import android.os.Parcel;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.view.KeyEvent;
+import android.view.Surface;
 
 import com.extbridge.daemon.DaemonConfig;
 import com.extbridge.daemon.DaemonConfig.DisplayStatusSnapshot;
 import com.extbridge.daemon.display.CompatPolicyController;
+import com.extbridge.daemon.display.LocalDexController;
 import com.extbridge.daemon.display.NativeMirrorController;
 import com.extbridge.daemon.display.NativeMirrorController.MirrorGeom;
 import com.extbridge.daemon.display.PhysicalDisplayController;
@@ -36,6 +38,7 @@ public final class BridgeBinderService extends Binder {
     private final DaemonConfig config;
     private final HelperClientBridge helperBridge;
     private final PhysicalDisplayController physicalDisplay;
+    private final LocalDexController localDex;
     private final NativeMirrorController mirrorDisplay;
     private final CompatPolicyController compatPolicy;
     private final SystemControlService systemControl;
@@ -48,7 +51,8 @@ public final class BridgeBinderService extends Binder {
 
     public BridgeBinderService(
             DaemonConfig config, HelperClientBridge helperBridge,
-            PhysicalDisplayController physicalDisplay, NativeMirrorController mirrorDisplay,
+            PhysicalDisplayController physicalDisplay, LocalDexController localDex,
+            NativeMirrorController mirrorDisplay,
             CompatPolicyController compatPolicy, SystemControlService systemControl,
             InputInjector injector, LocalInputController localInput,
             TaskWindowController taskController, RemoteSessionCoordinator remoteCoordinator,
@@ -56,6 +60,7 @@ public final class BridgeBinderService extends Binder {
         this.config = config;
         this.helperBridge = helperBridge;
         this.physicalDisplay = physicalDisplay;
+        this.localDex = localDex;
         this.mirrorDisplay = mirrorDisplay;
         this.compatPolicy = compatPolicy;
         this.systemControl = systemControl;
@@ -103,14 +108,18 @@ public final class BridgeBinderService extends Binder {
                 writeInt(reply, handleSetFullscreenPolicy(data.readInt()));
                 return true;
             case BridgeProtocol.TX_SET_ROTATION:
-                writeInt(reply, physicalDisplay.setRotation(data.readInt()));
+                writeInt(reply, (localDex != null && localDex.isActive()) ? 0 : physicalDisplay.setRotation(data.readInt()));
                 return true;
             case BridgeProtocol.TX_SET_MIRROR_SIDE_MODE:
-                writeInt(reply, handleSetMirrorSideMode(data.readInt()));
+                writeInt(reply, (localDex != null && localDex.isActive()) ? config.mirrorSideMode : handleSetMirrorSideMode(data.readInt()));
                 return true;
 
             // ---- Input & Mirror Sidebar Input ----
             case BridgeProtocol.TX_TOGGLE_INPUT:
+                if (localDex != null && localDex.isActive()) {
+                    writeInt(reply, config.inputToExt);
+                    return true;
+                }
                 config.inputToExt = (config.inputToExt == 0) ? 1 : 0;
                 injector.syncInput();
                 writeInt(reply, config.inputToExt);
@@ -225,6 +234,24 @@ public final class BridgeBinderService extends Binder {
                 return true;
             }
 
+            // ---- On-Device Standalone Local DeX Mode ----
+            case BridgeProtocol.TX_START_LOCAL_DEX:
+                handleStartLocalDex(data, reply);
+                return true;
+            case BridgeProtocol.TX_STOP_LOCAL_DEX: {
+                boolean releaseDisplay = data.readInt() != 0;
+                boolean ok = releaseDisplay ? localDex.stop() : localDex.detachSurface();
+                writeBool(reply, ok);
+                return true;
+            }
+            case BridgeProtocol.TX_SEND_LOCAL_TOUCH:
+                handleSendLocalTouch(data, reply);
+                return true;
+            case BridgeProtocol.TX_MOVE_WINDOW_LIVE:
+                writeBool(reply, taskController.moveWindowLive(
+                        data.readInt(), data.readInt(), data.readInt(), data.readInt(), data.readInt()));
+                return true;
+
             // ---- System Status, Controls, Wallpaper & Telemetry ----
             case BridgeProtocol.TX_GET_WALLPAPER:
                 if (reply != null) reply.writeByteArray(systemControl.getWallpaperBytes(data.readInt() == 1));
@@ -232,9 +259,17 @@ public final class BridgeBinderService extends Binder {
             case BridgeProtocol.TX_GET_SYS_STATUS:
                 systemControl.writeSysStatusToParcel(reply);
                 return true;
-            case BridgeProtocol.TX_EXEC_SYS_ACTION:
-                writeBool(reply, systemControl.execSysAction(data.readInt(), data.readInt(), data.readString()));
+            case BridgeProtocol.TX_EXEC_SYS_ACTION: {
+                int sysAct = data.readInt();
+                int sysArg = data.readInt();
+                String sysStr = data.readString();
+                if (localDex != null && localDex.isActive() && sysAct == BridgeProtocol.SYS_ACTION_SCREEN_DIM) {
+                    writeBool(reply, false);
+                    return true;
+                }
+                writeBool(reply, systemControl.execSysAction(sysAct, sysArg, sysStr));
                 return true;
+            }
             case BridgeProtocol.TX_GET_MIRROR_TELEMETRY:
                 systemControl.writeMirrorTelemetryToParcel(reply);
                 return true;
@@ -294,6 +329,9 @@ public final class BridgeBinderService extends Binder {
     }
 
     private int handleSetMirrorMode(int req) {
+        if (localDex != null && localDex.isActive()) {
+            return BridgeProtocol.MIRROR_MODE_DEX;
+        }
         int next;
         boolean changed;
         synchronized (config.displayLock) {
@@ -433,6 +471,48 @@ public final class BridgeBinderService extends Binder {
         reply.writeInt(wm.isAdaptiveSingleEnabled() ? 1 : 0);
         reply.writeInt(wm.getDefaultSingleWidthDp());
         reply.writeString(wm.resolveActiveLayoutMode());
+    }
+
+    private void handleStartLocalDex(Parcel data, Parcel reply) {
+        int reqW = data.readInt();
+        int reqH = data.readInt();
+        int reqDpi = data.readInt();
+        int reqFpsX100 = data.readInt();
+        Surface surf = (data.readInt() != 0) ? Surface.CREATOR.createFromParcel(data) : null;
+        int vdId = (localDex != null) ? localDex.startOrAttach(reqW, reqH, reqDpi, reqFpsX100, surf) : -1;
+        writeInt(reply, vdId);
+    }
+
+    private void handleSendLocalTouch(Parcel data, Parcel reply) {
+        int action = data.readInt();
+        long downTime = data.readLong();
+        long eventTime = data.readLong();
+        int source = data.readInt();
+        int buttonState = data.readInt();
+        int actionButton = data.readInt();
+        float hScroll = data.readFloat();
+        float vScroll = data.readFloat();
+        int count = Math.max(0, Math.min(10, data.readInt()));
+        if (count <= 0) {
+            writeBool(reply, false);
+            return;
+        }
+        int[] ids = new int[count];
+        int[] toolTypes = new int[count];
+        float[] xs = new float[count];
+        float[] ys = new float[count];
+        float[] pressures = new float[count];
+        for (int i = 0; i < count; i++) {
+            ids[i] = data.readInt();
+            toolTypes[i] = data.readInt();
+            xs[i] = data.readFloat();
+            ys[i] = data.readFloat();
+            pressures[i] = data.readFloat();
+        }
+        boolean ok = localInput.injectLocalMotionEvent(
+                action, downTime, eventTime, source, buttonState, actionButton,
+                hScroll, vScroll, ids, toolTypes, xs, ys, pressures);
+        writeBool(reply, ok);
     }
 
     private void handleShutdown(Parcel reply) {

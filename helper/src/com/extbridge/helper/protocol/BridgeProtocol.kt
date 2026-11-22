@@ -59,6 +59,10 @@ object BridgeProtocol {
         const val SET_ADAPTIVE_SINGLE_CONFIG = 55
         const val SET_INPUT_BACKEND = 56
         const val SET_DESKTOP_PREFS = 57
+        const val START_LOCAL_DEX = 58
+        const val STOP_LOCAL_DEX = 59
+        const val SEND_LOCAL_TOUCH = 60
+        const val MOVE_WINDOW_LIVE = 61
         const val SHUTDOWN = 99
     }
 
@@ -104,9 +108,12 @@ object BridgeProtocol {
         const val REMOTE_USB = 2
         const val REMOTE_WIFI = 3
         const val REMOTE_WIFI_ADB = 4
+        const val LOCAL = 5
 
         fun isRemote(sinkType: Int): Boolean =
             sinkType == REMOTE_USB || sinkType == REMOTE_WIFI || sinkType == REMOTE_WIFI_ADB
+
+        fun isLocal(sinkType: Int): Boolean = sinkType == LOCAL
     }
 
     object WindowMode {
@@ -234,6 +241,7 @@ object BridgeProtocol {
         const val SET_DOCK_AUTO_HIDE = "com.extbridge.helper.SET_DOCK_AUTO_HIDE"
         const val EXIT_ALL = "com.extbridge.helper.EXIT_ALL"
         const val DISCONNECT_REMOTE = "com.extbridge.helper.DISCONNECT_REMOTE"
+        const val STOP_LOCAL_DEX = "com.extbridge.helper.STOP_LOCAL_DEX"
 
         const val PROVIDER_AUTHORITY = "com.extbridge.helper.provider"
         const val PROVIDER_METHOD_SET_BINDER = "setBinder"

@@ -67,6 +67,7 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
     private var btnBack: ImageView? = null
     private var btnHome: ImageView? = null
     private var btnRecents: ImageView? = null
+    private var btnWorkbench: TextView? = null
     private var leftDivider: View? = null
     private var rightDivider: View? = null
     private var taskScroll: HorizontalScrollView? = null
@@ -88,7 +89,8 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
     private var lastTaskSig = ""
     private var lastDark: Boolean? = null
     private var lastInputToExt = -1
-    private var lastIsRemote: Boolean? = null
+    private var lastPillMode = -1 // 0=physical input pill, 1=remote hidden, 2=local dex exit pill
+    private var lastWorkbenchOn: Boolean? = null
     private var quickSettingsActive = false
 
     fun build(ctx: Context) {
@@ -126,7 +128,7 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
 
         btnBack = makeBarIconBtn(ctx, "返回") { host.sendGlobalBack() }
             .also { root.addView(it, ctx.llp(ctx.dp(34f), ctx.dp(36f), rightDp = 2f)) }
-        btnHome = makeBarIconBtn(ctx, "显示桌面 (Meta+D)") {
+        btnHome = makeBarIconBtn(ctx, "返回桌面 (Meta+D)") {
             hoverPreview.hideNow()
             host.toggleShowDesktop()
         }.also { root.addView(it, ctx.llp(ctx.dp(34f), ctx.dp(36f), rightDp = 2f)) }
@@ -134,6 +136,22 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
             hoverPreview.hideNow()
             host.toggleWindowSwitcher()
         }.also { root.addView(it, ctx.llp(ctx.dp(34f), ctx.dp(36f), rightDp = 4f)) }
+
+        btnWorkbench = TextView(ctx).apply {
+            text = "工作台"
+            setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f)
+            paint.isFakeBoldText = true
+            gravity = Gravity.CENTER
+            isSingleLine = true
+            setPadDp(9f, 6f)
+            pointerIcon = PointerIcon.getSystemIcon(ctx, PointerIcon.TYPE_HAND)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) tooltipText = "开关工作台应用卡片栏"
+            OverlayUiUtils.attachTactilePress(this, 0.92f)
+            setOnClickListener {
+                hoverPreview.hideNow()
+                host.toggleWorkbench()
+            }
+        }.also { root.addView(it, ctx.llp(WRAP, ctx.dp(34f), rightDp = 4f)) }
 
         leftDivider = View(ctx).also { root.addView(it, ctx.llp(ctx.dp(1f), ctx.dp(24f), leftDp = 4f, rightDp = 6f)) }
 
@@ -165,7 +183,7 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
 
         trayPill = buildSystemTray(ctx).also { root.addView(it, ctx.llp(WRAP, ctx.dp(40f), rightDp = 6f)) }
 
-        btnShowDesktop = makeBarIconBtn(ctx, "显示 / 恢复桌面窗口") {
+        btnShowDesktop = makeBarIconBtn(ctx, "返回桌面") {
             hoverPreview.hideNow()
             host.toggleShowDesktop()
         }.also { root.addView(it, ctx.llp(ctx.dp(34f), ctx.dp(36f))) }
@@ -219,7 +237,8 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
         trayBattTxt = TextView(ctx).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11f)
             paint.isFakeBoldText = true
-            OverlayUiUtils.enforceSingleLine(this)
+            isSingleLine = true
+            ellipsize = null
         }.also { addView(it, ctx.llp(rightDp = 9f)) }
 
         addView(LinearLayout(ctx).apply {
@@ -228,11 +247,16 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
             trayTime = TextView(ctx).apply {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 11.5f)
                 paint.isFakeBoldText = true
-                OverlayUiUtils.enforceSingleLine(this)
+                isSingleLine = true
+                ellipsize = null
+                minWidth = ctx.dp(36f)
+                gravity = Gravity.END
             }.also(::addView)
             trayDate = TextView(ctx).apply {
                 setTextSize(TypedValue.COMPLEX_UNIT_DIP, 9.5f)
-                OverlayUiUtils.enforceSingleLine(this)
+                isSingleLine = true
+                ellipsize = null
+                gravity = Gravity.END
             }.also(::addView)
         })
         updateClock()
@@ -248,10 +272,26 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
         autoHide.isDesktopClear = state.isDesktopClear
         autoHide.isImmersiveActive = state.activeImmersiveWindow != null
 
+        updateWorkbenchBtn(ctx, tokens)
         updateInputPill(ctx, status, tokens)
         updateTaskStrip(ctx, state.taskbarItems, tokens)
         refreshHardware(volLevel, sys, tokens)
         autoHide.evaluate(forceDelay = false)
+    }
+
+    private fun updateWorkbenchBtn(ctx: Context, tokens: GlassOverlayTokens) {
+        val btn = btnWorkbench ?: return
+        val active = host.isWorkbenchEnabled
+        if (lastWorkbenchOn == active && lastDark == tokens.isDark) return
+        lastWorkbenchOn = active
+        val fg = if (active) Color.WHITE else tokens.textPrimary
+        btn.setTextColor(fg)
+        btn.background = if (active) {
+            roundedBg(tokens.accentBlue, ctx.dpF(13f), ctx.dp(0.8f), 0x55FFFFFF)
+        } else {
+            OverlayUiUtils.makeStateListBg(ctx, tokens.hoverChipFill, tokens.activeChipFill, 13f)
+        }
+        HyperUi.setStartIcon(btn, HyperUi.ICON_SIDEBAR, fg, 12.5f, 4f)
     }
 
     fun setQuickSettingsHighlighted(active: Boolean) {
@@ -307,13 +347,37 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
 
     private fun updateInputPill(ctx: Context, status: BridgeClient.Status, tokens: GlassOverlayTokens) {
         val pill = inputPill ?: return
-        val isRemote = status.isRemoteSink
-        if (lastIsRemote != isRemote) {
-            lastIsRemote = isRemote
-            pill.visibility = if (isRemote) View.GONE else View.VISIBLE
+        val mode = when {
+            status.isRemoteSink -> 1
+            status.isLocalDexActive -> 2
+            else -> 0
         }
-        if (isRemote) return
-        if (lastInputToExt == status.inputToExt && lastDark == tokens.isDark && pill.text.isNotEmpty()) return
+        val modeChanged = (lastPillMode != mode)
+        if (modeChanged) {
+            lastPillMode = mode
+            pill.visibility = if (mode == 1) View.GONE else View.VISIBLE
+            if (mode == 2) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) pill.tooltipText = "退出本机 DeX 模式"
+                pill.setOnClickListener {
+                    hoverPreview.hideNow()
+                    host.exitLocalDex()
+                }
+            } else if (mode == 0) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) pill.tooltipText = "切换键鼠控制屏幕"
+                pill.setOnClickListener { host.toggleInputRouting() }
+            }
+        }
+        if (mode == 1) return
+        if (mode == 2) {
+            if (!modeChanged && lastDark == tokens.isDark && pill.text?.toString() == "退出 DeX") return
+            pill.text = "退出 DeX"
+            val fg = Color.WHITE
+            pill.setTextColor(fg)
+            pill.background = roundedBg(tokens.accentRed, ctx.dpF(14f), ctx.dp(0.75f), 0x55FFFFFF)
+            HyperUi.setStartIcon(pill, HyperUi.ICON_CLOSE, fg, 12f, 3.5f)
+            return
+        }
+        if (!modeChanged && lastInputToExt == status.inputToExt && lastDark == tokens.isDark && pill.text.isNotEmpty()) return
         lastInputToExt = status.inputToExt
         val onExt = status.inputToExt == 1
         pill.text = if (onExt) "外接" else "本机"
@@ -445,6 +509,8 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
         btnHome?.background = OverlayUiUtils.makeStateListBg(ctx, Color.TRANSPARENT, tokens.hoverChipFill, 12f)
         btnRecents?.setImageDrawable(HyperUi.icon(ctx, HyperUi.ICON_RECENTS_NAV, tokens.textPrimary, 15.5f))
         btnRecents?.background = OverlayUiUtils.makeStateListBg(ctx, Color.TRANSPARENT, tokens.hoverChipFill, 12f)
+        lastWorkbenchOn = null
+        updateWorkbenchBtn(ctx, tokens)
 
         btnShowDesktop?.setImageDrawable(HyperUi.icon(ctx, HyperUi.ICON_SHOW_DESKTOP, tokens.textSecondary, 16f))
         btnShowDesktop?.background = OverlayUiUtils.makeStateListBg(ctx, Color.TRANSPARENT, tokens.hoverChipFill, 12f)
@@ -479,10 +545,10 @@ internal class DeXTaskbarController(private val host: DesktopShellHost) {
         autoHide.detach()
         host.surfaceHost.unregister(SURFACE_KEY, host.extWm)
         barRoot = null; barLp = null
-        btnApps = null; btnBack = null; btnHome = null; btnRecents = null
+        btnApps = null; btnBack = null; btnHome = null; btnRecents = null; btnWorkbench = null
         leftDivider = null; rightDivider = null; taskScroll = null; taskStrip = null
         inputPill = null; trayPill = null; trayWifi = null; trayBt = null; trayVol = null
         trayBatt = null; trayBattTxt = null; trayTime = null; trayDate = null; btnShowDesktop = null
-        lastTaskSig = ""; lastDark = null; lastInputToExt = -1; lastIsRemote = null
+        lastTaskSig = ""; lastDark = null; lastInputToExt = -1; lastPillMode = -1; lastWorkbenchOn = null
     }
 }

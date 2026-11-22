@@ -165,6 +165,7 @@ public final class RemoteSessionCoordinator {
         RemoteStreamServer srv = server;
         if (isDesktopSessionActive() && srv != null) return srv.getActiveSinkType();
         if (srv != null && srv.hasActiveSession()) return srv.getActiveSinkType();
+        if (config.activeSinkType == DisplaySink.SINK_LOCAL) return DisplaySink.SINK_LOCAL;
         if (config.extId >= 0 || hasPhysicalDisplay) return DisplaySink.SINK_PHYSICAL;
         return config.activeSinkType;
     }

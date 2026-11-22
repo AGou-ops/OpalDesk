@@ -44,6 +44,14 @@ object AppPrefs {
     private const val KEY_RIGHT_CLICK_PASSTHROUGH = "dex_right_click_passthrough"
     private const val KEY_DESKTOP_DOUBLE_CLICK = "dex_desktop_double_click"
     private const val KEY_DEX_DEFAULT_LAUNCH_MODE = "dex_default_launch_mode"
+    private const val KEY_WORKBENCH_ENABLED = "dex_workbench_enabled"
+    private const val KEY_WORKBENCH_POSITION = "dex_workbench_position"
+    private const val KEY_WORKBENCH_APPS = "dex_workbench_apps"
+    private const val KEY_WORKBENCH_APPS_INIT = "dex_workbench_apps_init_v1"
+
+    const val WORKBENCH_POS_LEFT = 0
+    const val WORKBENCH_POS_TOP = 1
+    const val MAX_WORKBENCH_APPS = 12
 
     // extbridge_prefs keys
     private const val KEY_AUTO_ROOT = "auto_root_enabled"
@@ -149,6 +157,65 @@ object AppPrefs {
         prefs(ctx, FILE_EXT).edit().putString(KEY_DOCK_PINNED_APPS, joined).apply()
         onDockPinnedAppsChanged?.invoke(ctx)
     }
+
+    // ---- Workbench Mode (Stage Manager / App Card Rail) ----
+
+    fun isWorkbenchEnabled(ctx: Context?): Boolean =
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_WORKBENCH_ENABLED, false) } ?: false
+
+    fun setWorkbenchEnabled(ctx: Context?, enabled: Boolean) {
+        if (ctx == null) return
+        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_WORKBENCH_ENABLED, enabled).apply()
+    }
+
+    fun getWorkbenchPosition(ctx: Context?): Int {
+        val raw = ctx?.let { prefs(it, FILE_EXT).getInt(KEY_WORKBENCH_POSITION, WORKBENCH_POS_LEFT) } ?: WORKBENCH_POS_LEFT
+        return if (raw == WORKBENCH_POS_TOP) WORKBENCH_POS_TOP else WORKBENCH_POS_LEFT
+    }
+
+    fun setWorkbenchPosition(ctx: Context?, position: Int) {
+        if (ctx == null) return
+        val clamped = if (position == WORKBENCH_POS_TOP) WORKBENCH_POS_TOP else WORKBENCH_POS_LEFT
+        prefs(ctx, FILE_EXT).edit().putInt(KEY_WORKBENCH_POSITION, clamped).apply()
+    }
+
+    fun isWorkbenchAppsInitialized(ctx: Context?): Boolean =
+        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_WORKBENCH_APPS_INIT, false) } ?: false
+
+    fun getWorkbenchApps(ctx: Context?): List<String> {
+        if (ctx == null) return emptyList()
+        val raw = prefs(ctx, FILE_EXT).getString(KEY_WORKBENCH_APPS, "").orEmpty()
+        return raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(MAX_WORKBENCH_APPS)
+    }
+
+    fun setWorkbenchApps(ctx: Context?, pkgs: List<String>, markInitialized: Boolean = true) {
+        if (ctx == null) return
+        val joined = pkgs.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(MAX_WORKBENCH_APPS).joinToString(",")
+        prefs(ctx, FILE_EXT).edit().apply {
+            putString(KEY_WORKBENCH_APPS, joined)
+            if (markInitialized) putBoolean(KEY_WORKBENCH_APPS_INIT, true)
+        }.apply()
+    }
+
+    fun addWorkbenchApp(ctx: Context?, pkg: String): Boolean {
+        val clean = pkg.trim()
+        if (ctx == null || clean.isEmpty()) return false
+        val cur = getWorkbenchApps(ctx).toMutableList()
+        if (cur.contains(clean)) return true
+        if (cur.size >= MAX_WORKBENCH_APPS) return false
+        cur.add(clean)
+        setWorkbenchApps(ctx, cur)
+        return true
+    }
+
+    fun removeWorkbenchApp(ctx: Context?, pkg: String) {
+        val clean = pkg.trim()
+        if (ctx == null || clean.isEmpty()) return
+        setWorkbenchApps(ctx, getWorkbenchApps(ctx).filterNot { it == clean })
+    }
+
+    fun isWorkbenchApp(ctx: Context?, pkg: String): Boolean =
+        getWorkbenchApps(ctx).contains(pkg.trim())
 
     fun toggleDockPinnedApp(ctx: Context?, pkg: String): Boolean {
         val clean = pkg.trim()

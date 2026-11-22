@@ -52,7 +52,22 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
         </activity>
+
+        <activity
+            android:name=".LocalDexActivity"
+            android:exported="true"
+            android:label="ExtBridge 本机 DeX"
+            android:launchMode="singleTask"
+            android:taskAffinity="com.extbridge.helper.localdex"
+            android:screenOrientation="sensorLandscape"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustNothing|stateHidden"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
             android:name=".TouchpadActivity"
@@ -132,6 +147,7 @@
                 <action android:name="com.extbridge.helper.SPLIT_ACTION" />
                 <action android:name="com.extbridge.helper.SET_ROTATION" />
                 <action android:name="com.extbridge.helper.SET_DOCK_AUTO_HIDE" />
+                <action android:name="com.extbridge.helper.STOP_LOCAL_DEX" />
                 <action android:name="com.extbridge.helper.EXIT_ALL" />
             </intent-filter>
         </receiver>

@@ -35,7 +35,7 @@ class CursorOverlayController(private val host: OverlayHost) {
     private val hideCursorTask = Runnable { setCursorVisible(false) }
 
     fun buildCursorOverlay(ctx: Context, st: BridgeClient.Status) {
-        suppressedForRemoteSink = st.isRemoteSink
+        suppressedForRemoteSink = st.isRemoteSink || st.isLocalDexActive
         val view = CursorView(ctx).apply {
             isClickable = false; isFocusable = false
             elevation = ctx.dpF(CURSOR_ELEVATION_DP)
@@ -65,7 +65,7 @@ class CursorOverlayController(private val host: OverlayHost) {
     }
 
     fun updateRemoteSuppression(st: BridgeClient.Status) {
-        suppressedForRemoteSink = st.isRemoteDisplayActive
+        suppressedForRemoteSink = st.isRemoteDisplayActive || st.isLocalDexActive
         if (suppressedForRemoteSink) {
             host.handler.removeCallbacks(hideCursorTask)
             setCursorVisible(false)
@@ -84,7 +84,7 @@ class CursorOverlayController(private val host: OverlayHost) {
     fun updateCursorOnExt(x: Float, y: Float, pressing: Boolean) {
         val view = cursorView ?: return
         val lp = cursorLp ?: return
-        if (suppressedForRemoteSink || host.lastStatus.isRemoteSink) {
+        if (suppressedForRemoteSink || host.lastStatus.isRemoteSink || host.lastStatus.isLocalDexActive) {
             suppressedForRemoteSink = true
             host.handler.removeCallbacks(hideCursorTask)
             if (cursorVisible || view.visibility == View.VISIBLE) setCursorVisible(false)

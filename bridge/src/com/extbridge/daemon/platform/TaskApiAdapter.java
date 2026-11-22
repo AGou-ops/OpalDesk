@@ -10,6 +10,8 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 
+import com.extbridge.daemon.BridgeBuildConfig;
+import com.extbridge.daemon.DaemonConfig;
 import com.extbridge.daemon.util.ShellCommand;
 
 import java.lang.reflect.Field;
@@ -101,24 +103,48 @@ public final class TaskApiAdapter {
     }
 
     public static String extractTaskPkg(Object info) {
-        Object top = readObjField(info, "topActivity");
-        if (top instanceof ComponentName) {
-            String p = ((ComponentName) top).getPackageName();
-            if (p != null && !p.isEmpty()) return p;
+        String topPkg = readComponentPkg(info, "topActivity");
+        if (topPkg != null && !topPkg.isEmpty()) {
+            // Keep Helper tasks attributed to Helper, and normal user apps attributed to topActivity.
+            // If a user app task temporarily hosts an in-task system permission/privacy/chooser dialog
+            // (e.g. com.miui.securitycenter or permissioncontroller), attribute the task to its owning
+            // root app so DeX window headers, bounds, and taskbar focus stay attached.
+            if (BridgeBuildConfig.HELPER_PACKAGE.equals(topPkg)
+                    || !DaemonConfig.PackagePolicy.isProtectedSystemTaskPkg(topPkg)) {
+                return topPkg;
+            }
+            String rootPkg = extractRootTaskPkg(info);
+            if (rootPkg != null && !rootPkg.isEmpty()
+                    && !DaemonConfig.PackagePolicy.isProtectedSystemTaskPkg(rootPkg)) {
+                return rootPkg;
+            }
+            return topPkg;
         }
-        Object real = readObjField(info, "realActivity");
-        if (real instanceof ComponentName) {
-            String p = ((ComponentName) real).getPackageName();
-            if (p != null && !p.isEmpty()) return p;
-        }
+        return extractRootTaskPkg(info);
+    }
+
+    private static String extractRootTaskPkg(Object info) {
+        String real = readComponentPkg(info, "realActivity");
+        if (real != null && !real.isEmpty()) return real;
         Object bi = readObjField(info, "baseIntent");
         if (bi instanceof Intent) {
             Intent intent = (Intent) bi;
-            if (intent.getComponent() != null) return intent.getComponent().getPackageName();
-            if (intent.getPackage() != null) return intent.getPackage();
+            if (intent.getComponent() != null) {
+                String p = intent.getComponent().getPackageName();
+                if (p != null && !p.isEmpty()) return p;
+            }
+            String p = intent.getPackage();
+            if (p != null && !p.isEmpty()) return p;
         }
-        Object ba = readObjField(info, "baseActivity");
-        if (ba instanceof ComponentName) return ((ComponentName) ba).getPackageName();
+        return readComponentPkg(info, "baseActivity");
+    }
+
+    private static String readComponentPkg(Object info, String fieldName) {
+        Object comp = readObjField(info, fieldName);
+        if (comp instanceof ComponentName) {
+            String p = ((ComponentName) comp).getPackageName();
+            if (p != null && !p.isEmpty()) return p;
+        }
         return null;
     }
 
@@ -394,31 +420,63 @@ public final class TaskApiAdapter {
         }
     }
 
+    public static final int RESIZE_MODE_SYSTEM = 0;
+    /** Preserves app window surface during interactive drag without triggering system relayout transitions. */
+    public static final int RESIZE_MODE_USER = 1;
+
+    private volatile Method cachedResizeTaskMethod;
+    private volatile int cachedResizeTaskArgCount;
+    private volatile boolean resizeTaskResolved;
+
     public void resizeTask(int taskId, Rect bounds) {
+        resizeTask(taskId, bounds, RESIZE_MODE_SYSTEM);
+    }
+
+    public void resizeTask(int taskId, Rect bounds, int resizeMode) {
         if (taskId <= 0 || bounds == null || atm == null) return;
+        Method m = resolveResizeTaskMethod();
         boolean resized = false;
-        try {
-            for (Method m : atm.getClass().getMethods()) {
-                if (!"resizeTask".equals(m.getName())) continue;
-                Class<?>[] pt = m.getParameterTypes();
-                if (pt.length == 3 && pt[0] == int.class && pt[1] == Rect.class && pt[2] == int.class) {
-                    m.invoke(atm, taskId, bounds, 0);
-                    resized = true;
-                    break;
-                } else if (pt.length == 2 && pt[0] == int.class && pt[1] == Rect.class) {
+        if (m != null) {
+            try {
+                if (cachedResizeTaskArgCount == 3) {
+                    m.invoke(atm, taskId, bounds, resizeMode);
+                } else {
                     m.invoke(atm, taskId, bounds);
-                    resized = true;
-                    break;
                 }
+                resized = true;
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                System.err.println("EXTBRIDGE_RESIZE_TASK_ERR tid=" + taskId + ": " + e.getMessage());
             }
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("EXTBRIDGE_RESIZE_TASK_ERR tid=" + taskId + ": " + e.getMessage());
         }
         if (!resized) {
             ShellCommand.runOutput("cmd", "activity", "task", "resize", String.valueOf(taskId),
                     String.valueOf(bounds.left), String.valueOf(bounds.top),
                     String.valueOf(bounds.right), String.valueOf(bounds.bottom));
         }
+    }
+
+    private Method resolveResizeTaskMethod() {
+        if (resizeTaskResolved) return cachedResizeTaskMethod;
+        Method found = null;
+        int argCount = 0;
+        if (atm != null) {
+            for (Method m : atm.getClass().getMethods()) {
+                if (!"resizeTask".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 3 && pt[0] == int.class && pt[1] == Rect.class && pt[2] == int.class) {
+                    found = m;
+                    argCount = 3;
+                    break;
+                } else if (pt.length == 2 && pt[0] == int.class && pt[1] == Rect.class && found == null) {
+                    found = m;
+                    argCount = 2;
+                }
+            }
+        }
+        cachedResizeTaskMethod = found;
+        cachedResizeTaskArgCount = argCount;
+        resizeTaskResolved = true;
+        return found;
     }
 
     /**

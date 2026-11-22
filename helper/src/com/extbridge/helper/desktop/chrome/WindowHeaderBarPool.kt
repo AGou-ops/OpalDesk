@@ -442,15 +442,23 @@ internal class WindowHeaderBarPool(private val host: DesktopShellHost) {
                                 ),
                             )
                         } else {
-                            host.clearPreview()
+                            // Draw a 120fps Liquid Glass ghost frame while keeping the real header
+                            // attached to the live app window, then commit ONE single resizeTask on
+                            // release so Android 16 / HyperOS Shell Transitions never queue a 2s
+                            // backlog of 350ms animations or visually separate header from content.
                             val curDx = (ev.rawX - downRawX).roundToInt()
                             val curDy = (ev.rawY - downRawY).roundToInt()
                             liveRect = DesktopGeometry.computeMovedRect(
                                 baseRect, curDx, curDy, st.displayW, st.displayH, st.dpi, host.isTaskbarAutoHide,
                             )
-                            applyLivePosition(liveRect)
-                            host.setDraggingWindow(win.taskId, liveRect)
-                            host.moveWindowLive(win.taskId, win.pkg, liveRect)
+                            host.updatePreview(
+                                PreviewOverlayState(
+                                    active = true,
+                                    outerRect = DesktopGeometry.computeOuterFrame(liveRect, st.dpi),
+                                    hudLabel = "",
+                                    isSnapped = false,
+                                ),
+                            )
                         }
                         true
                     }

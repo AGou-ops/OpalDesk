@@ -74,6 +74,7 @@ internal class DeXQuickSettingsOverlay(
     private var battText: TextView? = null
     private var btnConsole: TextView? = null
     private var btnSettings: TextView? = null
+    private var btnExitLocalDex: TextView? = null
 
     private lateinit var tileWifi: GlassQuickTile
     private lateinit var tileBt: GlassQuickTile
@@ -83,10 +84,14 @@ internal class DeXQuickSettingsOverlay(
     private lateinit var tilePowerSave: GlassQuickTile
     private lateinit var volSlider: VerticalGlassSlider
     private lateinit var dimSlider: VerticalGlassSlider
+    private var bentoExtRow: LinearLayout? = null
+    private var modeChipRow: LinearLayout? = null
+    private var extChipRow: LinearLayout? = null
 
     private lateinit var btnDex: TextView
     private lateinit var btnMirror: TextView
     private lateinit var btnRotate: TextView
+    private lateinit var btnWorkbench: TextView
     private lateinit var btnAutoHide: TextView
     private lateinit var btnTheme: TextView
     private lateinit var btnBlackout: TextView
@@ -142,10 +147,13 @@ internal class DeXQuickSettingsOverlay(
         tilePowerSave = GlassQuickTile(ctx, HyperUi.ICON_BATTERY_SAVER, "节能模式",
             onClick = { host.execSysAction(BridgeClient.SYS_POWER_SAVE) })
 
+        val extRow = OverlayUiUtils.makeChipRow(ctx, 8f, bottomMarginDp = 8f, items = arrayOf(tileInput.root, tileTouchpad.root))
+        bentoExtRow = extRow
+
         val leftGrid = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
             addView(OverlayUiUtils.makeChipRow(ctx, 8f, bottomMarginDp = 8f, items = arrayOf(tileWifi.root, tileBt.root)))
-            addView(OverlayUiUtils.makeChipRow(ctx, 8f, bottomMarginDp = 8f, items = arrayOf(tileInput.root, tileTouchpad.root)))
+            addView(extRow)
             addView(OverlayUiUtils.makeChipRow(ctx, 8f, bottomMarginDp = 0f, items = arrayOf(tileAirplane.root, tilePowerSave.root)))
         }
 
@@ -178,15 +186,16 @@ internal class DeXQuickSettingsOverlay(
     private fun buildModeChips(ctx: Context, body: LinearLayout) {
         btnDex = makeChip(ctx) { dismiss(); host.switchMirrorMode(BridgeClient.MIRROR_MODE_DEX) }
         btnMirror = makeChip(ctx) { dismiss(); host.switchMirrorMode(BridgeClient.MIRROR_MODE_MIRROR) }
-        body.addView(OverlayUiUtils.makeChipRow(ctx, 6f, items = arrayOf(btnDex, btnMirror)))
+        modeChipRow = OverlayUiUtils.makeChipRow(ctx, 6f, items = arrayOf(btnDex, btnMirror)).also { body.addView(it) }
+
+        btnWorkbench = makeChip(ctx) { host.toggleWorkbench() }
+        btnAutoHide = makeChip(ctx) { host.setTaskbarAutoHide(!host.isTaskbarAutoHide) }
+        btnTheme = makeChip(ctx) { host.cycleGlassTheme() }
+        body.addView(OverlayUiUtils.makeChipRow(ctx, 6f, topMarginDp = 6f, items = arrayOf(btnWorkbench, btnAutoHide, btnTheme)))
 
         btnRotate = makeChip(ctx) { host.cycleRotation() }
-        btnAutoHide = makeChip(ctx) { host.setTaskbarAutoHide(!host.isTaskbarAutoHide) }
-        body.addView(OverlayUiUtils.makeChipRow(ctx, 6f, topMarginDp = 6f, items = arrayOf(btnRotate, btnAutoHide)))
-
-        btnTheme = makeChip(ctx) { host.cycleGlassTheme() }
         btnBlackout = makeChip(ctx) { host.toggleBlackout() }
-        body.addView(OverlayUiUtils.makeChipRow(ctx, 6f, topMarginDp = 6f, items = arrayOf(btnTheme, btnBlackout)))
+        extChipRow = OverlayUiUtils.makeChipRow(ctx, 6f, topMarginDp = 6f, items = arrayOf(btnRotate, btnBlackout)).also { body.addView(it) }
     }
 
     private fun buildFooter(ctx: Context): LinearLayout = LinearLayout(ctx).apply {
@@ -201,6 +210,11 @@ internal class DeXQuickSettingsOverlay(
 
         btnConsole = makeChip(ctx) { dismiss(); host.openTabletMain() }.also {
             it.text = "控制台"
+            addView(it, ctx.llp(WRAP, WRAP, rightDp = 8f))
+        }
+        btnExitLocalDex = makeChip(ctx) { dismiss(); host.exitLocalDex() }.also {
+            it.text = "退出 DeX"
+            it.visibility = View.GONE
             addView(it, ctx.llp(WRAP, WRAP, rightDp = 8f))
         }
         btnSettings = makeChip(ctx) { dismiss(); host.openExtSettings(Settings.ACTION_SETTINGS) }.also {
@@ -241,7 +255,7 @@ internal class DeXQuickSettingsOverlay(
         val dispW = max(600, host.state.displayW)
         val dispH = max(480, host.state.displayH)
         card.measureForMax(cardW, dispH, exactW = true)
-        val cardH = max(ctx.dp(320f), card.measuredHeight)
+        val cardH = max(ctx.dp(180f), card.measuredHeight)
         val margin = ctx.dp(14f)
         wmLp.x = max(margin, dispW - cardW - margin)
         wmLp.y = max(margin, dispH - ctx.dp(74f) - cardH)
@@ -281,6 +295,21 @@ internal class DeXQuickSettingsOverlay(
         }
         val st = host.lastStatus
         val sys = host.lastSysStatus
+        val isLocalDex = st.isLocalDexActive
+        val extVis = if (isLocalDex) View.GONE else View.VISIBLE
+        bentoExtRow?.visibility = extVis
+        dimSlider.visibility = extVis
+        modeChipRow?.visibility = extVis
+        extChipRow?.visibility = extVis
+        (volSlider.layoutParams as? LinearLayout.LayoutParams)?.let { vlp ->
+            val targetH = ctx.dp(if (isLocalDex) 122f else 186f)
+            val targetRight = if (isLocalDex) 0 else ctx.dp(8f)
+            if (vlp.height != targetH || vlp.rightMargin != targetRight) {
+                vlp.height = targetH
+                vlp.rightMargin = targetRight
+                volSlider.layoutParams = vlp
+            }
+        }
         if (sys.valid) {
             tileWifi.bind(sys.wifiOn, if (sys.wifiOn) sys.wifiSsid.ifEmpty { "已开启" } else "Wi-Fi", tokens)
             tileBt.bind(sys.btOn, if (sys.btOn) sys.btName.ifEmpty { "已开启" } else "蓝牙", tokens)
@@ -312,6 +341,7 @@ internal class DeXQuickSettingsOverlay(
         styleChip(ctx, btnDex, st.mirrorMode == BridgeClient.MIRROR_MODE_DEX, HyperUi.ICON_DEX, "DeX 桌面", tokens)
         styleChip(ctx, btnMirror, st.mirrorMode == BridgeClient.MIRROR_MODE_MIRROR, HyperUi.ICON_MIRROR, "融合镜像", tokens)
         styleChip(ctx, btnRotate, st.virtRot != 0, HyperUi.ICON_ROTATE, "旋转 ${BridgeClient.rotationLabel(st.virtRot)}", tokens)
+        styleChip(ctx, btnWorkbench, host.isWorkbenchEnabled, HyperUi.ICON_SIDEBAR, if (host.isWorkbenchEnabled) "工作台开" else "工作台", tokens)
         styleChip(ctx, btnAutoHide, host.isTaskbarAutoHide, HyperUi.ICON_PIN, if (host.isTaskbarAutoHide) "底栏隐藏" else "底栏固定", tokens)
         val themeLabel = when (ExtThemePrefs.getThemeModeIndex(host.serviceContext)) {
             ExtThemePrefs.MODE_DARK -> "黑曜毛玻璃"
@@ -324,6 +354,17 @@ internal class DeXQuickSettingsOverlay(
 
         battView?.setBattery(host.batteryPct, host.batteryCharging, tokens.textPrimary)
         battText?.text = "${host.batteryPct}%${if (host.batteryCharging) " · 充电中" else ""}"
+        btnExitLocalDex?.let { btn ->
+            val showExit = st.isLocalDexActive
+            btn.visibility = if (showExit) View.VISIBLE else View.GONE
+            if (showExit) {
+                btn.text = "退出 DeX"
+                val fg = Color.WHITE
+                btn.setTextColor(fg)
+                btn.background = roundedBg(tokens.accentRed, ctx.dpF(14f), ctx.dp(0.8f), 0x55FFFFFF)
+                HyperUi.setStartIcon(btn, HyperUi.ICON_CLOSE, fg, 12.5f, 4.5f)
+            }
+        }
     }
 
     private fun applyTheme(ctx: Context, tokens: GlassOverlayTokens) {
@@ -348,7 +389,8 @@ internal class DeXQuickSettingsOverlay(
         isOpen = false
         host.popovers.unregister(POPOVER_ID)
         host.surfaceHost.unregister(POPOVER_ID, host.extWm)
-        root = null; lp = null; footerBar = null; battView = null; battText = null; btnConsole = null; btnSettings = null
+        root = null; lp = null; footerBar = null; battView = null; battText = null; btnConsole = null; btnSettings = null; btnExitLocalDex = null
+        bentoExtRow = null; modeChipRow = null; extChipRow = null
     }
 
     private class GlassQuickTile(

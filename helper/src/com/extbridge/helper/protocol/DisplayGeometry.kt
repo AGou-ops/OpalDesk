@@ -139,6 +139,19 @@ object DisplayGeometry {
         }
     }
 
+    /**
+     * Computes a finger-friendly DeX DPI for on-device standalone Local DeX mode so the
+     * virtual display always crosses the tablet/desktop threshold (sw >= 720dp) while
+     * remaining comfortable to tap on phone and tablet screens alike.
+     */
+    fun computeLocalDexDpi(width: Int, height: Int, deviceSmallestWidthDp: Int = 411): Int {
+        val minEdge = min(max(480, width), max(480, height))
+        val targetShortDp = if (deviceSmallestWidthDp >= 600) 840f else 720f
+        val raw = (minEdge * 160f / targetShortDp).toInt()
+        val snapped = (raw / 4) * 4
+        return snapped.coerceIn(120, 360)
+    }
+
     fun alignResolution16(value: Int, minVal: Int = 640, maxVal: Int = 7680): Int {
         val clamped = value.coerceIn(minVal, maxVal)
         return ((clamped + 8) / 16) * 16

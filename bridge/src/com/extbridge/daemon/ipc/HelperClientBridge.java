@@ -60,6 +60,8 @@ public final class HelperClientBridge {
     private volatile Runnable onHelperDeath;
     private volatile int verifiedHelperUid = -1;
     private volatile long lastHelperUidVerifyMs = 0L;
+    private volatile boolean preferExternalProviderCall = false;
+    private volatile boolean skipDirectStartService = false;
     private final AtomicLong lastBinderPushAttemptMs = new AtomicLong(0L);
 
     public HelperClientBridge(AndroidServices services, DaemonConfig config, ExecutorService bgIoExec) {
@@ -170,6 +172,10 @@ public final class HelperClientBridge {
 
     public Bundle callHelperProvider(String method, Bundle extras) {
         if (services.context == null || method == null || !isVerifiedHelperProviderOwner()) return null;
+        if (preferExternalProviderCall) {
+            return AndroidServices.callContentProviderExternal(
+                    BridgeProtocol.HELPER_PROVIDER_AUTHORITY, method, null, extras);
+        }
         Bundle res = null;
         try {
             ContentProviderClient cpc = services.context.getContentResolver()
@@ -183,7 +189,11 @@ public final class HelperClientBridge {
                         Uri.parse("content://" + BridgeProtocol.HELPER_PROVIDER_AUTHORITY), method, null, extras);
             }
         } catch (RemoteException | RuntimeException e) {
-            System.err.println("EXTBRIDGE_PROVIDER_CALL_WARN method=" + method + ": " + e.getMessage());
+            String msg = e.getMessage();
+            if (msg != null && msg.contains("Unable to find app for caller")) {
+                preferExternalProviderCall = true;
+            }
+            System.err.println("EXTBRIDGE_PROVIDER_CALL_WARN method=" + method + ": " + msg);
         }
         if ((res == null || !res.getBoolean("ok", false)) && isVerifiedHelperProviderOwner()) {
             res = AndroidServices.callContentProviderExternal(
@@ -207,14 +217,18 @@ public final class HelperClientBridge {
     }
 
     public void startHelperService() {
-        if (services.context == null || getVerifiedHelperUid() <= 0) return;
+        if (skipDirectStartService || services.context == null || getVerifiedHelperUid() <= 0) return;
         try {
             Intent svc = new Intent().setComponent(new ComponentName(
                     BridgeBuildConfig.HELPER_PACKAGE, BridgeProtocol.HELPER_SERVICE_CLASS));
             if (Build.VERSION.SDK_INT >= 26) services.context.startForegroundService(svc);
             else services.context.startService(svc);
         } catch (RuntimeException e) {
-            System.err.println("EXTBRIDGE_START_HELPER_SVC_WARN: " + e.getMessage());
+            String msg = e.getMessage();
+            if (msg != null && msg.contains("Unable to find app for caller")) {
+                skipDirectStartService = true;
+            }
+            System.err.println("EXTBRIDGE_START_HELPER_SVC_WARN: " + msg);
         }
     }
 

@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Rect
 import android.os.IBinder
+import android.view.MotionEvent
+import android.view.Surface
 import com.extbridge.helper.ipc.BinderTransport
 import com.extbridge.helper.ipc.BridgeParcelCodecs
 import com.extbridge.helper.ipc.DaemonStateStore
@@ -57,6 +59,7 @@ object BridgeClient {
     const val SINK_REMOTE_USB = SinkType.REMOTE_USB
     const val SINK_REMOTE_WIFI = SinkType.REMOTE_WIFI
     const val SINK_REMOTE_WIFI_ADB = SinkType.REMOTE_WIFI_ADB
+    const val SINK_LOCAL = SinkType.LOCAL
 
     const val WIN_MODE_AUTO = WindowMode.AUTO
     const val WIN_MODE_FULLSCREEN = WindowMode.FULLSCREEN
@@ -249,6 +252,15 @@ object BridgeClient {
         writeInt(bottom)
         writeInt(if (rememberPref) 1 else 0)
     }
+
+    fun moveWindowLive(taskId: Int, bounds: Rect): Boolean =
+        BinderTransport.transactBool(TxCode.MOVE_WINDOW_LIVE) {
+            writeInt(taskId)
+            writeInt(bounds.left)
+            writeInt(bounds.top)
+            writeInt(bounds.right)
+            writeInt(bounds.bottom)
+        }
 
     fun setTilingLayout(topology: String, pkgs: List<String>, ratios: List<Int>): Boolean =
         setTilingLayout(
@@ -591,9 +603,64 @@ object BridgeClient {
     fun captureTaskSnapshot(taskId: Int, pkg: String?, live: Boolean): TaskSnapshotData =
         BridgeParcelCodecs.captureTaskSnapshot(taskId, pkg, live)
 
+    // --- On-Device Standalone Local DeX IPC (codes 58..60) ---
+
+    fun startLocalDex(w: Int, h: Int, dpi: Int, fps: Float, surface: Surface): Int =
+        BinderTransport.transactInt(TxCode.START_LOCAL_DEX, defaultValue = -1) {
+            writeInt(w)
+            writeInt(h)
+            writeInt(dpi)
+            writeInt((fps * 100f).roundToInt())
+            writeInt(1)
+            surface.writeToParcel(this, 0)
+        }
+
+    fun stopLocalDex(releaseDisplay: Boolean): Boolean =
+        BinderTransport.transactBool(TxCode.STOP_LOCAL_DEX) {
+            writeInt(if (releaseDisplay) 1 else 0)
+        }
+
+    fun sendLocalMotionEvent(
+        action: Int,
+        downTime: Long,
+        eventTime: Long,
+        source: Int,
+        buttonState: Int,
+        actionButton: Int,
+        hScroll: Float,
+        vScroll: Float,
+        ids: IntArray,
+        toolTypes: IntArray,
+        xs: FloatArray,
+        ys: FloatArray,
+        pressures: FloatArray,
+    ): Boolean {
+        val count = ids.size.coerceIn(0, 10)
+        if (count == 0) return false
+        return BinderTransport.transactBool(TxCode.SEND_LOCAL_TOUCH) {
+            writeInt(action)
+            writeLong(downTime)
+            writeLong(eventTime)
+            writeInt(source)
+            writeInt(buttonState)
+            writeInt(actionButton)
+            writeFloat(hScroll)
+            writeFloat(vScroll)
+            writeInt(count)
+            for (i in 0 until count) {
+                writeInt(ids[i])
+                writeInt(toolTypes[i])
+                writeFloat(xs[i])
+                writeFloat(ys[i])
+                writeFloat(pressures[i])
+            }
+        }
+    }
+
     // --- Pure Delegators to protocol/ & prefs/ (Zero Duplicated Logic) ---
 
     fun isRemoteDisplayActive(sinkType: Int): Boolean = SinkType.isRemote(sinkType)
+    fun isLocalDexSink(sinkType: Int): Boolean = SinkType.isLocal(sinkType)
     fun isTilingTopology(topology: String?): Boolean = LayoutMode.isTilingTopology(topology)
     fun layoutModeLabel(mode: String?): String = BridgeLabels.layoutModeLabel(mode)
     fun injectStatusLabel(injectStatus: Int): String = BridgeLabels.injectStatusLabel(injectStatus)
@@ -629,6 +696,8 @@ object BridgeClient {
         DisplayGeometry.computeSmallestWidthDp(virtW, virtH, dpi)
     fun recommendDpiForResolution(width: Int, height: Int): Int =
         DisplayGeometry.recommendDpiForResolution(width, height)
+    fun computeLocalDexDpi(width: Int, height: Int, deviceSmallestWidthDp: Int = 411): Int =
+        DisplayGeometry.computeLocalDexDpi(width, height, deviceSmallestWidthDp)
     fun alignResolution16(value: Int, minVal: Int = 640, maxVal: Int = 7680): Int =
         DisplayGeometry.alignResolution16(value, minVal, maxVal)
     fun mirrorModeLabel(mode: Int): String = BridgeLabels.mirrorModeLabel(mode)

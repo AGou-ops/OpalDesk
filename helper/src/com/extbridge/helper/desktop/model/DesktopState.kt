@@ -167,15 +167,13 @@ object DesktopStateReducer {
         else -> TaskbarClickOutcome.FOCUS_AND_RESTORE
     }
 
-    /** Computes task IDs to minimize (or restore if desktop is currently clear) for Show Desktop. */
+    /** Computes visible task IDs to minimize for Show Desktop (never bulk-restores minimized apps). */
     fun planShowDesktopToggle(state: DesktopState): Pair<Boolean, List<Int>> {
         val visibleIds = state.windows.filter { !it.minimized }.map { it.taskId }
         return if (visibleIds.isNotEmpty()) {
-            true to visibleIds // minimizeAll, remember visibleIds
+            true to visibleIds
         } else {
-            val aliveSet = state.windows.map { it.taskId }.toHashSet()
-            val toRestore = state.showDesktopRestoreIds.filter { it in aliveSet }
-            false to toRestore
+            false to emptyList()
         }
     }
 

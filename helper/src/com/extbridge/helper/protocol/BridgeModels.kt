@@ -64,6 +64,9 @@ data class DaemonStatus(
     val isRemoteStreaming: Boolean
         get() = connected && isRemoteDisplayActive
 
+    val isLocalDexActive: Boolean
+        get() = connected && BridgeProtocol.SinkType.isLocal(sinkType) && vdId > 0
+
     val isAdaptiveSingleEnabled: Boolean
         get() = adaptiveSingleEnabled != 0
 
