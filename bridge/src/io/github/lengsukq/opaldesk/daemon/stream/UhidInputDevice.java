@@ -173,7 +173,7 @@ public final class UhidInputDevice implements Closeable {
         int buttons;
         if (isTouch) {
             buttons = (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)
-                    ? 0 : OpalCastProtocol.BUTTON_PRIMARY;
+                    ? 0 : MotionEvent.BUTTON_PRIMARY;
         } else {
             buttons = me.getButtonState() & 0x1F;
             if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL

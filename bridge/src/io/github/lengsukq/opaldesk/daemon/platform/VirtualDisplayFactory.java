@@ -6,6 +6,7 @@ import android.view.Display;
 import android.view.Surface;
 
 import java.lang.reflect.Constructor;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
@@ -16,6 +17,8 @@ import java.lang.reflect.Method;
 public final class VirtualDisplayFactory {
     private static final Object INIT_LOCK = new Object();
     private static volatile boolean sInitialized;
+    // Remember the highest-capability flag mask accepted by this ROM so subsequent windows skip rejected masks.
+    private static volatile int sLastAcceptedFlags = -1;
 
     private static Constructor<?> sBuilderCtor;
     private static Method sSetFlags;
@@ -100,24 +103,62 @@ public final class VirtualDisplayFactory {
         if (dm == null || candidateFlags == null || candidateFlags.length == 0) {
             return null;
         }
+        int cached = sLastAcceptedFlags;
+        if (cached != -1 && containsFlag(candidateFlags, cached)) {
+            VirtualDisplay fast = tryCreateOnce(dm, name, width, height, dpi, cached, refreshRate, surface);
+            if (fast != null) {
+                if (chosenFlagsOut != null && chosenFlagsOut.length > 0) {
+                    chosenFlagsOut[0] = cached;
+                }
+                return fast;
+            }
+            sLastAcceptedFlags = -1;
+        }
         for (int flags : candidateFlags) {
-            try {
-                VirtualDisplay vd = create(dm, name, width, height, dpi, flags, refreshRate, surface);
-                if (vd != null && vd.getDisplay() != null) {
-                    if (chosenFlagsOut != null && chosenFlagsOut.length > 0) {
-                        chosenFlagsOut[0] = flags;
-                    }
-                    return vd;
+            if (flags == cached) continue;
+            VirtualDisplay vd = tryCreateOnce(dm, name, width, height, dpi, flags, refreshRate, surface);
+            if (vd != null) {
+                sLastAcceptedFlags = flags;
+                if (chosenFlagsOut != null && chosenFlagsOut.length > 0) {
+                    chosenFlagsOut[0] = flags;
                 }
-                if (vd != null) {
-                    vd.release();
-                }
-            } catch (ReflectiveOperationException | RuntimeException e) {
-                System.err.println("OPALDESK_VD_FLAG_RETRY name=" + name
-                        + " flags=0x" + Integer.toHexString(flags) + ": " + e.getMessage());
+                return vd;
             }
         }
         return null;
+    }
+
+    private static VirtualDisplay tryCreateOnce(
+            DisplayManager dm,
+            String name,
+            int width,
+            int height,
+            int dpi,
+            int flags,
+            float refreshRate,
+            Surface surface) {
+        try {
+            VirtualDisplay vd = create(dm, name, width, height, dpi, flags, refreshRate, surface);
+            if (vd != null && vd.getDisplay() != null) {
+                return vd;
+            }
+            if (vd != null) {
+                vd.release();
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            Throwable root = (e instanceof InvocationTargetException && e.getCause() != null)
+                    ? e.getCause() : e;
+            System.err.println("OPALDESK_VD_FLAG_RETRY name=" + name
+                    + " flags=0x" + Integer.toHexString(flags) + ": " + root);
+        }
+        return null;
+    }
+
+    private static boolean containsFlag(int[] arr, int target) {
+        for (int v : arr) {
+            if (v == target) return true;
+        }
+        return false;
     }
 
     public static String getUniqueId(Display display) {

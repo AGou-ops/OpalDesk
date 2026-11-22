@@ -2,19 +2,21 @@ package io.github.lengsukq.opaldesk
 
 import android.content.ContentProvider
 import android.content.ContentValues
-import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
 import android.util.Log
-import io.github.lengsukq.opaldesk.protocol.BridgeProtocol.HelperActions
+import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.IpcTrustVerifier
 
+/**
+ * Receives daemon Binder handshakes (`setBinder`) and zero-roundtrip compositor scene pushes (`syncScene`).
+ */
 class BridgeProvider : ContentProvider() {
     companion object {
         private const val TAG = "OpalDeskProvider"
-        private val sProcToken = Binder()
+        private val procToken = Binder()
     }
 
     override fun onCreate(): Boolean = true
@@ -26,9 +28,8 @@ class BridgeProvider : ContentProvider() {
             return Bundle().apply { putBoolean("ok", false) }
         }
         return when (method) {
-            HelperActions.PROVIDER_METHOD_SET_BINDER -> handleSetBinder(extras)
-            HelperActions.PROVIDER_METHOD_SYNC_STATE -> handleSyncState(extras)
-            HelperActions.PROVIDER_METHOD_MIR_EDGE_CAPTURE -> handleMirrorEdgeCapture(extras)
+            BridgeProtocol.PROVIDER_METHOD_SET_BINDER -> handleSetBinder(extras)
+            BridgeProtocol.PROVIDER_METHOD_SYNC_SCENE -> handleSyncScene(extras)
             else -> Bundle()
         }
     }
@@ -37,67 +38,32 @@ class BridgeProvider : ContentProvider() {
         if (extras == null || BridgeService.sUserStopping) {
             return Bundle().apply { putBoolean("ok", false) }
         }
-        val cb = extras.getBinder(HelperActions.EXTRA_CALLBACK_BINDER)
+        val cb = extras.getBinder(BridgeProtocol.EXTRA_CALLBACK_BINDER)
         if (!IpcTrustVerifier.isValidDaemonBinder(cb)) {
-            return Bundle()
+            return Bundle().apply { putBoolean("ok", false) }
         }
         BridgeClient.setBinder(cb)
         BridgeService.ensureStarted(context)
-        BridgeService.refreshFromReceiver(context)
         return Bundle().apply {
             putBoolean("ok", true)
-            putBinder(HelperActions.EXTRA_PROC_TOKEN, sProcToken)
+            putBinder(BridgeProtocol.EXTRA_PROC_TOKEN, procToken)
         }
     }
 
-    private fun handleSyncState(extras: Bundle?): Bundle {
-        val ctx = context
-        if (ctx != null && !BridgeService.sUserStopping) {
-            val pushedShortcut = extras?.getString(HelperActions.EXTRA_SYNC_SHORTCUT).orEmpty()
-            val pushedWinJson = extras?.getString(HelperActions.EXTRA_SYNC_WIN_JSON).orEmpty()
-            val pushedSeq = extras?.getLong(HelperActions.EXTRA_SYNC_STATE_SEQ, 0L) ?: 0L
-
-            if (pushedShortcut.isNotEmpty()) {
-                BridgeService.onDesktopShortcutFromDaemon(pushedShortcut)
-            }
-            if (pushedWinJson.isNotEmpty()) {
-                // Fast zero-roundtrip path: apply pushed window state directly to DeX shell
-                BridgeService.onPushedWindowSnapshot(pushedWinJson, pushedSeq)
-            } else if (pushedShortcut.isEmpty()) {
-                // Legacy or full-status sync signal
-                BridgeService.refreshFromReceiver(ctx)
-                try {
-                    val syncIntent = Intent(HelperActions.STATE_SYNC).setPackage(ctx.packageName)
-                    ctx.sendBroadcast(syncIntent)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "Failed to broadcast STATE_SYNC", t)
-                }
+    private fun handleSyncScene(extras: Bundle?): Bundle {
+        if (!BridgeService.sUserStopping && extras != null) {
+            val sceneJson = extras.getString(BridgeProtocol.EXTRA_SYNC_SCENE_JSON).orEmpty()
+            val seq = extras.getLong(BridgeProtocol.EXTRA_SYNC_STATE_SEQ, 0L)
+            if (sceneJson.isNotEmpty()) {
+                BridgeClient.onPushedSceneJson(sceneJson, seq)
             }
         }
         return Bundle().apply { putBoolean("ok", true) }
     }
 
-    private fun handleMirrorEdgeCapture(extras: Bundle?): Bundle {
-        if (extras != null && !BridgeService.sUserStopping) {
-            val enter = extras.getBoolean(HelperActions.EXTRA_EDGE_ENTER, true)
-            BridgeService.onEdgeCaptureFromDaemon(enter)
-        }
-        return Bundle().apply { putBoolean("ok", true) }
-    }
-
-    override fun query(
-        u: Uri,
-        p: Array<out String>?,
-        s: String?,
-        sa: Array<out String>?,
-        so: String?,
-    ): Cursor? = null
-
+    override fun query(u: Uri, p: Array<out String>?, s: String?, sa: Array<out String>?, so: String?): Cursor? = null
     override fun getType(u: Uri): String? = null
-
     override fun insert(u: Uri, v: ContentValues?): Uri? = null
-
     override fun delete(u: Uri, s: String?, sa: Array<out String>?): Int = 0
-
     override fun update(u: Uri, v: ContentValues?, s: String?, sa: Array<out String>?): Int = 0
 }

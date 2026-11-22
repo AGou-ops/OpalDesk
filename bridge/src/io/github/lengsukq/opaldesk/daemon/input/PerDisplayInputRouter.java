@@ -1,0 +1,289 @@
+package io.github.lengsukq.opaldesk.daemon.input;
+
+import android.os.Looper;
+import android.os.SystemClock;
+import android.view.InputDevice;
+import android.view.InputEvent;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
+import android.view.MotionEvent;
+
+import io.github.lengsukq.opaldesk.daemon.DaemonConfig;
+import io.github.lengsukq.opaldesk.daemon.compositor.WindowSession;
+import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
+import io.github.lengsukq.opaldesk.daemon.platform.AndroidServices;
+import io.github.lengsukq.opaldesk.daemon.stream.UhidInputDevice;
+
+import java.lang.reflect.InvocationTargetException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Per-Window VirtualDisplay Input Router.
+ *
+ * <p>Routes multi-touch, stylus, mouse hover/button/scroll, and key events directly into a
+ * target window's isolated {@code displayId} via {@code IInputManager.injectInputEvent}, with
+ * automatic fallback to Linux kernel {@code /dev/uhid} ({@link UhidInputDevice}) per display
+ * when OEM ROMs restrict {@code INJECT_EVENTS}.
+ */
+public final class PerDisplayInputRouter {
+    private static final long UHID_SETTLE_MS = 50L;
+
+    private final AndroidServices services;
+    private final DaemonConfig config;
+    private final Object uhidLock = new Object();
+    private final Map<Integer, UhidInputDevice> uhidByDisplay = new HashMap<>();
+
+    private volatile boolean uhidAutoActivated = false;
+    private volatile int lastInjectStatus = BridgeProtocol.INJECT_STATUS_SYSTEM;
+
+    public PerDisplayInputRouter(AndroidServices services, DaemonConfig config) {
+        this.services = services;
+        this.config = config;
+    }
+
+    public int getLastInjectStatus() {
+        return lastInjectStatus;
+    }
+
+    public int onInputBackendConfigChanged(int mode) {
+        if (mode != BridgeProtocol.INPUT_BACKEND_UHID) {
+            uhidAutoActivated = false;
+            releaseAllDisplays();
+            lastInjectStatus = BridgeProtocol.INJECT_STATUS_SYSTEM;
+        } else {
+            uhidAutoActivated = true;
+            lastInjectStatus = BridgeProtocol.INJECT_STATUS_UHID;
+        }
+        return lastInjectStatus;
+    }
+
+    public boolean injectWindowMotion(
+            WindowSession ws,
+            int action,
+            long downTime,
+            long eventTime,
+            int source,
+            int buttonState,
+            int actionButton,
+            float hScroll,
+            float vScroll,
+            int[] pointerIds,
+            int[] toolTypes,
+            float[] xs,
+            float[] ys,
+            float[] pressures) {
+        if (ws == null || !ws.isLive() || ws.displayId <= 0 || pointerIds == null || pointerIds.length == 0) {
+            return false;
+        }
+        int count = pointerIds.length;
+        MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[count];
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[count];
+        for (int i = 0; i < count; i++) {
+            MotionEvent.PointerProperties p = new MotionEvent.PointerProperties();
+            p.id = pointerIds[i];
+            p.toolType = toolTypes[i];
+            props[i] = p;
+
+            MotionEvent.PointerCoords c = new MotionEvent.PointerCoords();
+            c.x = xs[i];
+            c.y = ys[i];
+            c.pressure = pressures[i];
+            c.size = 1.0f;
+            if (i == 0 && (action & MotionEvent.ACTION_MASK) == MotionEvent.ACTION_SCROLL) {
+                c.setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll);
+                c.setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
+            }
+            coords[i] = c;
+        }
+
+        int masked = action & MotionEvent.ACTION_MASK;
+        boolean isScroll = (masked == MotionEvent.ACTION_SCROLL);
+        int effSource = isScroll
+                ? InputDevice.SOURCE_MOUSE
+                : ((source != 0) ? source : InputDevice.SOURCE_TOUCHSCREEN);
+        long effEventTime = (eventTime > 0L) ? eventTime : SystemClock.uptimeMillis();
+        long effDownTime = isScroll
+                ? effEventTime
+                : (downTime > 0L ? downTime : effEventTime);
+
+        if (isScroll) {
+            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+            coords[0].pressure = 0.0f;
+            MotionEvent.PointerCoords hoverCoord = new MotionEvent.PointerCoords();
+            hoverCoord.x = coords[0].x;
+            hoverCoord.y = coords[0].y;
+            hoverCoord.pressure = 0.0f;
+            hoverCoord.size = 1.0f;
+            // Prime hover target on this VirtualDisplay so InputDispatcher reliably routes ACTION_SCROLL
+            MotionEvent hoverPrime = MotionEvent.obtain(
+                    effEventTime, effEventTime, MotionEvent.ACTION_HOVER_MOVE,
+                    1, new MotionEvent.PointerProperties[]{props[0]},
+                    new MotionEvent.PointerCoords[]{hoverCoord},
+                    0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            try {
+                dispatchToDisplay(hoverPrime, ws.displayId, ws.vdUniqueId, ws.contentWidth, ws.contentHeight);
+            } finally {
+                hoverPrime.recycle();
+            }
+        }
+
+        MotionEvent ev = MotionEvent.obtain(
+                effDownTime,
+                effEventTime,
+                action,
+                count,
+                props,
+                coords,
+                0,
+                isScroll ? 0 : buttonState,
+                1.0f,
+                1.0f,
+                0,
+                0,
+                effSource,
+                0);
+        if (actionButton != 0) {
+            AndroidServices.setActionButton(ev, actionButton);
+        }
+        try {
+            return dispatchToDisplay(ev, ws.displayId, ws.vdUniqueId, ws.contentWidth, ws.contentHeight);
+        } finally {
+            ev.recycle();
+        }
+    }
+
+    public boolean injectWindowKey(WindowSession ws, int action, int keyCode, int metaState) {
+        if (ws == null || !ws.isLive() || ws.displayId <= 0) return false;
+        services.focusDisplay(ws.displayId);
+        long now = SystemClock.uptimeMillis();
+        KeyEvent ev = new KeyEvent(
+                now, now, action, keyCode, 0, metaState,
+                KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+        return dispatchToDisplay(ev, ws.displayId, ws.vdUniqueId, ws.contentWidth, ws.contentHeight);
+    }
+
+    public boolean sendBackToWindow(WindowSession ws) {
+        if (ws == null || !ws.isLive() || ws.displayId <= 0) return false;
+        boolean down = injectWindowKey(ws, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0);
+        boolean up = injectWindowKey(ws, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK, 0);
+        return down || up;
+    }
+
+    /** Direct display-targeted motion injection for remote Mac OpalCast sessions. */
+    public boolean injectRawEventToDisplay(InputEvent ev, int displayId, String vdUniqueId, int dispW, int dispH) {
+        if (ev == null || displayId <= 0) return false;
+        return dispatchToDisplay(ev, displayId, vdUniqueId, dispW, dispH);
+    }
+
+    /** Direct display-targeted key injection for remote Mac OpalCast sessions. */
+    public boolean injectRawKeyToDisplay(
+            int displayId, String vdUniqueId, int dispW, int dispH, int action, int keyCode, int metaState) {
+        if (displayId <= 0) return false;
+        services.focusDisplay(displayId);
+        long now = SystemClock.uptimeMillis();
+        KeyEvent ev = new KeyEvent(
+                now, now, action, keyCode, 0, metaState,
+                KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+        return dispatchToDisplay(ev, displayId, vdUniqueId, dispW, dispH);
+    }
+
+    public void releaseDisplayResources(int displayId) {
+        UhidInputDevice dev;
+        synchronized (uhidLock) {
+            dev = uhidByDisplay.remove(displayId);
+        }
+        if (dev != null) {
+            dev.close();
+        }
+    }
+
+    public void releaseAllDisplays() {
+        ArrayList<UhidInputDevice> all;
+        synchronized (uhidLock) {
+            if (uhidByDisplay.isEmpty()) return;
+            all = new ArrayList<>(uhidByDisplay.values());
+            uhidByDisplay.clear();
+        }
+        for (UhidInputDevice d : all) {
+            d.close();
+        }
+    }
+
+    private boolean dispatchToDisplay(InputEvent ev, int displayId, String vdUniqueId, int dispW, int dispH) {
+        int backend = config.getInputBackendMode();
+        if (backend == BridgeProtocol.INPUT_BACKEND_UHID
+                || (backend == BridgeProtocol.INPUT_BACKEND_AUTO && uhidAutoActivated)) {
+            if (injectViaUhid(ev, displayId, vdUniqueId, dispW, dispH)) {
+                lastInjectStatus = BridgeProtocol.INJECT_STATUS_UHID;
+                return true;
+            }
+            if (backend == BridgeProtocol.INPUT_BACKEND_UHID) {
+                lastInjectStatus = BridgeProtocol.INJECT_STATUS_BLOCKED;
+                return false;
+            }
+        }
+
+        if (services.iInputManager != null && services.injectInputEventMethod != null) {
+            try {
+                if (services.setDisplayIdMethod != null) {
+                    services.setDisplayIdMethod.invoke(ev, displayId);
+                }
+                Object res = services.injectInputEventMethod.invoke(services.iInputManager, ev, 0);
+                boolean ok = !(res instanceof Boolean) || (Boolean) res;
+                if (ok) {
+                    lastInjectStatus = BridgeProtocol.INJECT_STATUS_SYSTEM;
+                    return true;
+                }
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                Throwable root = (e instanceof InvocationTargetException && e.getCause() != null)
+                        ? e.getCause() : e;
+                if (root instanceof SecurityException && backend == BridgeProtocol.INPUT_BACKEND_AUTO) {
+                    if (injectViaUhid(ev, displayId, vdUniqueId, dispW, dispH)) {
+                        uhidAutoActivated = true;
+                        lastInjectStatus = BridgeProtocol.INJECT_STATUS_UHID;
+                        System.out.println("OPALDESK_UHID_AUTO_FALLBACK_ACTIVE displayId=" + displayId);
+                        return true;
+                    }
+                }
+                System.err.println("OPALDESK_INPUT_INJECT_WARN displayId=" + displayId + ": " + root.getMessage());
+            }
+        }
+        lastInjectStatus = BridgeProtocol.INJECT_STATUS_BLOCKED;
+        return false;
+    }
+
+    private boolean injectViaUhid(InputEvent ev, int displayId, String vdUniqueId, int dispW, int dispH) {
+        UhidInputDevice dev = ensureUhidDevice(displayId, vdUniqueId);
+        return dev != null && dev.injectInputEvent(ev, Math.max(2, dispW), Math.max(2, dispH));
+    }
+
+    private UhidInputDevice ensureUhidDevice(int displayId, String vdUniqueId) {
+        boolean newlyOpened = false;
+        UhidInputDevice dev;
+        synchronized (uhidLock) {
+            dev = uhidByDisplay.get(displayId);
+            if (dev != null && dev.isOpen()) {
+                String curUid = dev.getVdUniqueId();
+                if ((vdUniqueId == null && curUid == null) || (vdUniqueId != null && vdUniqueId.equals(curUid))) {
+                    return dev;
+                }
+                dev.close();
+                uhidByDisplay.remove(displayId);
+            }
+            try {
+                dev = UhidInputDevice.open(displayId, vdUniqueId, services.inputManager, services.iInputManager);
+                uhidByDisplay.put(displayId, dev);
+                newlyOpened = true;
+            } catch (Exception e) {
+                System.err.println("OPALDESK_UHID_OPEN_WARN displayId=" + displayId + ": " + e.getMessage());
+                return null;
+            }
+        }
+        if (newlyOpened && Looper.myLooper() != Looper.getMainLooper()) {
+            SystemClock.sleep(UHID_SETTLE_MS);
+        }
+        return dev;
+    }
+}

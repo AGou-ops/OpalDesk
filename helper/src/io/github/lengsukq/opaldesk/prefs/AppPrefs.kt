@@ -1,584 +1,271 @@
 package io.github.lengsukq.opaldesk.prefs
 
-import android.appwidget.AppWidgetHost
 import android.content.Context
-import android.content.SharedPreferences
-import android.util.Log
-import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
-import io.github.lengsukq.opaldesk.protocol.DisplayGeometry
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Unified typed SharedPreferences accessor preserving ALL 5 legacy preference file names
- * and key names (`opaldesk_core_prefs`, `opaldesk_prefs`, `opaldesk_onboarding`,
- * `opaldesk_remote_stream_prefs`, `opaldesk_ui_prefs`) for zero-loss upgrades.
+ * SharedPreferences store + live reactive flows for OpalDesk preferences:
+ * appearance theme (Light Frosted Glass / Follow System / Dark), wallpapers, pinned apps,
+ * external monitor UI scaling, stepless trackpad pointer speed, and activation preferences.
  */
 object AppPrefs {
-    private const val TAG = "ExtAppPrefs"
+    const val THEME_LIGHT = 0
+    const val THEME_SYSTEM = 1
+    const val THEME_DARK = 2
 
-    // Exact legacy SharedPreferences file names — DO NOT RENAME
-    const val FILE_EXT = "opaldesk_core_prefs"
-    const val FILE_BOOTSTRAP = "opaldesk_prefs"
-    const val FILE_ONBOARDING = "opaldesk_onboarding"
-    const val FILE_REMOTE_STREAM = "opaldesk_remote_stream_prefs"
-    const val FILE_UI = "opaldesk_ui_prefs"
+    const val MOUSE_TARGET_LOCAL = 0
+    const val MOUSE_TARGET_EXTERNAL = 1
 
-    // opaldesk_core_prefs keys
-    private const val KEY_DOCK_AUTO_HIDE = "dock_auto_hide"
-    private const val KEY_MIRROR_WIDGET_LEFT = "mirror_widget_left_id"
-    private const val KEY_MIRROR_WIDGET_RIGHT = "mirror_widget_right_id"
-    private const val KEY_MIRROR_PRESETS = "mirror_preset_slots"
-    private const val KEY_MIGRATED_SCREENDIM_V340 = "migrated_screendim_v340"
-    private const val KEY_MIRROR_MEMO = "mirror_memo_text"
-    private const val KEY_MIRROR_THEME = "mirror_theme_id"
-    private const val KEY_MIRROR_CUSTOM_BG = "mirror_custom_bg"
-    private const val KEY_MIRROR_CURSOR_SPEED = "mirror_cursor_speed_idx"
-    private const val KEY_MIRROR_WIDGET_RATIO_L = "mirror_widget_ratio_l"
-    private const val KEY_MIRROR_WIDGET_RATIO_R = "mirror_widget_ratio_r"
-    private const val KEY_DESKTOP_PINNED_INIT = "desktop_pinned_initialized_v1"
-    private const val KEY_DESKTOP_PINNED_APPS = "desktop_pinned_apps"
-    private const val KEY_DESKTOP_LAYOUT_V2 = "desktop_layout_v2_json"
-    private const val KEY_DOCK_PINNED_APPS = "dock_pinned_apps"
-    private const val KEY_DESKTOP_WIDGET_IDS = "desktop_custom_widget_ids"
-    private const val KEY_DESKTOP_PRESETS = "desktop_preset_slots"
-    private const val KEY_DESKTOP_SYNC_MIRROR = "desktop_sync_mirror_widgets"
-    private const val KEY_RIGHT_CLICK_PASSTHROUGH = "dex_right_click_passthrough"
-    private const val KEY_DESKTOP_DOUBLE_CLICK = "dex_desktop_double_click"
-    private const val KEY_DEX_DEFAULT_LAUNCH_MODE = "dex_default_launch_mode"
-    private const val KEY_WORKBENCH_ENABLED = "dex_workbench_enabled"
-    private const val KEY_WORKBENCH_POSITION = "dex_workbench_position"
-    private const val KEY_WORKBENCH_APPS = "dex_workbench_apps"
-    private const val KEY_WORKBENCH_APPS_INIT = "dex_workbench_apps_init_v1"
+    const val MIN_TRACKPAD_SENSITIVITY = 0.50f
+    const val MAX_TRACKPAD_SENSITIVITY = 3.00f
+    const val DEFAULT_TRACKPAD_SENSITIVITY = 1.45f
+    const val MAX_DOCK_PINNED = 8
 
-    const val WORKBENCH_POS_LEFT = 0
-    const val WORKBENCH_POS_TOP = 1
-    const val MAX_WORKBENCH_APPS = 12
-
-    // opaldesk_prefs keys
-    private const val KEY_AUTO_ROOT = "auto_root_enabled"
-    private const val KEY_AUTO_SHIZUKU = "auto_shizuku_enabled"
+    private const val PREFS_NAME = "opaldesk_v2_prefs"
     private const val KEY_AUTO_CLOSE_WIFI_ADB = "auto_close_wifi_adb"
+    private const val KEY_AUTO_ROOT = "auto_root"
+    private const val KEY_AUTO_SHIZUKU = "auto_shizuku"
+    private const val KEY_ROOT_ENHANCE = "root_enhance_optional"
+    private const val KEY_AUTO_EXT_DISPLAY = "auto_project_ext_display"
+    private const val KEY_PINNED_PKGS = "pinned_dock_pkgs"
+    private const val KEY_DESKTOP_SHORTCUTS = "desktop_shortcut_pkgs"
+    private const val KEY_DOCK_PINNED = "dock_pinned_pkgs_v2"
+    private const val KEY_WALLPAPER_PRESET = "desktop_wallpaper_preset"
+    private const val KEY_CUSTOM_WALLPAPER_PATH = "custom_wallpaper_path"
+    private const val KEY_EXTERNAL_UI_SCALE = "external_ui_scale"
+    private const val KEY_TRACKPAD_SENSITIVITY = "trackpad_sensitivity"
+    private const val KEY_THEME_MODE = "appearance_theme_mode"
+    private const val KEY_MOUSE_TARGET = "physical_mouse_target"
 
-    // opaldesk_onboarding keys
-    private const val KEY_STARTUP_PERMS_DONE = "startup_perms_done"
-    private const val KEY_NOTIF_ASKED = "notif_asked"
-    private const val KEY_DEV_GUIDE_DONE = "dev_guide_done"
-
-    // opaldesk_remote_stream_prefs keys
-    private const val KEY_REMOTE_CODEC = "remote_codec_pref"
-    private const val KEY_REMOTE_BITRATE_MBPS = "remote_max_bitrate_mbps"
-    private const val KEY_REMOTE_AUDIO = "remote_audio_enabled"
-    private const val KEY_ADAPTIVE_SINGLE_ENABLED = "adaptive_single_enabled"
-    private const val KEY_DEFAULT_SINGLE_WIDTH_DP = "default_single_width_dp"
-    private const val KEY_INPUT_BACKEND_MODE = "input_backend_mode"
-
-    // opaldesk_ui_prefs keys
-    private const val KEY_UI_THEME_MODE = "theme_mode"
-
-    private const val DEFAULT_MIRROR_MEMO =
-        "• 点击控制台可随时编辑便签文字\n• 支持虚拟触控板点按滑控小组件"
-    private const val DEFAULT_MIRROR_CUSTOM_BG = 0xFF1E293B.toInt()
-    private const val DEFAULT_MIRROR_SPEED_IDX = 2
-
-    /** Optional hook set by BridgeService so mirror sidebar prefs trigger live refresh without circular deps. */
-    @Volatile
-    var onMirrorPrefsChanged: ((Context) -> Unit)? = null
-
-    /** Optional hook delegating widget ID deletion to an active AppWidgetHost when available. */
-    @Volatile
-    var onDeleteAppWidgetId: ((Context, Int) -> Unit)? = null
-
-    private fun prefs(ctx: Context, name: String): SharedPreferences =
-        ctx.applicationContext.getSharedPreferences(name, Context.MODE_PRIVATE)
-
-    /** Optional hook set by LauncherActivity so desktop icon/widget edits trigger live refresh. */
-    @Volatile
-    var onDesktopPrefsChanged: ((Context) -> Unit)? = null
-
-    fun isDesktopPinnedInitialized(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DESKTOP_PINNED_INIT, false) } ?: false
-
-    fun getDesktopPinnedApps(ctx: Context?): List<String> {
-        if (ctx == null) return emptyList()
-        val raw = prefs(ctx, FILE_EXT).getString(KEY_DESKTOP_PINNED_APPS, "").orEmpty()
-        return raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
-    }
-
-    fun setDesktopPinnedApps(ctx: Context?, pkgs: List<String>, markInitialized: Boolean = true) {
-        if (ctx == null) return
-        val joined = pkgs.map { it.trim() }.filter { it.isNotEmpty() }.distinct().joinToString(",")
-        prefs(ctx, FILE_EXT).edit().apply {
-            putString(KEY_DESKTOP_PINNED_APPS, joined)
-            if (markInitialized) putBoolean(KEY_DESKTOP_PINNED_INIT, true)
-        }.apply()
-        onDesktopPrefsChanged?.invoke(ctx)
-    }
-
-    fun isDesktopAppPinned(ctx: Context?, pkg: String): Boolean =
-        getDesktopPinnedApps(ctx).contains(pkg.trim())
-
-    fun pinDesktopApp(ctx: Context?, pkg: String) {
-        val clean = pkg.trim()
-        if (ctx == null || clean.isEmpty()) return
-        val next = getDesktopPinnedApps(ctx).toMutableList()
-        if (!next.contains(clean)) next.add(clean)
-        setDesktopPinnedApps(ctx, next)
-    }
-
-    fun unpinDesktopApp(ctx: Context?, pkg: String) {
-        val clean = pkg.trim()
-        if (ctx == null || clean.isEmpty()) return
-        val next = getDesktopPinnedApps(ctx).filterNot { it == clean }
-        setDesktopPinnedApps(ctx, next)
-    }
-
-    fun getDesktopLayoutJson(ctx: Context?): String =
-        ctx?.let { prefs(it, FILE_EXT).getString(KEY_DESKTOP_LAYOUT_V2, "").orEmpty() } ?: ""
-
-    fun setDesktopLayoutJson(ctx: Context?, json: String, notify: Boolean = false) {
-        if (ctx == null) return
-        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_LAYOUT_V2, json).apply()
-        if (notify) onDesktopPrefsChanged?.invoke(ctx)
-    }
+    private val DEFAULT_PINNED = listOf(
+        "com.android.chrome",
+        "com.android.vending",
+        "com.android.settings",
+        "com.google.android.youtube",
+        "com.tencent.mm",
+        "tv.danmaku.bili",
+    )
 
     @Volatile
-    var onDockPinnedAppsChanged: ((Context) -> Unit)? = null
+    private var flowsHydrated = false
 
-    fun getDockPinnedApps(ctx: Context?): List<String> {
-        if (ctx == null) return emptyList()
-        val raw = prefs(ctx, FILE_EXT).getString(KEY_DOCK_PINNED_APPS, "").orEmpty()
-        return raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    private val _themeModeFlow = MutableStateFlow(THEME_LIGHT)
+    val themeModeFlow: StateFlow<Int> = _themeModeFlow.asStateFlow()
+
+    private val _wallpaperPresetFlow = MutableStateFlow(0)
+    val wallpaperPresetFlow: StateFlow<Int> = _wallpaperPresetFlow.asStateFlow()
+
+    private val _trackpadSensitivityFlow = MutableStateFlow(DEFAULT_TRACKPAD_SENSITIVITY)
+    val trackpadSensitivityFlow: StateFlow<Float> = _trackpadSensitivityFlow.asStateFlow()
+
+    private val _externalUiScaleFlow = MutableStateFlow(1.25f)
+    val externalUiScaleFlow: StateFlow<Float> = _externalUiScaleFlow.asStateFlow()
+
+    private val _mouseTargetFlow = MutableStateFlow(MOUSE_TARGET_EXTERNAL)
+    val mouseTargetFlow: StateFlow<Int> = _mouseTargetFlow.asStateFlow()
+
+    private val _desktopShortcutsFlow = MutableStateFlow(DEFAULT_PINNED)
+    val desktopShortcutsFlow: StateFlow<List<String>> = _desktopShortcutsFlow.asStateFlow()
+
+    private val _dockPinnedFlow = MutableStateFlow(DEFAULT_PINNED.take(MAX_DOCK_PINNED))
+    val dockPinnedFlow: StateFlow<List<String>> = _dockPinnedFlow.asStateFlow()
+
+    private val _customWallpaperPathFlow = MutableStateFlow("")
+    val customWallpaperPathFlow: StateFlow<String> = _customWallpaperPathFlow.asStateFlow()
+
+    private fun prefs(ctx: Context?) =
+        ctx?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun hydrateFlows(ctx: Context?) {
+        if (flowsHydrated || ctx == null) return
+        flowsHydrated = true
+        val p = prefs(ctx) ?: return
+        _themeModeFlow.value = p.getInt(KEY_THEME_MODE, THEME_LIGHT).coerceIn(THEME_LIGHT, THEME_DARK)
+        _wallpaperPresetFlow.value = p.getInt(KEY_WALLPAPER_PRESET, 0).coerceIn(0, 3)
+        _customWallpaperPathFlow.value = p.getString(KEY_CUSTOM_WALLPAPER_PATH, "").orEmpty()
+        _trackpadSensitivityFlow.value = p.getFloat(KEY_TRACKPAD_SENSITIVITY, DEFAULT_TRACKPAD_SENSITIVITY)
+            .coerceIn(MIN_TRACKPAD_SENSITIVITY, MAX_TRACKPAD_SENSITIVITY)
+        _externalUiScaleFlow.value = p.getFloat(KEY_EXTERNAL_UI_SCALE, 1.25f).coerceIn(0.85f, 2.0f)
+        _mouseTargetFlow.value = p.getInt(KEY_MOUSE_TARGET, MOUSE_TARGET_EXTERNAL)
+            .coerceIn(MOUSE_TARGET_LOCAL, MOUSE_TARGET_EXTERNAL)
+        _desktopShortcutsFlow.value = loadPkgList(p, KEY_DESKTOP_SHORTCUTS, fallbackKey = KEY_PINNED_PKGS)
+        _dockPinnedFlow.value = loadPkgList(p, KEY_DOCK_PINNED, fallbackKey = KEY_PINNED_PKGS).take(MAX_DOCK_PINNED)
     }
 
-    fun isDockAppPinned(ctx: Context?, pkg: String): Boolean =
-        getDockPinnedApps(ctx).contains(pkg.trim())
-
-    fun setDockPinnedApps(ctx: Context?, pkgs: List<String>) {
-        if (ctx == null) return
-        val joined = pkgs.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(6).joinToString(",")
-        prefs(ctx, FILE_EXT).edit().putString(KEY_DOCK_PINNED_APPS, joined).apply()
-        onDockPinnedAppsChanged?.invoke(ctx)
+    private fun loadPkgList(p: android.content.SharedPreferences, key: String, fallbackKey: String): List<String> {
+        val raw = p.getString(key, null) ?: p.getString(fallbackKey, null)
+        if (raw == null) return DEFAULT_PINNED
+        if (raw.isBlank()) return emptyList()
+        return raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     }
-
-    // ---- Workbench Mode (Stage Manager / App Card Rail) ----
-
-    fun isWorkbenchEnabled(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_WORKBENCH_ENABLED, false) } ?: false
-
-    fun setWorkbenchEnabled(ctx: Context?, enabled: Boolean) {
-        if (ctx == null) return
-        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_WORKBENCH_ENABLED, enabled).apply()
-    }
-
-    fun getWorkbenchPosition(ctx: Context?): Int {
-        val raw = ctx?.let { prefs(it, FILE_EXT).getInt(KEY_WORKBENCH_POSITION, WORKBENCH_POS_LEFT) } ?: WORKBENCH_POS_LEFT
-        return if (raw == WORKBENCH_POS_TOP) WORKBENCH_POS_TOP else WORKBENCH_POS_LEFT
-    }
-
-    fun setWorkbenchPosition(ctx: Context?, position: Int) {
-        if (ctx == null) return
-        val clamped = if (position == WORKBENCH_POS_TOP) WORKBENCH_POS_TOP else WORKBENCH_POS_LEFT
-        prefs(ctx, FILE_EXT).edit().putInt(KEY_WORKBENCH_POSITION, clamped).apply()
-    }
-
-    fun isWorkbenchAppsInitialized(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_WORKBENCH_APPS_INIT, false) } ?: false
-
-    fun getWorkbenchApps(ctx: Context?): List<String> {
-        if (ctx == null) return emptyList()
-        val raw = prefs(ctx, FILE_EXT).getString(KEY_WORKBENCH_APPS, "").orEmpty()
-        return raw.split(",").map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(MAX_WORKBENCH_APPS)
-    }
-
-    fun setWorkbenchApps(ctx: Context?, pkgs: List<String>, markInitialized: Boolean = true) {
-        if (ctx == null) return
-        val joined = pkgs.map { it.trim() }.filter { it.isNotEmpty() }.distinct().take(MAX_WORKBENCH_APPS).joinToString(",")
-        prefs(ctx, FILE_EXT).edit().apply {
-            putString(KEY_WORKBENCH_APPS, joined)
-            if (markInitialized) putBoolean(KEY_WORKBENCH_APPS_INIT, true)
-        }.apply()
-    }
-
-    fun addWorkbenchApp(ctx: Context?, pkg: String): Boolean {
-        val clean = pkg.trim()
-        if (ctx == null || clean.isEmpty()) return false
-        val cur = getWorkbenchApps(ctx).toMutableList()
-        if (cur.contains(clean)) return true
-        if (cur.size >= MAX_WORKBENCH_APPS) return false
-        cur.add(clean)
-        setWorkbenchApps(ctx, cur)
-        return true
-    }
-
-    fun removeWorkbenchApp(ctx: Context?, pkg: String) {
-        val clean = pkg.trim()
-        if (ctx == null || clean.isEmpty()) return
-        setWorkbenchApps(ctx, getWorkbenchApps(ctx).filterNot { it == clean })
-    }
-
-    fun isWorkbenchApp(ctx: Context?, pkg: String): Boolean =
-        getWorkbenchApps(ctx).contains(pkg.trim())
-
-    fun toggleDockPinnedApp(ctx: Context?, pkg: String): Boolean {
-        val clean = pkg.trim()
-        if (ctx == null || clean.isEmpty()) return false
-        val cur = getDockPinnedApps(ctx).toMutableList()
-        val nowPinned = if (cur.contains(clean)) {
-            cur.remove(clean)
-            false
-        } else {
-            if (cur.size >= 6) cur.removeAt(0)
-            cur.add(clean)
-            true
-        }
-        setDockPinnedApps(ctx, cur)
-        return nowPinned
-    }
-
-    fun isDesktopSyncMirrorWidgets(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DESKTOP_SYNC_MIRROR, true) } ?: true
-
-    fun setDesktopSyncMirrorWidgets(ctx: Context?, sync: Boolean) {
-        if (ctx == null) return
-        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_DESKTOP_SYNC_MIRROR, sync).apply()
-        onDesktopPrefsChanged?.invoke(ctx)
-    }
-
-    fun getDesktopCustomWidgetIds(ctx: Context?): List<Int> {
-        if (ctx == null) return emptyList()
-        val raw = prefs(ctx, FILE_EXT).getString(KEY_DESKTOP_WIDGET_IDS, "").orEmpty()
-        return raw.split(",").mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }.distinct()
-    }
-
-    fun addDesktopCustomWidgetId(ctx: Context?, widgetId: Int) {
-        if (ctx == null || widgetId <= 0) return
-        val next = getDesktopCustomWidgetIds(ctx).toMutableList()
-        if (!next.contains(widgetId)) next.add(widgetId)
-        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_WIDGET_IDS, next.joinToString(",")).apply()
-        onDesktopPrefsChanged?.invoke(ctx)
-    }
-
-    fun removeDesktopCustomWidgetId(ctx: Context?, widgetId: Int) {
-        if (ctx == null || widgetId <= 0) return
-        val next = getDesktopCustomWidgetIds(ctx).filterNot { it == widgetId }
-        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_WIDGET_IDS, next.joinToString(",")).apply()
-        try {
-            AppWidgetHost(ctx.applicationContext, MirrorThemeCatalog.DESKTOP_WIDGET_HOST_ID).deleteAppWidgetId(widgetId)
-        } catch (t: Throwable) {
-            Log.w(TAG, "Failed to delete desktop AppWidgetId=$widgetId", t)
-        }
-        onDesktopPrefsChanged?.invoke(ctx)
-    }
-
-    fun getDesktopPresetCards(ctx: Context?): List<String> {
-        if (ctx == null) return MirrorThemeCatalog.DEFAULT_DESKTOP_PRESETS.split(",")
-        val sp = prefs(ctx, FILE_EXT)
-        val raw = sp.getString(KEY_DESKTOP_PRESETS, null)
-        val src = if (raw.isNullOrBlank()) {
-            if (isDesktopSyncMirrorWidgets(ctx)) {
-                getMirrorPresetSlots(ctx).filterNot { it == "quickctrl" || it == "screendim" }
-            } else {
-                MirrorThemeCatalog.DEFAULT_DESKTOP_PRESETS.split(",")
-            }
-        } else {
-            raw.split(",").map { it.trim() }.filter { it.isNotEmpty() && MirrorThemeCatalog.mirrorPresetIndex(it) >= 0 }
-        }
-        return src.ifEmpty { MirrorThemeCatalog.DEFAULT_DESKTOP_PRESETS.split(",") }
-    }
-
-    fun setDesktopPresetCards(ctx: Context?, keys: List<String>?) {
-        if (ctx == null) return
-        val joined = keys?.map { it.trim() }
-            ?.filter { it.isNotEmpty() && MirrorThemeCatalog.mirrorPresetIndex(it) >= 0 }
-            ?.distinct()
-            ?.joinToString(",")
-            .orEmpty()
-        prefs(ctx, FILE_EXT).edit().putString(KEY_DESKTOP_PRESETS, joined).apply()
-        onDesktopPrefsChanged?.invoke(ctx)
-    }
-
-    // --- opaldesk_core_prefs: Dock & Mirror Sidebar ---
-
-    fun isDockAutoHide(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DOCK_AUTO_HIDE, false) } ?: false
-
-    fun setDockAutoHide(ctx: Context?, enabled: Boolean) {
-        ctx ?: return
-        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_DOCK_AUTO_HIDE, enabled).apply()
-    }
-
-    fun getMirrorPresetSlotsRaw(ctx: Context?): String {
-        if (ctx == null) return MirrorThemeCatalog.DEFAULT_MIRROR_PRESETS
-        val sp = prefs(ctx, FILE_EXT)
-        var v = sp.getString(KEY_MIRROR_PRESETS, MirrorThemeCatalog.DEFAULT_MIRROR_PRESETS)
-        if (!sp.getBoolean(KEY_MIGRATED_SCREENDIM_V340, false)) {
-            val cur = sp.getString(KEY_MIRROR_PRESETS, null)
-            if (cur != null && cur.trim().isNotEmpty() && !cur.split(",").contains("screendim")) {
-                v = "${cur.trim()},screendim"
-                sp.edit()
-                    .putString(KEY_MIRROR_PRESETS, v)
-                    .putBoolean(KEY_MIGRATED_SCREENDIM_V340, true)
-                    .apply()
-            } else {
-                sp.edit().putBoolean(KEY_MIGRATED_SCREENDIM_V340, true).apply()
-            }
-        }
-        return if (v.isNullOrBlank()) MirrorThemeCatalog.DEFAULT_MIRROR_PRESETS else v
-    }
-
-    fun getMirrorPresetSlots(ctx: Context?): List<String> {
-        val raw = getMirrorPresetSlotsRaw(ctx)
-        val filtered = raw.split(",")
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && MirrorThemeCatalog.mirrorPresetIndex(it) >= 0 }
-        return filtered.ifEmpty { MirrorThemeCatalog.DEFAULT_MIRROR_PRESETS.split(",") }
-    }
-
-    fun setMirrorPresetSlots(ctx: Context?, slots: List<String>?) {
-        if (ctx == null) return
-        val joined = slots
-            ?.map { it.trim() }
-            ?.filter { it.isNotEmpty() && MirrorThemeCatalog.mirrorPresetIndex(it) >= 0 }
-            ?.joinToString(",")
-            ?.takeIf { it.isNotEmpty() }
-            ?: MirrorThemeCatalog.DEFAULT_MIRROR_PRESETS
-        prefs(ctx, FILE_EXT).edit().putString(KEY_MIRROR_PRESETS, joined).apply()
-        onMirrorPrefsChanged?.invoke(ctx)
-    }
-
-    fun getMirrorMemoText(ctx: Context?): String {
-        if (ctx == null) return DEFAULT_MIRROR_MEMO
-        return prefs(ctx, FILE_EXT).getString(KEY_MIRROR_MEMO, DEFAULT_MIRROR_MEMO) ?: ""
-    }
-
-    fun setMirrorMemoText(ctx: Context?, txt: String?) {
-        if (ctx == null) return
-        prefs(ctx, FILE_EXT).edit().putString(KEY_MIRROR_MEMO, txt ?: "").apply()
-        onMirrorPrefsChanged?.invoke(ctx)
-    }
-
-    fun getMirrorWidgetId(ctx: Context?, slot: Int): Int {
-        if (ctx == null) return -1
-        val key = if (slot == 0) KEY_MIRROR_WIDGET_LEFT else KEY_MIRROR_WIDGET_RIGHT
-        return prefs(ctx, FILE_EXT).getInt(key, -1)
-    }
-
-    fun setMirrorWidgetId(ctx: Context?, slot: Int, widgetId: Int) {
-        if (ctx == null) return
-        val sp = prefs(ctx, FILE_EXT)
-        val key = if (slot == 0) KEY_MIRROR_WIDGET_LEFT else KEY_MIRROR_WIDGET_RIGHT
-        val prevId = sp.getInt(key, -1)
-        if (prevId > 0 && prevId != widgetId) {
-            try {
-                val hook = onDeleteAppWidgetId
-                if (hook != null) {
-                    hook.invoke(ctx, prevId)
-                } else {
-                    AppWidgetHost(ctx.applicationContext, MirrorThemeCatalog.MIRROR_WIDGET_HOST_ID)
-                        .deleteAppWidgetId(prevId)
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "Failed to delete previous AppWidgetId=$prevId for slot=$slot", t)
-            }
-        }
-        sp.edit().putInt(key, widgetId).apply()
-        onMirrorPrefsChanged?.invoke(ctx)
-    }
-
-    fun getMirrorThemeId(ctx: Context?): String {
-        if (ctx == null) return "night"
-        val id = prefs(ctx, FILE_EXT).getString(KEY_MIRROR_THEME, "night")
-        return if (!id.isNullOrEmpty()) id else "night"
-    }
-
-    fun setMirrorThemeId(ctx: Context?, id: String?) {
-        if (ctx == null) return
-        prefs(ctx, FILE_EXT).edit().putString(KEY_MIRROR_THEME, id ?: "night").apply()
-        onMirrorPrefsChanged?.invoke(ctx)
-    }
-
-    fun getMirrorCustomBg(ctx: Context?): Int {
-        if (ctx == null) return DEFAULT_MIRROR_CUSTOM_BG
-        return prefs(ctx, FILE_EXT).getInt(KEY_MIRROR_CUSTOM_BG, DEFAULT_MIRROR_CUSTOM_BG)
-    }
-
-    fun setMirrorCustomBg(ctx: Context?, bgColor: Int) {
-        if (ctx == null) return
-        prefs(ctx, FILE_EXT).edit()
-            .putString(KEY_MIRROR_THEME, "custom")
-            .putInt(KEY_MIRROR_CUSTOM_BG, 0xFF000000.toInt() or (bgColor and 0x00FFFFFF))
-            .apply()
-        onMirrorPrefsChanged?.invoke(ctx)
-    }
-
-    fun getActiveMirrorTheme(ctx: Context?): MirrorTheme =
-        MirrorThemeCatalog.resolveMirrorTheme(getMirrorThemeId(ctx), getMirrorCustomBg(ctx))
-
-    fun getMirrorCursorSpeedIdx(ctx: Context?): Int {
-        if (ctx == null) return DEFAULT_MIRROR_SPEED_IDX
-        val idx = prefs(ctx, FILE_EXT).getInt(KEY_MIRROR_CURSOR_SPEED, DEFAULT_MIRROR_SPEED_IDX)
-        return idx.coerceIn(0, MirrorThemeCatalog.MIRROR_SPEED_MULTS.lastIndex)
-    }
-
-    fun getMirrorCursorSpeedMult(ctx: Context?): Float =
-        MirrorThemeCatalog.MIRROR_SPEED_MULTS[getMirrorCursorSpeedIdx(ctx)]
-
-    fun setMirrorCursorSpeedIdx(ctx: Context?, idx: Int) {
-        if (ctx == null) return
-        val clamped = idx.coerceIn(0, MirrorThemeCatalog.MIRROR_SPEED_MULTS.lastIndex)
-        prefs(ctx, FILE_EXT).edit().putInt(KEY_MIRROR_CURSOR_SPEED, clamped).apply()
-    }
-
-    fun getMirrorWidgetRatio(ctx: Context?, slot: Int): Int {
-        if (ctx == null) return 0
-        val key = if (slot == 0) KEY_MIRROR_WIDGET_RATIO_L else KEY_MIRROR_WIDGET_RATIO_R
-        val mode = prefs(ctx, FILE_EXT).getInt(key, 0)
-        return mode.coerceIn(0, MirrorThemeCatalog.MIRROR_WIDGET_RATIO_LABELS.lastIndex)
-    }
-
-    fun setMirrorWidgetRatio(ctx: Context?, slot: Int, mode: Int) {
-        if (ctx == null) return
-        val key = if (slot == 0) KEY_MIRROR_WIDGET_RATIO_L else KEY_MIRROR_WIDGET_RATIO_R
-        val clamped = mode.coerceIn(0, MirrorThemeCatalog.MIRROR_WIDGET_RATIO_LABELS.lastIndex)
-        prefs(ctx, FILE_EXT).edit().putInt(key, clamped).apply()
-        onMirrorPrefsChanged?.invoke(ctx)
-    }
-
-    // --- opaldesk_prefs: Bootstrap ---
 
     fun isAutoCloseWifiAdbEnabled(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_BOOTSTRAP).getBoolean(KEY_AUTO_CLOSE_WIFI_ADB, false) } ?: false
+        prefs(ctx)?.getBoolean(KEY_AUTO_CLOSE_WIFI_ADB, false) ?: false
 
     fun setAutoCloseWifiAdbEnabled(ctx: Context?, enabled: Boolean) {
-        ctx ?: return
-        prefs(ctx, FILE_BOOTSTRAP).edit().putBoolean(KEY_AUTO_CLOSE_WIFI_ADB, enabled).apply()
+        prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_CLOSE_WIFI_ADB, enabled)?.apply()
     }
 
     fun isAutoRootEnabled(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_BOOTSTRAP).getBoolean(KEY_AUTO_ROOT, false) } ?: false
+        prefs(ctx)?.getBoolean(KEY_AUTO_ROOT, false) ?: false
 
     fun setAutoRootEnabled(ctx: Context?, enabled: Boolean) {
-        ctx ?: return
-        prefs(ctx, FILE_BOOTSTRAP).edit().putBoolean(KEY_AUTO_ROOT, enabled).apply()
+        prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_ROOT, enabled)?.apply()
     }
 
     fun isAutoShizukuEnabled(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_BOOTSTRAP).getBoolean(KEY_AUTO_SHIZUKU, false) } ?: false
+        prefs(ctx)?.getBoolean(KEY_AUTO_SHIZUKU, true) ?: true
 
     fun setAutoShizukuEnabled(ctx: Context?, enabled: Boolean) {
-        ctx ?: return
-        prefs(ctx, FILE_BOOTSTRAP).edit().putBoolean(KEY_AUTO_SHIZUKU, enabled).apply()
+        prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_SHIZUKU, enabled)?.apply()
     }
 
-    // --- opaldesk_onboarding: Permissions & Developer Guide ---
+    fun isRootEnhanceEnabled(ctx: Context?): Boolean =
+        prefs(ctx)?.getBoolean(KEY_ROOT_ENHANCE, false) ?: false
 
-    fun isStartupPermsDone(ctx: Context): Boolean =
-        prefs(ctx, FILE_ONBOARDING).getBoolean(KEY_STARTUP_PERMS_DONE, false)
-
-    fun setStartupPermsDone(ctx: Context, done: Boolean) {
-        prefs(ctx, FILE_ONBOARDING).edit().putBoolean(KEY_STARTUP_PERMS_DONE, done).apply()
+    fun setRootEnhanceEnabled(ctx: Context?, enabled: Boolean) {
+        prefs(ctx)?.edit()?.putBoolean(KEY_ROOT_ENHANCE, enabled)?.apply()
     }
 
-    fun isNotifAsked(ctx: Context): Boolean =
-        prefs(ctx, FILE_ONBOARDING).getBoolean(KEY_NOTIF_ASKED, false)
+    fun isAutoExternalDisplayEnabled(ctx: Context?): Boolean =
+        prefs(ctx)?.getBoolean(KEY_AUTO_EXT_DISPLAY, true) ?: true
 
-    fun setNotifAsked(ctx: Context, asked: Boolean) {
-        prefs(ctx, FILE_ONBOARDING).edit().putBoolean(KEY_NOTIF_ASKED, asked).apply()
+    fun setAutoExternalDisplayEnabled(ctx: Context?, enabled: Boolean) {
+        prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_EXT_DISPLAY, enabled)?.apply()
     }
 
-    fun isDevGuideDone(ctx: Context): Boolean =
-        prefs(ctx, FILE_ONBOARDING).getBoolean(KEY_DEV_GUIDE_DONE, false)
-
-    fun setDevGuideDone(ctx: Context, done: Boolean) {
-        prefs(ctx, FILE_ONBOARDING).edit().putBoolean(KEY_DEV_GUIDE_DONE, done).apply()
+    fun getDesktopShortcuts(ctx: Context?): List<String> {
+        hydrateFlows(ctx)
+        return _desktopShortcutsFlow.value
     }
 
-    // --- opaldesk_remote_stream_prefs: Remote Streaming & v4.1 Desktop Preferences ---
-
-    fun getRemoteCodecPref(ctx: Context): Int =
-        prefs(ctx, FILE_REMOTE_STREAM)
-            .getInt(KEY_REMOTE_CODEC, BridgeProtocol.RemoteStream.CODEC_AUTO_HEVC)
-            .coerceIn(BridgeProtocol.RemoteStream.CODEC_AUTO_HEVC, BridgeProtocol.RemoteStream.CODEC_H264)
-
-    fun getRemoteMaxBitrateMbps(ctx: Context): Int =
-        prefs(ctx, FILE_REMOTE_STREAM).getInt(KEY_REMOTE_BITRATE_MBPS, 16).coerceIn(4, 32)
-
-    fun isRemoteAudioEnabled(ctx: Context): Boolean =
-        prefs(ctx, FILE_REMOTE_STREAM).getBoolean(KEY_REMOTE_AUDIO, true)
-
-    fun saveRemoteStreamPrefs(ctx: Context, codecPref: Int, maxBitrateMbps: Int, audioEnabled: Boolean) {
-        prefs(ctx, FILE_REMOTE_STREAM).edit()
-            .putInt(KEY_REMOTE_CODEC, codecPref.coerceIn(0, 1))
-            .putInt(KEY_REMOTE_BITRATE_MBPS, maxBitrateMbps.coerceIn(4, 32))
-            .putBoolean(KEY_REMOTE_AUDIO, audioEnabled)
-            .apply()
+    /** Adds or removes [pkg] on the desktop shortcut grid; returns true if now present on desktop. */
+    fun toggleDesktopShortcut(ctx: Context?, pkg: String): Boolean {
+        hydrateFlows(ctx)
+        val current = _desktopShortcutsFlow.value.toMutableList()
+        val added = if (current.contains(pkg)) {
+            current.remove(pkg)
+            false
+        } else {
+            current.add(pkg)
+            true
+        }
+        prefs(ctx)?.edit()?.putString(KEY_DESKTOP_SHORTCUTS, current.joinToString(","))?.apply()
+        _desktopShortcutsFlow.value = current
+        return added
     }
 
-    fun isAdaptiveSingleEnabled(ctx: Context): Boolean =
-        prefs(ctx, FILE_REMOTE_STREAM).getBoolean(KEY_ADAPTIVE_SINGLE_ENABLED, true)
-
-    fun getDefaultSingleWidthDp(ctx: Context): Int =
-        DisplayGeometry.clampUiSingleWidthDp(
-            prefs(ctx, FILE_REMOTE_STREAM)
-                .getInt(KEY_DEFAULT_SINGLE_WIDTH_DP, DisplayGeometry.DEFAULT_SINGLE_WIDTH_DP),
-        )
-
-    fun saveAdaptiveSingleConfig(ctx: Context, enabled: Boolean, defaultWidthDp: Int) {
-        prefs(ctx, FILE_REMOTE_STREAM).edit()
-            .putBoolean(KEY_ADAPTIVE_SINGLE_ENABLED, enabled)
-            .putInt(KEY_DEFAULT_SINGLE_WIDTH_DP, DisplayGeometry.clampUiSingleWidthDp(defaultWidthDp))
-            .apply()
+    fun getDockPinnedPackages(ctx: Context?): List<String> {
+        hydrateFlows(ctx)
+        return _dockPinnedFlow.value
     }
 
-    fun getInputBackendMode(ctx: Context): Int =
-        prefs(ctx, FILE_REMOTE_STREAM)
-            .getInt(KEY_INPUT_BACKEND_MODE, BridgeProtocol.InputBackend.AUTO)
-            .coerceIn(BridgeProtocol.InputBackend.AUTO, BridgeProtocol.InputBackend.UHID)
+    enum class DockPinResult { ADDED, REMOVED, LIMIT_REACHED }
 
-    fun setInputBackendMode(ctx: Context, mode: Int) {
-        prefs(ctx, FILE_REMOTE_STREAM).edit()
-            .putInt(
-                KEY_INPUT_BACKEND_MODE,
-                mode.coerceIn(BridgeProtocol.InputBackend.AUTO, BridgeProtocol.InputBackend.UHID),
-            )
-            .apply()
+    /**
+     * Toggles [pkg] in the bottom Dock pinned strip, strictly enforcing [MAX_DOCK_PINNED].
+     */
+    fun toggleDockPin(ctx: Context?, pkg: String): DockPinResult {
+        hydrateFlows(ctx)
+        val current = _dockPinnedFlow.value.toMutableList()
+        if (current.contains(pkg)) {
+            current.remove(pkg)
+            prefs(ctx)?.edit()?.putString(KEY_DOCK_PINNED, current.joinToString(","))?.apply()
+            _dockPinnedFlow.value = current
+            return DockPinResult.REMOVED
+        }
+        if (current.size >= MAX_DOCK_PINNED) {
+            return DockPinResult.LIMIT_REACHED
+        }
+        current.add(pkg)
+        prefs(ctx)?.edit()?.putString(KEY_DOCK_PINNED, current.joinToString(","))?.apply()
+        _dockPinnedFlow.value = current
+        return DockPinResult.ADDED
     }
 
-    /** Optional hook set by BridgeService so theme mode changes live-update DeX glass overlays. */
-    @Volatile
-    var onThemeModeChanged: ((Context) -> Unit)? = null
-
-    fun isRightClickPassthroughInApps(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_RIGHT_CLICK_PASSTHROUGH, true) } ?: true
-
-    fun setRightClickPassthroughInApps(ctx: Context?, passthrough: Boolean) {
-        ctx ?: return
-        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_RIGHT_CLICK_PASSTHROUGH, passthrough).apply()
+    fun setCustomWallpaperPath(ctx: Context?, path: String) {
+        val clean = path.trim()
+        prefs(ctx)?.edit()?.putString(KEY_CUSTOM_WALLPAPER_PATH, clean)?.apply()
+        _customWallpaperPathFlow.value = clean
     }
 
-    fun isDesktopDoubleClickLaunch(ctx: Context?): Boolean =
-        ctx?.let { prefs(it, FILE_EXT).getBoolean(KEY_DESKTOP_DOUBLE_CLICK, false) } ?: false
-
-    fun setDesktopDoubleClickLaunch(ctx: Context?, enabled: Boolean) {
-        ctx ?: return
-        prefs(ctx, FILE_EXT).edit().putBoolean(KEY_DESKTOP_DOUBLE_CLICK, enabled).apply()
+    fun clearCustomWallpaper(ctx: Context?) {
+        setCustomWallpaperPath(ctx, "")
     }
 
-    /** 0 = Floating (Default), 1 = Maximized WorkArea, 2 = Immersive Fullscreen. */
-    fun getDexDefaultLaunchMode(ctx: Context?): Int =
-        ctx?.let { prefs(it, FILE_EXT).getInt(KEY_DEX_DEFAULT_LAUNCH_MODE, 0).coerceIn(0, 2) } ?: 0
-
-    fun setDexDefaultLaunchMode(ctx: Context?, mode: Int) {
-        ctx ?: return
-        prefs(ctx, FILE_EXT).edit().putInt(KEY_DEX_DEFAULT_LAUNCH_MODE, mode.coerceIn(0, 2)).apply()
+    fun getThemeMode(ctx: Context?): Int {
+        hydrateFlows(ctx)
+        return (prefs(ctx)?.getInt(KEY_THEME_MODE, THEME_LIGHT) ?: THEME_LIGHT).coerceIn(THEME_LIGHT, THEME_DARK)
     }
 
-    // --- opaldesk_ui_prefs: Compose UI Theme Mode ---
+    fun setThemeMode(ctx: Context?, mode: Int) {
+        val clamped = mode.coerceIn(THEME_LIGHT, THEME_DARK)
+        prefs(ctx)?.edit()?.putInt(KEY_THEME_MODE, clamped)?.apply()
+        _themeModeFlow.value = clamped
+    }
 
-    fun getUiThemeModeIndex(ctx: Context): Int =
-        prefs(ctx, FILE_UI).getInt(KEY_UI_THEME_MODE, 0).coerceIn(0, 2)
+    fun getWallpaperPreset(ctx: Context?): Int {
+        hydrateFlows(ctx)
+        return (prefs(ctx)?.getInt(KEY_WALLPAPER_PRESET, 0) ?: 0).coerceIn(0, 3)
+    }
 
-    fun setUiThemeModeIndex(ctx: Context, idx: Int) {
-        prefs(ctx, FILE_UI).edit().putInt(KEY_UI_THEME_MODE, idx.coerceIn(0, 2)).apply()
-        onThemeModeChanged?.invoke(ctx)
+    fun setWallpaperPreset(ctx: Context?, preset: Int) {
+        val clamped = preset.coerceIn(0, 3)
+        prefs(ctx)?.edit()?.putInt(KEY_WALLPAPER_PRESET, clamped)?.apply()
+        _wallpaperPresetFlow.value = clamped
+    }
+
+    fun getExternalUiScale(ctx: Context?): Float {
+        hydrateFlows(ctx)
+        return (prefs(ctx)?.getFloat(KEY_EXTERNAL_UI_SCALE, 1.25f) ?: 1.25f).coerceIn(0.85f, 2.0f)
+    }
+
+    fun setExternalUiScale(ctx: Context?, scale: Float) {
+        val clamped = scale.coerceIn(0.85f, 2.0f)
+        prefs(ctx)?.edit()?.putFloat(KEY_EXTERNAL_UI_SCALE, clamped)?.apply()
+        _externalUiScaleFlow.value = clamped
+    }
+
+    fun getTrackpadSensitivity(ctx: Context?): Float {
+        hydrateFlows(ctx)
+        return (prefs(ctx)?.getFloat(KEY_TRACKPAD_SENSITIVITY, DEFAULT_TRACKPAD_SENSITIVITY)
+            ?: DEFAULT_TRACKPAD_SENSITIVITY).coerceIn(MIN_TRACKPAD_SENSITIVITY, MAX_TRACKPAD_SENSITIVITY)
+    }
+
+    fun setTrackpadSensitivity(ctx: Context?, sensitivity: Float) {
+        val clamped = sensitivity.coerceIn(MIN_TRACKPAD_SENSITIVITY, MAX_TRACKPAD_SENSITIVITY)
+        prefs(ctx)?.edit()?.putFloat(KEY_TRACKPAD_SENSITIVITY, clamped)?.apply()
+        _trackpadSensitivityFlow.value = clamped
+    }
+
+    fun getMouseTarget(ctx: Context?): Int {
+        hydrateFlows(ctx)
+        return (prefs(ctx)?.getInt(KEY_MOUSE_TARGET, MOUSE_TARGET_EXTERNAL) ?: MOUSE_TARGET_EXTERNAL)
+            .coerceIn(MOUSE_TARGET_LOCAL, MOUSE_TARGET_EXTERNAL)
+    }
+
+    fun setMouseTarget(ctx: Context?, mode: Int) {
+        val clamped = mode.coerceIn(MOUSE_TARGET_LOCAL, MOUSE_TARGET_EXTERNAL)
+        prefs(ctx)?.edit()?.putInt(KEY_MOUSE_TARGET, clamped)?.apply()
+        _mouseTargetFlow.value = clamped
+    }
+
+    fun getOrCreatePeerClientId(ctx: Context?): String {
+        val p = prefs(ctx) ?: return "opal-android"
+        val existing = p.getString("peer_client_id", null)
+        if (!existing.isNullOrBlank()) return existing
+        val created = "android-${java.util.UUID.randomUUID().toString().take(12)}"
+        p.edit().putString("peer_client_id", created).apply()
+        return created
+    }
+
+    fun getPeerAuthToken(ctx: Context?, host: String): String =
+        prefs(ctx)?.getString("peer_tok_${host.trim()}", "").orEmpty()
+
+    fun savePeerAuthToken(ctx: Context?, host: String, token: String) {
+        if (host.isBlank() || token.isBlank()) return
+        prefs(ctx)?.edit()?.putString("peer_tok_${host.trim()}", token)?.apply()
     }
 }

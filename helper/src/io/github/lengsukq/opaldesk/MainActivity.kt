@@ -1,375 +1,299 @@
 package io.github.lengsukq.opaldesk
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
-import android.util.Log
+import android.os.Handler
+import android.os.Looper
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.runtime.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
-import io.github.lengsukq.opaldesk.design.iosglass.CrossWindowBlurController
-import io.github.lengsukq.opaldesk.design.iosglass.LiquidGlassTheme
-import io.github.lengsukq.opaldesk.design.iosglass.LiquidMeshBackground
-import io.github.lengsukq.opaldesk.design.iosglass.LiquidShapes
-import io.github.lengsukq.opaldesk.design.iosglass.SquircleShape
-import io.github.lengsukq.opaldesk.design.iosglass.rememberAdaptiveViewportInfo
+import io.github.lengsukq.opaldesk.adb.ShizukuBootstrap
+import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
+import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
+import io.github.lengsukq.opaldesk.cast.PeerCastViewerActivity
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
-import io.github.lengsukq.opaldesk.protocol.BridgeLabels
+import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
-import io.github.lengsukq.opaldesk.ui.*
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import top.yukonga.miuix.kmp.basic.*
+import io.github.lengsukq.opaldesk.ui.ActivationModal
+import io.github.lengsukq.opaldesk.ui.ConsoleDashboardTab
+import io.github.lengsukq.opaldesk.ui.ConsoleDisplaySettingsTab
+import io.github.lengsukq.opaldesk.ui.ConsoleEngineSettingsTab
+import io.github.lengsukq.opaldesk.ui.OpalAmbientBackdrop
+import io.github.lengsukq.opaldesk.ui.OpalPalette
+import io.github.lengsukq.opaldesk.ui.OpalSegmentedRow
+import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
+import io.github.lengsukq.opaldesk.ui.OpalText
+import io.github.lengsukq.opaldesk.ui.OpalTheme
 
+/**
+ * OpalDesk v1.0.0 macOS Liquid Glass Control Console.
+ *
+ * Unifies:
+ * 1. On-device Local DeX Workstation ([DesktopActivity])
+ * 2. USB-C / HDMI Full-Bleed External Monitor & Precision Trackpad ([ExternalDesktopActivity])
+ * 3. MacOS OpalCast v1.1 USB + Wi-Fi TLS Remote Streaming
+ * 4. Display Resolution / EDID Refresh Rate / FPS / DPI / Auto-Adapt & Engine Pool Tuning
+ */
 class MainActivity : ComponentActivity() {
 
-    companion object {
-        private const val TAG = "ExtMainActivity"
-    }
-
-    private lateinit var ctrl: MainController
-    private lateinit var perms: MainPermissionHelper
-    private lateinit var widgetBinder: MainWidgetBinder
-
-    private val binderReadyCb = Runnable {
-        if (::ctrl.isInitialized && !isFinishing && !isDestroyed) {
-            ctrl.scope.launch { ctrl.refreshStatusNow(syncFromDaemon = true) }
-        }
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val notifPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { _ -> }
+    private val wallpaperPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri == null) return@registerForActivityResult
+        Thread({
+            val saved = WallpaperStorage.importWallpaperFromUri(this, uri)
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    if (saved != null) "已更换桌面壁纸" else "无法读取所选图片",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }, "OpalWallpaperImport").start()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (DisplayLaunchHelper.ensureOnDisplay0(this)) return
-        enableEdgeToEdge()
-        CrossWindowBlurController.applyToActivityWindow(window)
+        WindowCompat.setDecorFitsSystemWindows(window, false)
 
-        ctrl = MainController(this)
-        widgetBinder = MainWidgetBinder(this, ctrl.scope) { ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel) }
-        perms = MainPermissionHelper(
-            activity = this,
-            onPermissionsChanged = { ctrl.refreshStatusNow(syncFromDaemon = false) },
-            onStartupOnboardingFinished = { scheduleAutoPromptIfReady(200L) },
-        )
-
+        requestNotificationPermissionIfNeeded()
         BridgeService.sUserStopping = false
         BridgeService.ensureStarted(this)
-        ctrl.bindShizukuCallbacks()
-        ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel)
-        perms.refreshSnapshot()
-        ctrl.refreshStatusNow(syncFromDaemon = true)
-
-        if (perms.shouldRunFirstLaunchOnboarding()) {
-            perms.beginStartupOnboarding()
-            ctrl.scope.launch { delay(220L); perms.startFirstLaunchPermissions() }
-        }
-
-        val versionName = try { packageManager.getPackageInfo(packageName, 0).versionName.orEmpty() }
-        catch (t: Throwable) { Log.w(TAG, "Failed to read package versionName", t); "" }
+        BridgeClient.requestBinder(this)
+        scheduleSilentAutoBootstrapIfConfigured()
 
         setContent {
-            ExtHyperTheme(themeModeIndex = ctrl.themeModeIdx) {
-                val dark = isEffectiveDark(ctrl.themeModeIdx)
-                SideEffect {
-                    WindowCompat.getInsetsController(window, window.decorView).apply {
-                        isAppearanceLightStatusBars = !dark; isAppearanceLightNavigationBars = !dark
-                    }
+            OpalTheme {
+                val isDark = OpalPalette.isDark
+                LaunchedEffect(isDark) {
+                    val ctrl = WindowCompat.getInsetsController(window, window.decorView)
+                    ctrl.isAppearanceLightStatusBars = !isDark
+                    ctrl.isAppearanceLightNavigationBars = !isDark
                 }
-                MainAppShell(versionName)
+                OpalConsoleScreen(
+                    onEnterDesktop = ::launchDesktopWorkstation,
+                    onProjectExternalOrTrackpad = ::launchExternalOrTrackpad,
+                    onConnectPeerCast = ::launchPeerCastViewer,
+                    onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
+                    onStopEngine = {
+                        BridgeService.stopAllAndExit(this)
+                    },
+                )
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        if (!::ctrl.isInitialized) return
-        BridgeClient.setOnBinderReady(binderReadyCb)
-        if (BridgeClient.getService() == null) BridgeClient.requestBinder(this)
-        BridgeService.sUserStopping = false
-        BridgeService.ensureStarted(this)
-        ctrl.bindShizukuCallbacks()
-        ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel)
-        if (!perms.onResumeReturnIfNeeded()) ctrl.refreshStatusNow(syncFromDaemon = false)
-        ctrl.startForegroundSync()
-        if (!perms.startupPermInProgress) scheduleAutoPromptIfReady(450L)
+        BridgeClient.requestBinder(this)
+        OpalPeerDiscovery.startBrowsing(this, BridgeClient.remoteStatusFlow.value.lanIp)
+        Thread({
+            BridgeClient.refreshStatus()
+            BridgeClient.refreshSceneSnapshot()
+            val r = BridgeClient.refreshRemoteStatus()
+            OpalPeerCastMutex.syncDaemonSendingState(r.connected, r.peerName)
+            OpalPeerDiscovery.syncAdvertise(this, r.wifiEnabled, r.wifiPort, r.shortCertFingerprint)
+            OpalPeerDiscovery.startBrowsing(this, r.lanIp)
+        }, "OpalConsoleRefresh").start()
     }
 
     override fun onPause() {
+        OpalPeerDiscovery.stopBrowsing()
         super.onPause()
-        BridgeClient.removeOnBinderReady(binderReadyCb)
-        if (::ctrl.isInitialized) ctrl.stopForegroundSync()
     }
 
-    override fun onDestroy() {
-        if (::ctrl.isInitialized) ctrl.dispose()
-        super.onDestroy()
-    }
-
-    @Deprecated("Deprecated in Java")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        @Suppress("DEPRECATION") super.onActivityResult(requestCode, resultCode, data)
-        if (::widgetBinder.isInitialized) widgetBinder.onActivityResult(requestCode, resultCode)
-    }
-
-    @Deprecated("Deprecated in Java")
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        @Suppress("DEPRECATION") super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (::perms.isInitialized) perms.onRequestPermissionsResult(requestCode)
-    }
-
-    private fun scheduleAutoPromptIfReady(delayMs: Long) =
-        ctrl.scheduleAutoPrompt(delayMs) { isFinishing || perms.startupPermInProgress || perms.showPermDialog }
-
-    private fun openActivityOnDisplay0(cls: Class<*>) {
-        if (!DisplayLaunchHelper.launchOnDisplay0(this, Intent(this, cls))) startActivity(Intent(this, cls))
-    }
-
-    private fun openWidgetSlot(slot: Int) {
-        ctrl.activeWidgetSlot = slot
-        ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel)
-        ctrl.showWidgetSheet = true
-        widgetBinder.ensureCandidatesLoaded()
-    }
-
-    @Composable
-    private fun MainAppShell(versionName: String) {
-        val navItems = remember {
-            listOf(
-                Triple("控制台", ExtVectorIcons.Dashboard, "OpalDesk"),
-                Triple("显示与边栏", ExtVectorIcons.DisplayTuning, "显示与边栏"),
-                Triple("应用规则", ExtVectorIcons.AppRules, "分应用显示规则"),
-                Triple("设置", ExtVectorIcons.SettingsGear, "设置与服务"),
-            )
+    private fun launchPeerCastViewer(host: String, port: Int, pin: String, label: String) {
+        val remote = BridgeClient.remoteStatusFlow.value
+        val check = OpalPeerCastMutex.validateStartReceiving(
+            daemonSending = remote.connected,
+            sendingPeerName = remote.peerName,
+            targetHost = host,
+            selfLanIp = remote.lanIp,
+        )
+        if (!check.allowed) {
+            Toast.makeText(this, check.reason, Toast.LENGTH_LONG).show()
+            return
         }
-        val subtitle = remember(versionName, ctrl.daemonStatus, ctrl.localLanIp) {
-            val short = BridgeLabels.classifyConnectionSummary(ctrl.daemonStatus, ctrl.localLanIp).shortSubtitle
-            if (versionName.isNotBlank()) "v$versionName · $short" else short
-        }
+        startActivity(
+            Intent(this, PeerCastViewerActivity::class.java).apply {
+                putExtra(PeerCastViewerActivity.EXTRA_HOST, host)
+                putExtra(PeerCastViewerActivity.EXTRA_PORT, port)
+                putExtra(PeerCastViewerActivity.EXTRA_PIN, pin)
+                putExtra(PeerCastViewerActivity.EXTRA_LABEL, label)
+            },
+        )
+    }
 
-        LaunchedEffect(ctrl.navTab, ctrl.daemonStatus.connected) {
-            if (ctrl.navTab == 2 && ctrl.daemonStatus.connected && !ctrl.appRulesLoadedOnce && !ctrl.appRulesLoading) {
-                ctrl.loadAppRules()
-            }
-        }
+    private fun launchDesktopWorkstation() {
+        startActivity(
+            Intent(this, DesktopActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            },
+        )
+    }
 
-        val viewport = rememberAdaptiveViewportInfo()
-        val isWide = viewport.isTwoPaneCapable && viewport.widthDp >= 720
-        LiquidMeshBackground(modifier = Modifier.fillMaxSize()) {
-            val scrollBehavior = MiuixScrollBehavior()
-            Scaffold(
-                modifier = Modifier.fillMaxSize(),
-                topBar = {
-                    if (!isWide) TopAppBar(navItems[ctrl.navTab].third, subtitle = subtitle, scrollBehavior = scrollBehavior, actions = { TopBarQuickActions() })
-                },
-                bottomBar = {
-                    if (!isWide) {
-                        IosFloatingGlassBottomBar(
-                            items = navItems,
-                            selectedIndex = ctrl.navTab,
-                            onSelect = { ctrl.navTab = it },
-                        )
-                    }
-                },
-            ) { innerPadding ->
-                if (isWide) {
-                    Row(modifier = Modifier.fillMaxSize()) {
-                        NavigationRail(
-                            header = {
-                                Box(
-                                    modifier = Modifier.padding(vertical = 8.dp).size(40.dp).clip(SquircleShape(13.dp))
-                                        .background(HyperBlue.copy(alpha = 0.15f)),
-                                    contentAlignment = Alignment.Center,
-                                ) { Icon(ExtVectorIcons.MonitorDex, "OpalDesk", tint = HyperBlue, modifier = Modifier.size(20.dp)) }
-                            },
-                        ) {
-                            navItems.forEachIndexed { idx, (label, icon, _) ->
-                                NavigationRailItem(selected = ctrl.navTab == idx, onClick = { ctrl.navTab = idx }, icon = icon, label = label)
-                            }
-                        }
-                        Column(modifier = Modifier.weight(1f).fillMaxHeight()) {
-                            SmallTopAppBar(navItems[ctrl.navTab].third, subtitle = subtitle, actions = { TopBarQuickActions() })
-                            Box(modifier = Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
-                                ActiveTabContent(isWide = true, contentPadding = PaddingValues(horizontal = 20.dp, vertical = 12.dp))
-                            }
-                        }
-                    }
-                } else {
-                    Box(modifier = Modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection)) {
-                        ActiveTabContent(
-                            isWide = false,
-                            contentPadding = PaddingValues(
-                                start = 16.dp, end = 16.dp,
-                                top = innerPadding.calculateTopPadding() + 8.dp,
-                                bottom = innerPadding.calculateBottomPadding() + 24.dp,
-                            ),
-                        )
-                    }
-                }
-                MainOverlays()
+    private fun launchExternalOrTrackpad(displayId: Int) {
+        val intent = Intent(this, ExternalDesktopActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            putExtra("targetDisplayId", displayId)
+        }
+        // If Presentation mode is already active on Display 0, bring the DeX Trackpad straight to front!
+        if (ExternalDesktopActivity.isPresentationActive) {
+            DisplayLaunchHelper.launchOnDisplay0(this, intent)
+        } else {
+            DisplayLaunchHelper.launchOnDisplay(this, intent, displayId)
+        }
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                notifPermLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
     }
 
-    @Composable
-    private fun IosFloatingGlassBottomBar(
-        items: List<Triple<String, androidx.compose.ui.graphics.vector.ImageVector, String>>,
-        selectedIndex: Int,
-        onSelect: (Int) -> Unit,
-    ) {
-        val glass = LiquidGlassTheme.colors
-        val rim = remember(glass) {
-            Brush.linearGradient(listOf(glass.specularTopLeft, glass.specularMid, glass.specularBottomRight))
-        }
+    private fun scheduleSilentAutoBootstrapIfConfigured() {
+        mainHandler.postDelayed({
+            if (BridgeClient.statusFlow.value.connected || BridgeService.sUserStopping) return@postDelayed
+            if (AppPrefs.isAutoShizukuEnabled(this) && ShizukuBootstrap.isReadyAndGranted()) {
+                AdbBootstrap.shizukuBootstrapAsync(this, markAutoShizuku = true, listener = null)
+            } else if (AppPrefs.isAutoRootEnabled(this) && AdbBootstrap.hasSuBinaryHint()) {
+                AdbBootstrap.rootBootstrapAsync(
+                    ctx = this,
+                    markAutoRoot = true,
+                    rootEnhance = AppPrefs.isRootEnhanceEnabled(this),
+                    listener = null,
+                )
+            }
+        }, 700L)
+    }
+}
+
+@Composable
+private fun OpalConsoleScreen(
+    onEnterDesktop: () -> Unit,
+    onProjectExternalOrTrackpad: (Int) -> Unit,
+    onConnectPeerCast: (String, Int, String, String) -> Unit,
+    onPickCustomWallpaper: () -> Unit,
+    onStopEngine: () -> Unit,
+) {
+    val status by BridgeClient.statusFlow.collectAsState()
+    val scene by BridgeClient.sceneFlow.collectAsState()
+    val remote by BridgeClient.remoteStatusFlow.collectAsState()
+    val extDisplay by BridgeService.externalDisplayFlow.collectAsState()
+
+    var selectedTab by remember { mutableIntStateOf(0) }
+    var showActivationModal by remember { mutableStateOf(false) }
+    val wallpaperPreset by AppPrefs.wallpaperPresetFlow.collectAsState()
+
+    OpalAmbientBackdrop(modifier = Modifier.fillMaxSize(), wallpaperPreset = wallpaperPreset) {
         Box(
             modifier = Modifier
-                .fillMaxWidth()
-                .navigationBarsPadding()
-                .padding(horizontal = 18.dp, vertical = 10.dp),
-            contentAlignment = Alignment.Center,
+                .fillMaxSize()
+                .systemBarsPadding(),
+            contentAlignment = Alignment.TopCenter,
         ) {
-            Row(
+            Column(
                 modifier = Modifier
+                    .widthIn(max = 840.dp)
                     .fillMaxWidth()
-                    .clip(LiquidShapes.Capsule)
-                    .background(glass.glassThick)
-                    .border(1.dp, rim, LiquidShapes.Capsule)
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically,
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                items.forEachIndexed { idx, (label, icon, _) ->
-                    val selected = idx == selectedIndex
-                    val tint = if (selected) Color.White else glass.textSecondary
-                    Row(
-                        modifier = Modifier
-                            .weight(1f)
-                            .clip(LiquidShapes.Capsule)
-                            .background(if (selected) glass.accentBlue else Color.Transparent)
-                            .clickable { onSelect(idx) }
-                            .padding(vertical = 8.dp, horizontal = 6.dp),
-                        horizontalArrangement = Arrangement.Center,
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Icon(icon, label, tint = tint, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text(label, fontSize = 11.5.sp, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium, color = tint, maxLines = 1)
+                // Top Header Bar
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column {
+                        OpalText(text = "OpalDesk", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                        OpalText(
+                            text = "macOS 液态毛玻璃 × DeX 多窗合成工作站 · v1.0.0",
+                            fontSize = 12.sp,
+                            color = OpalPalette.TextSecondary,
+                        )
                     }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (status.connected && status.rootEnhanced) {
+                            OpalStatusBadge(label = "Root 增强", color = OpalPalette.AccentEmerald)
+                        }
+                        OpalStatusBadge(
+                            label = status.privilegeSummary,
+                            color = if (status.connected) OpalPalette.AccentEmerald else OpalPalette.AccentAmber,
+                        )
+                    }
+                }
+
+                // macOS Floating Glass Segmented Tab Switcher
+                OpalSegmentedRow(
+                    options = listOf("工作站总览", "显示与画质", "高级与引擎"),
+                    selectedIndex = selectedTab,
+                    onSelect = { selectedTab = it },
+                )
+
+                when (selectedTab) {
+                    0 -> ConsoleDashboardTab(
+                        status = status,
+                        scene = scene,
+                        remote = remote,
+                        extDisplay = extDisplay,
+                        onEnterLocalDesktop = onEnterDesktop,
+                        onOpenExternalOrTrackpad = onProjectExternalOrTrackpad,
+                        onConnectPeerCast = onConnectPeerCast,
+                        onOpenActivation = { showActivationModal = true },
+                    )
+                    1 -> ConsoleDisplaySettingsTab(
+                        status = status,
+                        extDisplay = extDisplay,
+                        onPickCustomWallpaper = onPickCustomWallpaper,
+                    )
+                    else -> ConsoleEngineSettingsTab(
+                        status = status,
+                        onStopEngine = onStopEngine,
+                    )
                 }
             }
         }
-    }
 
-    @Composable
-    private fun TopBarQuickActions() {
-        if (!ctrl.daemonStatus.connected) {
-            IconButton(onClick = { ctrl.openActivationSheet() }) { Icon(ExtVectorIcons.BoltActivate, "激活服务", tint = HyperAmber) }
-        }
-        IconButton(onClick = { ctrl.showDiagSheet = true }) { Icon(ExtVectorIcons.Diagnostics, "连接诊断") }
-    }
-
-    @Composable
-    private fun ActiveTabContent(isWide: Boolean, contentPadding: PaddingValues) {
-        when (ctrl.navTab) {
-            0 -> DashboardPage(
-                ctrl, perms.allCoreGranted, isWide, contentPadding,
-                onOpenPermDialog = { perms.openPermDialog(false) },
-                onOpenLocalDex = {
-                    when {
-                        !ctrl.daemonStatus.connected -> ctrl.openActivationSheet()
-                        ctrl.daemonStatus.isRemoteSink -> ctrl.toast("Mac 远程大屏运行中，请先断开 Mac 连接")
-                        else -> openActivityOnDisplay0(LocalDexActivity::class.java)
-                    }
-                },
-                onOpenTouchpad = { openActivityOnDisplay0(TouchpadActivity::class.java) },
-                onOpenSideControl = { openActivityOnDisplay0(SideControlActivity::class.java) },
-                onOpenWidgetSlot = ::openWidgetSlot,
-            )
-            1 -> DisplayAndSidebarPage(ctrl, contentPadding, { openActivityOnDisplay0(SideControlActivity::class.java) }, ::openWidgetSlot)
-            2 -> AppRulesPage(ctrl, contentPadding)
-            else -> SettingsPage(
-                ctrl, perms.grantedCount, contentPadding,
-                onOpenPermChecklist = { perms.openPermDialog(false) },
-                onOpenRestrictedSettings = { perms.openRestrictedSettings(false) },
-                onStopAllAndExit = { ctrl.toast("正在停止 OpalDesk 守护进程并退出…"); BridgeService.stopAllAndExit(this) },
+        if (showActivationModal) {
+            ActivationModal(
+                onDismiss = { showActivationModal = false },
+                onActivated = { showActivationModal = false },
             )
         }
-    }
-
-    @Composable
-    private fun MainOverlays() {
-        val pcAdbCmd = remember { AdbBootstrap.buildPcAdbCommand() }
-        DiagnosticsSheet(ctrl.showDiagSheet, ctrl.daemonStatus, { ctrl.rebuildRenderPipeline("已发送渲染重建指令") }, { ctrl.disconnectRemoteMac() }) {
-            ctrl.showDiagSheet = false
-        }
-        RemoteMacDisplaySheet(ctrl.toRemoteMacUiState(), ctrl.toRemoteMacActions())
-        ActivationSheet(
-            ctrl.toActivationUiState(pcAdbCmd),
-            ctrl.toActivationActions(
-                pcAdbCmd = pcAdbCmd,
-                onOpenDevOptions = { perms.openDeveloperOptionsWithGate() },
-                onSendPairNotif = {
-                    if (perms.ensureNotifPermAndShowPairNotif()) ctrl.toast("已发送配对通知，可在系统弹窗上方下拉直接输入配对码", long = true)
-                },
-            ),
-        )
-        PermissionChecklistDialog(
-            perms.showPermDialog, perms.permDialogIsDevGate, perms.notifGranted, perms.overlayGranted, perms.a11yGranted,
-            { perms.onDialogGrantNotif() }, { perms.onDialogGrantOverlay() }, { perms.onDialogGrantA11y() },
-            { perms.openRestrictedSettings(true) }, { perms.onDialogSkipOrContinue() },
-        )
-        DevOptionsGuideDialog(perms.showDevGuideDialog, { perms.confirmDevGuideAndLaunch() }) { perms.showDevGuideDialog = false }
-        CustomResolutionDialog(ctrl.showCustomResDialog, ctrl.selW, ctrl.selH, ctrl::applyCustomResolution) { ctrl.showCustomResDialog = false }
-        EdidAndRefreshSheet(ctrl.showEdidSheet, ctrl.selFps, ctrl.daemonStatus.modesRaw, ctrl.selPhysModeId, ctrl::selectTargetFps, ctrl::selectPhysicalEdidMode) {
-            ctrl.showEdidSheet = false
-        }
-        MirrorPresetManagerSheet(
-            show = ctrl.showPresetMgrSheet, slots = ctrl.mirrorPresets.toList(),
-            onUpdateSlots = { next ->
-                AppPrefs.setMirrorPresetSlots(this, next)
-                ctrl.mirrorPresets.clear(); ctrl.mirrorPresets.addAll(AppPrefs.getMirrorPresetSlots(this))
-            },
-            onEditMemo = { ctrl.showMemoDialog = true },
-            onResetDefault = {
-                AppPrefs.setMirrorPresetSlots(this, null)
-                ctrl.mirrorPresets.clear(); ctrl.mirrorPresets.addAll(AppPrefs.getMirrorPresetSlots(this))
-                ctrl.toast("已恢复默认 7 张边栏卡片")
-            },
-            onDismiss = { ctrl.showPresetMgrSheet = false },
-        )
-        MirrorMemoDialog(ctrl.showMemoDialog, ctrl.mirrorMemoPreview, { txt ->
-            AppPrefs.setMirrorMemoText(this, txt); ctrl.mirrorMemoPreview = AppPrefs.getMirrorMemoText(this)
-            ctrl.toast("便签内容已同步至外接边栏")
-        }) { ctrl.showMemoDialog = false }
-        CustomMirrorColorDialog(ctrl.showCustomColorDialog, AppPrefs.getMirrorCustomBg(this), { colorInt ->
-            AppPrefs.setMirrorCustomBg(this, colorInt); ctrl.mirrorThemeId = "custom"; ctrl.toast("已应用自定义副屏颜色")
-        }) { ctrl.showCustomColorDialog = false }
-        MirrorWidgetSlotSheet(
-            show = ctrl.showWidgetSheet, slotIndex = ctrl.activeWidgetSlot,
-            boundWidgetLabel = if (ctrl.activeWidgetSlot == 0) ctrl.widgetSlot0Label else ctrl.widgetSlot1Label,
-            currentRatioIdx = if (ctrl.activeWidgetSlot == 0) ctrl.widgetSlot0Ratio else ctrl.widgetSlot1Ratio,
-            candidates = widgetBinder.candidates.toList(), loading = widgetBinder.loading,
-            onChangeRatio = { AppPrefs.setMirrorWidgetRatio(this, ctrl.activeWidgetSlot, it); ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel) },
-            onClearWidget = {
-                AppPrefs.setMirrorWidgetId(this, ctrl.activeWidgetSlot, -1); ctrl.syncLocalPrefs(widgetBinder::resolveBoundWidgetLabel)
-                ctrl.toast("已清除槽位 ${ctrl.activeWidgetSlot + 1} 小组件")
-            },
-            onPickCandidate = { widgetBinder.bindChosenWidget(ctrl.activeWidgetSlot, it) },
-            onDismiss = { ctrl.showWidgetSheet = false },
-        )
     }
 }

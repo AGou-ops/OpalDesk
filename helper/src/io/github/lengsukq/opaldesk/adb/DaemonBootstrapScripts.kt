@@ -14,7 +14,8 @@ import java.util.Locale
  * Single source of truth for `opaldesk.jar` asset SHA-256 verification/staging and
  * fail-closed daemon bootstrap shell scripts (PC ADB, Wireless ADB, Shizuku/Sui, and Root-to-Shell).
  *
- * Avoids Toybox-incompatible `unzip -tq` (broken on Android 11-14 / early 15) in favor of
+ * 100% OEM-agnostic (zero MIUI/HyperOS AppOps `10021`, zero `SYSTEM_ALERT_WINDOW` overlays) and
+ * avoids Toybox-incompatible `unzip -tq` (broken on Android 11-14 / early 15) in favor of
  * `PK` magic check + 256-bit SHA-256 verification + `app_process --verify-helper`.
  */
 object DaemonBootstrapScripts {
@@ -30,7 +31,6 @@ object DaemonBootstrapScripts {
     private val SECURE_RANDOM = SecureRandom()
 
     private val APPOPS_BEST_EFFORT = listOf(
-        "appops set $HELPER_PKG 10021 allow",
         "appops set $HELPER_PKG ACCESS_RESTRICTED_SETTINGS allow",
         "pm grant $HELPER_PKG android.permission.POST_NOTIFICATIONS",
         "pm grant $HELPER_PKG android.permission.ACCESS_LOCAL_NETWORK",
@@ -120,7 +120,6 @@ object DaemonBootstrapScripts {
         val newJar = "$DST_JAR.new"
         val srcApk = "/data/local/tmp/opd_src.apk"
         val grants = buildList {
-            add("(appops set $HELPER_PKG SYSTEM_ALERT_WINDOW allow 2>/dev/null || true)")
             add("(appops set $HELPER_PKG RUN_ANY_IN_BACKGROUND allow 2>/dev/null || true)")
             APPOPS_BEST_EFFORT.forEach { cmd ->
                 val redir = if (cmd.startsWith("dumpsys")) ">/dev/null 2>&1" else "2>/dev/null"
@@ -236,19 +235,27 @@ object DaemonBootstrapScripts {
 
     /**
      * Root-to-shell bootstrap script: Root ONLY copies & SHA-256 verifies a nonce temp jar
-     * (with multi-user/split APK fallback for isolated Mount Namespaces), chowns it 2000:2000,
-     * and drops privileges to uid 2000 (`u:r:shell:s0`) before running `app_process`.
+     * (with multi-user/split APK fallback for isolated Mount Namespaces), optionally applies
+     * benign global multi-window flags (`--root-enhance`), chowns 2000:2000, and drops privileges
+     * to uid 2000 (`u:r:shell:s0`) before running `app_process`.
      */
     fun buildRootBootstrapScript(
         stagedPath: String,
         expectedSha256: String,
         userId: Int = currentUserId(),
+        rootEnhance: Boolean = false,
     ): String {
         val qStage = stagedPath.replace("'", "")
         val expSha = expectedSha256.lowercase(Locale.US)
         val rootTmp = "/data/local/tmp/opd_${randomHex16()}.jar"
-        val qShellInner = buildShellSwapAndLaunchScript("'$rootTmp'", expSha).replace("'", "'\\''")
+        val qShellInner = buildShellSwapAndLaunchScript("'$rootTmp'", expSha, rootEnhance).replace("'", "'\\''")
         val fallbackExtract = buildMultiApkUnzipFallback(userId, "'$rootTmp'")
+        val preDropEnhance = if (rootEnhance) {
+            "settings put global force_resizable_activities 1 >/dev/null 2>&1 || true; " +
+                "settings put global enable_non_resizable_multi_window 1 >/dev/null 2>&1 || true; "
+        } else {
+            ""
+        }
 
         return "UID_NOW=\$(id -u 2>/dev/null || echo -1); " +
             "if [ \"\$UID_NOW\" != \"0\" ]; then echo NO_ROOT:\$UID_NOW; exit 12; fi; " +
@@ -265,6 +272,7 @@ object DaemonBootstrapScripts {
             "rm -f '$rootTmp' 2>/dev/null; echo ERR_STAGE_HASH:\$SRC_SHA; exit 21; fi; " +
             "chmod 644 '$rootTmp' && chown -h 2000:2000 '$rootTmp' " +
             "|| { rm -f '$rootTmp' 2>/dev/null; echo ERR_STAGE_CHOWN; exit 21; }; " +
+            preDropEnhance +
             "run_as_shell() { " +
             "su 2000 -c \"\$1\" && return 0; rc=\$?; [ \"\$rc\" -ge 20 ] && [ \"\$rc\" -le 29 ] && return \"\$rc\"; " +
             "su shell -c \"\$1\" 2>/dev/null && return 0; rc=\$?; [ \"\$rc\" -ge 20 ] && [ \"\$rc\" -le 29 ] && return \"\$rc\"; " +
@@ -275,9 +283,14 @@ object DaemonBootstrapScripts {
             "rm -f '$rootTmp' 2>/dev/null; exit \$RC"
     }
 
-    internal fun buildShellSwapAndLaunchScript(tmpJarExpr: String, expectedSha256: String? = null): String {
+    internal fun buildShellSwapAndLaunchScript(
+        tmpJarExpr: String,
+        expectedSha256: String? = null,
+        rootEnhance: Boolean = false,
+    ): String {
         val cleanSha = expectedSha256?.trim()?.lowercase(Locale.US).orEmpty()
         val hasSha = SHA256_HEX_REGEX.matches(cleanSha)
+        val daemonArgs = if (rootEnhance) "$DAEMON_CLASS --root-enhance" else DAEMON_CLASS
         val shaGuard = if (hasSha) {
             "ACT_SHA=\$(sha256sum $tmpJarExpr 2>/dev/null | cut -d' ' -f1); " +
                 "if [ -n \"\$ACT_SHA\" ] && [ \"\$ACT_SHA\" != '$cleanSha' ]; then " +
@@ -293,7 +306,6 @@ object DaemonBootstrapScripts {
             ""
         }
         val shellGrants = buildList {
-            add("appops set $HELPER_PKG SYSTEM_ALERT_WINDOW allow 2>/dev/null")
             add("appops set $HELPER_PKG POST_NOTIFICATION allow 2>/dev/null")
             add("appops set $HELPER_PKG RUN_ANY_IN_BACKGROUND allow 2>/dev/null")
             APPOPS_BEST_EFFORT.forEach { cmd ->
@@ -326,14 +338,14 @@ object DaemonBootstrapScripts {
             "CUR_CTX=\$(id -Z 2>/dev/null || echo ''); " +
             "case \"\$CUR_CTX\" in " +
             "*:shell:*) " +
-            "(CLASSPATH=$DST_JAR setsid /system/bin/app_process /data/local/tmp $DAEMON_CLASS </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.5 ;; " +
+            "(CLASSPATH=$DST_JAR setsid /system/bin/app_process /data/local/tmp $daemonArgs </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.5 ;; " +
             "*) " +
-            "(CLASSPATH=$DST_JAR setsid runcon u:r:shell:s0 /system/bin/app_process /data/local/tmp $DAEMON_CLASS </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.5; " +
+            "(CLASSPATH=$DST_JAR setsid runcon u:r:shell:s0 /system/bin/app_process /data/local/tmp $daemonArgs </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.5; " +
             "if ! $aliveExpr; then " +
-            "(CLASSPATH=$DST_JAR setsid /system/bin/app_process /data/local/tmp $DAEMON_CLASS </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.5; fi ;; " +
+            "(CLASSPATH=$DST_JAR setsid /system/bin/app_process /data/local/tmp $daemonArgs </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.5; fi ;; " +
             "esac; " +
             "if ! $aliveExpr; then " +
-            "(CLASSPATH=$DST_JAR nohup app_process /data/local/tmp $DAEMON_CLASS </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.6; fi; " +
+            "(CLASSPATH=$DST_JAR nohup app_process /data/local/tmp $daemonArgs </dev/null >>\"\$LOG_DST\" 2>&1 &); sleep 0.6; fi; " +
             "if $aliveExpr; then echo LAUNCH_DONE; else echo ERR_DAEMON_DIED; [ \"\$LOG_DST\" != \"/dev/null\" ] && cat \"\$LOG_DST\" 2>/dev/null; exit 24; fi"
     }
 }

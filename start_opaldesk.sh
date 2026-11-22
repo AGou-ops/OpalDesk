@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# OpalDesk daemon bootstrap script (safe under both shell uid=2000 and root uid=0).
+# OpalDesk Universal Compositor daemon bootstrap script (safe under both shell uid=2000 and root uid=0).
 #
 # Exit codes (contract with AdbBootstrap / caller diagnostics):
 #   20 - Unsafe script path or failed to drop root (uid=0) to shell (uid=2000)
@@ -22,8 +22,6 @@ DAEMON_JAR="/data/local/tmp/opaldesk.jar"
 DAEMON_LOG="/data/local/tmp/opaldesk.log"
 DAEMON_PAT_SHORT='^app_process.*OpalDeskDaemon'
 DAEMON_PAT_FULL='^/system/bin/app_process.*OpalDeskDaemon'
-# MIUI/HyperOS hidden AppOps code OP_BACKGROUND_START_ACTIVITY (allows launching external display activities from background).
-MIUI_OP_BACKGROUND_START=10021
 
 if [ "$(id -u 2>/dev/null)" = "0" ]; then
     SCRIPT_REAL=$(realpath "$0" 2>/dev/null || echo "$0")
@@ -37,8 +35,12 @@ if [ "$(id -u 2>/dev/null)" = "0" ]; then
         echo "ERR_INVALID_SCRIPT: script path must be a regular file" >&2
         exit "$EXIT_DROP_ROOT"
     fi
-    exec su 2000 -c "/system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
-        || exec su shell -c "/system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
+    if [ "${OPALDESK_ROOT_ENHANCE:-0}" = "1" ]; then
+        settings put global force_resizable_activities 1 >/dev/null 2>&1 || true
+        settings put global enable_non_resizable_multi_window 1 >/dev/null 2>&1 || true
+    fi
+    exec su 2000 -c "OPALDESK_ROOT_ENHANCE='${OPALDESK_ROOT_ENHANCE:-0}' /system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
+        || exec su shell -c "OPALDESK_ROOT_ENHANCE='${OPALDESK_ROOT_ENHANCE:-0}' /system/bin/sh '$SCRIPT_REAL'" 2>/dev/null \
         || exec su 2000 /system/bin/sh "$SCRIPT_REAL"
     echo "ERR_DROP_ROOT: failed to switch from root to shell uid 2000 before touching /data/local/tmp" >&2
     exit "$EXIT_DROP_ROOT"
@@ -49,7 +51,6 @@ is_daemon_alive() {
 }
 
 stop_existing_daemon() {
-    # Request a graceful shutdown via IPC first so the daemon can release virtual displays cleanly.
     timeout 8 env CLASSPATH="$1" /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" --stop >/dev/null 2>&1 || true
     if is_daemon_alive; then
         pkill -f "$DAEMON_PAT_SHORT" 2>/dev/null || true
@@ -117,11 +118,9 @@ if [ -n "$APK_PATHS" ]; then
         exit "$EXIT_SWAP_JAR"
     fi
 
-    # Best-effort permission/AppOps grants; individual ops may not exist on all Android versions or OEMs.
-    appops set "$HELPER_PKG" SYSTEM_ALERT_WINDOW allow 2>/dev/null
+    # Vendor-neutral AOSP permissions (zero OEM/MIUI hardcodes, zero SYSTEM_ALERT_WINDOW).
     appops set "$HELPER_PKG" POST_NOTIFICATION allow 2>/dev/null
     appops set "$HELPER_PKG" RUN_ANY_IN_BACKGROUND allow 2>/dev/null
-    appops set "$HELPER_PKG" "$MIUI_OP_BACKGROUND_START" allow 2>/dev/null
     appops set "$HELPER_PKG" ACCESS_RESTRICTED_SETTINGS allow 2>/dev/null
     pm grant "$HELPER_PKG" android.permission.POST_NOTIFICATIONS 2>/dev/null
     pm grant "$HELPER_PKG" android.permission.ACCESS_LOCAL_NETWORK 2>/dev/null
@@ -136,32 +135,35 @@ fi
 
 LOG_DST=/dev/null
 rm -f "$DAEMON_LOG" 2>/dev/null
-# Create the log file with noclobber (set -C) to defend against /data/local/tmp symlink attacks.
 if (umask 022; set -C; : > "$DAEMON_LOG") 2>/dev/null && [ -f "$DAEMON_LOG" ] && [ ! -L "$DAEMON_LOG" ]; then
     chown -h 2000:2000 "$DAEMON_LOG" 2>/dev/null
     LOG_DST="$DAEMON_LOG"
 fi
-chown -h 2000:2000 "$DAEMON_JAR" /data/local/tmp/opaldesk.conf /data/local/tmp/opaldesk_apps.conf /data/local/tmp/opaldesk_healed_v2 2>/dev/null
+chown -h 2000:2000 "$DAEMON_JAR" /data/local/tmp/opaldesk_v2.conf /data/local/tmp/opaldesk_v2_apps.conf 2>/dev/null
+
+DAEMON_EXTRA_ARG=""
+if [ "${OPALDESK_ROOT_ENHANCE:-0}" = "1" ]; then
+    DAEMON_EXTRA_ARG="--root-enhance"
+fi
 
 export CLASSPATH="$DAEMON_JAR"
 CUR_CTX=$(id -Z 2>/dev/null || echo "")
 case "$CUR_CTX" in
     *:shell:*)
-        (setsid /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" </dev/null >>"$LOG_DST" 2>&1 &)
+        (setsid /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" $DAEMON_EXTRA_ARG </dev/null >>"$LOG_DST" 2>&1 &)
         sleep 0.5
         ;;
     *)
-        # Prefer the standard shell SELinux domain when invoked from an unconfined/root-transitioned context.
-        (setsid runcon u:r:shell:s0 /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" </dev/null >>"$LOG_DST" 2>&1 &)
+        (setsid runcon u:r:shell:s0 /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" $DAEMON_EXTRA_ARG </dev/null >>"$LOG_DST" 2>&1 &)
         sleep 0.5
         if ! is_daemon_alive; then
-            (setsid /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" </dev/null >>"$LOG_DST" 2>&1 &)
+            (setsid /system/bin/app_process /data/local/tmp "$DAEMON_CLASS" $DAEMON_EXTRA_ARG </dev/null >>"$LOG_DST" 2>&1 &)
             sleep 0.5
         fi
         ;;
 esac
 if ! is_daemon_alive; then
-    nohup app_process /data/local/tmp "$DAEMON_CLASS" >>"$LOG_DST" 2>&1 </dev/null &
+    nohup app_process /data/local/tmp "$DAEMON_CLASS" $DAEMON_EXTRA_ARG >>"$LOG_DST" 2>&1 </dev/null &
 fi
 sleep 1
 if [ "$LOG_DST" != "/dev/null" ]; then

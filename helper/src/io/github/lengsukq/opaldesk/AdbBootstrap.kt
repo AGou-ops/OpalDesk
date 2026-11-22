@@ -133,24 +133,33 @@ object AdbBootstrap {
             }
         }
 
-    fun rootBootstrapAsync(ctx: Context, markAutoRoot: Boolean, listener: ProgressListener?) =
-        submitBootstrap(ctx, listener, "rootBootstrap") { appCtx ->
-            postStep(listener, "正在请求 Root (su) 权限...")
-            val staged = DaemonBootstrapScripts.stageBridgeJarWithSha256(appCtx)
-            if (staged == null || staged.first.isEmpty() || staged.second.isEmpty()) {
-                postResult(listener, false, "无法从 APK 释放并校验 opaldesk.jar"); return@submitBootstrap
-            }
-            val res = AdbProcessRunner.runSu(25000, DaemonBootstrapScripts.buildRootBootstrapScript(staged.first, staged.second))
-            val out = res.output.trim()
-            if (res.code != 0 || !out.contains("LAUNCH_DONE")) {
-                val hint = if (out.contains("NO_ROOT")) {
-                    "未获取到 Root 权限（请在 Magisk / KernelSU / APatch 弹窗中允许授权，或改用无线调试/Shizuku/ADB 激活）。"
-                } else "Root 执行失败（设备可能未 Root 或未对 OpalDesk 授权 Root）：\n$out"
-                postResult(listener, false, hint); return@submitBootstrap
-            }
-            if (markAutoRoot) setAutoRootEnabled(appCtx, true)
-            awaitDaemonBinderReady(appCtx, DIAG_ROOT, listener, "Root 一键激活成功，OpalDesk 服务已就绪！")
+    fun rootBootstrapAsync(
+        ctx: Context,
+        markAutoRoot: Boolean,
+        rootEnhance: Boolean = AppPrefs.isRootEnhanceEnabled(ctx),
+        listener: ProgressListener?,
+    ) = submitBootstrap(ctx, listener, "rootBootstrap") { appCtx ->
+        postStep(listener, "正在请求 Root (su) 权限...")
+        val staged = DaemonBootstrapScripts.stageBridgeJarWithSha256(appCtx)
+        if (staged == null || staged.first.isEmpty() || staged.second.isEmpty()) {
+            postResult(listener, false, "无法从 APK 释放并校验 opaldesk.jar"); return@submitBootstrap
         }
+        val script = DaemonBootstrapScripts.buildRootBootstrapScript(
+            stagedPath = staged.first,
+            expectedSha256 = staged.second,
+            rootEnhance = rootEnhance,
+        )
+        val res = AdbProcessRunner.runSu(25000, script)
+        val out = res.output.trim()
+        if (res.code != 0 || !out.contains("LAUNCH_DONE")) {
+            val hint = if (out.contains("NO_ROOT")) {
+                "未获取到 Root 权限（请在 Magisk / KernelSU / APatch 弹窗中允许授权，或改用无线调试/Shizuku/ADB 激活）。"
+            } else "Root 执行失败（设备可能未 Root 或未对 OpalDesk 授权 Root）：\n$out"
+            postResult(listener, false, hint); return@submitBootstrap
+        }
+        if (markAutoRoot) setAutoRootEnabled(appCtx, true)
+        awaitDaemonBinderReady(appCtx, DIAG_ROOT, listener, "Root 一键激活成功，OpalDesk 服务已就绪！")
+    }
 
     fun shizukuBootstrapAsync(ctx: Context, markAutoShizuku: Boolean, listener: ProgressListener?) =
         submitBootstrap(ctx, listener, "shizukuBootstrap") { appCtx ->
@@ -270,13 +279,10 @@ object AdbBootstrap {
         if (staged != null && staged.first.isNotEmpty()) {
             val stageFile = File(staged.first)
             if (stageFile.isFile && stageFile.length() > 0L) {
-                // Tier 1: Direct `adb push` via SYNC protocol — bypasses `pm path`, `/data/app` SELinux,
-                // Second Space / Split APKs, and Toybox `unzip` quirks.
                 val pushRes = AdbProcessRunner.runAdb(appCtx, 15000, "-s", target, "push", staged.first, remoteTmp)
                 if (pushRes.code == 0) {
                     pushedOk = true
                 } else {
-                    // Tier 2: Stream jar bytes over `adb shell` stdin into exclusive temp file.
                     val pipeRes = AdbProcessRunner.runAdbWithStdinFile(
                         appCtx,
                         15000,
@@ -291,7 +297,6 @@ object AdbBootstrap {
             }
         }
 
-        // Tier 3 fallback (multi-user/multi-split `pm path` extraction) is embedded inside post-push script.
         val script = DaemonBootstrapScripts.buildWirelessPostPushScript(remoteTmp, pushedOk, expectedSha256 = expectedSha)
         val shRes = AdbProcessRunner.runAdb(appCtx, 24000, "-s", target, "shell", script)
         if (shRes.code != 0 || !shRes.output.contains("LAUNCH_DONE")) {

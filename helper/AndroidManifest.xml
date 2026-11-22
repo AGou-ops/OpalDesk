@@ -1,7 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
@@ -10,21 +9,11 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.BLUETOOTH" />
 
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
-        </intent>
-        <intent>
-            <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
-        </intent>
-        <intent>
-            <action android:name="android.media.browse.MediaBrowserService" />
-        </intent>
-        <intent>
-            <action android:name="android.settings.SETTINGS" />
         </intent>
         <package android:name="moe.shizuku.privileged.api" />
     </queries>
@@ -32,6 +21,7 @@
     <application
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
+        android:hardwareAccelerated="true"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher"
         android:label="OpalDesk"
@@ -46,7 +36,7 @@
             android:exported="true"
             android:label="OpalDesk"
             android:launchMode="singleTask"
-            android:taskAffinity="io.github.lengsukq.opaldesk.tablet"
+            android:taskAffinity="io.github.lengsukq.opaldesk.console"
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode">
             <intent-filter>
@@ -59,11 +49,11 @@
         </activity>
 
         <activity
-            android:name=".LocalDexActivity"
+            android:name=".DesktopActivity"
             android:exported="true"
-            android:label="OpalDesk 本机 DeX"
+            android:label="OpalDesk 桌面工作站"
             android:launchMode="singleTask"
-            android:taskAffinity="io.github.lengsukq.opaldesk.localdex"
+            android:taskAffinity="io.github.lengsukq.opaldesk.workstation"
             android:screenOrientation="sensorLandscape"
             android:resizeableActivity="true"
             android:windowSoftInputMode="adjustNothing|stateHidden"
@@ -71,43 +61,24 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
-            android:name=".TouchpadActivity"
+            android:name=".ExternalDesktopActivity"
             android:exported="false"
-            android:label="OpalDesk 触摸板"
-            android:launchMode="singleTask"
-            android:taskAffinity="io.github.lengsukq.opaldesk.tablet"
-            android:resizeableActivity="true"
-            android:windowSoftInputMode="adjustResize|stateHidden"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
-
-        <activity
-            android:name=".SideControlActivity"
-            android:exported="false"
-            android:label="OpalDesk 副屏直控"
-            android:launchMode="singleTask"
-            android:taskAffinity="io.github.lengsukq.opaldesk.tablet"
-            android:resizeableActivity="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
-
-        <activity
-            android:name=".SideMouseCaptureActivity"
-            android:exported="false"
-            android:excludeFromRecents="true"
-            android:noHistory="true"
-            android:resizeableActivity="false"
+            android:label="OpalDesk 外接屏工作站"
             android:launchMode="singleInstance"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen"
-            android:taskAffinity="io.github.lengsukq.opaldesk.capture"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize" />
+            android:taskAffinity="io.github.lengsukq.opaldesk.external"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustNothing|stateHidden"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
-            android:name=".LauncherActivity"
-            android:exported="true"
-            android:label="OpalDesk 桌面"
+            android:name=".cast.PeerCastViewerActivity"
+            android:exported="false"
+            android:label="OpalDesk 设备互投接收端"
             android:launchMode="singleTask"
-            android:taskAffinity="io.github.lengsukq.opaldesk.extdesktop"
+            android:screenOrientation="sensorLandscape"
             android:resizeableActivity="true"
-            android:windowSoftInputMode="stateAlwaysHidden|adjustNothing"
+            android:windowSoftInputMode="adjustNothing|stateHidden"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
@@ -117,45 +88,8 @@
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="External display overlay controller and cursor presenter" />
+                android:value="Universal Android multi-window compositor session and external display host" />
         </service>
-
-        <service
-            android:name=".NavAssistService"
-            android:exported="true"
-            android:label="OpalDesk 平板辅助手势"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data
-                android:name="android.accessibilityservice"
-                android:resource="@xml/nav_assist_config" />
-        </service>
-
-        <receiver
-            android:name=".ControlReceiver"
-            android:exported="true"
-            android:permission="android.permission.INJECT_EVENTS">
-            <intent-filter>
-                <action android:name="io.github.lengsukq.opaldesk.BINDER_PUSH" />
-                <action android:name="io.github.lengsukq.opaldesk.TOGGLE_INPUT" />
-                <action android:name="io.github.lengsukq.opaldesk.STATE_SYNC" />
-                <action android:name="io.github.lengsukq.opaldesk.REBUILD" />
-                <action android:name="io.github.lengsukq.opaldesk.LAUNCH_EXT_HOME" />
-                <action android:name="io.github.lengsukq.opaldesk.TOGGLE_MIRROR" />
-                <action android:name="io.github.lengsukq.opaldesk.SET_MIRROR_SIDE_MODE" />
-                <action android:name="io.github.lengsukq.opaldesk.SPLIT_ACTION" />
-                <action android:name="io.github.lengsukq.opaldesk.SET_ROTATION" />
-                <action android:name="io.github.lengsukq.opaldesk.SET_DOCK_AUTO_HIDE" />
-                <action android:name="io.github.lengsukq.opaldesk.STOP_LOCAL_DEX" />
-                <action android:name="io.github.lengsukq.opaldesk.EXIT_ALL" />
-            </intent-filter>
-        </receiver>
-
-        <receiver
-            android:name=".ControlReceiver$Internal"
-            android:exported="false" />
 
         <receiver
             android:name=".AdbPairingReceiver"

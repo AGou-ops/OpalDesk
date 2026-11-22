@@ -24,13 +24,11 @@ class AdbHelperLogicTest {
             AdbProcessRunner.isLocalDeviceAddress(InetAddress.getByName(localIpv4)),
         )
 
-        // Public & RFC documentation addresses must always be rejected.
         val nonLocalAddresses = listOf("8.8.8.8", "1.1.1.1", "198.51.100.42", "203.0.113.99", "2001:db8::1")
         for (ip in nonLocalAddresses) {
             assertFalse("Expected $ip to be rejected", AdbProcessRunner.isLocalDeviceAddress(InetAddress.getByName(ip)))
         }
 
-        // Private RFC1918 LAN addresses not assigned to this host must be rejected.
         val foreignPrivateIps = findNonLocalPrivateLanAddresses(localIpv4)
         assertTrue("Expected at least two unused private LAN test IPs", foreignPrivateIps.size >= 2)
         for (addr in foreignPrivateIps) {
@@ -60,7 +58,6 @@ class AdbHelperLogicTest {
             assertTrue("Expected host '$host' to be allowed", AdbProcessRunner.isAllowedLocalHost(host))
         }
 
-        // Any active local non-loopback IPv4 interface must also be allowed.
         for (ip in findLocalNonLoopbackIpv4Addresses()) {
             assertTrue("Expected local NIC IPv4 '$ip' to be allowed", AdbProcessRunner.isAllowedLocalHost(ip))
         }
@@ -91,7 +88,7 @@ class AdbHelperLogicTest {
     }
 
     @Test
-    fun buildPcAdbCommandSatisfiesCrossShellAndFailClosedInvariants() {
+    fun buildPcAdbCommandSatisfiesVendorNeutralCrossShellAndFailClosedInvariants() {
         val cmd = DaemonBootstrapScripts.buildPcAdbCommand()
         assertTrue("Must start with adb shell quote", cmd.startsWith("adb shell \""))
         assertTrue("Must end with closing quote", cmd.endsWith("\""))
@@ -103,10 +100,12 @@ class AdbHelperLogicTest {
         assertFalse("PC ADB command must not contain backticks", inner.contains('`'))
         assertFalse("PC ADB command must not contain inner double quotes", inner.contains('"'))
 
-        // Required permission & privilege grants.
-        assertTrue(inner.contains("appops set io.github.lengsukq.opaldesk 10021 allow"))
+        // Vendor-neutral: zero MIUI/HyperOS 10021 or SYSTEM_ALERT_WINDOW overlay dependencies!
+        assertFalse("Must not contain MIUI 10021 AppOp", inner.contains("10021"))
+        assertFalse("Must not require SYSTEM_ALERT_WINDOW", inner.contains("SYSTEM_ALERT_WINDOW"))
+
+        // Required AOSP permission & privilege grants.
         assertTrue(inner.contains("appops set io.github.lengsukq.opaldesk ACCESS_RESTRICTED_SETTINGS allow"))
-        assertTrue(inner.contains("appops set io.github.lengsukq.opaldesk SYSTEM_ALERT_WINDOW allow"))
         assertTrue(inner.contains("appops set io.github.lengsukq.opaldesk RUN_ANY_IN_BACKGROUND allow"))
         assertTrue(inner.contains("pm grant io.github.lengsukq.opaldesk android.permission.POST_NOTIFICATIONS"))
         assertTrue(inner.contains("pm grant io.github.lengsukq.opaldesk android.permission.ACCESS_LOCAL_NETWORK"))
@@ -135,10 +134,10 @@ class AdbHelperLogicTest {
         val expectedLowerSha = "a1b2c3d4".repeat(8)
         val script = DaemonBootstrapScripts.buildShellSwapAndLaunchScript("\"\$TMP_JAR\"", validUpperSha)
 
-        // Required appops & permissions.
-        assertTrue(script.contains("appops set io.github.lengsukq.opaldesk 10021 allow"))
+        // Vendor-neutral AOSP permissions only.
+        assertFalse(script.contains("10021"))
+        assertFalse(script.contains("SYSTEM_ALERT_WINDOW"))
         assertTrue(script.contains("appops set io.github.lengsukq.opaldesk ACCESS_RESTRICTED_SETTINGS allow"))
-        assertTrue(script.contains("appops set io.github.lengsukq.opaldesk SYSTEM_ALERT_WINDOW allow"))
         assertTrue(script.contains("appops set io.github.lengsukq.opaldesk POST_NOTIFICATION allow"))
         assertTrue(script.contains("appops set io.github.lengsukq.opaldesk RUN_ANY_IN_BACKGROUND allow"))
         assertTrue(script.contains("pm grant io.github.lengsukq.opaldesk android.permission.POST_NOTIFICATIONS"))
@@ -158,7 +157,6 @@ class AdbHelperLogicTest {
         assertTrue(script.contains("LAUNCH_DONE"))
         assertTrue(script.contains("ERR_DAEMON_DIED"))
 
-        // Malformed or shell-injection SHA-256 inputs must never be interpolated into the script.
         val untrustedShas = listOf(null, "", "deadbeef", "g".repeat(64), "\$(touch /tmp/pwn)", "'; rm -rf /; '")
         for (badSha in untrustedShas) {
             val sanitized = DaemonBootstrapScripts.buildShellSwapAndLaunchScript("'/data/local/tmp/t.jar'", badSha)
@@ -171,7 +169,7 @@ class AdbHelperLogicTest {
     }
 
     @Test
-    fun wirelessShizukuAndRootBootstrapScriptsPreservePrivilegeDropAndQuotingInvariants() {
+    fun wirelessShizukuAndRootBootstrapScriptsPreservePrivilegeDropAndOptionalRootEnhance() {
         val validSha = "0123456789abcdef".repeat(4)
 
         val wireless = DaemonBootstrapScripts.buildWirelessAdbBootstrapScript(validSha, userId = 10)
@@ -180,7 +178,7 @@ class AdbHelperLogicTest {
         assertTrue(wireless.contains("ERR_STAGE_JAR"))
         assertTrue(wireless.contains("pm path --user 10 io.github.lengsukq.opaldesk"))
         assertFalse(wireless.contains("unzip -tq"))
-        assertTrue(wireless.contains("appops set io.github.lengsukq.opaldesk 10021 allow"))
+        assertFalse(wireless.contains("10021"))
         assertTrue(wireless.contains("'$validSha'"))
 
         val postPush = DaemonBootstrapScripts.buildWirelessPostPushScript("/data/local/tmp/opd_1234.jar", pushedOk = true, userId = 0, expectedSha256 = validSha)
@@ -198,18 +196,20 @@ class AdbHelperLogicTest {
         assertTrue(shizukuLaunch.contains("LAUNCH_DONE"))
         assertFalse(shizukuLaunch.contains("unzip -tq"))
 
-        // Single quotes in stagedPath must be stripped to prevent shell breakout.
-        val root = DaemonBootstrapScripts.buildRootBootstrapScript("/data/user/0/app/a'b;id.jar", validSha, userId = 0)
-        assertTrue(root.contains("UID_NOW="))
-        assertTrue(root.contains("ERR_STAGE_HASH:"))
-        assertTrue(root.contains("chown -h 2000:2000"))
-        assertTrue(root.contains("su 2000 -c"))
-        assertTrue(root.contains("su shell -c"))
-        assertTrue(root.contains("appops set io.github.lengsukq.opaldesk 10021 allow"))
-        assertTrue(root.contains("LAUNCH_DONE"))
-        assertFalse(root.contains("unzip -tq"))
-        assertFalse("Unstripped single quote must not appear in staged path", root.contains("a'b;id.jar"))
-        assertTrue(root.contains("'/data/user/0/app/ab;id.jar'"))
+        // Root standard (rootEnhance = false)
+        val rootPlain = DaemonBootstrapScripts.buildRootBootstrapScript("/data/user/0/app/a'b;id.jar", validSha, userId = 0, rootEnhance = false)
+        assertTrue(rootPlain.contains("UID_NOW="))
+        assertTrue(rootPlain.contains("ERR_STAGE_HASH:"))
+        assertTrue(rootPlain.contains("chown -h 2000:2000"))
+        assertTrue(rootPlain.contains("su 2000 -c"))
+        assertFalse(rootPlain.contains("--root-enhance"))
+        assertFalse("Unstripped single quote must not appear in staged path", rootPlain.contains("a'b;id.jar"))
+        assertTrue(rootPlain.contains("'/data/user/0/app/ab;id.jar'"))
+
+        // Root with optional ~5% enhancements (rootEnhance = true)
+        val rootEnhanced = DaemonBootstrapScripts.buildRootBootstrapScript("/data/user/0/app/s.jar", validSha, userId = 0, rootEnhance = true)
+        assertTrue(rootEnhanced.contains("force_resizable_activities 1"))
+        assertTrue(rootEnhanced.contains("--root-enhance"))
     }
 
     private fun findNonLocalPrivateLanAddresses(localIpv4: String): List<InetAddress> {

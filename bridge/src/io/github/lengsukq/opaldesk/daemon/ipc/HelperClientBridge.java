@@ -30,30 +30,30 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Cert-pinned IPC bridge to {@code io.github.lengsukq.opaldesk}: SHA-256 certificate verification,
- * caller trust checks, ContentProvider/Broadcast Binder push, death linking, and state-sync pings.
+ * caller trust checks, ContentProvider Binder push, death linking, and coalesced scene-state sync.
  */
 public final class HelperClientBridge {
     private static final long HELPER_UID_CACHE_MS = 5000L;
-    private static final long PUSH_RATE_LIMIT_MS = 700L;
+    private static final long PUSH_RATE_LIMIT_MS = 600L;
     private static final long TICK_PUSH_INTERVAL_MS = 2500L;
 
     private final AndroidServices services;
     private final DaemonConfig config;
-    private final ExecutorService bgIoExec;
     private final ExecutorService binderPushExec = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "ExtBinderPush");
+        Thread t = new Thread(r, "OpalBinderPush");
         t.setDaemon(true);
         return t;
     });
-    private final ExecutorService statePushExec = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "ExtStatePush");
+    private final ExecutorService scenePushExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "OpalScenePush");
         t.setDaemon(true);
         return t;
     });
+
     private final Object pendingPushLock = new Object();
-    private String pendingWinJson;
+    private String pendingSceneJson;
     private long pendingStateSeq = -1L;
-    private boolean statePushScheduled;
+    private boolean scenePushScheduled;
 
     private volatile IBinder ctlBinder;
     private volatile IBinder helperProcToken;
@@ -61,13 +61,11 @@ public final class HelperClientBridge {
     private volatile int verifiedHelperUid = -1;
     private volatile long lastHelperUidVerifyMs = 0L;
     private volatile boolean preferExternalProviderCall = false;
-    private volatile boolean skipDirectStartService = false;
     private final AtomicLong lastBinderPushAttemptMs = new AtomicLong(0L);
 
-    public HelperClientBridge(AndroidServices services, DaemonConfig config, ExecutorService bgIoExec) {
+    public HelperClientBridge(AndroidServices services, DaemonConfig config) {
         this.services = services;
         this.config = config;
-        this.bgIoExec = bgIoExec;
     }
 
     public static boolean isTrustedDaemonServerUid(int uid) {
@@ -119,11 +117,7 @@ public final class HelperClientBridge {
             verifiedHelperUid = verifyHelperUid(services.context);
             lastHelperUidVerifyMs = now;
             return verifiedHelperUid;
-        } catch (PackageManager.NameNotFoundException e) {
-            verifiedHelperUid = -1;
-            return -1;
-        } catch (RuntimeException e) {
-            System.err.println("OPALDESK_HELPER_UID_ERR: " + e.getMessage());
+        } catch (PackageManager.NameNotFoundException | RuntimeException e) {
             verifiedHelperUid = -1;
             return -1;
         }
@@ -165,7 +159,6 @@ public final class HelperClientBridge {
                     && pi.applicationInfo.uid == helperUid
                     && BridgeBuildConfig.HELPER_PACKAGE.equals(pi.packageName);
         } catch (RuntimeException e) {
-            System.err.println("OPALDESK_PROVIDER_OWNER_ERR: " + e.getMessage());
             return false;
         }
     }
@@ -193,7 +186,6 @@ public final class HelperClientBridge {
             if (msg != null && msg.contains("Unable to find app for caller")) {
                 preferExternalProviderCall = true;
             }
-            System.err.println("OPALDESK_PROVIDER_CALL_WARN method=" + method + ": " + msg);
         }
         if ((res == null || !res.getBoolean("ok", false)) && isVerifiedHelperProviderOwner()) {
             res = AndroidServices.callContentProviderExternal(
@@ -216,100 +208,50 @@ public final class HelperClientBridge {
         }
     }
 
-    public void startHelperService() {
-        if (skipDirectStartService || services.context == null || getVerifiedHelperUid() <= 0) return;
-        try {
-            Intent svc = new Intent().setComponent(new ComponentName(
-                    BridgeBuildConfig.HELPER_PACKAGE, BridgeProtocol.HELPER_SERVICE_CLASS));
-            if (Build.VERSION.SDK_INT >= 26) services.context.startForegroundService(svc);
-            else services.context.startService(svc);
-        } catch (RuntimeException e) {
-            String msg = e.getMessage();
-            if (msg != null && msg.contains("Unable to find app for caller")) {
-                skipDirectStartService = true;
-            }
-            System.err.println("OPALDESK_START_HELPER_SVC_WARN: " + msg);
-        }
-    }
-
-    public void notifyHelperSync() {
-        if (config.shuttingDown || !isHelperAlive()) return;
-        statePushExec.execute(() -> {
-            if (!config.shuttingDown && isHelperAlive()) {
-                callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_STATE, null);
-            }
-        });
-    }
-
-    /**
-     * Coalescing zero-roundtrip push of the latest window snapshot JSON and monotonic {@code stateSeq}
-     * directly inside {@code PROVIDER_METHOD_SYNC_STATE}, giving the Helper sub-30ms focus/bounds updates.
-     */
-    public void pushWindowState(String winJson, long stateSeq) {
-        if (config.shuttingDown || !isHelperAlive() || winJson == null) return;
+    public void pushSceneState(String sceneJson, long stateSeq) {
+        if (config.shuttingDown || !isHelperAlive() || sceneJson == null) return;
         boolean shouldSchedule;
         synchronized (pendingPushLock) {
-            pendingWinJson = winJson;
+            pendingSceneJson = sceneJson;
             pendingStateSeq = stateSeq;
-            shouldSchedule = !statePushScheduled;
-            statePushScheduled = true;
+            shouldSchedule = !scenePushScheduled;
+            scenePushScheduled = true;
         }
         if (!shouldSchedule) return;
-        statePushExec.execute(() -> {
+        scenePushExec.execute(() -> {
             while (!config.shuttingDown && isHelperAlive()) {
                 String json;
                 long seq;
                 synchronized (pendingPushLock) {
-                    json = pendingWinJson;
+                    json = pendingSceneJson;
                     seq = pendingStateSeq;
-                    pendingWinJson = null;
+                    pendingSceneJson = null;
                     if (json == null) {
-                        statePushScheduled = false;
+                        scenePushScheduled = false;
                         return;
                     }
                 }
                 Bundle extras = new Bundle();
-                extras.putString(BridgeProtocol.EXTRA_SYNC_WIN_JSON, json);
+                extras.putString(BridgeProtocol.EXTRA_SYNC_SCENE_JSON, json);
                 extras.putLong(BridgeProtocol.EXTRA_SYNC_STATE_SEQ, seq);
-                callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_STATE, extras);
+                callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_SCENE, extras);
             }
             synchronized (pendingPushLock) {
-                pendingWinJson = null;
-                statePushScheduled = false;
+                pendingSceneJson = null;
+                scenePushScheduled = false;
             }
         });
-    }
-
-    /** Pushes a global DeX desktop keyboard shortcut action directly to the Helper overlay shell. */
-    public void pushDesktopShortcut(String shortcutAction) {
-        if (config.shuttingDown || !isHelperAlive() || shortcutAction == null || shortcutAction.isEmpty()) return;
-        statePushExec.execute(() -> {
-            if (config.shuttingDown || !isHelperAlive()) return;
-            Bundle extras = new Bundle();
-            extras.putString(BridgeProtocol.EXTRA_SYNC_SHORTCUT, shortcutAction);
-            callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SYNC_STATE, extras);
-        });
-    }
-
-    public void notifyMirrorEdgeCapture(boolean enter, float cx, float cy) {
-        if (services.context == null || config.shuttingDown) return;
-        Bundle b = new Bundle();
-        b.putBoolean("enter", enter);
-        b.putFloat("cx", cx);
-        b.putFloat("cy", cy);
-        callHelperProvider(BridgeProtocol.PROVIDER_METHOD_MIR_EDGE_CAPTURE, b);
     }
 
     public void grantHelperPrivileges() {
         if (getVerifiedHelperUid() <= 0) return;
-        ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "10021", "allow");
-        ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "ACCESS_RESTRICTED_SETTINGS", "allow");
-        ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "SYSTEM_ALERT_WINDOW", "allow");
+        // Standard AOSP background & notification grants (zero SYSTEM_ALERT_WINDOW or MIUI ops needed!)
+        ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "RUN_ANY_IN_BACKGROUND", "allow");
+        ShellCommand.runOutput("pm", "grant", BridgeBuildConfig.HELPER_PACKAGE, "android.permission.POST_NOTIFICATIONS");
         if (Build.VERSION.SDK_INT >= 37) {
             ShellCommand.runOutput("pm", "grant", BridgeBuildConfig.HELPER_PACKAGE, "android.permission.ACCESS_LOCAL_NETWORK");
             ShellCommand.runOutput("appops", "set", BridgeBuildConfig.HELPER_PACKAGE, "ACCESS_LOCAL_NETWORK", "allow");
         }
-        AndroidServices.grantBindAppWidgetPermission(BridgeBuildConfig.HELPER_PACKAGE, 0);
     }
 
     private void pushBinderToHelper() {
@@ -322,13 +264,17 @@ public final class HelperClientBridge {
                     ? callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SET_BINDER, b) : null;
             if (res != null && res.getBoolean("ok", false)) {
                 linkHelperProcessToken(res.getBinder("proc"));
-            } else {
-                sendBinderFallbackBroadcast(b);
             }
         } catch (RuntimeException e) {
-            System.err.println("OPALDESK_PUSH_BINDER_ERR: " + e.getMessage());
+            System.err.println("OPALDESK_PUSH_BINDER_WARN: " + e.getMessage());
         }
-        startHelperService();
+        try {
+            Intent svc = new Intent().setComponent(new ComponentName(
+                    BridgeBuildConfig.HELPER_PACKAGE, BridgeProtocol.HELPER_SERVICE_CLASS));
+            if (Build.VERSION.SDK_INT >= 26) services.context.startForegroundService(svc);
+            else services.context.startService(svc);
+        } catch (RuntimeException ignored) {
+        }
     }
 
     private void linkHelperProcessToken(IBinder tok) {
@@ -343,26 +289,7 @@ public final class HelperClientBridge {
                 }
             }, 0);
         } catch (RemoteException e) {
-            System.err.println("OPALDESK_LINK_DEATH_WARN: " + e.getMessage());
             if (helperProcToken == tok) helperProcToken = null;
-        }
-    }
-
-    private void sendBinderFallbackBroadcast(Bundle extras) {
-        if (services.context == null || extras == null || getVerifiedHelperUid() <= 0) return;
-        try {
-            Intent bi = new Intent(BridgeProtocol.HELPER_ACTION_BINDER_PUSH)
-                    .setComponent(new ComponentName(BridgeBuildConfig.HELPER_PACKAGE, BridgeProtocol.HELPER_CONTROL_RECEIVER_CLASS))
-                    .addFlags(Intent.FLAG_RECEIVER_FOREGROUND | Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-                    .putExtras(extras);
-            if (Build.VERSION.SDK_INT >= 34) {
-                Bundle opts = android.app.BroadcastOptions.makeBasic().setShareIdentityEnabled(true).toBundle();
-                services.context.sendBroadcast(bi, "android.permission.INJECT_EVENTS", opts);
-            } else {
-                services.context.sendBroadcast(bi, "android.permission.INJECT_EVENTS");
-            }
-        } catch (RuntimeException e) {
-            System.err.println("OPALDESK_BINDER_BCAST_ERR: " + e.getMessage());
         }
     }
 }

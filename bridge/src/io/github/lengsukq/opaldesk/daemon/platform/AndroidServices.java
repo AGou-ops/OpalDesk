@@ -4,7 +4,6 @@ import android.app.ActivityManager;
 import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
-import android.graphics.Point;
 import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.os.Binder;
@@ -22,30 +21,25 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Centralized Android hidden-API service lookup and cached reflection handles for
- * {@code ServiceManager}, {@code IWindowManager}, {@code IInputManager}, {@code IActivityTaskManager},
- * {@code IDisplayManager}, {@code IActivityManager}, {@code IAppWidgetService}, {@code IClipboard},
- * and {@code MotionEvent.setActionButton}.
+ * OEM-agnostic Android system service binder facade for {@code OpalDeskDaemon} ({@code uid=2000}).
+ * Resolves {@code IWindowManager}, {@code IActivityTaskManager}, {@code IInputManager},
+ * {@code IDisplayManager}, {@code IActivityManager}, and virtual display IME policies.
  */
 public final class AndroidServices {
-    private static final String SHELL_PACKAGE = "com.android.shell";
+    public static final String SHELL_PACKAGE = "com.android.shell";
 
-    // Cached static reflection handles shared across daemon components
     private static volatile Method sGetServiceMethod;
     private static volatile boolean sGetServiceChecked;
-
     private static volatile Method sSetActionButtonMethod;
     private static volatile boolean sSetActionButtonChecked;
-
+    private static final Object CLIPBOARD_LOCK = new Object();
+    private static volatile boolean sClipboardInitAttempted;
     private static volatile Object sIClipboard;
     private static volatile Method sSetPrimaryClipMethod;
     private static volatile int sSetPrimaryClipArgCount;
     private static volatile Method sGetPrimaryClipMethod;
     private static volatile int sGetPrimaryClipArgCount;
-    private static volatile boolean sClipboardInitAttempted;
-    private static final Object CLIPBOARD_LOCK = new Object();
 
-    // Instance service references & cached Method handles
     public final Context context;
     public final Context systemContext;
     public final DisplayManager displayManager;
@@ -58,33 +52,11 @@ public final class AndroidServices {
 
     public final Method injectInputEventMethod;
     public final Method setDisplayIdMethod;
-    public final Method getCursorPositionMethod;
-    public final Method addInputAssocMethod;
-    public final Method removeInputAssocMethod;
-    public final Method replaceContentOnDisplayMethod;
-    public final Method mirrorDisplayMethod;
-    public final Method moveDisplayToTopMethod;
     public final Method startActivityMethod;
     public final Method focusTopTaskMethod;
-    public final Method getDisplayInfoMethod;
-    public final Method getDisplayTypeMethod;
-
-    public final Method setUserPreferredModeMethod;
-    public final Object setUserPreferredModeTarget;
-    public final int setUserPreferredModeArgCount;
-
-    public AndroidServices(
-            Context context,
-            DisplayManager displayManager,
-            InputManager inputManager,
-            Object iWindowManager,
-            Object iInputManager,
-            Object iActivityTaskManager,
-            Object iDisplayManager,
-            Object iActivityManager) {
-        this(context, context, displayManager, inputManager, iWindowManager,
-                iInputManager, iActivityTaskManager, iDisplayManager, iActivityManager);
-    }
+    public final Method moveDisplayToTopMethod;
+    public final Method setDisplayImePolicyMethod;
+    public final Method shouldShowSystemDecorsMethod;
 
     public AndroidServices(
             Context context,
@@ -108,48 +80,30 @@ public final class AndroidServices {
 
         this.injectInputEventMethod = resolveInjectInputEventMethod(iInputManager);
         this.setDisplayIdMethod = findMethodOrNull(InputEvent.class, "setDisplayId", int.class);
-        this.getCursorPositionMethod = (iInputManager != null)
-                ? findMethodOrNull(iInputManager.getClass(), "getCursorPositionInLogicalDisplay", int.class)
-                : null;
-        this.addInputAssocMethod = findMethodOrNull(
-                InputManager.class, "addUniqueIdAssociationByDescriptor", String.class, String.class);
-        this.removeInputAssocMethod = findMethodOrNull(
-                InputManager.class, "removeUniqueIdAssociationByDescriptor", String.class);
-
-        this.replaceContentOnDisplayMethod = findMethodByName(iWindowManager, "replaceContentOnDisplay", -1);
-        this.mirrorDisplayMethod = findMethodByName(iWindowManager, "mirrorDisplay", -1);
-        this.moveDisplayToTopMethod = findMethodByName(iWindowManager, "moveDisplayToTop", 2);
-
         this.startActivityMethod = findMethodByName(iActivityTaskManager, "startActivity", 11);
         this.focusTopTaskMethod = findMethodByName(iActivityTaskManager, "focusTopTask", 1);
-        this.getDisplayInfoMethod = (iDisplayManager != null)
-                ? findMethodOrNull(iDisplayManager.getClass(), "getDisplayInfo", int.class)
+        this.moveDisplayToTopMethod = findMethodByName(iWindowManager, "moveDisplayToTop", 2);
+        this.setDisplayImePolicyMethod = (iWindowManager != null)
+                ? findMethodOrNull(iWindowManager.getClass(), "setDisplayImePolicy", int.class, int.class)
                 : null;
-        this.getDisplayTypeMethod = findMethodOrNull(Display.class, "getType");
-
-        PreferredModeBinding pref = resolveUserPreferredModeBinding(displayManager, iDisplayManager);
-        this.setUserPreferredModeMethod = pref.method;
-        this.setUserPreferredModeTarget = pref.target;
-        this.setUserPreferredModeArgCount = pref.argCount;
+        this.shouldShowSystemDecorsMethod = (iWindowManager != null)
+                ? findMethodOrNull(iWindowManager.getClass(), "setShouldShowSystemDecors", int.class, boolean.class)
+                : null;
     }
 
-    /** Creates the base Android system {@link Context} via {@code ActivityThread.systemMain()}. */
     public static Context createSystemContext() throws ReflectiveOperationException {
         Class<?> atCls = Class.forName("android.app.ActivityThread");
         Object at = atCls.getMethod("systemMain").invoke(null);
         return (Context) atCls.getMethod("getSystemContext").invoke(at);
     }
 
-    /**
-     * Initializes the daemon's shell system Context and binds all required system services.
-     */
     public static AndroidServices createForDaemon() throws ReflectiveOperationException {
         Context sysCtx = createSystemContext();
         Context shellCtx = sysCtx;
         try {
             shellCtx = sysCtx.createPackageContext(SHELL_PACKAGE, Context.CONTEXT_IGNORE_SECURITY);
         } catch (Throwable t) {
-            System.err.println("OPALDESK_SHELL_CTX_WARN createPackageContext failed: " + t.getMessage());
+            System.err.println("OPALDESK_SHELL_CTX_WARN: " + t.getMessage());
         }
         shellCtx = fixShellContext(shellCtx);
         DisplayManager dm = (DisplayManager) shellCtx.getSystemService(Context.DISPLAY_SERVICE);
@@ -166,12 +120,20 @@ public final class AndroidServices {
 
     public static IBinder getServiceBinder(String name) {
         if (name == null || name.isEmpty()) return null;
-        Method m = getServiceMethod();
+        if (!sGetServiceChecked) {
+            try {
+                sGetServiceMethod = Class.forName("android.os.ServiceManager").getMethod("getService", String.class);
+            } catch (ReflectiveOperationException e) {
+                System.err.println("OPALDESK_SM_ERR: " + e.getMessage());
+            } finally {
+                sGetServiceChecked = true;
+            }
+        }
+        Method m = sGetServiceMethod;
         if (m == null) return null;
         try {
             return (IBinder) m.invoke(null, name);
         } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_SVC_LOOKUP_ERR name=" + name + ": " + unwrapMessage(e));
             return null;
         }
     }
@@ -183,15 +145,10 @@ public final class AndroidServices {
             Class<?> stubCls = Class.forName(stubClassName);
             return stubCls.getMethod("asInterface", IBinder.class).invoke(null, binder);
         } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_SVC_STUB_ERR name=" + serviceName + " stub=" + stubClassName + ": " + unwrapMessage(e));
             return null;
         }
     }
 
-    /**
-     * Patches ContextImpl package & AttributionSource fields to {@code com.android.shell} so
-     * uid=2000 {@code app_process} Binder calls pass AppOps / AttributionSource verification.
-     */
     public static Context fixShellContext(Context base) {
         if (base == null) return null;
         setStringFieldQuietly(base, "mOpPackageName", SHELL_PACKAGE);
@@ -204,126 +161,57 @@ public final class AndroidServices {
                 fAttr.set(base, attrSrc);
             }
         } catch (NoSuchFieldException ignored) {
-            // Field only exists on Android 12+ ContextImpl.
         } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_SHELL_ATTR_WARN: " + unwrapMessage(e));
+            System.err.println("OPALDESK_ATTR_WARN: " + unwrapMessage(e));
         }
         return base;
     }
 
     /**
-     * Invokes hidden {@code MotionEvent.setActionButton(int)} using a cached {@link Method} handle.
+     * Configures IME policy for an isolated window VirtualDisplay so tapping text fields
+     * triggers soft keyboard fallback on Display 0 (or local IME where supported) instead of dropping input.
      */
-    public static void setActionButton(MotionEvent ev, int actionButton) {
-        if (ev == null || actionButton == 0) return;
-        if (!sSetActionButtonChecked) {
-            sSetActionButtonMethod = findMethodOrNull(MotionEvent.class, "setActionButton", int.class);
-            sSetActionButtonChecked = true;
-        }
-        Method m = sSetActionButtonMethod;
-        if (m == null) return;
-        try {
-            m.invoke(ev, actionButton);
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_SET_ACTION_BTN_ERR: " + unwrapMessage(e));
-        }
-    }
-
-    public static void disableLocalDisplayInfoCaches() {
-        try {
-            Class<?> dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal");
-            Method m = dmgCls.getMethod("disableLocalDisplayInfoCaches");
-            if (Modifier.isStatic(m.getModifiers())) {
-                m.invoke(null);
-            } else {
-                // Newer Android / HyperOS exposes disableLocalDisplayInfoCaches() as an instance method.
-                Object dmg = dmgCls.getMethod("getInstance").invoke(null);
-                if (dmg != null) {
-                    m.invoke(dmg);
-                }
+    public void configureVirtualDisplayWindowing(int displayId, int imePolicy) {
+        if (displayId <= 0 || iWindowManager == null) return;
+        if (shouldShowSystemDecorsMethod != null) {
+            try {
+                shouldShowSystemDecorsMethod.invoke(iWindowManager, displayId, false);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
             }
-        } catch (ClassNotFoundException | NoSuchMethodException ignored) {
-            // Not present on all API levels.
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_DMG_CACHE_WARN: " + unwrapMessage(e));
         }
-    }
-
-    // ---- IClipboard cached helpers ----
-
-    public static boolean setPrimaryClip(ClipData clip) {
-        if (clip == null) return false;
-        ensureClipboardInit();
-        Object cb = sIClipboard;
-        Method m = sSetPrimaryClipMethod;
-        if (cb == null || m == null) return false;
-        try {
-            switch (sSetPrimaryClipArgCount) {
-                case 5:
-                    m.invoke(cb, clip, SHELL_PACKAGE, null, 0, 0);
-                    return true;
-                case 4:
-                    m.invoke(cb, clip, SHELL_PACKAGE, null, 0);
-                    return true;
-                case 3:
-                    m.invoke(cb, clip, SHELL_PACKAGE, 0);
-                    return true;
-                case 2:
-                    m.invoke(cb, clip, SHELL_PACKAGE);
-                    return true;
-                default:
-                    return false;
+        if (setDisplayImePolicyMethod != null) {
+            try {
+                setDisplayImePolicyMethod.invoke(iWindowManager, displayId, imePolicy);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
             }
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_CLIPBOARD_SET_ERR: " + unwrapMessage(e));
-            return false;
         }
     }
 
-    public static ClipData getPrimaryClip() {
-        ensureClipboardInit();
-        Object cb = sIClipboard;
-        Method m = sGetPrimaryClipMethod;
-        if (cb == null || m == null) return null;
-        try {
-            Object res;
-            switch (sGetPrimaryClipArgCount) {
-                case 4:
-                    res = m.invoke(cb, SHELL_PACKAGE, null, 0, 0);
-                    break;
-                case 3:
-                    res = m.invoke(cb, SHELL_PACKAGE, null, 0);
-                    break;
-                case 2:
-                    res = m.invoke(cb, SHELL_PACKAGE, 0);
-                    break;
-                case 1:
-                    res = m.invoke(cb, SHELL_PACKAGE);
-                    break;
-                default:
-                    return null;
+    public void focusDisplay(int displayId) {
+        if (displayId <= 0) return;
+        if (focusTopTaskMethod != null && iActivityTaskManager != null) {
+            try {
+                focusTopTaskMethod.invoke(iActivityTaskManager, displayId);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
             }
-            return (res instanceof ClipData) ? (ClipData) res : null;
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_CLIPBOARD_GET_ERR: " + unwrapMessage(e));
-            return null;
+        }
+        if (moveDisplayToTopMethod != null && iWindowManager != null) {
+            try {
+                moveDisplayToTopMethod.invoke(iWindowManager, displayId, "OpalDesk");
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+            }
         }
     }
 
-    // ---- IAppWidgetService & IActivityManager helpers ----
-
-    public static boolean grantBindAppWidgetPermission(String pkg, int userId) {
-        if (pkg == null || pkg.isEmpty()) return false;
-        Object aw = getServiceInterface("appwidget", "com.android.internal.appwidget.IAppWidgetService$Stub");
-        if (aw == null) return false;
+    public boolean startActivityAsShell(Intent intent, Bundle options) {
+        if (intent == null || iActivityTaskManager == null || startActivityMethod == null) return false;
         try {
-            aw.getClass().getMethod("setBindAppWidgetPermission", String.class, int.class, boolean.class)
-                    .invoke(aw, pkg, userId, true);
-            Object has = aw.getClass().getMethod("hasBindAppWidgetPermission", String.class, int.class)
-                    .invoke(aw, pkg, userId);
-            return (has instanceof Boolean) && (Boolean) has;
+            Object rc = startActivityMethod.invoke(
+                    iActivityTaskManager, null, SHELL_PACKAGE, null, intent,
+                    null, null, null, 0, 0, null, options);
+            return !(rc instanceof Integer) || (Integer) rc >= 0;
         } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_APPWIDGET_GRANT_ERR pkg=" + pkg + ": " + unwrapMessage(e));
+            System.err.println("OPALDESK_START_ACTIVITY_ERR intent=" + intent + ": " + unwrapMessage(e));
             return false;
         }
     }
@@ -338,105 +226,21 @@ public final class AndroidServices {
             return (List<ActivityManager.RunningAppProcessInfo>)
                     am.getClass().getMethod("getRunningAppProcesses").invoke(am);
         } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_AM_PROCS_ERR: " + unwrapMessage(e));
             return null;
         }
     }
 
-    public int getDisplayType(Display display) {
-        if (display == null || getDisplayTypeMethod == null) return -1;
+    public static void setActionButton(MotionEvent ev, int actionButton) {
+        if (ev == null || actionButton == 0) return;
+        if (!sSetActionButtonChecked) {
+            sSetActionButtonMethod = findMethodOrNull(MotionEvent.class, "setActionButton", int.class);
+            sSetActionButtonChecked = true;
+        }
+        Method m = sSetActionButtonMethod;
+        if (m == null) return;
         try {
-            return (Integer) getDisplayTypeMethod.invoke(display);
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            return -1;
-        }
-    }
-
-    @SuppressWarnings("deprecation")
-    public Point readDisplayRealSize(int displayId) {
-        Point p = new Point(0, 0);
-        if (iDisplayManager != null && getDisplayInfoMethod != null) {
-            try {
-                Object di = getDisplayInfoMethod.invoke(iDisplayManager, displayId);
-                if (di != null) {
-                    int lw = TaskApiAdapter.readIntField(di, "logicalWidth", 0);
-                    int lh = TaskApiAdapter.readIntField(di, "logicalHeight", 0);
-                    if (lw > 0 && lh > 0) {
-                        p.set(lw, lh);
-                        return p;
-                    }
-                }
-            } catch (ReflectiveOperationException | RuntimeException e) {
-                System.err.println("OPALDESK_DISP_INFO_WARN displayId=" + displayId + ": " + unwrapMessage(e));
-            }
-        }
-        if (displayManager != null) {
-            try {
-                Display d = displayManager.getDisplay(displayId);
-                if (d != null) {
-                    d.getRealSize(p);
-                }
-            } catch (RuntimeException e) {
-                System.err.println("OPALDESK_DISP_SIZE_WARN displayId=" + displayId + ": " + e.getMessage());
-            }
-        }
-        return p;
-    }
-
-    public Object mirrorDisplay(int displayId) {
-        if (mirrorDisplayMethod == null || iWindowManager == null) return null;
-        try {
-            if (mirrorDisplayMethod.getParameterCount() == 2) {
-                Object outSc = SurfaceLayerHelper.surfaceControlClass().getConstructor().newInstance();
-                Object ok = mirrorDisplayMethod.invoke(iWindowManager, displayId, outSc);
-                return (ok instanceof Boolean && (Boolean) ok) ? outSc : null;
-            }
-            return mirrorDisplayMethod.invoke(iWindowManager, displayId);
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_MIRROR_DISPLAY_ERR id=" + displayId + ": " + unwrapMessage(e));
-            return null;
-        }
-    }
-
-    public boolean replaceContentOnDisplay(int displayId, Object rootSurfaceControl) {
-        if (displayId <= 0 || iWindowManager == null || replaceContentOnDisplayMethod == null) return false;
-        try {
-            replaceContentOnDisplayMethod.invoke(iWindowManager, displayId, rootSurfaceControl);
-            return true;
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_REPLACE_CONTENT_ERR id=" + displayId + ": " + unwrapMessage(e));
-            return false;
-        }
-    }
-
-    public void moveDisplayToTop(int displayId, String reason) {
-        if (iWindowManager == null || moveDisplayToTopMethod == null) return;
-        try {
-            moveDisplayToTopMethod.invoke(iWindowManager, displayId, reason);
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_MOVE_DISPLAY_TOP_WARN id=" + displayId + ": " + unwrapMessage(e));
-        }
-    }
-
-    public void focusTopTask(int displayId) {
-        if (displayId <= 0 || iActivityTaskManager == null || focusTopTaskMethod == null) return;
-        try {
-            focusTopTaskMethod.invoke(iActivityTaskManager, displayId);
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_FOCUS_TOP_TASK_WARN id=" + displayId + ": " + unwrapMessage(e));
-        }
-    }
-
-    public boolean startActivityAsShell(Intent intent, Bundle options) {
-        if (intent == null || iActivityTaskManager == null || startActivityMethod == null) return false;
-        try {
-            Object rc = startActivityMethod.invoke(
-                    iActivityTaskManager, null, SHELL_PACKAGE, null, intent,
-                    null, null, null, 0, 0, null, options);
-            return !(rc instanceof Integer) || (Integer) rc >= 0;
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_START_ACTIVITY_ERR intent=" + intent + ": " + unwrapMessage(e));
-            return false;
+            m.invoke(ev, actionButton);
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
         }
     }
 
@@ -455,47 +259,211 @@ public final class AndroidServices {
             Method callAttr5 = null;
             Method callStr5 = null;
             Method callStr6 = null;
-            StringBuilder sigs = new StringBuilder();
             for (Method m : prov.getClass().getMethods()) {
                 if (!"call".equals(m.getName())) continue;
                 Class<?>[] pts = m.getParameterTypes();
-                sigs.append(Arrays.toString(pts)).append("; ");
                 if (pts.length == 5 && "android.content.AttributionSource".equals(pts[0].getName())) callAttr5 = m;
                 else if (pts.length == 5 && pts[0] == String.class) callStr5 = m;
                 else if (pts.length == 6 && pts[0] == String.class) callStr6 = m;
             }
             if (callAttr5 != null) {
-                Object attrSrc = buildShellAttributionSource();
-                return (Bundle) callAttr5.invoke(prov, attrSrc, authority, method, arg, extras);
+                return (Bundle) callAttr5.invoke(prov, buildShellAttributionSource(), authority, method, arg, extras);
             } else if (callStr5 != null) {
                 return (Bundle) callStr5.invoke(prov, SHELL_PACKAGE, authority, method, arg, extras);
             } else if (callStr6 != null) {
                 return (Bundle) callStr6.invoke(prov, SHELL_PACKAGE, null, authority, method, arg, extras);
-            } else {
-                System.err.println("OPALDESK_PROVIDER_CALL_NO_SIG authority=" + authority + " sigs=" + sigs);
             }
         } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_PROVIDER_CALL_ERR authority=" + authority + ": " + unwrapMessage(e));
+            System.err.println("OPALDESK_PROVIDER_EXT_WARN: " + unwrapMessage(e));
         } finally {
             removeContentProviderExternalQuietly(am, authority, tok);
         }
         return null;
     }
 
-    // ---- Internal reflection resolution helpers ----
+    public static void disableLocalDisplayInfoCaches() {
+        try {
+            Class<?> dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal");
+            Method m = dmgCls.getMethod("disableLocalDisplayInfoCaches");
+            if (Modifier.isStatic(m.getModifiers())) {
+                m.invoke(null);
+            } else {
+                Object dmg = dmgCls.getMethod("getInstance").invoke(null);
+                if (dmg != null) m.invoke(dmg);
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+    }
 
-    private static Method getServiceMethod() {
-        if (!sGetServiceChecked) {
-            try {
-                Class<?> smCls = Class.forName("android.os.ServiceManager");
-                sGetServiceMethod = smCls.getMethod("getService", String.class);
-            } catch (ClassNotFoundException | NoSuchMethodException e) {
-                System.err.println("OPALDESK_SM_INIT_ERR: " + e.getMessage());
-            } finally {
-                sGetServiceChecked = true;
+    /**
+     * Switches a physical external display's active EDID resolution & refresh rate via
+     * {@code DisplayManager.setUserPreferredDisplayMode} (or resets when {@code width <= 0}).
+     */
+    public boolean setExternalDisplayMode(int displayId, int width, int height, float fps) {
+        if (displayId <= 0 || displayManager == null) return false;
+        try {
+            Display disp = displayManager.getDisplay(displayId);
+            if (disp == null) return false;
+            if (width <= 0 || height <= 0) {
+                Method clearM = findMethodOrNull(DisplayManager.class, "clearUserPreferredDisplayMode", int.class);
+                if (clearM != null) {
+                    clearM.invoke(displayManager, displayId);
+                    return true;
+                }
+                return false;
+            }
+            Display.Mode[] modes = disp.getSupportedModes();
+            if (modes == null || modes.length == 0) return false;
+            Display.Mode chosen = null;
+            float bestDiff = Float.MAX_VALUE;
+            for (Display.Mode m : modes) {
+                if (m.getPhysicalWidth() == width && m.getPhysicalHeight() == height) {
+                    float diff = (fps > 1f) ? Math.abs(m.getRefreshRate() - fps) : -m.getRefreshRate();
+                    if (chosen == null || diff < bestDiff) {
+                        chosen = m;
+                        bestDiff = diff;
+                    }
+                }
+            }
+            if (chosen == null) return false;
+            Method setM = findMethodOrNull(DisplayManager.class, "setUserPreferredDisplayMode", int.class, Display.Mode.class);
+            if (setM != null) {
+                setM.invoke(displayManager, displayId, chosen);
+                return true;
+            }
+            if (iDisplayManager != null) {
+                for (Method m : iDisplayManager.getClass().getMethods()) {
+                    if ("setUserPreferredDisplayMode".equals(m.getName()) && m.getParameterCount() == 2) {
+                        m.invoke(iDisplayManager, displayId, chosen);
+                        return true;
+                    }
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_SET_DISP_MODE_WARN id=" + displayId + ": " + unwrapMessage(e));
+        }
+        return false;
+    }
+
+    /** Resolves AOSP Display uniqueId (e.g. {@code local:4622403537125514005}) across Android 11–17. */
+    public String getDisplayUniqueId(int displayId) {
+        if (displayId < 0 || displayManager == null) return null;
+        try {
+            Display disp = displayManager.getDisplay(displayId);
+            if (disp == null) return null;
+            Method getUid = findMethodOrNull(Display.class, "getUniqueId");
+            if (getUid != null) {
+                Object uid = getUid.invoke(disp);
+                if (uid instanceof String && !((String) uid).isEmpty()) {
+                    return (String) uid;
+                }
+            }
+            Class<?> infoCls = Class.forName("android.view.DisplayInfo");
+            Object info = infoCls.getDeclaredConstructor().newInstance();
+            Method getInfo = findMethodOrNull(Display.class, "getDisplayInfo", infoCls);
+            if (getInfo != null) {
+                getInfo.invoke(disp, info);
+                Field fUid = infoCls.getField("uniqueId");
+                Object uid = fUid.get(info);
+                if (uid instanceof String && !((String) uid).isEmpty()) {
+                    return (String) uid;
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_GET_DISP_UID_WARN id=" + displayId + ": " + unwrapMessage(e));
+        }
+        return null;
+    }
+
+    /** Resolves physical connector port byte (0..255) for Android 11 port-association fallback, or -1. */
+    public int getDisplayPhysicalPort(int displayId) {
+        if (displayId < 0 || displayManager == null) return -1;
+        try {
+            Display disp = displayManager.getDisplay(displayId);
+            if (disp == null) return -1;
+            Method getAddr = findMethodOrNull(Display.class, "getAddress");
+            if (getAddr == null) return -1;
+            Object addr = getAddr.invoke(disp);
+            if (addr == null) return -1;
+            Method getPort = findMethodOrNull(addr.getClass(), "getPort");
+            if (getPort != null) {
+                Object portObj = getPort.invoke(addr);
+                if (portObj instanceof Number) {
+                    return ((Number) portObj).intValue() & 0xFF;
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+        return -1;
+    }
+
+    /** Applies hardware mouse pointer speed (-7..+7) via {@code IInputManager.tryPointerSpeed}. */
+    public boolean setHardwarePointerSpeed(int speed) {
+        int clamped = Math.max(-7, Math.min(7, speed));
+        boolean ok = false;
+        if (iInputManager != null) {
+            Method tryM = findMethodOrNull(iInputManager.getClass(), "tryPointerSpeed", int.class);
+            if (tryM != null) {
+                try {
+                    tryM.invoke(iInputManager, clamped);
+                    ok = true;
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    System.err.println("OPALDESK_PTR_SPEED_WARN: " + unwrapMessage(e));
+                }
             }
         }
-        return sGetServiceMethod;
+        if (inputManager != null) {
+            Method setM = findMethodOrNull(InputManager.class, "setPointerSpeed", Context.class, int.class);
+            if (setM != null && context != null) {
+                try {
+                    setM.invoke(inputManager, context, clamped);
+                    ok = true;
+                } catch (ReflectiveOperationException | RuntimeException ignored) {
+                }
+            }
+        }
+        return ok;
+    }
+
+    public static boolean setPrimaryClip(ClipData clip) {
+        if (clip == null) return false;
+        ensureClipboardInit();
+        Object cb = sIClipboard;
+        Method m = sSetPrimaryClipMethod;
+        if (cb == null || m == null) return false;
+        try {
+            switch (sSetPrimaryClipArgCount) {
+                case 5: m.invoke(cb, clip, SHELL_PACKAGE, null, 0, 0); return true;
+                case 4: m.invoke(cb, clip, SHELL_PACKAGE, null, 0); return true;
+                case 3: m.invoke(cb, clip, SHELL_PACKAGE, 0); return true;
+                case 2: m.invoke(cb, clip, SHELL_PACKAGE); return true;
+                default: return false;
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_CLIPBOARD_SET_ERR: " + unwrapMessage(e));
+            return false;
+        }
+    }
+
+    public static ClipData getPrimaryClip() {
+        ensureClipboardInit();
+        Object cb = sIClipboard;
+        Method m = sGetPrimaryClipMethod;
+        if (cb == null || m == null) return null;
+        try {
+            Object res;
+            switch (sGetPrimaryClipArgCount) {
+                case 4: res = m.invoke(cb, SHELL_PACKAGE, null, 0, 0); break;
+                case 3: res = m.invoke(cb, SHELL_PACKAGE, null, 0); break;
+                case 2: res = m.invoke(cb, SHELL_PACKAGE, 0); break;
+                case 1: res = m.invoke(cb, SHELL_PACKAGE); break;
+                default: return null;
+            }
+            return (res instanceof ClipData) ? (ClipData) res : null;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_CLIPBOARD_GET_ERR: " + unwrapMessage(e));
+            return null;
+        }
     }
 
     private static void ensureClipboardInit() {
@@ -512,35 +480,27 @@ public final class AndroidServices {
                 if ("setPrimaryClip".equals(name) && sSetPrimaryClipMethod == null) {
                     if (pt.length == 5 && pt[0] == ClipData.class && pt[1] == String.class
                             && pt[2] == String.class && pt[3] == int.class && pt[4] == int.class) {
-                        sSetPrimaryClipMethod = m;
-                        sSetPrimaryClipArgCount = 5;
+                        sSetPrimaryClipMethod = m; sSetPrimaryClipArgCount = 5;
                     } else if (pt.length == 4 && pt[0] == ClipData.class && pt[1] == String.class
                             && pt[2] == String.class && pt[3] == int.class) {
-                        sSetPrimaryClipMethod = m;
-                        sSetPrimaryClipArgCount = 4;
+                        sSetPrimaryClipMethod = m; sSetPrimaryClipArgCount = 4;
                     } else if (pt.length == 3 && pt[0] == ClipData.class && pt[1] == String.class
                             && pt[2] == int.class) {
-                        sSetPrimaryClipMethod = m;
-                        sSetPrimaryClipArgCount = 3;
+                        sSetPrimaryClipMethod = m; sSetPrimaryClipArgCount = 3;
                     } else if (pt.length == 2 && pt[0] == ClipData.class && pt[1] == String.class) {
-                        sSetPrimaryClipMethod = m;
-                        sSetPrimaryClipArgCount = 2;
+                        sSetPrimaryClipMethod = m; sSetPrimaryClipArgCount = 2;
                     }
                 } else if ("getPrimaryClip".equals(name) && sGetPrimaryClipMethod == null) {
                     if (pt.length == 4 && pt[0] == String.class && pt[1] == String.class
                             && pt[2] == int.class && pt[3] == int.class) {
-                        sGetPrimaryClipMethod = m;
-                        sGetPrimaryClipArgCount = 4;
+                        sGetPrimaryClipMethod = m; sGetPrimaryClipArgCount = 4;
                     } else if (pt.length == 3 && pt[0] == String.class && pt[1] == String.class
                             && pt[2] == int.class) {
-                        sGetPrimaryClipMethod = m;
-                        sGetPrimaryClipArgCount = 3;
+                        sGetPrimaryClipMethod = m; sGetPrimaryClipArgCount = 3;
                     } else if (pt.length == 2 && pt[0] == String.class && pt[1] == int.class) {
-                        sGetPrimaryClipMethod = m;
-                        sGetPrimaryClipArgCount = 2;
+                        sGetPrimaryClipMethod = m; sGetPrimaryClipArgCount = 2;
                     } else if (pt.length == 1 && pt[0] == String.class) {
-                        sGetPrimaryClipMethod = m;
-                        sGetPrimaryClipArgCount = 1;
+                        sGetPrimaryClipMethod = m; sGetPrimaryClipArgCount = 1;
                     }
                 }
             }
@@ -559,17 +519,12 @@ public final class AndroidServices {
             am.getClass().getMethod("removeContentProviderExternalAsUser", String.class, IBinder.class, int.class)
                     .invoke(am, authority, tok, 0);
             return;
-        } catch (NoSuchMethodException ignored) {
-            // Try older 2-arg signature below.
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_PROVIDER_REMOVE_WARN: " + unwrapMessage(e));
-            return;
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
         }
         try {
             am.getClass().getMethod("removeContentProviderExternal", String.class, IBinder.class)
                     .invoke(am, authority, tok);
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_PROVIDER_REMOVE_WARN: " + unwrapMessage(e));
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
         }
     }
 
@@ -578,18 +533,14 @@ public final class AndroidServices {
             Field f = target.getClass().getDeclaredField(fieldName);
             f.setAccessible(true);
             f.set(target, value);
-        } catch (NoSuchFieldException ignored) {
-            // Field name differs on some Android builds.
-        } catch (IllegalAccessException e) {
-            System.err.println("OPALDESK_SHELL_FIELD_WARN field=" + fieldName + ": " + e.getMessage());
+        } catch (ReflectiveOperationException ignored) {
         }
     }
 
     private static Method resolveInjectInputEventMethod(Object iim) {
         if (iim == null) return null;
         Method exact = findMethodOrNull(iim.getClass(), "injectInputEvent", InputEvent.class, int.class);
-        if (exact != null) return exact;
-        return findMethodByName(iim, "injectInputEvent", -1);
+        return (exact != null) ? exact : findMethodByName(iim, "injectInputEvent", -1);
     }
 
     private static Method findMethodOrNull(Class<?> cls, String name, Class<?>... params) {
@@ -600,47 +551,17 @@ public final class AndroidServices {
     private static Method findMethodByName(Object target, String name, int expectedParamCount) {
         if (target == null) return null;
         for (Method m : target.getClass().getMethods()) {
-            if (name.equals(m.getName()) && (expectedParamCount < 0 || m.getParameterCount() == expectedParamCount)) return m;
+            if (name.equals(m.getName()) && (expectedParamCount < 0 || m.getParameterCount() == expectedParamCount)) {
+                return m;
+            }
         }
         return null;
     }
 
-    private static final class PreferredModeBinding {
-        final Method method;
-        final Object target;
-        final int argCount;
-
-        PreferredModeBinding(Method method, Object target, int argCount) {
-            this.method = method; this.target = target; this.argCount = argCount;
-        }
-    }
-
-    private static PreferredModeBinding resolveUserPreferredModeBinding(DisplayManager dm, Object idm) {
-        Method m = findMethodOrNull(DisplayManager.class, "setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
-        if (m != null && dm != null) return new PreferredModeBinding(m, dm, 3);
-        m = findMethodOrNull(DisplayManager.class, "setUserPreferredDisplayMode", int.class, Display.Mode.class);
-        if (m != null && dm != null) return new PreferredModeBinding(m, dm, 2);
-        try {
-            Class<?> dmgCls = Class.forName("android.hardware.display.DisplayManagerGlobal");
-            Object dmg = dmgCls.getMethod("getInstance").invoke(null);
-            if (dmg != null) {
-                m = findMethodOrNull(dmgCls, "setUserPreferredDisplayMode", int.class, Display.Mode.class);
-                if (m != null) return new PreferredModeBinding(m, dmg, 2);
-                m = findMethodOrNull(dmgCls, "setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
-                if (m != null) return new PreferredModeBinding(m, dmg, 3);
-            }
-        } catch (ReflectiveOperationException | RuntimeException ignored) { /* Fall through to IDisplayManager. */ }
-        if (idm != null) {
-            m = findMethodOrNull(idm.getClass(), "setUserPreferredDisplayMode", int.class, Display.Mode.class);
-            if (m != null) return new PreferredModeBinding(m, idm, 2);
-            m = findMethodOrNull(idm.getClass(), "setUserPreferredDisplayMode", int.class, Display.Mode.class, boolean.class);
-            if (m != null) return new PreferredModeBinding(m, idm, 3);
-        }
-        return new PreferredModeBinding(null, null, 0);
-    }
-
     private static String unwrapMessage(Throwable t) {
-        if (t instanceof InvocationTargetException && t.getCause() != null) return String.valueOf(t.getCause());
+        if (t instanceof InvocationTargetException && t.getCause() != null) {
+            return String.valueOf(t.getCause());
+        }
         return t.getMessage() != null ? t.getMessage() : t.toString();
     }
 }

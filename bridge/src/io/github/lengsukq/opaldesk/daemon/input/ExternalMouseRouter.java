@@ -1,0 +1,396 @@
+package io.github.lengsukq.opaldesk.daemon.input;
+
+import android.hardware.display.DisplayManager;
+import android.hardware.input.InputManager;
+import android.os.Handler;
+import android.view.InputDevice;
+
+import io.github.lengsukq.opaldesk.daemon.DaemonConfig;
+import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
+import io.github.lengsukq.opaldesk.daemon.platform.AndroidServices;
+
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Daemon-level physical mouse display router ({@code uid=2000}, {@code ASSOCIATE_INPUT_DEVICE_TO_DISPLAY}).
+ *
+ * <p>Routes connected external Bluetooth/USB mice directly onto an active external display
+ * (e.g. USB-C / HDMI monitor running full-bleed Presentation) via standard AOSP
+ * {@code InputManager.addUniqueIdAssociationByDescriptor} (Android 14–17) with graceful
+ * port-association fallback (Android 11–13). Because the association lives in Android's
+ * {@code InputReader}/{@code PointerChoreographer}, the physical mouse continues operating
+ * the external monitor smoothly even when Display 0 switches to Home or other Android apps.
+ *
+ * <p>Automatically restores every mouse to Display 0 when the user selects {@code LOCAL},
+ * exits projection, unplugs the monitor, or stops the daemon.
+ */
+public final class ExternalMouseRouter {
+    private static final class BoundMouse {
+        final String descriptor;
+        final String location;
+        final int bindKind; // 1=descriptor, 2=uniquePort, 3=legacyUniquePort, 4=physicalPort
+        final String displayUniqueId;
+
+        BoundMouse(String descriptor, String location, int bindKind, String displayUniqueId) {
+            this.descriptor = descriptor;
+            this.location = location;
+            this.bindKind = bindKind;
+            this.displayUniqueId = displayUniqueId;
+        }
+    }
+
+    private final AndroidServices services;
+    private final DaemonConfig config;
+    private final Handler mainHandler;
+    private final Object lock = new Object();
+    private final Map<String, BoundMouse> boundByKey = new HashMap<>();
+
+    private volatile int activeExternalDisplayId = -1;
+    private volatile String activeDisplayUniqueId = null;
+    private volatile int activeDisplayPort = -1;
+    private volatile boolean listenersRegistered = false;
+
+    private InputManager.InputDeviceListener inputListener;
+    private DisplayManager.DisplayListener displayListener;
+
+    public ExternalMouseRouter(AndroidServices services, DaemonConfig config, Handler mainHandler) {
+        this.services = services;
+        this.config = config;
+        this.mainHandler = mainHandler;
+    }
+
+    public void start() {
+        if (listenersRegistered || services == null) return;
+        listenersRegistered = true;
+        if (services.inputManager != null) {
+            inputListener = new InputManager.InputDeviceListener() {
+                @Override
+                public void onInputDeviceAdded(int deviceId) {
+                    resyncBindings();
+                }
+
+                @Override
+                public void onInputDeviceRemoved(int deviceId) {
+                    resyncBindings();
+                }
+
+                @Override
+                public void onInputDeviceChanged(int deviceId) {
+                    resyncBindings();
+                }
+            };
+            try {
+                services.inputManager.registerInputDeviceListener(inputListener, mainHandler);
+            } catch (RuntimeException e) {
+                System.err.println("OPALDESK_MOUSE_LISTENER_WARN: " + e.getMessage());
+            }
+        }
+        if (services.displayManager != null) {
+            displayListener = new DisplayManager.DisplayListener() {
+                @Override
+                public void onDisplayAdded(int displayId) {}
+
+                @Override
+                public void onDisplayChanged(int displayId) {}
+
+                @Override
+                public void onDisplayRemoved(int displayId) {
+                    if (displayId > 0 && displayId == activeExternalDisplayId) {
+                        System.out.println("OPALDESK_MOUSE_EXT_DISPLAY_REMOVED id=" + displayId + " -> returning mouse to Display 0");
+                        unbindAllInternal(true);
+                    }
+                }
+            };
+            try {
+                services.displayManager.registerDisplayListener(displayListener, mainHandler);
+            } catch (RuntimeException e) {
+                System.err.println("OPALDESK_MOUSE_DISP_LISTENER_WARN: " + e.getMessage());
+            }
+        }
+    }
+
+    public void shutdown() {
+        unbindAllInternal(true);
+        if (!listenersRegistered || services == null) return;
+        listenersRegistered = false;
+        if (services.inputManager != null && inputListener != null) {
+            try {
+                services.inputManager.unregisterInputDeviceListener(inputListener);
+            } catch (RuntimeException ignored) {
+            }
+        }
+        if (services.displayManager != null && displayListener != null) {
+            try {
+                services.displayManager.unregisterDisplayListener(displayListener);
+            } catch (RuntimeException ignored) {
+            }
+        }
+    }
+
+    /**
+     * Applies mouse target routing mode ({@link BridgeProtocol#MOUSE_TARGET_LOCAL} or
+     * {@link BridgeProtocol#MOUSE_TARGET_EXTERNAL}) for {@code externalDisplayId}.
+     *
+     * @return number of physical external mice currently bound to the external monitor (0 in LOCAL mode).
+     */
+    public int setMouseTarget(int targetMode, int externalDisplayId) {
+        config.setMouseTargetMode(targetMode);
+        if (targetMode != BridgeProtocol.MOUSE_TARGET_EXTERNAL || externalDisplayId <= 0) {
+            unbindAllInternal(true);
+            return 0;
+        }
+        String uniqueId = (services != null) ? services.getDisplayUniqueId(externalDisplayId) : null;
+        int physPort = (services != null) ? services.getDisplayPhysicalPort(externalDisplayId) : -1;
+        if ((uniqueId == null || uniqueId.isEmpty()) && physPort < 0) {
+            System.err.println("OPALDESK_MOUSE_ROUTE_SKIP no uniqueId/port for displayId=" + externalDisplayId);
+            unbindAllInternal(true);
+            return 0;
+        }
+        synchronized (lock) {
+            boolean displayChanged = (activeExternalDisplayId != externalDisplayId)
+                    || (uniqueId != null && !uniqueId.equals(activeDisplayUniqueId));
+            if (displayChanged && !boundByKey.isEmpty()) {
+                unbindLocked();
+            }
+            activeExternalDisplayId = externalDisplayId;
+            activeDisplayUniqueId = uniqueId;
+            activeDisplayPort = physPort;
+        }
+        return resyncBindings();
+    }
+
+    public void releaseToLocal() {
+        unbindAllInternal(true);
+    }
+
+    public int getBoundMouseCount() {
+        synchronized (lock) {
+            return boundByKey.size();
+        }
+    }
+
+    public int getBoundDisplayId() {
+        synchronized (lock) {
+            return boundByKey.isEmpty() ? -1 : activeExternalDisplayId;
+        }
+    }
+
+    public int getConnectedMouseCount() {
+        if (services == null || services.inputManager == null) return 0;
+        int count = 0;
+        try {
+            int[] ids = services.inputManager.getInputDeviceIds();
+            if (ids == null) return 0;
+            for (int id : ids) {
+                InputDevice dev = services.inputManager.getInputDevice(id);
+                if (dev != null && shouldRouteDevice(dev.getName(), dev.getSources(), dev.isVirtual(), dev.isExternal())) {
+                    count++;
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return count;
+    }
+
+    public boolean applyHardwarePointerSpeed(float sensitivity) {
+        if (services == null) return false;
+        int androidSpeed = mapSensitivityToAndroidPointerSpeed(sensitivity);
+        return services.setHardwarePointerSpeed(androidSpeed);
+    }
+
+    /** Pure JVM-testable filter deciding whether an InputDevice is a routable physical mouse. */
+    public static boolean shouldRouteDevice(String name, int sources, boolean isVirtual, boolean isExternal) {
+        return MouseRoutingPolicy.shouldRouteDevice(name, sources, isVirtual, isExternal);
+    }
+
+    /** Maps continuous pointer sensitivity to Android's hardware pointer speed ({@code -7..+7}). */
+    public static int mapSensitivityToAndroidPointerSpeed(float sensitivity) {
+        return MouseRoutingPolicy.mapSensitivityToAndroidPointerSpeed(sensitivity);
+    }
+
+    private int resyncBindings() {
+        if (services == null || services.inputManager == null) return 0;
+        synchronized (lock) {
+            if (config.getMouseTargetMode() != BridgeProtocol.MOUSE_TARGET_EXTERNAL
+                    || activeExternalDisplayId <= 0
+                    || ((activeDisplayUniqueId == null || activeDisplayUniqueId.isEmpty()) && activeDisplayPort < 0)) {
+                unbindLocked();
+                return 0;
+            }
+            Set<String> stillPresentKeys = new HashSet<>();
+            int[] ids;
+            try {
+                ids = services.inputManager.getInputDeviceIds();
+            } catch (RuntimeException e) {
+                return boundByKey.size();
+            }
+            if (ids != null) {
+                for (int id : ids) {
+                    InputDevice dev = services.inputManager.getInputDevice(id);
+                    if (dev == null) continue;
+                    if (!shouldRouteDevice(dev.getName(), dev.getSources(), dev.isVirtual(), dev.isExternal())) {
+                        continue;
+                    }
+                    String descriptor = dev.getDescriptor();
+                    String location = extractInputLocation(dev);
+                    String key = (descriptor != null && !descriptor.isEmpty()) ? descriptor : location;
+                    if (key == null || key.isEmpty()) continue;
+                    stillPresentKeys.add(key);
+
+                    BoundMouse existing = boundByKey.get(key);
+                    if (existing != null && activeDisplayUniqueId != null
+                            && activeDisplayUniqueId.equals(existing.displayUniqueId)) {
+                        continue;
+                    }
+                    if (existing != null) {
+                        unbindSingle(existing);
+                        boundByKey.remove(key);
+                    }
+                    int kind = bindSingle(descriptor, location, activeDisplayUniqueId, activeDisplayPort);
+                    if (kind > 0) {
+                        boundByKey.put(key, new BoundMouse(descriptor, location, kind, activeDisplayUniqueId));
+                        System.out.println("OPALDESK_MOUSE_ROUTED_EXTERNAL name=" + dev.getName()
+                                + " displayId=" + activeExternalDisplayId
+                                + " uniqueId=" + activeDisplayUniqueId + " kind=" + kind);
+                    }
+                }
+            }
+            // Prune disconnected mice cleanly
+            ArrayList<String> staleKeys = new ArrayList<>();
+            for (String k : boundByKey.keySet()) {
+                if (!stillPresentKeys.contains(k)) staleKeys.add(k);
+            }
+            for (String stale : staleKeys) {
+                BoundMouse bm = boundByKey.remove(stale);
+                if (bm != null) unbindSingle(bm);
+            }
+            return boundByKey.size();
+        }
+    }
+
+    private void unbindAllInternal(boolean clearDisplay) {
+        synchronized (lock) {
+            unbindLocked();
+            if (clearDisplay) {
+                activeExternalDisplayId = -1;
+                activeDisplayUniqueId = null;
+                activeDisplayPort = -1;
+            }
+        }
+    }
+
+    private void unbindLocked() {
+        if (boundByKey.isEmpty()) return;
+        for (BoundMouse bm : boundByKey.values()) {
+            unbindSingle(bm);
+        }
+        boundByKey.clear();
+        System.out.println("OPALDESK_MOUSE_RETURNED_LOCAL");
+    }
+
+    private int bindSingle(String descriptor, String location, String displayUniqueId, int displayPort) {
+        if (displayUniqueId != null && !displayUniqueId.isEmpty()) {
+            if (descriptor != null && !descriptor.isEmpty()) {
+                if (invokeInputMethod("addUniqueIdAssociationByDescriptor",
+                        new Class<?>[]{String.class, String.class}, descriptor, displayUniqueId)) {
+                    return 1;
+                }
+            }
+            if (location != null && !location.isEmpty()) {
+                if (invokeInputMethod("addUniqueIdAssociationByPort",
+                        new Class<?>[]{String.class, String.class}, location, displayUniqueId)) {
+                    return 2;
+                }
+                if (invokeInputMethod("addUniqueIdAssociation",
+                        new Class<?>[]{String.class, String.class}, location, displayUniqueId)) {
+                    return 3;
+                }
+            }
+        }
+        if (location != null && !location.isEmpty() && displayPort >= 0) {
+            if (invokeInputMethod("addPortAssociation",
+                    new Class<?>[]{String.class, int.class}, location, displayPort)) {
+                return 4;
+            }
+        }
+        return 0;
+    }
+
+    private void unbindSingle(BoundMouse bm) {
+        switch (bm.bindKind) {
+            case 1:
+                if (bm.descriptor != null) {
+                    invokeInputMethod("removeUniqueIdAssociationByDescriptor",
+                            new Class<?>[]{String.class}, bm.descriptor);
+                }
+                break;
+            case 2:
+                if (bm.location != null) {
+                    invokeInputMethod("removeUniqueIdAssociationByPort",
+                            new Class<?>[]{String.class}, bm.location);
+                }
+                break;
+            case 3:
+                if (bm.location != null) {
+                    invokeInputMethod("removeUniqueIdAssociation",
+                            new Class<?>[]{String.class}, bm.location);
+                }
+                break;
+            case 4:
+                if (bm.location != null) {
+                    invokeInputMethod("removePortAssociation",
+                            new Class<?>[]{String.class}, bm.location);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    private boolean invokeInputMethod(String name, Class<?>[] paramTypes, Object... args) {
+        if (services == null) return false;
+        if (invokeOnTarget(services.iInputManager, name, paramTypes, args)) return true;
+        return invokeOnTarget(services.inputManager, name, paramTypes, args);
+    }
+
+    private static boolean invokeOnTarget(Object target, String name, Class<?>[] paramTypes, Object... args) {
+        if (target == null) return false;
+        try {
+            Method m = target.getClass().getMethod(name, paramTypes);
+            m.invoke(target, args);
+            return true;
+        } catch (NoSuchMethodException ignored) {
+            return false;
+        } catch (InvocationTargetException e) {
+            Throwable root = (e.getCause() != null) ? e.getCause() : e;
+            System.err.println("OPALDESK_MOUSE_ASSOC_WARN " + name + ": " + root);
+            return false;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_MOUSE_ASSOC_WARN " + name + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private static String extractInputLocation(InputDevice dev) {
+        if (dev == null) return null;
+        try {
+            Method m = dev.getClass().getMethod("getLocation");
+            Object v = m.invoke(dev);
+            if (v instanceof String && !((String) v).isEmpty()) return (String) v;
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+        try {
+            Method m = dev.getClass().getMethod("getExternalLocation");
+            Object v = m.invoke(dev);
+            if (v instanceof String && !((String) v).isEmpty()) return (String) v;
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
+        }
+        return null;
+    }
+}

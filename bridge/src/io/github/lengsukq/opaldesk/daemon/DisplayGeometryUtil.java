@@ -1,133 +1,123 @@
 package io.github.lengsukq.opaldesk.daemon;
 
+import io.github.lengsukq.opaldesk.daemon.compositor.WindowProfile;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
 
 /**
- * Pure-Java display geometry, encoder dimension alignment, rotation, and mirror
- * coordinate mapping utilities shared by OpalDesk, RemoteStreamSink, and RemoteInputBridge.
+ * Pure Java 11 geometry math for the Universal Per-Window Compositor:
+ * dimension alignment, DPI clamping, work-area constraints, cascade placement, and snap zones.
  */
 public final class DisplayGeometryUtil {
+    public static final int MIN_WINDOW_EDGE_PX = 260;
+    public static final int MAX_WINDOW_EDGE_PX = 4096;
     public static final int MIN_LONG_EDGE = 640;
-    public static final int MAX_LONG_EDGE = 7680;
     public static final int MIN_SHORT_EDGE = 480;
-    public static final int MAX_SHORT_EDGE = 4320;
     public static final int MAX_ENCODER_LONG_EDGE = 4096;
     public static final int MAX_ENCODER_SHORT_EDGE = 2160;
-    public static final int MIN_DPI = 80;
-    public static final int MAX_DPI = 640;
-    public static final float MIN_FPS = 15.0f;
-    public static final float MAX_FPS = 360.0f;
-    public static final int EDGE_MARGIN_MIN_PX = 48;
+    public static final int MIN_DPI = 120;
+    public static final int MAX_DPI = 560;
+    public static final float MIN_FPS = 24.0f;
+    public static final float MAX_FPS = 165.0f;
 
-    // Unified Samsung DeX Desktop WorkArea constants (SSOT shared with helper DesktopGeometry)
-    public static final int MENU_BAR_HEIGHT_DP = 0;
-    public static final int WORKAREA_TOP_INSET_DP = 8;
-    public static final int TASKBAR_HEIGHT_DP = 56;
-    public static final int TASKBAR_RESERVED_INSET_DP = 72;
-    public static final int TASKBAR_AUTOHIDE_INSET_DP = 8;
-    public static final int WINDOW_HEADER_HEIGHT_DP = 38;
-    public static final int WINDOW_BOTTOM_CHIN_DP = 0;
-    public static final int DOCK_RESERVED_INSET_DP = TASKBAR_RESERVED_INSET_DP;
-    public static final int DOCK_AUTOHIDE_INSET_DP = TASKBAR_AUTOHIDE_INSET_DP;
-    public static final int WORKAREA_SIDE_INSET_DP = 8;
+    public static final int TOP_BAR_HEIGHT_DP = 28;
+    public static final int WINDOW_CHROME_HEADER_DP = 36;
+    public static final int DOCK_RESERVED_BOTTOM_DP = 70;
+    public static final int SNAP_GAP_DP = 8;
 
-    /** Immutable pixel bounds of the usable desktop area excluding Taskbar and safe margins. */
-    public static final class WorkArea {
+    private DisplayGeometryUtil() {}
+
+    public static final class IntRect {
         public final int left;
         public final int top;
         public final int right;
         public final int bottom;
 
-        public WorkArea(int left, int top, int right, int bottom) {
+        public IntRect(int left, int top, int right, int bottom) {
             this.left = left;
             this.top = top;
-            this.right = Math.max(left + 1, right);
-            this.bottom = Math.max(top + 1, bottom);
+            this.right = Math.max(left, right);
+            this.bottom = Math.max(top, bottom);
         }
 
-        public int width() { return Math.max(1, right - left); }
-        public int height() { return Math.max(1, bottom - top); }
+        public int width() {
+            return Math.max(0, right - left);
+        }
+
+        public int height() {
+            return Math.max(0, bottom - top);
+        }
+
+        public boolean isEmpty() {
+            return width() <= 0 || height() <= 0;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (!(o instanceof IntRect)) return false;
+            IntRect r = (IntRect) o;
+            return left == r.left && top == r.top && right == r.right && bottom == r.bottom;
+        }
+
+        @Override
+        public int hashCode() {
+            int res = left;
+            res = 31 * res + top;
+            res = 31 * res + right;
+            res = 31 * res + bottom;
+            return res;
+        }
     }
 
-    private DisplayGeometryUtil() {}
-
-    public static int dpToPx(int dp, int dpi) {
-        int effDpi = clampDpi(dpi, 1920, 1080);
-        return Math.max(0, Math.round(dp * (effDpi / 160f)));
+    public static int dpToPx(float dp, int dpi) {
+        int effDpi = clampDpi(dpi);
+        return Math.max(1, Math.round(dp * (effDpi / 160.0f)));
     }
 
-    /**
-     * Computes the unified DeX desktop usable {@link WorkArea} for any USB or Mac canvas.
-     * Reserves no top menu bar (pure bottom floating taskbar) and leaves clean breathing margins.
-     */
-    public static WorkArea computeDesktopWorkArea(int displayW, int displayH, int dpi, boolean taskbarAutoHide) {
-        int w = Math.max(320, displayW);
-        int h = Math.max(240, displayH);
-        int topPx = Math.min(h / 4, dpToPx(WORKAREA_TOP_INSET_DP, dpi));
-        int bottomInsetPx = Math.min(h / 3, dpToPx(taskbarAutoHide ? TASKBAR_AUTOHIDE_INSET_DP : TASKBAR_RESERVED_INSET_DP, dpi));
-        int sidePx = Math.min(w / 16, dpToPx(WORKAREA_SIDE_INSET_DP, dpi));
-        return new WorkArea(sidePx, topPx, Math.max(sidePx + 1, w - sidePx), Math.max(topPx + 1, h - bottomInsetPx));
+    public static int alignEven(int value, int minVal, int maxVal) {
+        int clamped = Math.max(minVal, Math.min(maxVal, value));
+        return (clamped & ~1);
     }
 
-    public static boolean isValidDims(int w, int h) {
-        int longEdge = Math.max(w, h);
-        int shortEdge = Math.min(w, h);
-        return longEdge >= MIN_LONG_EDGE && longEdge <= MAX_LONG_EDGE
-                && shortEdge >= MIN_SHORT_EDGE && shortEdge <= MAX_SHORT_EDGE;
+    public static int clampDpi(int dpi) {
+        if (dpi <= 0) return 220;
+        return Math.max(MIN_DPI, Math.min(MAX_DPI, dpi));
+    }
+
+    public static int computeAutoDpi(int w, int h) {
+        int minEdge = Math.min(Math.max(1, w), Math.max(1, h));
+        return Math.max(120, Math.min(280, Math.round(minEdge * 160f / 1440f)));
+    }
+
+    public static int clampDpi(int dpi, int fallbackW, int fallbackH) {
+        if (dpi < 80 || dpi > 640) {
+            return computeAutoDpi(fallbackW, fallbackH);
+        }
+        return dpi;
     }
 
     public static int normalizeRotation(int rot) {
         return ((rot % 4) + 4) % 4;
     }
 
-    public static boolean isPortraitRotation(int rot) {
-        return (normalizeRotation(rot) & 1) == 1;
+    public static int clampBitrateKbps(int bitrateKbps, int minKbps, int maxKbps) {
+        int lo = Math.max(500, minKbps);
+        int hi = Math.max(lo, maxKbps);
+        if (bitrateKbps <= 0) return Math.min(hi, Math.max(lo, 12_000));
+        return Math.max(lo, Math.min(hi, bitrateKbps));
     }
 
-    /**
-     * Returns true when swapping from (prevW, prevH) to (newW, newH) flips
-     * landscape <-> portrait orientation.
-     */
-    public static boolean isOrientationAspectFlipped(int prevW, int prevH, int newW, int newH) {
-        if (prevW <= 0 || prevH <= 0 || newW <= 0 || newH <= 0) {
-            return false;
-        }
-        if (prevW == prevH || newW == newH) {
-            return false;
-        }
-        return (prevW > prevH) != (newW > newH);
-    }
-
-    /**
-     * Aligns a single dimension to a positive even multiple of {@code alignment} (minimum 2),
-     * rounding to the nearest multiple and clamping within [minVal, maxVal].
-     */
     public static int alignDimension(int value, int alignment, int minVal, int maxVal) {
         int align = Math.max(2, alignment);
-        if ((align & 1) != 0) {
-            align += 1;
-        }
+        if ((align & 1) != 0) align += 1;
         int clampedMin = ((minVal + align - 1) / align) * align;
         int clampedMax = (maxVal / align) * align;
-        if (clampedMax < clampedMin) {
-            clampedMax = clampedMin;
-        }
+        if (clampedMax < clampedMin) clampedMax = clampedMin;
         int v = Math.max(clampedMin, Math.min(clampedMax, value));
         int rounded = ((v + (align / 2)) / align) * align;
-        if (rounded < clampedMin) {
-            rounded = clampedMin;
-        }
-        if (rounded > clampedMax) {
-            rounded = clampedMax;
-        }
-        return rounded;
+        return Math.max(clampedMin, Math.min(clampedMax, rounded));
     }
 
-    /**
-     * Aligns (width, height) for hardware MediaCodec video encoders to even multiples of
-     * {@code alignment} (typically 8 or 16; 8 preserves 1920x1080 exactly while keeping
-     * all common HEVC/AVC encoders happy, and 16 serves as strict fallback).
-     */
     public static int[] alignForEncoder(int width, int height, int alignment) {
         return alignForEncoder(width, height, alignment, alignment);
     }
@@ -140,143 +130,125 @@ public final class DisplayGeometryUtil {
         int maxW = portrait ? MAX_ENCODER_SHORT_EDGE : MAX_ENCODER_LONG_EDGE;
         int minH = portrait ? MIN_LONG_EDGE : MIN_SHORT_EDGE;
         int maxH = portrait ? MAX_ENCODER_LONG_EDGE : MAX_ENCODER_SHORT_EDGE;
-
-        // Preserve aspect ratio if dimensions exceed encoder limits before rounding.
         if (safeW > maxW || safeH > maxH) {
             double scale = Math.min((double) maxW / safeW, (double) maxH / safeH);
             safeW = (int) Math.round(safeW * scale);
             safeH = (int) Math.round(safeH * scale);
         }
-
-        int outW = alignDimension(safeW, alignW, minW, maxW);
-        int outH = alignDimension(safeH, alignH, minH, maxH);
-        return new int[]{outW, outH};
-    }
-
-    /**
-     * Ensures dimensions match the requested rotation orientation (0/2=landscape, 1/3=portrait).
-     */
-    public static int[] orientDimensionsForRotation(int width, int height, int rot) {
-        boolean wantPortrait = isPortraitRotation(rot);
-        if (wantPortrait && width > height) {
-            return new int[]{height, width};
-        }
-        if (!wantPortrait && height > width) {
-            return new int[]{height, width};
-        }
-        return new int[]{width, height};
-    }
-
-    public static int computeAutoDpi(int w, int h) {
-        int minEdge = Math.min(Math.max(1, w), Math.max(1, h));
-        return Math.max(120, Math.min(280, Math.round(minEdge * 160f / 1440f)));
-    }
-
-    public static int clampDpi(int dpi, int fallbackW, int fallbackH) {
-        if (dpi < MIN_DPI || dpi > MAX_DPI) {
-            return computeAutoDpi(fallbackW, fallbackH);
-        }
-        return dpi;
-    }
-
-    public static float clampFps(float fps, float def) {
-        if (!Float.isFinite(fps) || fps < MIN_FPS) {
-            return def;
-        }
-        return Math.min(MAX_FPS, fps);
-    }
-
-    public static int clampBitrateKbps(int bitrateKbps, int minKbps, int maxKbps) {
-        int lo = Math.max(500, minKbps);
-        int hi = Math.max(lo, maxKbps);
-        if (bitrateKbps <= 0) {
-            return Math.min(hi, Math.max(lo, 12000));
-        }
-        return Math.max(lo, Math.min(hi, bitrateKbps));
-    }
-
-    /**
-     * Computes centered aspect-preserving letterbox rectangle {x, y, w, h} of source (srcW, srcH)
-     * rendered inside destination (dstW, dstH).
-     */
-    public static int[] computeLetterboxRect(int srcW, int srcH, int dstW, int dstH) {
-        if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0) {
-            return new int[]{0, 0, Math.max(0, dstW), Math.max(0, dstH)};
-        }
-        double scale = Math.min((double) dstW / srcW, (double) dstH / srcH);
-        int scaledW = Math.max(1, Math.min(dstW, (int) Math.round(srcW * scale)));
-        int scaledH = Math.max(1, Math.min(dstH, (int) Math.round(srcH * scale)));
-        int x = (dstW - scaledW) / 2;
-        int y = (dstH - scaledH) / 2;
-        return new int[]{x, y, scaledW, scaledH};
-    }
-
-    /**
-     * Computes unified Display 0 mirror placement {@code {mirX, mirY, mirW, mirH}} inside an external
-     * or remote canvas {@code (outW, outH)} for any {@code sideMode} ({@code OFF}, {@code LEFT},
-     * {@code RIGHT}, {@code CENTER_DUAL}), identical across USB physical monitors and Mac streams.
-     */
-    public static int[] computeMirrorPlacement(int d0W, int d0H, int outW, int outH, int sideMode) {
-        int safeD0W = d0W > 0 ? d0W : 1920;
-        int safeD0H = d0H > 0 ? d0H : 1200;
-        int safeOutW = Math.max(1, outW);
-        int safeOutH = Math.max(1, outH);
-        float fit = Math.min(safeOutW / (float) safeD0W, safeOutH / (float) safeD0H);
-        int mirW = Math.max(1, Math.round(safeD0W * fit));
-        int mirH = Math.max(1, Math.round(safeD0H * fit));
-        int mirX = Math.max(0, (safeOutW - mirW) / 2);
-        int mirY = Math.max(0, (safeOutH - mirH) / 2);
-        if (safeOutW - mirW >= EDGE_MARGIN_MIN_PX) {
-            if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT) {
-                mirX = 0;
-            } else if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT) {
-                mirX = Math.max(0, safeOutW - mirW);
-            }
-        } else if (safeOutH - mirH >= EDGE_MARGIN_MIN_PX) {
-            if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_LEFT) {
-                mirY = 0;
-            } else if (sideMode == BridgeProtocol.MIRROR_SIDE_ALIGN_RIGHT) {
-                mirY = Math.max(0, safeOutH - mirH);
-            }
-        }
-        return new int[]{mirX, mirY, mirW, mirH};
-    }
-
-    /**
-     * Maps a pointer coordinate (streamX, streamY) from a letterboxed remote mirror stream
-     * (streamW x streamH) into Display 0 coordinates (d0W x d0H).
-     */
-    public static float[] mapStreamPointToDisplay(
-            float streamX, float streamY,
-            int streamW, int streamH,
-            int targetW, int targetH,
-            boolean letterboxed) {
-        if (targetW <= 0 || targetH <= 0) {
-            return new float[]{Math.max(0f, streamX), Math.max(0f, streamY)};
-        }
-        if (!letterboxed || streamW <= 0 || streamH <= 0) {
-            float sx = (streamW > 0 && streamW != targetW)
-                    ? (streamX * targetW / (float) streamW) : streamX;
-            float sy = (streamH > 0 && streamH != targetH)
-                    ? (streamY * targetH / (float) streamH) : streamY;
-            return new float[]{
-                    clampCoord(sx, targetW - 1f),
-                    clampCoord(sy, targetH - 1f)
-            };
-        }
-        int[] rect = computeLetterboxRect(targetW, targetH, streamW, streamH);
-        float rx = (streamX - rect[0]) * targetW / (float) Math.max(1, rect[2]);
-        float ry = (streamY - rect[1]) * targetH / (float) Math.max(1, rect[3]);
-        return new float[]{
-                clampCoord(rx, targetW - 1f),
-                clampCoord(ry, targetH - 1f)
+        return new int[]{
+                alignDimension(safeW, alignW, minW, maxW),
+                alignDimension(safeH, alignH, minH, maxH)
         };
     }
 
-    private static float clampCoord(float value, float maxInclusive) {
-        if (!Float.isFinite(value)) {
-            return 0f;
+    public static float clampFps(float fps, float fallback) {
+        if (!Float.isFinite(fps) || fps <= 0f) return fallback;
+        return Math.max(MIN_FPS, Math.min(MAX_FPS, fps));
+    }
+
+    /**
+     * Computes the usable desktop work area (excluding top menu bar and bottom floating dock).
+     */
+    public static IntRect computeWorkArea(int canvasW, int canvasH, int canvasDpi) {
+        int w = Math.max(640, canvasW);
+        int h = Math.max(480, canvasH);
+        int topInset = dpToPx(TOP_BAR_HEIGHT_DP + 4, canvasDpi);
+        int bottomInset = dpToPx(DOCK_RESERVED_BOTTOM_DP, canvasDpi);
+        int padX = dpToPx(6, canvasDpi);
+        int bottom = Math.max(topInset + MIN_WINDOW_EDGE_PX, h - bottomInset);
+        return new IntRect(padX, topInset, Math.max(padX + MIN_WINDOW_EDGE_PX, w - padX), bottom);
+    }
+
+    /**
+     * Computes staggered cascading initial frame for a newly opened window according to its profile.
+     */
+    public static IntRect computeInitialWindowFrame(
+            WindowProfile profile, int cascadeIndex, int canvasW, int canvasH, int canvasDpi) {
+        IntRect work = computeWorkArea(canvasW, canvasH, canvasDpi);
+        int workW = work.width();
+        int workH = work.height();
+
+        int targetW;
+        int targetH;
+        if (profile == WindowProfile.PORTRAIT) {
+            targetH = Math.min(workH - dpToPx(16, canvasDpi), Math.max(dpToPx(420, canvasDpi), Math.round(workH * 0.86f)));
+            int contentH = Math.max(240, targetH - dpToPx(WINDOW_CHROME_HEADER_DP, canvasDpi));
+            targetW = Math.min(workW - dpToPx(24, canvasDpi), Math.max(dpToPx(280, canvasDpi), Math.round(contentH * 0.486f)));
+        } else if (profile == WindowProfile.TABLET) {
+            targetH = Math.min(workH - dpToPx(24, canvasDpi), Math.round(workH * 0.80f));
+            targetW = Math.min(workW - dpToPx(32, canvasDpi), Math.round(targetH * 1.33f));
+        } else {
+            targetW = Math.min(workW - dpToPx(36, canvasDpi), Math.max(dpToPx(520, canvasDpi), Math.round(workW * 0.64f)));
+            targetH = Math.min(workH - dpToPx(28, canvasDpi), Math.max(dpToPx(360, canvasDpi), Math.round(workH * 0.76f)));
         }
-        return Math.max(0f, Math.min(Math.max(0f, maxInclusive), value));
+
+        targetW = alignEven(targetW, MIN_WINDOW_EDGE_PX, Math.max(MIN_WINDOW_EDGE_PX, workW));
+        targetH = alignEven(targetH, MIN_WINDOW_EDGE_PX, Math.max(MIN_WINDOW_EDGE_PX, workH));
+
+        int step = Math.max(0, cascadeIndex % 6);
+        int offsetStepPx = dpToPx(26, canvasDpi);
+        int baseLeft = work.left + Math.max(0, (workW - targetW) / 2) - dpToPx(40, canvasDpi);
+        int baseTop = work.top + Math.max(0, (workH - targetH) / 3);
+
+        int left = baseLeft + step * offsetStepPx;
+        int top = baseTop + step * offsetStepPx;
+        return clampWindowFrame(new IntRect(left, top, left + targetW, top + targetH), canvasW, canvasH, canvasDpi);
+    }
+
+    /**
+     * Clamps a window frame so its title bar stays reachable inside the desktop canvas.
+     */
+    public static IntRect clampWindowFrame(IntRect raw, int canvasW, int canvasH, int canvasDpi) {
+        int w = alignEven(raw.width(), MIN_WINDOW_EDGE_PX, Math.max(MIN_WINDOW_EDGE_PX, canvasW));
+        int h = alignEven(raw.height(), MIN_WINDOW_EDGE_PX, Math.max(MIN_WINDOW_EDGE_PX, canvasH - dpToPx(TOP_BAR_HEIGHT_DP, canvasDpi)));
+        int minTop = dpToPx(TOP_BAR_HEIGHT_DP, canvasDpi);
+        int maxTop = Math.max(minTop, canvasH - dpToPx(WINDOW_CHROME_HEADER_DP + 24, canvasDpi));
+        int minVisX = dpToPx(96, canvasDpi);
+        int minLeft = -w + minVisX;
+        int maxLeft = Math.max(0, canvasW - minVisX);
+
+        int clampedLeft = Math.max(minLeft, Math.min(maxLeft, raw.left));
+        int clampedTop = Math.max(minTop, Math.min(maxTop, raw.top));
+        return new IntRect(clampedLeft, clampedTop, clampedLeft + w, clampedTop + h);
+    }
+
+    /**
+     * Computes exact snap-zone bounds inside the desktop work area.
+     */
+    public static IntRect computeSnapFrame(String presentation, int canvasW, int canvasH, int canvasDpi) {
+        IntRect work = computeWorkArea(canvasW, canvasH, canvasDpi);
+        int gap = dpToPx(SNAP_GAP_DP, canvasDpi);
+        int midX = work.left + work.width() / 2;
+        int midY = work.top + work.height() / 2;
+
+        if (BridgeProtocol.PRES_SNAP_LEFT.equals(presentation)) {
+            return new IntRect(work.left, work.top, midX - gap / 2, work.bottom);
+        }
+        if (BridgeProtocol.PRES_SNAP_RIGHT.equals(presentation)) {
+            return new IntRect(midX + gap / 2, work.top, work.right, work.bottom);
+        }
+        if (BridgeProtocol.PRES_SNAP_TL.equals(presentation)) {
+            return new IntRect(work.left, work.top, midX - gap / 2, midY - gap / 2);
+        }
+        if (BridgeProtocol.PRES_SNAP_TR.equals(presentation)) {
+            return new IntRect(midX + gap / 2, work.top, work.right, midY - gap / 2);
+        }
+        if (BridgeProtocol.PRES_SNAP_BL.equals(presentation)) {
+            return new IntRect(work.left, midY + gap / 2, midX - gap / 2, work.bottom);
+        }
+        if (BridgeProtocol.PRES_SNAP_BR.equals(presentation)) {
+            return new IntRect(midX + gap / 2, midY + gap / 2, work.right, work.bottom);
+        }
+        return work;
+    }
+
+    /**
+     * Computes the VirtualDisplay pixel dimensions for a window's client content area (excluding header bar).
+     */
+    public static int[] computeContentBufferSize(IntRect windowFrame, int canvasDpi) {
+        int headerPx = dpToPx(WINDOW_CHROME_HEADER_DP, canvasDpi);
+        int cw = alignEven(windowFrame.width(), 240, MAX_WINDOW_EDGE_PX);
+        int ch = alignEven(Math.max(200, windowFrame.height() - headerPx), 200, MAX_WINDOW_EDGE_PX);
+        return new int[]{cw, ch};
     }
 }

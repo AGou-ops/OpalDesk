@@ -9,22 +9,20 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 
-import io.github.lengsukq.opaldesk.daemon.display.CompatPolicyController;
-import io.github.lengsukq.opaldesk.daemon.display.LocalDexController;
-import io.github.lengsukq.opaldesk.daemon.display.NativeMirrorController;
-import io.github.lengsukq.opaldesk.daemon.display.PhysicalDisplayController;
-import io.github.lengsukq.opaldesk.daemon.display.SystemControlService;
-import io.github.lengsukq.opaldesk.daemon.input.InputInjector;
-import io.github.lengsukq.opaldesk.daemon.input.LocalInputController;
+import io.github.lengsukq.opaldesk.daemon.compositor.CompositorEngine;
+import io.github.lengsukq.opaldesk.daemon.compositor.VirtualDisplayPool;
+import io.github.lengsukq.opaldesk.daemon.input.ExternalMouseRouter;
+import io.github.lengsukq.opaldesk.daemon.input.PerDisplayInputRouter;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeBinderService;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
 import io.github.lengsukq.opaldesk.daemon.ipc.DaemonControlSocket;
 import io.github.lengsukq.opaldesk.daemon.ipc.HelperClientBridge;
+import io.github.lengsukq.opaldesk.daemon.platform.AndroidDisplayDriver;
 import io.github.lengsukq.opaldesk.daemon.platform.AndroidServices;
+import io.github.lengsukq.opaldesk.daemon.platform.RootEnhancer;
 import io.github.lengsukq.opaldesk.daemon.platform.TaskApiAdapter;
-import io.github.lengsukq.opaldesk.daemon.stream.RemoteSessionCoordinator;
-import io.github.lengsukq.opaldesk.daemon.window.DesktopWindowManager;
-import io.github.lengsukq.opaldesk.daemon.window.TaskWindowController;
+import io.github.lengsukq.opaldesk.daemon.platform.TaskStackObserver;
+import io.github.lengsukq.opaldesk.daemon.stream.OpalCastCompositorBridge;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -32,107 +30,99 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Thin entry point and lifecycle coordinator for the OpalDesk shell daemon.
+ * Entry point and lifecycle coordinator for the OpalDesk v2 Universal Compositor Shell Daemon.
  *
- * <p>Preserves exact CLI ({@code --verify-helper}, {@code --stop}), fail-closed root drop,
- * single-instance abstract LocalSocket ({@code io.github.lengsukq.opaldesk.daemon.ctl}), {@code NEED_BINDER}
- * broadcast receiver, shutdown hook, concrete module wiring, and 1.5s reconciliation tick.
+ * <p>100% OEM-agnostic and rootless-first ({@code uid=2000}, {@code u:r:shell:s0}).
+ * Preserves exact CLI ({@code --verify-helper}, {@code --stop}, optional {@code --root-enhance}),
+ * fail-closed root privilege drop, single-instance {@code @io.github.lengsukq.opaldesk.daemon.ctl}
+ * abstract socket, and zero-roundtrip scene state push.
  */
 public final class OpalDeskDaemon implements Runnable {
-    private static final long TICK_INTERVAL_MS = 1500L;
+    private static final long RECONCILE_TICK_MS = 2000L;
     private static final long NEED_BINDER_DEBOUNCE_MS = 500L;
 
     private final AndroidServices services;
     private final DaemonConfig config;
     private final Handler mainHandler;
-    private final ExecutorService bgIoExec;
+    private final ExecutorService bgExec;
     private final HelperClientBridge helperBridge;
-    private final CompatPolicyController compatPolicy;
-    private final SystemControlService systemControl;
-    private final InputInjector injector;
-    private final LocalInputController localInput;
-    private final TaskWindowController taskController;
-    private final NativeMirrorController mirrorDisplay;
-    private final PhysicalDisplayController physicalDisplay;
-    private final LocalDexController localDex;
-    private final RemoteSessionCoordinator remoteCoordinator;
+    private final PerDisplayInputRouter inputRouter;
+    private final ExternalMouseRouter mouseRouter;
+    private final VirtualDisplayPool vdPool;
+    private final CompositorEngine compositor;
+    private final OpalCastCompositorBridge remoteBridge;
+    private final TaskStackObserver taskStackObserver;
 
-    private final AtomicBoolean shutdownCleanupDone = new AtomicBoolean(false);
+    private final AtomicBoolean shutdownDone = new AtomicBoolean(false);
     private volatile long lastNeedBinderRxMs = 0L;
 
-    private OpalDeskDaemon(AndroidServices services) {
+    private OpalDeskDaemon(AndroidServices services, RootEnhancer.EnhancementReport rootReport) {
         this.services = services;
         this.config = new DaemonConfig();
+        this.config.loadAll();
+        if (rootReport != null) {
+            this.config.markRootEnhanced(rootReport.rootEnhanced, rootReport.secureCaptureHint);
+        }
+
         this.mainHandler = new Handler(Looper.getMainLooper());
-        this.bgIoExec = Executors.newSingleThreadExecutor(r -> newDaemonThread(r, "ExtBgIo"));
-        ScheduledExecutorService bgSchedExec = Executors.newSingleThreadScheduledExecutor(r -> newDaemonThread(r, "ExtBgSched"));
+        this.bgExec = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "OpalDaemonBg");
+            t.setDaemon(true);
+            return t;
+        });
 
         TaskApiAdapter taskApi = new TaskApiAdapter(services.iActivityTaskManager);
-        DesktopWindowManager windowManager = new DesktopWindowManager();
+        AndroidDisplayDriver displayDriver = new AndroidDisplayDriver(services, taskApi);
+        this.inputRouter = new PerDisplayInputRouter(services, config);
+        this.mouseRouter = new ExternalMouseRouter(services, config, mainHandler);
+        displayDriver.setInputRouter(this.inputRouter);
 
-        this.helperBridge = new HelperClientBridge(services, config, bgIoExec);
-        this.compatPolicy = new CompatPolicyController(services, taskApi, config, bgIoExec);
-        this.systemControl = new SystemControlService(services, config, helperBridge);
-        this.injector = new InputInjector(services, config, helperBridge);
-        this.localInput = new LocalInputController(config, injector, taskApi);
-        this.mirrorDisplay = new NativeMirrorController(
-                services, config, compatPolicy, systemControl, helperBridge,
-                injector, localInput, taskApi, mainHandler, bgIoExec, bgSchedExec);
-        this.physicalDisplay = new PhysicalDisplayController(
-                services, config, compatPolicy, systemControl, mirrorDisplay,
-                helperBridge, injector, localInput, taskApi, mainHandler, bgIoExec);
-        this.localDex = new LocalDexController(
-                services, config, compatPolicy, helperBridge, injector, localInput,
-                taskApi, mainHandler, bgIoExec);
-        TaskWindowController taskController = new TaskWindowController(
-                services, config, taskApi, windowManager, compatPolicy,
-                helperBridge, mainHandler, bgIoExec);
-        this.taskController = taskController;
-        this.remoteCoordinator = new RemoteSessionCoordinator(
-                services, config, compatPolicy, systemControl, helperBridge,
-                injector, localInput, physicalDisplay, mirrorDisplay, taskController,
-                taskApi, mainHandler, bgIoExec);
+        this.helperBridge = new HelperClientBridge(services, config);
+        this.vdPool = new VirtualDisplayPool(
+                displayDriver,
+                config.getMaxActiveDisplays(),
+                config.isSecureCaptureEnabled());
+        this.compositor = new CompositorEngine(
+                config,
+                vdPool,
+                displayDriver,
+                this::pushSceneSnapshotAsync);
+        this.remoteBridge = new OpalCastCompositorBridge(
+                services,
+                config,
+                compositor,
+                displayDriver,
+                inputRouter);
+        this.taskStackObserver = new TaskStackObserver(
+                services.iActivityTaskManager,
+                mainHandler,
+                () -> bgExec.execute(compositor::reconcileWithSystemTasks));
+
         BridgeBinderService binderService = new BridgeBinderService(
-                config, helperBridge, physicalDisplay, localDex, mirrorDisplay, compatPolicy,
-                systemControl, injector, localInput, taskController, remoteCoordinator,
-                this::tick, this::performShutdownCleanup);
-
-        localInput.setMirrorController(mirrorDisplay);
-        localInput.setDesktopHooks(taskController::scheduleFastFocusSync, taskController::handleDesktopShortcut);
+                services,
+                config,
+                helperBridge,
+                compositor,
+                inputRouter,
+                mouseRouter,
+                taskApi,
+                remoteBridge,
+                this::performShutdownCleanup);
         helperBridge.setControlBinder(binderService);
         helperBridge.setOnHelperDeath(() -> {
-            localInput.releaseStaleMouseDragOnHelperDeath();
-            if (localDex.isActive()) localDex.stop();
+            // Detach orphaned surfaces & restore hardware mice to Display 0 when client UI exits
+            mouseRouter.releaseToLocal();
+            inputRouter.releaseAllDisplays();
         });
-        systemControl.setOnDimStateChanged(() -> remoteCoordinator.pushDesktopDeviceState(true));
-        taskController.setOnRemoteStateDirty(() -> remoteCoordinator.pushDesktopDeviceState(true));
-        taskController.setOnSendBackKey(() -> localInput.injectKey(android.view.KeyEvent.KEYCODE_BACK, 0));
-        physicalDisplay.wireCollaborators(
-                taskController, this::tick,
-                remoteCoordinator::applyDesktopResizeFromConfig,
-                localDex::resizeFromConfigLocked);
-        localDex.wireCollaborators(
-                taskController,
-                remoteCoordinator::isDesktopSessionActive,
-                this::teardownPhysicalForLocalLocked);
-        remoteCoordinator.wireCallbacks(
-                this::teardownPhysicalForRemoteLocked,
-                () -> physicalDisplay.cleanupDisplayLocked(false, false),
-                this::tick);
-        injector.setExtraDisplayHooks(
-                remoteCoordinator::resolveStandaloneUniqueId,
-                remoteCoordinator::resolveStandaloneDims,
-                remoteCoordinator::openUhidForStandaloneDisplays,
-                remoteCoordinator::pushAllDeviceStates);
     }
 
-    @SuppressWarnings("deprecation") // Looper.prepareMainLooper() is required in standalone app_process daemons.
+    @SuppressWarnings("deprecation")
     public static void main(String[] args) {
         try {
+            RootEnhancer.EnhancementReport report = RootEnhancer.maybeApplyPreDropEnhancements(args);
             dropRootFailClosed();
             if (args != null && args.length > 0) {
                 if ("--verify-helper".equals(args[0])) {
@@ -155,7 +145,7 @@ public final class OpalDeskDaemon implements Runnable {
             Looper.prepareMainLooper();
             installUncaughtExceptionHandler();
 
-            OpalDeskDaemon daemon = new OpalDeskDaemon(AndroidServices.createForDaemon());
+            OpalDeskDaemon daemon = new OpalDeskDaemon(AndroidServices.createForDaemon(), report);
             DaemonControlSocket.bindHandlers(
                     () -> daemon.config.shuttingDown,
                     daemon.helperBridge::isTrustedCaller,
@@ -170,103 +160,72 @@ public final class OpalDeskDaemon implements Runnable {
     }
 
     private void start() {
-        injector.unbindInput();
-        systemControl.restoreOrphanScreenDimBackup();
-        boolean firstConf = config.loadAll();
-        localInput.resetCursorCenter(config.virtW, config.virtH);
-        compatPolicy.maybeScheduleInitialHeal(firstConf);
-
-        remoteCoordinator.start();
-        taskController.startTaskStackObserver();
+        taskStackObserver.start();
+        mouseRouter.start();
+        remoteBridge.start();
         helperBridge.enqueuePushBinder(true);
-        for (long delayMs : new long[]{400L, 1100L, 2400L}) {
+        for (long delayMs : new long[]{350L, 1000L, 2200L}) {
             mainHandler.postDelayed(() -> {
-                if (!config.shuttingDown && !helperBridge.isHelperAlive()) helperBridge.enqueuePushBinder(true);
+                if (!config.shuttingDown && !helperBridge.isHelperAlive()) {
+                    helperBridge.enqueuePushBinder(true);
+                }
             }, delayMs);
         }
 
         registerNeedBinderReceiver();
-        Runtime.getRuntime().addShutdownHook(new Thread(this::performShutdownCleanup, "ExtShutdownHook"));
+        Runtime.getRuntime().addShutdownHook(new Thread(this::performShutdownCleanup, "OpalShutdownHook"));
 
-        System.out.println("OPALDESK_V3_DAEMON_STARTED cfg=" + config.virtW + "x" + config.virtH
-                + "@" + config.virtDpi + "dpi," + config.virtFps + "fps");
+        System.out.println("OPALDESK_UNIVERSAL_COMPOSITOR_DAEMON_STARTED uid=" + android.os.Process.myUid()
+                + " maxVd=" + config.getMaxActiveDisplays()
+                + " rootEnhanced=" + config.isRootEnhanced());
         System.out.flush();
 
-        bgIoExec.execute(() -> {
-            helperBridge.grantHelperPrivileges();
-            compatPolicy.healStrayCompatOverrides(false);
-            compatPolicy.sanitizeSystemHomeTasks(true, config.vdId, mirrorDisplay.getSideVdId(), config.extId);
-        });
-        mainHandler.post(this);
+        bgExec.execute(helperBridge::grantHelperPrivileges);
+        mainHandler.postDelayed(this, RECONCILE_TICK_MS);
     }
 
     @Override
     public void run() {
         if (config.shuttingDown) return;
         try {
-            tick();
+            long now = SystemClock.uptimeMillis();
+            helperBridge.maybePushBinderOnTick(now);
+            vdPool.setConfiguredMaxDisplays(config.getMaxActiveDisplays());
+            bgExec.execute(compositor::reconcileWithSystemTasks);
         } catch (Throwable t) {
-            System.err.println("OPALDESK_TICK_ERR: " + t);
-            t.printStackTrace();
+            System.err.println("OPALDESK_TICK_WARN: " + t.getMessage());
         }
-        if (!config.shuttingDown) mainHandler.postDelayed(this, TICK_INTERVAL_MS);
-    }
-
-    private void tick() {
-        long nowMs = SystemClock.uptimeMillis();
-        helperBridge.maybePushBinderOnTick(nowMs);
-        compatPolicy.maybeScheduleHomeSanitize(nowMs, config.vdId, mirrorDisplay.getSideVdId(), config.extId);
-
-        if (!config.shuttingDown && !remoteCoordinator.isDesktopSessionActive() && !localDex.isActive()) {
-            // Promote native EDID mode strictly OUTSIDE displayLock (avoids sleeping under lock).
-            physicalDisplay.maybePromoteNativeEdidBeforeLock(physicalDisplay.findExternalDisplay());
-        }
-
-        synchronized (config.displayLock) {
-            if (config.shuttingDown) return;
-            if (remoteCoordinator.isDesktopSessionActive()) {
-                physicalDisplay.resetLastPushedExtId();
-                remoteCoordinator.tickRemoteLocked();
-            } else if (localDex.isActive()) {
-                physicalDisplay.resetLastPushedExtId();
-                localDex.tickLocalLocked();
-            } else {
-                physicalDisplay.tickPhysicalLocked();
-            }
+        if (!config.shuttingDown) {
+            mainHandler.postDelayed(this, RECONCILE_TICK_MS);
         }
     }
 
-    private void teardownPhysicalForLocalLocked() {
-        if (config.extId >= 0 || physicalDisplay.hasActiveDisplay() || mirrorDisplay.hasActiveResources()) {
-            physicalDisplay.cleanupDisplayLocked(false, true);
-        }
-    }
-
-    private void teardownPhysicalForRemoteLocked() {
-        if (localDex.isActive()) {
-            localDex.stopLocked(false);
-        }
-        if (config.extId >= 0 || physicalDisplay.hasActiveDisplay() || mirrorDisplay.hasActiveResources()) {
-            physicalDisplay.cleanupDisplayLocked(false, true);
-        }
+    private void pushSceneSnapshotAsync() {
+        helperBridge.pushSceneState(compositor.toSceneJson(), compositor.getStateSeq());
     }
 
     private void performShutdownCleanup() {
         config.shuttingDown = true;
-        if (!shutdownCleanupDone.compareAndSet(false, true)) return;
+        if (!shutdownDone.compareAndSet(false, true)) return;
         try {
-            taskController.stopTaskStackObserver();
-        } catch (RuntimeException e) {
-            System.err.println("OPALDESK_SHUTDOWN_OBSERVER_ERR: " + e.getMessage());
+            remoteBridge.shutdown();
+        } catch (RuntimeException ignored) {
         }
         try {
-            remoteCoordinator.shutdown();
-        } catch (RuntimeException e) {
-            System.err.println("OPALDESK_SHUTDOWN_REMOTE_ERR: " + e.getMessage());
+            taskStackObserver.stop();
+        } catch (RuntimeException ignored) {
         }
-        synchronized (config.displayLock) {
-            localDex.stopLocked(false);
-            physicalDisplay.cleanupDisplayLocked(true, false);
+        try {
+            compositor.closeAllWindows(false);
+        } catch (RuntimeException ignored) {
+        }
+        try {
+            mouseRouter.shutdown();
+        } catch (RuntimeException ignored) {
+        }
+        try {
+            inputRouter.releaseAllDisplays();
+        } catch (RuntimeException ignored) {
         }
     }
 
@@ -294,12 +253,11 @@ public final class OpalDeskDaemon implements Runnable {
         try {
             if (Build.VERSION.SDK_INT >= 33) ctx.registerReceiver(rx, flt, Context.RECEIVER_EXPORTED);
             else ctx.registerReceiver(rx, flt);
-        } catch (RuntimeException e) {
-            System.err.println("OPALDESK_REG_RECEIVER_WARN: " + e.getMessage());
+        } catch (RuntimeException ignored) {
         }
     }
 
-    @SuppressWarnings("deprecation") // android.system.Os.setgid/setuid are the only JDK-level root-drop syscalls.
+    @SuppressWarnings("deprecation")
     private static void dropRootFailClosed() {
         int initUid = android.os.Process.myUid();
         int osUid = -1;
@@ -319,7 +277,6 @@ public final class OpalDeskDaemon implements Runnable {
             try (FileOutputStream out = new FileOutputStream("/proc/thread-self/attr/current")) {
                 out.write("u:r:shell:s0\0".getBytes(StandardCharsets.US_ASCII));
             } catch (IOException ignored) {
-                // Best-effort SELinux domain transition when launched without runcon.
             }
             System.out.println("OPALDESK_ROOT_DROPPED_TO_SHELL uid=2000 gid=2000");
         } catch (Throwable t) {
@@ -338,8 +295,7 @@ public final class OpalDeskDaemon implements Runnable {
                     return;
                 }
             }
-        } catch (ReflectiveOperationException | RuntimeException e) {
-            System.err.println("OPALDESK_SETGROUPS_WARN: " + e.getMessage());
+        } catch (ReflectiveOperationException | RuntimeException ignored) {
         }
     }
 
@@ -347,15 +303,10 @@ public final class OpalDeskDaemon implements Runnable {
         Thread mainThread = Thread.currentThread();
         Thread.UncaughtExceptionHandler prev = Thread.getDefaultUncaughtExceptionHandler();
         Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
-            System.err.println("OPALDESK_UNCAUGHT_EXCEPTION thread=" + (thread != null ? thread.getName() : "unknown") + ": " + throwable);
+            System.err.println("OPALDESK_UNCAUGHT_EXCEPTION thread="
+                    + (thread != null ? thread.getName() : "unknown") + ": " + throwable);
             if (throwable != null) throwable.printStackTrace();
             if (thread == mainThread && prev != null) prev.uncaughtException(thread, throwable);
         });
-    }
-
-    private static Thread newDaemonThread(Runnable r, String name) {
-        Thread t = new Thread(r, name);
-        t.setDaemon(true);
-        return t;
     }
 }

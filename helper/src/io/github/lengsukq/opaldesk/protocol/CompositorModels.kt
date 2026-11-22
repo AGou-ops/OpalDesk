@@ -1,0 +1,487 @@
+package io.github.lengsukq.opaldesk.protocol
+
+import org.json.JSONObject
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
+
+/**
+ * Immutable client-side models, JSON parser, and pure geometry math (hit-testing, 8-way resize,
+ * edge snap detection) for the OpalDesk Universal Compositor.
+ */
+data class DaemonStatus(
+    val connected: Boolean = false,
+    val protocolVersion: Int = 0,
+    val daemonUid: Int = -1,
+    val injectStatus: Int = BridgeProtocol.InputBackend.STATUS_SYSTEM,
+    val inputBackendMode: Int = BridgeProtocol.InputBackend.AUTO,
+    val activeVdCount: Int = 0,
+    val maxVdCount: Int = 6,
+    val windowCount: Int = 0,
+    val rootEnhanced: Boolean = false,
+    val canvasWidth: Int = 1920,
+    val canvasHeight: Int = 1200,
+    val canvasDpi: Int = 240,
+    val targetFps: Int = 0,
+    val windowDpiScalePct: Int = 100,
+    val mouseTargetMode: Int = BridgeProtocol.MouseTarget.EXTERNAL,
+    val boundMouseCount: Int = 0,
+    val connectedMouseCount: Int = 0,
+    val mouseRoutedDisplayId: Int = -1,
+) {
+    val injectBackendLabel: String
+        get() = when {
+            !connected -> "未连接"
+            injectStatus == BridgeProtocol.InputBackend.STATUS_UHID -> "Linux /dev/uhid 内核虚拟外设"
+            injectStatus == BridgeProtocol.InputBackend.STATUS_SYSTEM -> "AOSP InputManager 系统直通"
+            else -> "输入受限（建议切换至 UHID）"
+        }
+
+    val privilegeSummary: String
+        get() = when {
+            !connected -> "守护进程离线"
+            rootEnhanced -> "Shell 沙盒 (uid=$daemonUid) · 已启用可选 Root 增强"
+            else -> "免 Root 纯净模式 (uid=$daemonUid)"
+        }
+}
+
+data class RemoteStreamStatus(
+    val connected: Boolean = false,
+    val sinkType: Int = 0,
+    val peerName: String = "",
+    val width: Int = 0,
+    val height: Int = 0,
+    val fpsX100: Int = 0,
+    val bitrateKbps: Int = 0,
+    val wifiEnabled: Boolean = false,
+    val wifiPort: Int = 19878,
+    val certFingerprint: String = "",
+    val activePin: String = "",
+    val lanIp: String = "",
+) {
+    val shortCertFingerprint: String
+        get() {
+            val clean = certFingerprint.replace(":", "").trim().uppercase()
+            if (clean.length < 12) return clean
+            return "${clean.substring(0, 4)}-${clean.substring(4, 8)}-${clean.substring(8, 12)}"
+        }
+
+    val channelLabel: String
+        get() = when (sinkType) {
+            2 -> "USB 有线直连"
+            4 -> "无线 ADB 隧道"
+            3 -> "Wi-Fi TLS 直连"
+            else -> "Mac 投屏"
+        }
+}
+
+data class WindowRect(
+    val left: Int,
+    val top: Int,
+    val right: Int,
+    val bottom: Int,
+) {
+    val width: Int get() = max(0, right - left)
+    val height: Int get() = max(0, bottom - top)
+    val isEmpty: Boolean get() = width <= 0 || height <= 0
+}
+
+data class CompositorWindow(
+    val windowId: Int,
+    val pkg: String,
+    val activityClass: String,
+    val title: String,
+    val profileName: String,
+    val profileCode: Int,
+    val state: String,
+    val presentation: String,
+    val frame: WindowRect,
+    val contentWidth: Int,
+    val contentHeight: Int,
+    val contentDpi: Int,
+    val displayId: Int,
+    val taskId: Int,
+    val zOrder: Int,
+    val focused: Boolean,
+    val snapshotVersion: Long,
+    val hasSnapshot: Boolean,
+) {
+    val isLive: Boolean get() = state == BridgeProtocol.WinState.LIVE && displayId > 0
+    val isHibernated: Boolean get() = state == BridgeProtocol.WinState.HIBERNATED
+    val isMinimized: Boolean get() = state == BridgeProtocol.WinState.MINIMIZED
+    val isMaximized: Boolean get() = presentation == BridgeProtocol.Presentation.MAXIMIZED
+    val isPortraitProfile: Boolean get() = profileCode == BridgeProtocol.Profile.PORTRAIT
+}
+
+data class CompositorScene(
+    val seq: Long = 0L,
+    val canvasWidth: Int = 1920,
+    val canvasHeight: Int = 1200,
+    val canvasDpi: Int = 240,
+    val activeVdCount: Int = 0,
+    val maxVdCount: Int = 6,
+    val windows: List<CompositorWindow> = emptyList(),
+) {
+    val visibleWindows: List<CompositorWindow>
+        get() = windows.filter { !it.isMinimized }.sortedBy { it.zOrder }
+
+    val focusedWindow: CompositorWindow?
+        get() = visibleWindows.lastOrNull { it.focused } ?: visibleWindows.lastOrNull()
+}
+
+enum class ResizeEdge {
+    N, S, E, W, NW, NE, SW, SE
+}
+
+/**
+ * Common desktop multi-window tiling presets for wide tablets and 2K/4K external monitors.
+ */
+enum class WindowTilingLayout(
+    val label: String,
+    val shortLabel: String,
+    val maxSlots: Int,
+) {
+    SPLIT_2_COLS("左右二分屏", "左右二分", 2),
+    SPLIT_2_MAIN_SIDE("主副分屏 (2:1)", "主副 2:1", 2),
+    SPLIT_3_COLS("三列分屏", "三列分屏", 3),
+    SPLIT_3_MAIN_STACK("一主两副", "一主两副", 3),
+    SPLIT_4_COLS("四列分屏", "四列分屏", 4),
+    SPLIT_4_GRID("四宫格 (2×2)", "四宫格", 4),
+    CASCADE("层叠平铺", "层叠平铺", 6),
+}
+
+object CompositorSceneParser {
+    fun parse(json: String?): CompositorScene {
+        if (json.isNullOrBlank()) return CompositorScene()
+        return try {
+            val root = JSONObject(json)
+            val arr = root.optJSONArray("windows")
+            val list = ArrayList<CompositorWindow>(arr?.length() ?: 0)
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    val winId = o.optInt("windowId", -1)
+                    if (winId <= 0) continue
+                    list.add(
+                        CompositorWindow(
+                            windowId = winId,
+                            pkg = o.optString("pkg", ""),
+                            activityClass = o.optString("cls", ""),
+                            title = o.optString("title", ""),
+                            profileName = o.optString("profile", "DESKTOP"),
+                            profileCode = o.optInt("profileCode", BridgeProtocol.Profile.DESKTOP),
+                            state = o.optString("state", BridgeProtocol.WinState.HIBERNATED),
+                            presentation = o.optString("presentation", BridgeProtocol.Presentation.FLOATING),
+                            frame = WindowRect(
+                                left = o.optInt("left", 100),
+                                top = o.optInt("top", 80),
+                                right = o.optInt("right", 960),
+                                bottom = o.optInt("bottom", 680),
+                            ),
+                            contentWidth = o.optInt("contentW", 860),
+                            contentHeight = o.optInt("contentH", 560),
+                            contentDpi = o.optInt("contentDpi", 200),
+                            displayId = o.optInt("displayId", -1),
+                            taskId = o.optInt("taskId", -1),
+                            zOrder = o.optInt("zOrder", 0),
+                            focused = o.optBoolean("focused", false),
+                            snapshotVersion = o.optLong("snapshotVer", 0L),
+                            hasSnapshot = o.optBoolean("hasSnapshot", false),
+                        ),
+                    )
+                }
+            }
+            list.sortBy { it.zOrder }
+            CompositorScene(
+                seq = root.optLong("seq", 0L),
+                canvasWidth = root.optInt("canvasW", 1920),
+                canvasHeight = root.optInt("canvasH", 1200),
+                canvasDpi = root.optInt("canvasDpi", 240),
+                activeVdCount = root.optInt("activeVdCount", 0),
+                maxVdCount = root.optInt("maxVdCount", 6),
+                windows = list,
+            )
+        } catch (_: Throwable) {
+            CompositorScene()
+        }
+    }
+}
+
+/**
+ * Pure client-side compositor geometry helpers (unit-testable with zero Android dependencies).
+ */
+object CompositorGeometry {
+    const val TOP_BAR_DP = 28f
+    const val HEADER_HEIGHT_DP = 36f
+    const val DOCK_INSET_DP = 70f
+    const val MIN_WIN_W_DP = 250f
+    const val MIN_WIN_H_DP = 240f
+    const val SNAP_TRIGGER_PX = 28
+
+    fun dpToPx(dp: Float, density: Float): Int = max(1, (dp * density).roundToInt())
+
+    fun clampMove(
+        base: WindowRect,
+        dx: Int,
+        dy: Int,
+        canvasW: Int,
+        canvasH: Int,
+        density: Float,
+    ): WindowRect {
+        val w = base.width
+        val h = base.height
+        val minTop = dpToPx(TOP_BAR_DP, density)
+        val maxTop = max(minTop, canvasH - dpToPx(HEADER_HEIGHT_DP + 24f, density))
+        val minVisX = dpToPx(96f, density)
+        val nextLeft = (base.left + dx).coerceIn(-w + minVisX, max(0, canvasW - minVisX))
+        val nextTop = (base.top + dy).coerceIn(minTop, maxTop)
+        return WindowRect(nextLeft, nextTop, nextLeft + w, nextTop + h)
+    }
+
+    fun computeResize(
+        base: WindowRect,
+        edge: ResizeEdge,
+        dx: Int,
+        dy: Int,
+        canvasW: Int,
+        canvasH: Int,
+        density: Float,
+    ): WindowRect {
+        val minW = dpToPx(MIN_WIN_W_DP, density)
+        val minH = dpToPx(MIN_WIN_H_DP, density)
+        val minTop = dpToPx(TOP_BAR_DP, density)
+        val maxBottom = max(minTop + minH, canvasH - dpToPx(12f, density))
+
+        var l = base.left
+        var t = base.top
+        var r = base.right
+        var b = base.bottom
+
+        when (edge) {
+            ResizeEdge.E, ResizeEdge.NE, ResizeEdge.SE -> {
+                r = (base.right + dx).coerceIn(l + minW, max(l + minW, canvasW - 4))
+            }
+            ResizeEdge.W, ResizeEdge.NW, ResizeEdge.SW -> {
+                l = (base.left + dx).coerceIn(4, max(4, r - minW))
+            }
+            else -> Unit
+        }
+        when (edge) {
+            ResizeEdge.S, ResizeEdge.SE, ResizeEdge.SW -> {
+                b = (base.bottom + dy).coerceIn(t + minH, maxBottom)
+            }
+            ResizeEdge.N, ResizeEdge.NE, ResizeEdge.NW -> {
+                t = (base.top + dy).coerceIn(minTop, max(minTop, b - minH))
+            }
+            else -> Unit
+        }
+        val evenW = (r - l) and 1.inv()
+        val evenH = (b - t) and 1.inv()
+        return WindowRect(l, t, l + max(minW, evenW), t + max(minH, evenH))
+    }
+
+    /**
+     * Detects edge/corner snap zones when dragging a window header near desktop borders.
+     */
+    fun detectSnapPresentation(pointerX: Int, pointerY: Int, canvasW: Int, canvasH: Int, density: Float): String? {
+        if (canvasW <= 0 || canvasH <= 0) return null
+        val cornerZone = dpToPx(90f, density)
+        val topTrigger = dpToPx(TOP_BAR_DP + 14f, density)
+        val nearLeft = pointerX <= SNAP_TRIGGER_PX
+        val nearRight = pointerX >= canvasW - SNAP_TRIGGER_PX
+        val nearTop = pointerY <= topTrigger
+        val nearBottom = pointerY >= canvasH - SNAP_TRIGGER_PX
+
+        return when {
+            nearLeft && pointerY <= cornerZone -> BridgeProtocol.Presentation.SNAP_TL
+            nearLeft && pointerY >= canvasH - cornerZone -> BridgeProtocol.Presentation.SNAP_BL
+            nearRight && pointerY <= cornerZone -> BridgeProtocol.Presentation.SNAP_TR
+            nearRight && pointerY >= canvasH - cornerZone -> BridgeProtocol.Presentation.SNAP_BR
+            nearLeft -> BridgeProtocol.Presentation.SNAP_LEFT
+            nearRight -> BridgeProtocol.Presentation.SNAP_RIGHT
+            nearTop -> BridgeProtocol.Presentation.MAXIMIZED
+            nearBottom -> null
+            else -> null
+        }
+    }
+
+    fun computeSnapPreviewRect(presentation: String, canvasW: Int, canvasH: Int, density: Float): WindowRect {
+        val topInset = dpToPx(TOP_BAR_DP + 4f, density)
+        val botInset = dpToPx(DOCK_INSET_DP, density)
+        val pad = dpToPx(6f, density)
+        val wl = pad
+        val wr = max(wl + 200, canvasW - pad)
+        val wt = topInset
+        val wb = max(wt + 200, canvasH - botInset)
+        val midX = (wl + wr) / 2
+        val midY = (wt + wb) / 2
+        val halfGap = dpToPx(4f, density)
+
+        return when (presentation) {
+            BridgeProtocol.Presentation.SNAP_LEFT -> WindowRect(wl, wt, midX - halfGap, wb)
+            BridgeProtocol.Presentation.SNAP_RIGHT -> WindowRect(midX + halfGap, wt, wr, wb)
+            BridgeProtocol.Presentation.SNAP_TL -> WindowRect(wl, wt, midX - halfGap, midY - halfGap)
+            BridgeProtocol.Presentation.SNAP_TR -> WindowRect(midX + halfGap, wt, wr, midY - halfGap)
+            BridgeProtocol.Presentation.SNAP_BL -> WindowRect(wl, midY + halfGap, midX - halfGap, wb)
+            BridgeProtocol.Presentation.SNAP_BR -> WindowRect(midX + halfGap, midY + halfGap, wr, wb)
+            else -> WindowRect(wl, wt, wr, wb)
+        }
+    }
+
+    /**
+     * Computes deterministic, non-overlapping, even-aligned outer window frames for pro desktop
+     * multi-window tiling layouts (2-col, 2:1 main+side, 3-col, 1-main+2-stack, 4-col, 2×2 grid, cascade).
+     */
+    fun computeTilingFrames(
+        layout: WindowTilingLayout,
+        windowCount: Int,
+        canvasW: Int,
+        canvasH: Int,
+        density: Float,
+    ): List<WindowRect> {
+        if (windowCount <= 0 || canvasW <= 0 || canvasH <= 0) return emptyList()
+        val slots = min(windowCount, layout.maxSlots)
+        val topInset = dpToPx(TOP_BAR_DP + 4f, density)
+        val botInset = dpToPx(DOCK_INSET_DP, density)
+        val pad = dpToPx(6f, density)
+        val gap = dpToPx(8f, density)
+        val wl = pad
+        val wr = max(wl + 260, canvasW - pad)
+        val wt = topInset
+        val wb = max(wt + 240, canvasH - botInset)
+        val workW = wr - wl
+        val workH = wb - wt
+
+        fun alignedRect(left: Int, top: Int, right: Int, bottom: Int): WindowRect {
+            val w = max(260, (right - left) and 1.inv())
+            val h = max(240, (bottom - top) and 1.inv())
+            return WindowRect(left, top, left + w, top + h)
+        }
+
+        fun splitColumns(colCount: Int): List<WindowRect> {
+            val totalGaps = gap * (colCount - 1)
+            val colW = max(260, ((workW - totalGaps) / colCount) and 1.inv())
+            val out = ArrayList<WindowRect>(slots)
+            for (i in 0 until slots) {
+                val l = wl + i * (colW + gap)
+                val r = if (i == colCount - 1) wr else min(wr, l + colW)
+                out.add(alignedRect(l, wt, r, wb))
+            }
+            return out
+        }
+
+        return when (layout) {
+            WindowTilingLayout.SPLIT_2_COLS -> splitColumns(2)
+            WindowTilingLayout.SPLIT_3_COLS -> splitColumns(3)
+            WindowTilingLayout.SPLIT_4_COLS -> splitColumns(4)
+            WindowTilingLayout.SPLIT_2_MAIN_SIDE -> {
+                val mainW = (((workW - gap) * 0.65f).roundToInt() and 1.inv()).coerceIn(260, max(260, workW - gap - 260))
+                val r1 = alignedRect(wl, wt, wl + mainW, wb)
+                if (slots == 1) listOf(r1)
+                else listOf(r1, alignedRect(wl + mainW + gap, wt, wr, wb))
+            }
+            WindowTilingLayout.SPLIT_3_MAIN_STACK -> {
+                val mainW = (((workW - gap) * 0.56f).roundToInt() and 1.inv()).coerceIn(260, max(260, workW - gap - 260))
+                val midY = wt + (workH - gap) / 2
+                val out = ArrayList<WindowRect>(slots)
+                out.add(alignedRect(wl, wt, wl + mainW, wb))
+                if (slots >= 2) out.add(alignedRect(wl + mainW + gap, wt, wr, midY))
+                if (slots >= 3) out.add(alignedRect(wl + mainW + gap, midY + gap, wr, wb))
+                out
+            }
+            WindowTilingLayout.SPLIT_4_GRID -> {
+                val midX = wl + (workW - gap) / 2
+                val midY = wt + (workH - gap) / 2
+                val all = listOf(
+                    alignedRect(wl, wt, midX, midY),
+                    alignedRect(midX + gap, wt, wr, midY),
+                    alignedRect(wl, midY + gap, midX, wb),
+                    alignedRect(midX + gap, midY + gap, wr, wb),
+                )
+                all.take(slots)
+            }
+            WindowTilingLayout.CASCADE -> {
+                val winW = ((workW * 0.62f).roundToInt() and 1.inv()).coerceIn(320, workW)
+                val winH = ((workH * 0.74f).roundToInt() and 1.inv()).coerceIn(280, workH)
+                val step = dpToPx(32f, density)
+                val baseL = wl + max(0, (workW - winW - step * max(0, slots - 1)) / 2)
+                val baseT = wt + max(0, (workH - winH - step * max(0, slots - 1)) / 2)
+                val out = ArrayList<WindowRect>(slots)
+                for (i in 0 until slots) {
+                    val l = min(max(wl, baseL + i * step), max(wl, wr - winW))
+                    val t = min(max(wt, baseT + i * step), max(wt, wb - winH))
+                    out.add(alignedRect(l, t, l + winW, t + winH))
+                }
+                out
+            }
+        }
+    }
+
+    /**
+     * Maps a touch/mouse coordinate inside a window's TextureView [viewW × viewH] to the isolated
+     * VirtualDisplay pixel space [contentW × contentH].
+     */
+    fun mapViewToDisplayCoord(coord: Float, viewSize: Int, contentSize: Int): Float {
+        if (viewSize <= 1 || contentSize <= 1) return 0f
+        val scaled = coord * (contentSize.toFloat() / viewSize.toFloat())
+        return min((contentSize - 1).toFloat(), max(0f, scaled))
+    }
+
+    /**
+     * Geometric Z-order occlusion guard preventing click-through to a lower floating window
+     * whenever another visible window with strictly higher [CompositorWindow.zOrder] covers
+     * the desktop canvas coordinate ([canvasX], [canvasY]).
+     */
+    fun isPointOccludedByHigherWindow(
+        target: CompositorWindow,
+        canvasX: Float,
+        canvasY: Float,
+        visibleWindows: List<CompositorWindow>,
+    ): Boolean {
+        for (other in visibleWindows) {
+            if (other.windowId == target.windowId) continue
+            if (other.zOrder > target.zOrder ||
+                (other.zOrder == target.zOrder && other.focused && !target.focused)
+            ) {
+                val f = other.frame
+                if (canvasX >= f.left && canvasX <= f.right && canvasY >= f.top && canvasY <= f.bottom) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * Smart macOS-style cursor-anchored context menu placement:
+     * opens just bottom-right of ([anchorX], [anchorY]), automatically flipping left/up when near
+     * right or bottom screen edges (e.g. Dock icons) and clamping cleanly inside the canvas.
+     */
+    fun computeAnchoredMenuPosition(
+        anchorX: Int,
+        anchorY: Int,
+        menuW: Int,
+        menuH: Int,
+        canvasW: Int,
+        canvasH: Int,
+        density: Float,
+    ): Pair<Int, Int> {
+        val margin = dpToPx(10f, density)
+        val topMin = dpToPx(TOP_BAR_DP + 6f, density)
+        val cursorPad = dpToPx(4f, density)
+        val maxX = max(margin, canvasW - menuW - margin)
+        val maxY = max(topMin, canvasH - menuH - margin)
+
+        val preferredX = if (anchorX + cursorPad + menuW + margin <= canvasW) {
+            anchorX + cursorPad
+        } else {
+            anchorX - menuW - cursorPad
+        }
+        val preferredY = if (anchorY + cursorPad + menuH + margin <= canvasH) {
+            anchorY + cursorPad
+        } else {
+            anchorY - menuH - cursorPad
+        }
+        return preferredX.coerceIn(margin, maxX) to preferredY.coerceIn(topMin, maxY)
+    }
+}
