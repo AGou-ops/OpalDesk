@@ -64,6 +64,7 @@ import io.github.lengsukq.opaldesk.ui.OpalButton
 import io.github.lengsukq.opaldesk.ui.OpalGlyphIcon
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalSegmentedRow
+import io.github.lengsukq.opaldesk.ui.OpalSwitchRow
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTextInput
 import io.github.lengsukq.opaldesk.ui.TilingLayoutPreviewIcon
@@ -129,6 +130,9 @@ fun MacDesktopMenuBar(
     hostScreenOff: Boolean,
     isCompactWidth: Boolean,
     showControlCenter: Boolean,
+    showPhoneTrackpadButton: Boolean = false,
+    phoneTrackpadVisible: Boolean = false,
+    onTogglePhoneTrackpad: () -> Unit = {},
     onToggleFullscreen: () -> Unit,
     onToggleControlCenter: () -> Unit,
     onOpenConsole: () -> Unit,
@@ -223,6 +227,33 @@ fun MacDesktopMenuBar(
         }
 
         Spacer(Modifier.width(8.dp))
+
+        if (showPhoneTrackpadButton) {
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.20f) else OpalPalette.ChipFill)
+                    .clickable(onClick = onTogglePhoneTrackpad)
+                    .padding(horizontal = if (isCompactWidth) 6.dp else 8.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(if (phoneTrackpadVisible) OpalPalette.AccentBlue else OpalPalette.TextMuted),
+                )
+                OpalText(
+                    text = if (isCompactWidth) "触控板" else "手机触控板",
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (phoneTrackpadVisible) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                    maxLines = 1,
+                )
+            }
+            Spacer(Modifier.width(6.dp))
+        }
 
         // Unified Top-Right Status Bar & Control Center Trigger
         Row(
@@ -720,7 +751,13 @@ fun MacControlCenterPopover(
     isExternalMonitor: Boolean,
     hostScreenOff: Boolean,
     showHostScreenToggle: Boolean,
+    showPhoneTrackpadSection: Boolean = false,
+    phoneTrackpadVisible: Boolean = false,
+    showAutoTrackpadSwitch: Boolean = false,
+    autoShowPhoneTrackpad: Boolean = true,
     maxHeight: Dp = 640.dp,
+    onTogglePhoneTrackpad: () -> Unit = {},
+    onToggleAutoPhoneTrackpad: (Boolean) -> Unit = {},
     onSelectTargetFps: (Int) -> Unit,
     onSelectWindowDpiPct: (Int) -> Unit,
     onSelectUiScale: (Float) -> Unit,
@@ -877,6 +914,73 @@ fun MacControlCenterPopover(
                     accent = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
                     onClick = { onToggleHostScreenPower(hostScreenOff) },
                 )
+            }
+        }
+
+        // Phone Trackpad On-Screen Control & Auto-Display Setting (External Monitor / Cast)
+        if (showPhoneTrackpadSection) {
+            Spacer(Modifier.height(10.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(infoCardShape)
+                    .background(
+                        if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.12f) else OpalPalette.ChipFill,
+                    )
+                    .border(
+                        width = 0.8.dp,
+                        color = if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.40f) else OpalPalette.BorderHairline,
+                        shape = infoCardShape,
+                    )
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        OpalText(
+                            text = if (phoneTrackpadVisible) "手机触控板运行中" else "手机屏幕触控板",
+                            fontSize = 12.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (phoneTrackpadVisible) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        OpalText(
+                            text = if (phoneTrackpadVisible) {
+                                "手机当前正作为外接屏多指触控板使用"
+                            } else {
+                                "在手机屏幕上显示多指触控板与虚拟键鼠，随时操控外接屏"
+                            },
+                            fontSize = 10.5.sp,
+                            color = OpalPalette.TextSecondary,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    OpalButton(
+                        label = if (phoneTrackpadVisible) "关闭触控板" else "显示触控板",
+                        compact = true,
+                        filled = !phoneTrackpadVisible,
+                        accent = if (phoneTrackpadVisible) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
+                        onClick = onTogglePhoneTrackpad,
+                    )
+                }
+                if (showAutoTrackpadSwitch) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(0.8.dp)
+                            .background(OpalPalette.DividerColor),
+                    )
+                    OpalSwitchRow(
+                        title = "接入外接屏时自动显示手机触控板",
+                        subtitle = "原生扩展屏启动后自动在手机拉起触控板，关闭后仅手动打开",
+                        checked = autoShowPhoneTrackpad,
+                        onCheckedChange = onToggleAutoPhoneTrackpad,
+                    )
+                }
             }
         }
 
@@ -1179,6 +1283,9 @@ fun TaskbarContextMenuPopover(
 fun DesktopWallpaperContextMenu(
     wallpaperPreset: Int,
     hasCustomWallpaper: Boolean,
+    showPhoneTrackpadAction: Boolean = false,
+    phoneTrackpadVisible: Boolean = false,
+    onTogglePhoneTrackpad: () -> Unit = {},
     onSelectPreset: (Int) -> Unit,
     onPickCustomWallpaper: () -> Unit,
     onClearCustomWallpaper: () -> Unit,
@@ -1279,6 +1386,15 @@ fun DesktopWallpaperContextMenu(
         ContextMenuRow(if (isDark) "切换为浅色液态毛玻璃" else "切换为深色液态毛玻璃") {
             onToggleLightDark()
             onDismiss()
+        }
+        if (showPhoneTrackpadAction) {
+            ContextMenuRow(
+                title = if (phoneTrackpadVisible) "关闭手机屏幕触控板" else "在手机上显示触控板",
+                textColor = OpalPalette.AccentBlue,
+            ) {
+                onDismiss()
+                onTogglePhoneTrackpad()
+            }
         }
         ContextMenuRow("打开 OpalDesk 主控制台") {
             onDismiss()

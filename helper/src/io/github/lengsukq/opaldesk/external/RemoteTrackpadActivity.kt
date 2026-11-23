@@ -21,44 +21,63 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.geometry.Offset
 import androidx.core.view.WindowCompat
 import io.github.lengsukq.opaldesk.BridgeClient
+import io.github.lengsukq.opaldesk.DesktopActivity
 import io.github.lengsukq.opaldesk.MainActivity
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.ui.OpalImeFocusTracker
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalTheme
 import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
-import kotlin.math.max
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * Display 0 Precision Multi-Touch Trackpad & Control Deck for active Wireless / USB OpalCast sessions.
+ * Display 0 Precision Multi-Touch Trackpad & Control Deck supporting BOTH:
+ * 1. Physical Direct Extended external monitors (USB-C / HDMI where [io.github.lengsukq.opaldesk.ExternalDesktopActivity]
+ *    runs directly on Display N > 0), dispatching zero-lag in-process cursor/touch/scroll via [ExternalTrackpadBridge].
+ * 2. Active Wireless / USB OpalCast desktop sessions, injecting 120Hz `FLAG_ONEWAY` events onto `OpalDesk-Remote`.
  *
- * Lives on its own Display 0 task so it never collides with [io.github.lengsukq.opaldesk.ExternalDesktopActivity]
- * rendering on the remote `OpalDesk-Remote` VirtualDisplay. Injects 120Hz `FLAG_ONEWAY` pointer/scroll
- * events directly onto the remote desktop while rendering a zero-lag in-process cursor on the casted screen.
+ * Lives on its own Display 0 task (`taskAffinity=".trackpad"`) so it never collides with
+ * [io.github.lengsukq.opaldesk.ExternalDesktopActivity] on the external or remote display.
  */
 class RemoteTrackpadActivity : ComponentActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val cursorPosState = mutableStateOf(Offset(960f, 540f))
-    private var isPrimaryPressed = false
+    private val remoteCursorPosState = mutableStateOf(Offset(960f, 540f))
+    private var isRemotePrimaryPressed = false
+
+    private val trackpadCloser: () -> Unit = {
+        runOnUiThread { finish() }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
-        val initialRemote = BridgeClient.remoteStatusFlow.value
-        if (!initialRemote.hasActiveDesktopCast) {
-            Toast.makeText(this, "当前未处于桌面投屏状态", Toast.LENGTH_SHORT).show()
-            finish()
-            return
+        val initialTarget = ExternalTrackpadPolicy.resolveTrackpadTarget(
+            remote = BridgeClient.remoteStatusFlow.value,
+            session = ExternalTrackpadBridge.sessionFlow.value,
+        )
+        when (initialTarget) {
+            TrackpadTargetMode.NONE -> {
+                Toast.makeText(this, "当前未处于外接屏或桌面投屏状态", Toast.LENGTH_SHORT).show()
+                finish()
+                return
+            }
+            TrackpadTargetMode.PHYSICAL_PRESENTATION -> {
+                ExternalTrackpadLauncher.openPhoneTrackpad(this)
+                finish()
+                return
+            }
+            TrackpadTargetMode.REMOTE_CAST -> {
+                val initialRemote = BridgeClient.remoteStatusFlow.value
+                val initW = initialRemote.width.coerceAtLeast(640)
+                val initH = initialRemote.height.coerceAtLeast(480)
+                val center = Offset(initW * 0.5f, initH * 0.5f)
+                remoteCursorPosState.value = center
+                BridgeClient.updateRemoteTrackpadCursor(center)
+            }
+            TrackpadTargetMode.PHYSICAL_DIRECT_EXTENDED -> Unit
         }
-        val initW = initialRemote.width.coerceAtLeast(640)
-        val initH = initialRemote.height.coerceAtLeast(480)
-        val center = Offset(initW * 0.5f, initH * 0.5f)
-        cursorPosState.value = center
-        BridgeClient.updateRemoteTrackpadCursor(center)
 
         onBackPressedDispatcher.addCallback(
             this,
@@ -73,7 +92,9 @@ class RemoteTrackpadActivity : ComponentActivity() {
             OpalTheme {
                 val isDark = OpalPalette.isDark
                 val remote by BridgeClient.remoteStatusFlow.collectAsState()
-                val cursor = cursorPosState.value
+                val extSession by ExternalTrackpadBridge.sessionFlow.collectAsState()
+                val directCursorPair by ExternalTrackpadBridge.directCursorFlow.collectAsState()
+                val targetMode = ExternalTrackpadPolicy.resolveTrackpadTarget(remote, extSession)
 
                 LaunchedEffect(isDark) {
                     val ctrl = WindowCompat.getInsetsController(window, window.decorView)
@@ -81,56 +102,106 @@ class RemoteTrackpadActivity : ComponentActivity() {
                     ctrl.isAppearanceLightNavigationBars = !isDark
                 }
 
-                LaunchedEffect(remote.hasActiveDesktopCast) {
-                    if (!remote.hasActiveDesktopCast) {
+                LaunchedEffect(targetMode) {
+                    if (targetMode == TrackpadTargetMode.NONE) {
+                        finish()
+                    } else if (targetMode == TrackpadTargetMode.PHYSICAL_PRESENTATION) {
+                        ExternalTrackpadLauncher.openPhoneTrackpad(this@RemoteTrackpadActivity)
                         finish()
                     }
                 }
 
-                val targetW = remote.width.coerceAtLeast(640)
-                val targetH = remote.height.coerceAtLeast(480)
-                val fps = (remote.fpsX100 / 100).coerceAtLeast(30)
-                val summary = "${remote.peerName.ifBlank { "投屏端" }} · ${targetW}×${targetH} @ ${fps}Hz"
+                if (targetMode == TrackpadTargetMode.PHYSICAL_DIRECT_EXTENDED) {
+                    val summary = extSession.summary.ifBlank { "外接扩展屏" }
+                    DexTrackpadScreen(
+                        monitorSummary = summary,
+                        externalDisplayId = extSession.displayId,
+                        cursorX = directCursorPair.first.roundToInt(),
+                        cursorY = directCursorPair.second.roundToInt(),
+                        badgePrefix = "外接扩展屏",
+                        allowSwitchToLocalDesktop = true,
+                        exitButtonLabel = "退出投射",
+                        onMoveCursor = { dx, dy -> ExternalTrackpadBridge.getDirectSink()?.moveCursorBy(dx, dy) },
+                        onSetPrimaryButton = { down -> ExternalTrackpadBridge.getDirectSink()?.setPrimaryButton(down) },
+                        onTapPrimary = { ExternalTrackpadBridge.getDirectSink()?.tapPrimary() },
+                        onScroll = { h, v -> ExternalTrackpadBridge.getDirectSink()?.scrollAtCursor(h, v) },
+                        onSecondaryAction = ::sendBackToFocusedWindow,
+                        onSendKeyTap = ::sendKeyTapToFocusedWindow,
+                        onCommitTextToFocusedWindow = ::commitTextToFocusedWindow,
+                        onSwitchToLocalDesktop = {
+                            ExternalTrackpadBridge.getDirectSink()?.closeExternalDesktop()
+                            startActivity(
+                                Intent(this, DesktopActivity::class.java).apply {
+                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                                },
+                            )
+                            finish()
+                        },
+                        onOpenConsole = ::openConsole,
+                        onExitExternal = {
+                            ExternalTrackpadBridge.getDirectSink()?.closeExternalDesktop()
+                            finish()
+                        },
+                    )
+                } else {
+                    val cursor = remoteCursorPosState.value
+                    val targetW = remote.width.coerceAtLeast(640)
+                    val targetH = remote.height.coerceAtLeast(480)
+                    val fps = (remote.fpsX100 / 100).coerceAtLeast(30)
+                    val summary = "${remote.peerName.ifBlank { "投屏端" }} · ${targetW}×${targetH} @ ${fps}Hz"
 
-                DexTrackpadScreen(
-                    monitorSummary = summary,
-                    externalDisplayId = remote.desktopDisplayId,
-                    cursorX = cursor.x.roundToInt(),
-                    cursorY = cursor.y.roundToInt(),
-                    badgePrefix = remote.channelLabel,
-                    allowSwitchToLocalDesktop = false,
-                    exitButtonLabel = "断开投屏",
-                    onMoveCursor = { dx, dy -> moveCursorBy(dx, dy, targetW, targetH) },
-                    onSetPrimaryButton = { down -> setPrimaryButton(down) },
-                    onTapPrimary = { tapPrimary() },
-                    onScroll = { h, v -> scrollAtCursor(h, v) },
-                    onSecondaryAction = ::sendBackToFocusedWindow,
-                    onSendKeyTap = ::sendKeyTapToFocusedWindow,
-                    onCommitTextToFocusedWindow = ::commitTextToFocusedWindow,
-                    onSwitchToLocalDesktop = { /* Locked while casting */ },
-                    onOpenConsole = ::openConsole,
-                    onExitExternal = {
-                        BridgeClient.disconnectRemoteStreamAsync()
-                        finish()
-                    },
-                )
+                    DexTrackpadScreen(
+                        monitorSummary = summary,
+                        externalDisplayId = remote.desktopDisplayId,
+                        cursorX = cursor.x.roundToInt(),
+                        cursorY = cursor.y.roundToInt(),
+                        badgePrefix = remote.channelLabel,
+                        allowSwitchToLocalDesktop = false,
+                        exitButtonLabel = "断开投屏",
+                        onMoveCursor = { dx, dy -> moveRemoteCursorBy(dx, dy, targetW, targetH) },
+                        onSetPrimaryButton = { down -> setRemotePrimaryButton(down) },
+                        onTapPrimary = { tapRemotePrimary() },
+                        onScroll = { h, v -> scrollRemoteAtCursor(h, v) },
+                        onSecondaryAction = ::sendBackToFocusedWindow,
+                        onSendKeyTap = ::sendKeyTapToFocusedWindow,
+                        onCommitTextToFocusedWindow = ::commitTextToFocusedWindow,
+                        onSwitchToLocalDesktop = { /* Locked while casting */ },
+                        onOpenConsole = ::openConsole,
+                        onExitExternal = {
+                            BridgeClient.disconnectRemoteStreamAsync()
+                            finish()
+                        },
+                    )
+                }
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
+        ExternalTrackpadBridge.setPhoneTrackpadVisible(true, trackpadCloser)
         BridgeClient.requestBinder(this)
         Thread({
-            val latest = BridgeClient.refreshRemoteStatus()
-            if (!latest.hasActiveDesktopCast) {
+            val latestRemote = BridgeClient.refreshRemoteStatus()
+            val target = ExternalTrackpadPolicy.resolveTrackpadTarget(
+                remote = latestRemote,
+                session = ExternalTrackpadBridge.sessionFlow.value,
+            )
+            if (target == TrackpadTargetMode.NONE) {
                 runOnUiThread { finish() }
             }
         }, "OpalRemoteTrackpadSync").start()
     }
 
+    override fun onPause() {
+        ExternalTrackpadBridge.setPhoneTrackpadVisible(false, trackpadCloser)
+        super.onPause()
+    }
+
     override fun onDestroy() {
+        ExternalTrackpadBridge.setPhoneTrackpadVisible(false, trackpadCloser)
         BridgeClient.updateRemoteTrackpadCursor(null)
+        ExternalTrackpadBridge.getDirectSink()?.hideCursor()
         super.onDestroy()
     }
 
@@ -141,43 +212,41 @@ class RemoteTrackpadActivity : ComponentActivity() {
         return super.dispatchKeyEvent(event)
     }
 
-    private fun moveCursorBy(dx: Float, dy: Float, dispW: Int, dispH: Int) {
-        val cur = cursorPosState.value
-        val next = Offset(
-            x = min(max(1f, (dispW - 1).toFloat()), max(0f, cur.x + dx)),
-            y = min(max(1f, (dispH - 1).toFloat()), max(0f, cur.y + dy)),
-        )
-        cursorPosState.value = next
+    private fun moveRemoteCursorBy(dx: Float, dy: Float, dispW: Int, dispH: Int) {
+        val cur = remoteCursorPosState.value
+        val (nx, ny) = ExternalTrackpadPolicy.clampCursorPosition(cur.x + dx, cur.y + dy, dispW, dispH)
+        val next = Offset(nx, ny)
+        remoteCursorPosState.value = next
         BridgeClient.updateRemoteTrackpadCursor(next)
-        if (isPrimaryPressed) {
+        if (isRemotePrimaryPressed) {
             BridgeClient.injectRemoteTrackpadOneway(
                 action = MotionEvent.ACTION_MOVE,
-                x = next.x,
-                y = next.y,
+                x = nx,
+                y = ny,
                 buttonState = MotionEvent.BUTTON_PRIMARY,
             )
         } else {
             BridgeClient.injectRemoteTrackpadOneway(
                 action = MotionEvent.ACTION_HOVER_MOVE,
-                x = next.x,
-                y = next.y,
+                x = nx,
+                y = ny,
                 buttonState = 0,
             )
         }
     }
 
-    private fun setPrimaryButton(pressed: Boolean) {
-        val pos = cursorPosState.value
-        if (pressed && !isPrimaryPressed) {
-            isPrimaryPressed = true
+    private fun setRemotePrimaryButton(pressed: Boolean) {
+        val pos = remoteCursorPosState.value
+        if (pressed && !isRemotePrimaryPressed) {
+            isRemotePrimaryPressed = true
             BridgeClient.injectRemoteTrackpadOneway(
                 action = MotionEvent.ACTION_DOWN,
                 x = pos.x,
                 y = pos.y,
                 buttonState = MotionEvent.BUTTON_PRIMARY,
             )
-        } else if (!pressed && isPrimaryPressed) {
-            isPrimaryPressed = false
+        } else if (!pressed && isRemotePrimaryPressed) {
+            isRemotePrimaryPressed = false
             BridgeClient.injectRemoteTrackpadOneway(
                 action = MotionEvent.ACTION_UP,
                 x = pos.x,
@@ -187,9 +256,9 @@ class RemoteTrackpadActivity : ComponentActivity() {
         }
     }
 
-    private fun tapPrimary() {
-        val pos = cursorPosState.value
-        isPrimaryPressed = false
+    private fun tapRemotePrimary() {
+        val pos = remoteCursorPosState.value
+        isRemotePrimaryPressed = false
         BridgeClient.injectRemoteTrackpadOneway(
             action = MotionEvent.ACTION_DOWN,
             x = pos.x,
@@ -206,8 +275,8 @@ class RemoteTrackpadActivity : ComponentActivity() {
         }, 20L)
     }
 
-    private fun scrollAtCursor(hScroll: Float, vScroll: Float) {
-        val pos = cursorPosState.value
+    private fun scrollRemoteAtCursor(hScroll: Float, vScroll: Float) {
+        val pos = remoteCursorPosState.value
         BridgeClient.injectRemoteTrackpadOneway(
             action = MotionEvent.ACTION_SCROLL,
             x = pos.x,

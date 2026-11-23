@@ -57,6 +57,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import io.github.lengsukq.opaldesk.BridgeClient
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadBridge
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadLauncher
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadPolicy
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
@@ -148,6 +151,32 @@ fun OpalCompositorWorkspace(
     val scene by BridgeClient.sceneFlow.collectAsState()
     val remote by BridgeClient.remoteStatusFlow.collectAsState()
     val pendingPairing by BridgeClient.pendingPairingFlow.collectAsState()
+    val extSession by ExternalTrackpadBridge.sessionFlow.collectAsState()
+    val phoneTrackpadVisible by ExternalTrackpadBridge.phoneTrackpadVisibleFlow.collectAsState()
+    val autoShowPhoneTrackpad by AppPrefs.autoShowPhoneTrackpadFlow.collectAsState()
+
+    val canControlPhoneTrackpad = ExternalTrackpadPolicy.canControlPhoneTrackpad(
+        isExternalMonitor = isExternalMonitor,
+        remote = remote,
+        session = extSession,
+    )
+
+    fun togglePhoneTrackpadFromExternal() {
+        if (phoneTrackpadVisible) {
+            val closed = ExternalTrackpadBridge.requestClosePhoneTrackpad()
+            if (!closed) {
+                onOpenConsole()
+            }
+            Toast.makeText(ctx, "已关闭手机触控板", Toast.LENGTH_SHORT).show()
+        } else {
+            val launched = ExternalTrackpadLauncher.openPhoneTrackpad(ctx)
+            Toast.makeText(
+                ctx,
+                if (launched) "已在手机屏幕显示触控板" else "当前未检测到可用的外接屏触控目标",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
+    }
 
     var allApps by remember { mutableStateOf<List<InstalledAppEntry>>(emptyList()) }
     val desktopPkgs by AppPrefs.desktopShortcutsFlow.collectAsState()
@@ -336,6 +365,12 @@ fun OpalCompositorWorkspace(
                     hostScreenOff = status.hostScreenOff,
                     isCompactWidth = isCompactWidth,
                     showControlCenter = showControlCenter,
+                    showPhoneTrackpadButton = canControlPhoneTrackpad,
+                    phoneTrackpadVisible = phoneTrackpadVisible,
+                    onTogglePhoneTrackpad = {
+                        dismissAllPopovers()
+                        togglePhoneTrackpadFromExternal()
+                    },
                     onToggleFullscreen = {
                         val focused = scene.focusedWindow ?: return@MacDesktopMenuBar
                         dismissAllPopovers()
@@ -490,7 +525,23 @@ fun OpalCompositorWorkspace(
                     isExternalMonitor = isExternalMonitor,
                     hostScreenOff = status.hostScreenOff,
                     showHostScreenToggle = isExternalMonitor || remote.connected || status.hostScreenOff,
+                    showPhoneTrackpadSection = canControlPhoneTrackpad,
+                    phoneTrackpadVisible = phoneTrackpadVisible,
+                    showAutoTrackpadSwitch = canControlPhoneTrackpad && !remote.hasActiveDesktopCast,
+                    autoShowPhoneTrackpad = autoShowPhoneTrackpad,
                     maxHeight = ccMaxH,
+                    onTogglePhoneTrackpad = {
+                        showControlCenter = false
+                        togglePhoneTrackpadFromExternal()
+                    },
+                    onToggleAutoPhoneTrackpad = { enabled ->
+                        AppPrefs.setAutoShowPhoneTrackpadEnabled(ctx, enabled)
+                        Toast.makeText(
+                            ctx,
+                            if (enabled) "接入外接屏时将自动在手机显示触控板" else "已关闭自动显示，仍可随时在此手动打开",
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    },
                     onSelectTargetFps = { fps ->
                         BridgeClient.updateDisplayPrefsAsync(
                             targetFps = fps,
@@ -529,7 +580,7 @@ fun OpalCompositorWorkspace(
                     },
                     onSelectMouseTarget = { mode ->
                         AppPrefs.setMouseTarget(ctx, mode)
-                        val extId = io.github.lengsukq.opaldesk.ExternalDesktopActivity.activeExternalDisplayId
+                        val extId = ExternalTrackpadBridge.sessionFlow.value.displayId
                         BridgeClient.setMouseTargetAsync(mode, if (extId > 0) extId else -1)
                     },
                     onApplyTilingLayout = ::applyTiling,
@@ -560,7 +611,9 @@ fun OpalCompositorWorkspace(
             wallpaperMenuPos?.let { pos ->
                 val isCurrentlyDark = OpalPalette.isDark
                 val menuW = with(density) { 252.dp.toPx() }.roundToInt()
-                val menuH = with(density) { (if (customWallpaperPath.isNotBlank()) 320.dp else 284.dp).toPx() }.roundToInt()
+                val baseMenuDp = (if (customWallpaperPath.isNotBlank()) 320f else 284f) +
+                    (if (canControlPhoneTrackpad) 38f else 0f)
+                val menuH = with(density) { baseMenuDp.dp.toPx() }.roundToInt()
                 val (xPx, yPx) = CompositorGeometry.computeAnchoredMenuPosition(
                     anchorX = pos.x.roundToInt(),
                     anchorY = pos.y.roundToInt(),
@@ -573,6 +626,9 @@ fun OpalCompositorWorkspace(
                 DesktopWallpaperContextMenu(
                     wallpaperPreset = wallpaperPreset,
                     hasCustomWallpaper = customWallpaperPath.isNotBlank(),
+                    showPhoneTrackpadAction = canControlPhoneTrackpad,
+                    phoneTrackpadVisible = phoneTrackpadVisible,
+                    onTogglePhoneTrackpad = ::togglePhoneTrackpadFromExternal,
                     onSelectPreset = { idx ->
                         WallpaperStorage.clearCustomWallpaper(ctx)
                         AppPrefs.setWallpaperPreset(ctx, idx)

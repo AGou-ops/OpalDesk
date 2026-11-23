@@ -15,6 +15,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.view.Display
+import io.github.lengsukq.opaldesk.external.ExternalDisplayPolicy
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.PendingPairingRequest
@@ -223,13 +224,14 @@ class BridgeService : Service() {
         }
     }
 
-    private fun isPhysicalExternalMonitor(display: Display): Boolean {
-        if (display.displayId <= Display.DEFAULT_DISPLAY || !display.isValid) return false
-        val name = display.name.orEmpty()
-        // Never treat our own per-window VirtualDisplays ("OpalWin-*") as external monitors!
-        if (name.startsWith("OpalWin-") || name.startsWith("OpalDesk-")) return false
-        return (display.flags and Display.FLAG_PRESENTATION) != 0
-    }
+    private fun isPhysicalExternalMonitor(display: Display): Boolean =
+        ExternalDisplayPolicy.isPhysicalExternalDisplay(
+            displayId = display.displayId,
+            isValid = display.isValid,
+            name = display.name,
+            flags = display.flags,
+            state = display.state,
+        )
 
     fun projectToExternalDisplay(ctx: Context, displayId: Int) {
         val intent = Intent(ctx, ExternalDesktopActivity::class.java).apply {

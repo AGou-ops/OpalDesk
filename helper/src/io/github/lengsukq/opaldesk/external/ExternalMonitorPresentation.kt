@@ -1,22 +1,15 @@
 package io.github.lengsukq.opaldesk.external
 
 import android.app.Presentation
-import android.content.Context
 import android.os.Bundle
-import android.os.SystemClock
 import android.view.Display
-import android.view.InputDevice
 import android.view.KeyEvent
-import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.widget.FrameLayout
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -40,19 +33,17 @@ import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.ui.OpalImeFocusTracker
 import io.github.lengsukq.opaldesk.ui.OpalTheme
 import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
-import kotlin.math.max
-import kotlin.math.min
 
 /**
  * Full-bleed native external monitor compositor host built on standard public AOSP [Presentation].
  *
- * Uses its own independent [PresentationLifecycleOwner] so Display 4's Compose tree stays 100%
- * live and interactive at peak refresh rate (e.g. 2560×1440 @ 100Hz) even when Display 0 switches
- * to Home, OpalDesk Console, or other Android apps.
+ * Uses its own independent [PresentationLifecycleOwner] so the external display's Compose tree stays
+ * 100% live and interactive at peak refresh rate (e.g. 2560×1440 @ 100Hz) even when Display 0
+ * switches to Home, OpalDesk Console, or other Android apps.
  *
  * Supports BOTH:
- * - Direct hardware mouse routed natively to Display 4 (auto-hides virtual cursor for zero double-cursor)
- * - Display 0 Precision Trackpad synthetic cursor/touch/scroll injection
+ * - Direct hardware mouse routed natively to the external display (auto-hides virtual cursor)
+ * - Display 0 Precision Trackpad synthetic cursor/touch/scroll injection via [ExternalPointerDispatcher]
  */
 class ExternalMonitorPresentation(
     hostActivity: ComponentActivity,
@@ -62,18 +53,20 @@ class ExternalMonitorPresentation(
     private val onExitDesktop: () -> Unit,
 ) : Presentation(hostActivity, targetDisplay, android.R.style.Theme_DeviceDefault_NoActionBar_Fullscreen) {
 
-    private val displayWidthPx: Int = targetDisplay.mode?.physicalWidth?.coerceAtLeast(640) ?: 1920
-    private val displayHeightPx: Int = targetDisplay.mode?.physicalHeight?.coerceAtLeast(480) ?: 1080
-    private val refreshRateHz: Int = resolvePeakRefreshRateMode(targetDisplay)?.refreshRate?.toInt()
+    val displayWidthPx: Int = targetDisplay.mode?.physicalWidth?.coerceAtLeast(640) ?: 1920
+    val displayHeightPx: Int = targetDisplay.mode?.physicalHeight?.coerceAtLeast(480) ?: 1080
+    val refreshRateHz: Int = resolvePeakRefreshRateMode(targetDisplay)?.refreshRate?.toInt()
         ?: (targetDisplay.mode?.refreshRate ?: 60f).toInt()
 
     private val ownLifecycle = PresentationLifecycleOwner()
-    val cursorPosState = mutableStateOf(Offset(displayWidthPx * 0.5f, displayHeightPx * 0.5f))
-    private val showVirtualCursorState = mutableStateOf(false)
-
     private var composeView: ComposeView? = null
-    private var primaryDownTimeMs: Long = 0L
-    private var isPrimaryPressed: Boolean = false
+    private val pointerDispatcher = ExternalPointerDispatcher(
+        defaultWidthPx = displayWidthPx,
+        defaultHeightPx = displayHeightPx,
+        targetViewProvider = { composeView },
+    )
+
+    val cursorPosState get() = pointerDispatcher.cursorPosState
 
     val monitorSummary: String
         get() = "${targetDisplay.name ?: "外接屏"} · ${displayWidthPx}×${displayHeightPx} @ ${refreshRateHz}Hz"
@@ -90,7 +83,6 @@ class ExternalMonitorPresentation(
             )
             win.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
 
-            // Prefer highest refresh-rate mode at native resolution (e.g. 2560×1440 @ 100Hz)
             val peakMode = resolvePeakRefreshRateMode(targetDisplay)
             if (peakMode != null) {
                 val lp = win.attributes
@@ -123,7 +115,11 @@ class ExternalMonitorPresentation(
                         OpalCompositorWorkspace(
                             isExternalMonitor = true,
                             externalMonitorSummary = monitorSummary,
-                            virtualCursorPx = if (showVirtualCursorState.value) cursorPosState.value else null,
+                            virtualCursorPx = if (pointerDispatcher.showVirtualCursorState.value) {
+                                pointerDispatcher.cursorPosState.value
+                            } else {
+                                null
+                            },
                             onPickCustomWallpaper = onPickCustomWallpaper,
                             onOpenConsole = onOpenConsole,
                             onExitDesktop = onExitDesktop,
@@ -135,8 +131,7 @@ class ExternalMonitorPresentation(
         composeView = view
 
         val rootContainer = HardwareMouseDetectingFrameLayout(context) {
-            // Real hardware mouse arrived natively on Display 4 -> hide trackpad virtual cursor
-            if (showVirtualCursorState.value) showVirtualCursorState.value = false
+            pointerDispatcher.hideCursor()
         }.apply {
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -164,75 +159,13 @@ class ExternalMonitorPresentation(
         super.onStop()
     }
 
-    fun moveCursorBy(dxPx: Float, dyPx: Float) {
-        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
-        val cur = cursorPosState.value
-        val maxX = max(1f, (displayWidthPx - 1).toFloat())
-        val maxY = max(1f, (displayHeightPx - 1).toFloat())
-        val next = Offset(
-            x = min(maxX, max(0f, cur.x + dxPx)),
-            y = min(maxY, max(0f, cur.y + dyPx)),
-        )
-        cursorPosState.value = next
-        if (isPrimaryPressed) {
-            dispatchPointerTouch(MotionEvent.ACTION_MOVE, next.x, next.y)
-        } else {
-            dispatchPointerHover(next.x, next.y)
-        }
-    }
+    fun moveCursorBy(dxPx: Float, dyPx: Float) = pointerDispatcher.moveCursorBy(dxPx, dyPx)
 
-    fun setPrimaryButton(pressed: Boolean) {
-        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
-        val pos = cursorPosState.value
-        if (pressed && !isPrimaryPressed) {
-            isPrimaryPressed = true
-            primaryDownTimeMs = SystemClock.uptimeMillis()
-            dispatchPointerTouch(MotionEvent.ACTION_DOWN, pos.x, pos.y)
-        } else if (!pressed && isPrimaryPressed) {
-            isPrimaryPressed = false
-            dispatchPointerTouch(MotionEvent.ACTION_UP, pos.x, pos.y)
-        }
-    }
+    fun setPrimaryButton(pressed: Boolean) = pointerDispatcher.setPrimaryButton(pressed)
 
-    fun tapPrimary() {
-        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
-        val pos = cursorPosState.value
-        val now = SystemClock.uptimeMillis()
-        isPrimaryPressed = false
-        primaryDownTimeMs = now
-        dispatchPointerTouch(MotionEvent.ACTION_DOWN, pos.x, pos.y, now)
-        dispatchPointerTouch(MotionEvent.ACTION_UP, pos.x, pos.y, now + 18L)
-    }
+    fun tapPrimary() = pointerDispatcher.tapPrimary()
 
-    fun scrollAtCursor(hScroll: Float, vScroll: Float) {
-        val target = composeView ?: return
-        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
-        val pos = cursorPosState.value
-        val now = SystemClock.uptimeMillis()
-        val props = arrayOf(
-            MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_MOUSE
-            },
-        )
-        val coords = arrayOf(
-            MotionEvent.PointerCoords().apply {
-                x = pos.x
-                y = pos.y
-                setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
-                setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
-            },
-        )
-        val ev = MotionEvent.obtain(
-            now, now, MotionEvent.ACTION_SCROLL, 1, props, coords,
-            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0,
-        )
-        try {
-            target.dispatchGenericMotionEvent(ev)
-        } finally {
-            ev.recycle()
-        }
-    }
+    fun scrollAtCursor(hScroll: Float, vScroll: Float) = pointerDispatcher.scrollAtCursor(hScroll, vScroll)
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
@@ -246,37 +179,6 @@ class ExternalMonitorPresentation(
         return target.dispatchKeyEvent(event)
     }
 
-    private fun dispatchPointerTouch(action: Int, x: Float, y: Float, eventTimeMs: Long = SystemClock.uptimeMillis()) {
-        val target = composeView ?: return
-        val downTime = if (primaryDownTimeMs > 0L) primaryDownTimeMs else eventTimeMs
-        val ev = MotionEvent.obtain(
-            downTime,
-            eventTimeMs,
-            action,
-            x,
-            y,
-            0,
-        )
-        ev.source = InputDevice.SOURCE_TOUCHSCREEN
-        try {
-            target.dispatchTouchEvent(ev)
-        } finally {
-            ev.recycle()
-        }
-    }
-
-    private fun dispatchPointerHover(x: Float, y: Float) {
-        val target = composeView ?: return
-        val now = SystemClock.uptimeMillis()
-        val ev = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0)
-        ev.source = InputDevice.SOURCE_MOUSE
-        try {
-            target.dispatchGenericMotionEvent(ev)
-        } finally {
-            ev.recycle()
-        }
-    }
-
     private fun resolvePeakRefreshRateMode(display: Display): Display.Mode? {
         val cur = display.mode ?: return null
         val supported = display.supportedModes ?: return cur
@@ -284,25 +186,6 @@ class ExternalMonitorPresentation(
             .filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
             .maxByOrNull { it.refreshRate }
             ?: cur
-    }
-}
-
-private class HardwareMouseDetectingFrameLayout(
-    ctx: Context,
-    private val onHardwareMouseSeen: () -> Unit,
-) : FrameLayout(ctx) {
-    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
-        if (ev.deviceId > 0 && (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
-            onHardwareMouseSeen()
-        }
-        return super.dispatchGenericMotionEvent(ev)
-    }
-
-    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.deviceId > 0 && (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
-            onHardwareMouseSeen()
-        }
-        return super.dispatchTouchEvent(ev)
     }
 }
 

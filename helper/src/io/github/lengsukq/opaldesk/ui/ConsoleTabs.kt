@@ -39,10 +39,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.BridgeService
-import io.github.lengsukq.opaldesk.ExternalDesktopActivity
 import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
 import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
 import io.github.lengsukq.opaldesk.cast.PeerFloatingAppService
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadBridge
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
@@ -104,6 +104,8 @@ fun ConsoleDashboardTab(
 ) {
     val ctx = LocalContext.current
     var autoExtDisplay by remember { mutableStateOf(AppPrefs.isAutoExternalDisplayEnabled(ctx)) }
+    val autoShowPhoneTrackpad by AppPrefs.autoShowPhoneTrackpadFlow.collectAsState()
+    val extSession by ExternalTrackpadBridge.sessionFlow.collectAsState()
     val peerRole by OpalPeerCastMutex.roleFlow.collectAsState()
     val discoveredPeers by OpalPeerDiscovery.discoveredPeersFlow.collectAsState()
     val trustedPeers by BridgeClient.trustedPeersFlow.collectAsState()
@@ -118,7 +120,11 @@ fun ConsoleDashboardTab(
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         // Card 1: Primary Workstation Hero Card — Single clear primary action per live state
-        val physicalExtActive = extDisplay != null && ExternalDesktopActivity.isPresentationActive
+        val physicalExtActive = extSession.isPhysicalActive
+        val activeExtDisplayId = extSession.displayId.takeIf { it > 0 } ?: (extDisplay?.displayId ?: -1)
+        val activeExtSummary = extSession.summary.ifBlank {
+            extDisplay?.let { "${it.name} · ${it.width}×${it.height} @ ${it.refreshRateHz}Hz" }.orEmpty()
+        }
         val heroAccent = when {
             !status.connected -> null
             remote.connected -> OpalPalette.AccentEmerald
@@ -241,7 +247,7 @@ fun ConsoleDashboardTab(
                             }
                             Spacer(Modifier.height(4.dp))
                             OpalText(
-                                text = "${extDisplay.name} · ${extDisplay.width}×${extDisplay.height} @ ${extDisplay.refreshRateHz}Hz",
+                                text = activeExtSummary.ifBlank { "物理外接显示器已连接" },
                                 fontSize = 12.5.sp,
                                 color = OpalPalette.AccentCyan,
                             )
@@ -250,7 +256,7 @@ fun ConsoleDashboardTab(
                     Spacer(Modifier.height(16.dp))
                     OpalButton(
                         label = "打开本机触控板",
-                        onClick = { onOpenExternalOrTrackpad(extDisplay.displayId) },
+                        onClick = { onOpenExternalOrTrackpad(activeExtDisplayId) },
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Spacer(Modifier.height(10.dp))
@@ -751,6 +757,7 @@ fun ConsoleDashboardTab(
         }
 
         // Card 3: Physical USB-C / HDMI External Monitor (Compact, Low-Noise)
+        val hasPhysicalExt = extDisplay != null || physicalExtActive
         MacGlassSectionCard {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -761,22 +768,23 @@ fun ConsoleDashboardTab(
                     OpalText(text = "USB-C / HDMI 外接显示器", fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(2.dp))
                     OpalText(
-                        text = if (extDisplay != null) {
-                            "${extDisplay.name} · ${extDisplay.width}×${extDisplay.height} @ ${extDisplay.refreshRateHz}Hz"
-                        } else {
-                            "未检测到物理外接显示器"
+                        text = when {
+                            physicalExtActive && activeExtSummary.isNotBlank() -> activeExtSummary
+                            extDisplay != null ->
+                                "${extDisplay.name} · ${extDisplay.width}×${extDisplay.height} @ ${extDisplay.refreshRateHz}Hz"
+                            else -> "未检测到物理外接显示器"
                         },
                         fontSize = 12.sp,
-                        color = if (extDisplay != null) OpalPalette.AccentEmerald else OpalPalette.TextSecondary,
+                        color = if (hasPhysicalExt) OpalPalette.AccentEmerald else OpalPalette.TextSecondary,
                     )
                 }
-                if (extDisplay != null) {
+                if (hasPhysicalExt) {
                     Spacer(Modifier.width(10.dp))
                     OpalButton(
-                        label = if (ExternalDesktopActivity.isPresentationActive) "触控板" else "满屏投射",
+                        label = if (physicalExtActive) "触控板" else "满屏投射",
                         enabled = status.connected,
                         compact = true,
-                        onClick = { onOpenExternalOrTrackpad(extDisplay.displayId) },
+                        onClick = { onOpenExternalOrTrackpad(activeExtDisplayId) },
                     )
                 }
             }
@@ -788,6 +796,14 @@ fun ConsoleDashboardTab(
                 onCheckedChange = {
                     autoExtDisplay = it
                     AppPrefs.setAutoExternalDisplayEnabled(ctx, it)
+                },
+            )
+            OpalSwitchRow(
+                title = "接入外接屏时自动显示手机触控板",
+                subtitle = "连上外接屏启动工作站时自动在手机拉起触控板，亦可在外接屏控制中心随时开关",
+                checked = autoShowPhoneTrackpad,
+                onCheckedChange = { enabled ->
+                    AppPrefs.setAutoShowPhoneTrackpadEnabled(ctx, enabled)
                 },
             )
         }
@@ -1479,9 +1495,9 @@ private fun CopyableInfoLine(ctx: Context, label: String, value: String) {
 }
 
 private fun resolveActiveExternalDisplayId(extDisplay: BridgeService.ExternalDisplayInfo?): Int {
-    val liveId = ExternalDesktopActivity.activeExternalDisplayId
-    if (liveId > 0) return liveId
-    return if (ExternalDesktopActivity.isPresentationActive && extDisplay != null) extDisplay.displayId else -1
+    val session = ExternalTrackpadBridge.sessionFlow.value
+    if (session.displayId > 0) return session.displayId
+    return extDisplay?.displayId ?: -1
 }
 
 private fun copyTextWithToast(ctx: Context, text: String, toastMsg: String) {

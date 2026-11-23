@@ -46,7 +46,8 @@ import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
 import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
 import io.github.lengsukq.opaldesk.cast.PeerCastViewerActivity
 import io.github.lengsukq.opaldesk.cast.RemoteAppPickerModal
-import io.github.lengsukq.opaldesk.external.RemoteTrackpadActivity
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadBridge
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadLauncher
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
@@ -210,32 +211,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchRemoteTrackpad() {
-        val remote = BridgeClient.remoteStatusFlow.value
-        if (!remote.hasActiveDesktopCast) {
-            Toast.makeText(this, "当前未处于桌面投屏状态", Toast.LENGTH_SHORT).show()
-            return
+        if (!ExternalTrackpadLauncher.openPhoneTrackpad(this)) {
+            Toast.makeText(this, "当前未处于外接屏或桌面投屏状态", Toast.LENGTH_SHORT).show()
         }
-        val intent = Intent(this, RemoteTrackpadActivity::class.java).apply {
-            addFlags(
-                Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
-            )
-        }
-        DisplayLaunchHelper.launchOnDisplay0(this, intent)
     }
 
     private fun launchExternalOrTrackpad(displayId: Int) {
+        if (ExternalTrackpadBridge.sessionFlow.value.isPhysicalActive) {
+            ExternalTrackpadLauncher.openPhoneTrackpad(this)
+            return
+        }
         val intent = Intent(this, ExternalDesktopActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
             putExtra("targetDisplayId", displayId)
         }
-        // If Presentation mode is already active on Display 0, bring the DeX Trackpad straight to front!
-        if (ExternalDesktopActivity.isPresentationActive) {
-            DisplayLaunchHelper.launchOnDisplay0(this, intent)
-        } else {
-            DisplayLaunchHelper.launchOnDisplay(this, intent, displayId)
-        }
+        DisplayLaunchHelper.launchOnDisplay(this, intent, displayId)
     }
 
     private fun requestNotificationPermissionIfNeeded() {

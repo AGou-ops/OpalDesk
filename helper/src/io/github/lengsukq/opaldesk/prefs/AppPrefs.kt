@@ -29,6 +29,7 @@ object AppPrefs {
     private const val KEY_AUTO_SHIZUKU = "auto_shizuku"
     private const val KEY_ROOT_ENHANCE = "root_enhance_optional"
     private const val KEY_AUTO_EXT_DISPLAY = "auto_project_ext_display"
+    private const val KEY_AUTO_SHOW_PHONE_TRACKPAD = "auto_show_phone_trackpad_on_external"
     private const val KEY_PINNED_PKGS = "pinned_dock_pkgs"
     private const val KEY_DESKTOP_SHORTCUTS = "desktop_shortcut_pkgs"
     private const val KEY_DOCK_PINNED = "dock_pinned_pkgs_v2"
@@ -89,6 +90,9 @@ object AppPrefs {
     private val _autoCheckUpdateFlow = MutableStateFlow(true)
     val autoCheckUpdateFlow: StateFlow<Boolean> = _autoCheckUpdateFlow.asStateFlow()
 
+    private val _autoShowPhoneTrackpadFlow = MutableStateFlow(true)
+    val autoShowPhoneTrackpadFlow: StateFlow<Boolean> = _autoShowPhoneTrackpadFlow.asStateFlow()
+
     private fun prefs(ctx: Context?) =
         ctx?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -109,6 +113,7 @@ object AppPrefs {
         _sortAppsByUsageFlow.value = p.getBoolean(KEY_SORT_APPS_BY_USAGE, true)
         _appLaunchCountsFlow.value = parseLaunchCounts(p.getString(KEY_APP_LAUNCH_COUNTS, null))
         _autoCheckUpdateFlow.value = p.getBoolean(KEY_AUTO_CHECK_UPDATE, true)
+        _autoShowPhoneTrackpadFlow.value = p.getBoolean(KEY_AUTO_SHOW_PHONE_TRACKPAD, true)
     }
 
     private fun loadPkgList(p: android.content.SharedPreferences, key: String, fallbackKey: String): List<String> {
@@ -151,6 +156,16 @@ object AppPrefs {
 
     fun setAutoExternalDisplayEnabled(ctx: Context?, enabled: Boolean) {
         prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_EXT_DISPLAY, enabled)?.apply()
+    }
+
+    fun isAutoShowPhoneTrackpadEnabled(ctx: Context?): Boolean {
+        hydrateFlows(ctx)
+        return _autoShowPhoneTrackpadFlow.value
+    }
+
+    fun setAutoShowPhoneTrackpadEnabled(ctx: Context?, enabled: Boolean) {
+        prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_SHOW_PHONE_TRACKPAD, enabled)?.apply()
+        _autoShowPhoneTrackpadFlow.value = enabled
     }
 
     fun getDesktopShortcuts(ctx: Context?): List<String> {

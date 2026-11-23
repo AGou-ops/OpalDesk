@@ -2,9 +2,11 @@ package io.github.lengsukq.opaldesk
 
 import android.content.Intent
 import android.os.Bundle
+import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
 import android.widget.Toast
+import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
@@ -69,6 +71,16 @@ class DesktopActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val currentDisplayId = display?.displayId ?: Display.DEFAULT_DISPLAY
+        if (currentDisplayId > Display.DEFAULT_DISPLAY) {
+            val extIntent = Intent(this, ExternalDesktopActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                putExtra("targetDisplayId", currentDisplayId)
+            }
+            DisplayLaunchHelper.launchOnDisplay(this, extIntent, currentDisplayId)
+            finish()
+            return
+        }
         if (BridgeClient.remoteStatusFlow.value.connected) {
             Toast.makeText(this, "投屏进行中，无法进入本机桌面，请使用本机触控板或先断开投屏", Toast.LENGTH_SHORT).show()
             finish()

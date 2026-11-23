@@ -12,6 +12,7 @@ import android.os.Looper
 import android.util.Log
 import android.view.Display
 import android.view.KeyEvent
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -24,14 +25,25 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.unit.Density
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.github.lengsukq.opaldesk.compositor.OpalCompositorWorkspace
 import io.github.lengsukq.opaldesk.external.DexTrackpadScreen
+import io.github.lengsukq.opaldesk.external.DirectExternalTrackpadSink
+import io.github.lengsukq.opaldesk.external.ExternalDesktopMode
+import io.github.lengsukq.opaldesk.external.ExternalDesktopSession
+import io.github.lengsukq.opaldesk.external.ExternalDisplayPolicy
 import io.github.lengsukq.opaldesk.external.ExternalMonitorPresentation
+import io.github.lengsukq.opaldesk.external.ExternalPointerDispatcher
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadBridge
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadLauncher
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadPolicy
+import io.github.lengsukq.opaldesk.external.HardwareMouseDetectingFrameLayout
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
@@ -45,24 +57,22 @@ import kotlin.math.roundToInt
  * Universal External Monitor Workstation Host (USB-C DisplayPort Alt-Mode / HDMI / Mac Remote Display).
  *
  * Automatically supports BOTH external display modes across Android 11–17:
- * 1. **Direct Extended Display Mode** (`canHostTasks == true`, e.g. Pixel / AOSP Desktop / OpalCast Mac Remote VD):
- *    Renders [OpalCompositorWorkspace] natively directly inside this Activity on the external display.
- * 2. **Full-Bleed Presentation + Display 0 DeX Trackpad Mode** (`canHostTasks == false`, e.g. HyperOS / OEM mirror-default ROMs):
- *    Opens a fullscreen [ExternalMonitorPresentation] directly on the physical external display (stopping
- *    mirroring immediately for native edge-to-edge resolution & refresh rate with zero black bars) while
- *    Display 0 serves as a Samsung DeX-style precision multi-touch trackpad & monitor control deck.
+ * 1. **Direct Extended Display Mode** (`currentDisplayId > 0`, e.g. Pixel / AOSP Desktop / OpalCast Remote VD):
+ *    Renders [OpalCompositorWorkspace] natively directly on the external display while registering an
+ *    in-process [DirectExternalTrackpadSink] so phone Display 0 can serve as a zero-lag precision trackpad.
+ * 2. **Full-Bleed Presentation + Display 0 DeX Trackpad Mode** (`currentDisplayId == 0`, e.g. HyperOS / mirror ROMs):
+ *    Opens a fullscreen [ExternalMonitorPresentation] on the physical external display while Display 0
+ *    serves as a Samsung DeX-style precision multi-touch trackpad & monitor control deck.
  */
 class ExternalDesktopActivity : ComponentActivity() {
     companion object {
         private const val TAG = "OpalExtDesktop"
 
-        @Volatile
-        var isPresentationActive: Boolean = false
-            private set
+        val isPresentationActive: Boolean
+            get() = ExternalTrackpadBridge.sessionFlow.value.isPresentation
 
-        @Volatile
-        var activeExternalDisplayId: Int = -1
-            private set
+        val activeExternalDisplayId: Int
+            get() = ExternalTrackpadBridge.sessionFlow.value.displayId
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -81,13 +91,25 @@ class ExternalDesktopActivity : ComponentActivity() {
     }
     private var displayManager: DisplayManager? = null
     private var presentation: ExternalMonitorPresentation? = null
+    private var directComposeView: ComposeView? = null
+    private var directPointerDispatcher: ExternalPointerDispatcher? = null
+    private var directTrackpadSink: DirectExternalTrackpadSink? = null
     private var targetDisplayId: Int = -1
     private var presentationSummary by mutableStateOf("")
+    private var directDisplaySummary by mutableStateOf("")
     private var runningInPresentationMode by mutableStateOf(false)
+
+    private val presentationTrackpadCloser: () -> Unit = {
+        runOnUiThread { openConsoleOnPrimaryDisplay() }
+    }
 
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) = Unit
-        override fun onDisplayChanged(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (!runningInPresentationMode && targetDisplayId > Display.DEFAULT_DISPLAY && displayId == targetDisplayId) {
+                refreshDirectSessionMetadata(targetDisplayId)
+            }
+        }
         override fun onDisplayRemoved(displayId: Int) {
             if (targetDisplayId > Display.DEFAULT_DISPLAY && displayId == targetDisplayId) {
                 dismissPresentation()
@@ -113,12 +135,10 @@ class ExternalDesktopActivity : ComponentActivity() {
         val requestedId = intent?.getIntExtra("targetDisplayId", -1) ?: -1
         val physicalExternal = findPhysicalExternalDisplay(requestedId)
 
-        // If Android placed this Activity on Display 0 while a physical external monitor is attached
-        // (mirror-mode / FLAG_PRESENTATION), launch native full-bleed Presentation on the monitor!
         val usePresentation = (currentDisplayId == Display.DEFAULT_DISPLAY) && (physicalExternal != null)
         runningInPresentationMode = usePresentation
 
-        if (physicalExternal != null && currentDisplayId == Display.DEFAULT_DISPLAY) {
+        if (currentDisplayId == Display.DEFAULT_DISPLAY && physicalExternal != null) {
             targetDisplayId = physicalExternal.displayId
             val pres = ExternalMonitorPresentation(
                 hostActivity = this,
@@ -130,20 +150,39 @@ class ExternalDesktopActivity : ComponentActivity() {
             try {
                 pres.show()
                 presentation = pres
-                isPresentationActive = true
-                activeExternalDisplayId = physicalExternal.displayId
                 presentationSummary = pres.monitorSummary
+                ExternalTrackpadBridge.publishSession(
+                    owner = this,
+                    session = ExternalDesktopSession(
+                        mode = ExternalDesktopMode.PRESENTATION,
+                        displayId = physicalExternal.displayId,
+                        displayName = physicalExternal.name ?: "外接屏",
+                        widthPx = pres.displayWidthPx,
+                        heightPx = pres.displayHeightPx,
+                        refreshRateHz = pres.refreshRateHz,
+                        isRemoteCastDisplay = false,
+                    ),
+                )
                 syncExternalMouseRouting(physicalExternal.displayId)
             } catch (t: Throwable) {
                 Log.w(TAG, "Presentation.show failed, falling back to direct render: ${t.message}")
                 runningInPresentationMode = false
-                isPresentationActive = false
-                activeExternalDisplayId = -1
+                ExternalTrackpadBridge.clearSessionIfOwner(this)
             }
         } else if (currentDisplayId > Display.DEFAULT_DISPLAY) {
             targetDisplayId = currentDisplayId
-            activeExternalDisplayId = currentDisplayId
+            val session = publishDirectSession(currentDisplayId)
             syncExternalMouseRouting(currentDisplayId)
+            if (ExternalTrackpadPolicy.shouldAutoLaunchPhoneTrackpad(
+                    session = session,
+                    autoShowEnabled = AppPrefs.isAutoShowPhoneTrackpadEnabled(this),
+                    alreadyVisible = ExternalTrackpadBridge.phoneTrackpadVisibleFlow.value,
+                )
+            ) {
+                handler.post {
+                    ExternalTrackpadLauncher.openPhoneTrackpad(this)
+                }
+            }
         }
 
         onBackPressedDispatcher.addCallback(
@@ -155,44 +194,79 @@ class ExternalDesktopActivity : ComponentActivity() {
             },
         )
 
+        if (runningInPresentationMode && presentation != null) {
+            bindPresentationTrackpadUi(presentation!!)
+        } else {
+            bindDirectExtendedWorkspaceUi(currentDisplayId)
+            applyImmersiveFullscreen()
+        }
+    }
+
+    private fun bindPresentationTrackpadUi(pres: ExternalMonitorPresentation) {
         setContent {
             OpalTheme {
                 val isDark = OpalPalette.isDark
-                if (runningInPresentationMode) {
-                    LaunchedEffect(isDark) {
-                        val ctrl = WindowCompat.getInsetsController(window, window.decorView)
-                        ctrl.isAppearanceLightStatusBars = !isDark
-                        ctrl.isAppearanceLightNavigationBars = !isDark
-                    }
+                LaunchedEffect(isDark) {
+                    val ctrl = WindowCompat.getInsetsController(window, window.decorView)
+                    ctrl.isAppearanceLightStatusBars = !isDark
+                    ctrl.isAppearanceLightNavigationBars = !isDark
                 }
-                if (runningInPresentationMode && presentation != null) {
-                    val pres = presentation!!
-                    val cursor = pres.cursorPosState.value
-                    DexTrackpadScreen(
-                        monitorSummary = presentationSummary,
-                        externalDisplayId = targetDisplayId,
-                        cursorX = cursor.x.roundToInt(),
-                        cursorY = cursor.y.roundToInt(),
-                        onMoveCursor = { dx, dy -> pres.moveCursorBy(dx, dy) },
-                        onSetPrimaryButton = { down -> pres.setPrimaryButton(down) },
-                        onTapPrimary = { pres.tapPrimary() },
-                        onScroll = { h, v -> pres.scrollAtCursor(h, v) },
-                        onSecondaryAction = ::sendBackToFocusedWindow,
-                        onSendKeyTap = ::sendKeyTapToFocusedWindow,
-                        onCommitTextToFocusedWindow = ::commitTextToFocusedWindow,
-                        onSwitchToLocalDesktop = {
-                            dismissPresentation()
-                            startActivity(
-                                Intent(this, DesktopActivity::class.java).apply {
-                                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                                },
-                            )
-                            finish()
-                        },
-                        onOpenConsole = ::openConsoleOnPrimaryDisplay,
-                        onExitExternal = { finish() },
-                    )
-                } else {
+                val cursor = pres.cursorPosState.value
+                DexTrackpadScreen(
+                    monitorSummary = presentationSummary,
+                    externalDisplayId = targetDisplayId,
+                    cursorX = cursor.x.roundToInt(),
+                    cursorY = cursor.y.roundToInt(),
+                    onMoveCursor = { dx, dy -> pres.moveCursorBy(dx, dy) },
+                    onSetPrimaryButton = { down -> pres.setPrimaryButton(down) },
+                    onTapPrimary = { pres.tapPrimary() },
+                    onScroll = { h, v -> pres.scrollAtCursor(h, v) },
+                    onSecondaryAction = ::sendBackToFocusedWindow,
+                    onSendKeyTap = ::sendKeyTapToFocusedWindow,
+                    onCommitTextToFocusedWindow = ::commitTextToFocusedWindow,
+                    onSwitchToLocalDesktop = {
+                        dismissPresentation()
+                        startActivity(
+                            Intent(this, DesktopActivity::class.java).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                            },
+                        )
+                        finish()
+                    },
+                    onOpenConsole = ::openConsoleOnPrimaryDisplay,
+                    onExitExternal = { finish() },
+                )
+            }
+        }
+    }
+
+    private fun bindDirectExtendedWorkspaceUi(currentDisplayId: Int) {
+        val curMode = display?.mode
+        val defaultW = curMode?.physicalWidth?.coerceAtLeast(640) ?: resources.displayMetrics.widthPixels.coerceAtLeast(640)
+        val defaultH = curMode?.physicalHeight?.coerceAtLeast(480) ?: resources.displayMetrics.heightPixels.coerceAtLeast(480)
+        val dispatcher = ExternalPointerDispatcher(
+            defaultWidthPx = defaultW,
+            defaultHeightPx = defaultH,
+            targetViewProvider = { directComposeView },
+            onCursorChanged = { x, y -> ExternalTrackpadBridge.updateDirectCursor(x, y) },
+        )
+        directPointerDispatcher = dispatcher
+
+        val session = ExternalTrackpadBridge.sessionFlow.value
+        if (currentDisplayId > Display.DEFAULT_DISPLAY && session.isPhysicalDirectExtended) {
+            val sink = createDirectTrackpadSink(currentDisplayId, dispatcher)
+            directTrackpadSink = sink
+            ExternalTrackpadBridge.registerDirectSink(sink)
+        }
+
+        val view = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            setContent {
+                OpalTheme {
                     val uiScale by AppPrefs.externalUiScaleFlow.collectAsState()
                     val remoteCursor by BridgeClient.remoteTrackpadCursorFlow.collectAsState()
                     val baseDensity = LocalDensity.current
@@ -200,17 +274,16 @@ class ExternalDesktopActivity : ComponentActivity() {
                         density = (baseDensity.density * uiScale).coerceIn(0.85f, 3.5f),
                         fontScale = baseDensity.fontScale,
                     )
-                    val curMode = display?.mode
-                    val summary = if (curMode != null) {
-                        "${display?.name ?: "外接屏"} · ${curMode.physicalWidth}×${curMode.physicalHeight} @ ${curMode.refreshRate.toInt()}Hz"
+                    val directCursor = if (dispatcher.showVirtualCursorState.value) {
+                        dispatcher.cursorPosState.value
                     } else {
-                        ""
+                        null
                     }
                     CompositionLocalProvider(LocalDensity provides effDensity) {
                         OpalCompositorWorkspace(
                             isExternalMonitor = true,
-                            externalMonitorSummary = summary,
-                            virtualCursorPx = remoteCursor,
+                            externalMonitorSummary = directDisplaySummary,
+                            virtualCursorPx = directCursor ?: remoteCursor,
                             onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
                             onOpenConsole = ::openConsoleOnPrimaryDisplay,
                             onExitDesktop = { finish() },
@@ -219,9 +292,75 @@ class ExternalDesktopActivity : ComponentActivity() {
                 }
             }
         }
+        directComposeView = view
 
-        if (!runningInPresentationMode) {
-            applyImmersiveFullscreen()
+        val rootContainer = HardwareMouseDetectingFrameLayout(this) {
+            dispatcher.hideCursor()
+            if (BridgeClient.remoteTrackpadCursorFlow.value != null) {
+                BridgeClient.updateRemoteTrackpadCursor(null)
+            }
+        }.apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            )
+            addView(view)
+        }
+        setContentView(rootContainer)
+    }
+
+    private fun createDirectTrackpadSink(
+        extDisplayId: Int,
+        dispatcher: ExternalPointerDispatcher,
+    ): DirectExternalTrackpadSink = object : DirectExternalTrackpadSink {
+        override val displayId: Int = extDisplayId
+        override fun currentSurfaceWidthPx(): Int = dispatcher.currentSurfaceWidthPx()
+        override fun currentSurfaceHeightPx(): Int = dispatcher.currentSurfaceHeightPx()
+        override fun currentCursorX(): Float = dispatcher.cursorPosState.value.x
+        override fun currentCursorY(): Float = dispatcher.cursorPosState.value.y
+        override fun moveCursorBy(dxPx: Float, dyPx: Float) = runOnUiThread { dispatcher.moveCursorBy(dxPx, dyPx) }
+        override fun setPrimaryButton(pressed: Boolean) = runOnUiThread { dispatcher.setPrimaryButton(pressed) }
+        override fun tapPrimary() = runOnUiThread { dispatcher.tapPrimary() }
+        override fun scrollAtCursor(hScroll: Float, vScroll: Float) = runOnUiThread { dispatcher.scrollAtCursor(hScroll, vScroll) }
+        override fun hideCursor() = runOnUiThread { dispatcher.hideCursor() }
+        override fun closeExternalDesktop() = runOnUiThread { finish() }
+    }
+
+    private fun publishDirectSession(currentDisplayId: Int): ExternalDesktopSession {
+        val curDisplay = display ?: displayManager?.getDisplay(currentDisplayId)
+        val curMode = curDisplay?.mode
+        val widthPx = curMode?.physicalWidth?.coerceAtLeast(640) ?: resources.displayMetrics.widthPixels.coerceAtLeast(640)
+        val heightPx = curMode?.physicalHeight?.coerceAtLeast(480) ?: resources.displayMetrics.heightPixels.coerceAtLeast(480)
+        val hz = (curMode?.refreshRate ?: 60f).toInt().coerceAtLeast(30)
+        val dispName = curDisplay?.name ?: "外接屏"
+        val isRemoteCast = ExternalDisplayPolicy.isRemoteCastDisplay(
+            displayId = currentDisplayId,
+            displayName = dispName,
+            remote = BridgeClient.remoteStatusFlow.value,
+        )
+        val session = ExternalDesktopSession(
+            mode = ExternalDesktopMode.DIRECT_EXTENDED,
+            displayId = currentDisplayId,
+            displayName = dispName,
+            widthPx = widthPx,
+            heightPx = heightPx,
+            refreshRateHz = hz,
+            isRemoteCastDisplay = isRemoteCast,
+        )
+        directDisplaySummary = session.summary
+        ExternalTrackpadBridge.publishSession(this, session)
+        return session
+    }
+
+    private fun refreshDirectSessionMetadata(currentDisplayId: Int) {
+        val session = publishDirectSession(currentDisplayId)
+        if (!session.isPhysicalDirectExtended) {
+            directTrackpadSink?.let { ExternalTrackpadBridge.unregisterDirectSink(it) }
+            directTrackpadSink = null
+        } else if (directTrackpadSink == null && directPointerDispatcher != null) {
+            val sink = createDirectTrackpadSink(currentDisplayId, directPointerDispatcher!!)
+            directTrackpadSink = sink
+            ExternalTrackpadBridge.registerDirectSink(sink)
         }
     }
 
@@ -231,24 +370,34 @@ class ExternalDesktopActivity : ComponentActivity() {
         val currentDisplayId = display?.displayId ?: Display.DEFAULT_DISPLAY
         if (!runningInPresentationMode && currentDisplayId > Display.DEFAULT_DISPLAY) {
             targetDisplayId = currentDisplayId
-            activeExternalDisplayId = currentDisplayId
+            refreshDirectSessionMetadata(currentDisplayId)
             syncExternalMouseRouting(currentDisplayId)
         }
     }
 
     override fun onResume() {
         super.onResume()
-        if (!runningInPresentationMode) {
+        if (runningInPresentationMode) {
+            ExternalTrackpadBridge.setPhoneTrackpadVisible(true, presentationTrackpadCloser)
+        } else {
             applyImmersiveFullscreen()
         }
         BridgeClient.requestBinder(this)
-        if (activeExternalDisplayId > Display.DEFAULT_DISPLAY) {
-            syncExternalMouseRouting(activeExternalDisplayId)
+        val extId = ExternalTrackpadBridge.sessionFlow.value.displayId
+        if (extId > Display.DEFAULT_DISPLAY) {
+            syncExternalMouseRouting(extId)
         }
         Thread({
             BridgeClient.refreshStatus()
             BridgeClient.refreshSceneSnapshot()
         }, "OpalExtDesktopSync").start()
+    }
+
+    override fun onPause() {
+        if (runningInPresentationMode) {
+            ExternalTrackpadBridge.setPhoneTrackpadVisible(false, presentationTrackpadCloser)
+        }
+        super.onPause()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -257,9 +406,19 @@ class ExternalDesktopActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        if (runningInPresentationMode) {
+            ExternalTrackpadBridge.setPhoneTrackpadVisible(false, presentationTrackpadCloser)
+        }
+        directTrackpadSink?.let { ExternalTrackpadBridge.unregisterDirectSink(it) }
+        directTrackpadSink = null
+        directPointerDispatcher?.hideCursor()
+        directPointerDispatcher = null
+        directComposeView = null
+
         displayManager?.unregisterDisplayListener(displayListener)
         displayManager = null
         dismissPresentation()
+        ExternalTrackpadBridge.clearSessionIfOwner(this)
         if (BridgeClient.statusFlow.value.hostScreenOff) {
             BridgeClient.setHostScreenPowerAsync(true)
         }
@@ -269,13 +428,11 @@ class ExternalDesktopActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
 
-        // Allow Display 0 inline IME box or App Drawer search box to consume keys when explicitly focused
         if (OpalImeFocusTracker.localComposeTextFieldFocused) {
             if (super.dispatchKeyEvent(event)) return true
             if (presentation?.dispatchKeyEventToPresentation(event) == true) return true
         }
 
-        // Prioritize forwarding physical / remote keyboard keystrokes directly to the focused app window
         if (WorkstationKeyDispatcher.forwardToFocusedWindow(event)) {
             return true
         }
@@ -293,12 +450,14 @@ class ExternalDesktopActivity : ComponentActivity() {
         return dm.displays.firstOrNull { isPhysicalExternal(it) }
     }
 
-    private fun isPhysicalExternal(d: Display): Boolean {
-        if (d.displayId <= Display.DEFAULT_DISPLAY || !d.isValid) return false
-        val name = d.name.orEmpty()
-        if (name.startsWith("OpalWin-") || name.startsWith("OpalDesk-")) return false
-        return (d.flags and Display.FLAG_PRESENTATION) != 0
-    }
+    private fun isPhysicalExternal(d: Display): Boolean =
+        ExternalDisplayPolicy.isPhysicalExternalDisplay(
+            displayId = d.displayId,
+            isValid = d.isValid,
+            name = d.name,
+            flags = d.flags,
+            state = d.state,
+        )
 
     private fun sendBackToFocusedWindow() {
         val focused = BridgeClient.sceneFlow.value.focusedWindow
@@ -337,8 +496,6 @@ class ExternalDesktopActivity : ComponentActivity() {
     }
 
     private fun dismissPresentation() {
-        isPresentationActive = false
-        activeExternalDisplayId = -1
         BridgeClient.setMouseTargetAsync(BridgeProtocol.MouseTarget.LOCAL, -1)
         val p = presentation
         presentation = null

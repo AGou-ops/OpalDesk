@@ -1,0 +1,214 @@
+package io.github.lengsukq.opaldesk.external
+
+import android.content.Context
+import android.content.Intent
+import android.os.SystemClock
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.view.View
+import android.widget.FrameLayout
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.geometry.Offset
+import io.github.lengsukq.opaldesk.BridgeClient
+import io.github.lengsukq.opaldesk.ExternalDesktopActivity
+import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
+
+/**
+ * Shared synthetic pointer/touch/scroll dispatcher for in-process external monitor Compose hosts
+ * ([ExternalMonitorPresentation] and Direct Extended [ExternalDesktopActivity]).
+ */
+class ExternalPointerDispatcher(
+    private val defaultWidthPx: Int,
+    private val defaultHeightPx: Int,
+    private val targetViewProvider: () -> View?,
+    private val onCursorChanged: ((Float, Float) -> Unit)? = null,
+) {
+    val cursorPosState = mutableStateOf(
+        Offset(defaultWidthPx.coerceAtLeast(640) * 0.5f, defaultHeightPx.coerceAtLeast(480) * 0.5f),
+    )
+    val showVirtualCursorState = mutableStateOf(false)
+
+    private var primaryDownTimeMs: Long = 0L
+    private var isPrimaryPressed: Boolean = false
+
+    fun currentSurfaceWidthPx(): Int =
+        targetViewProvider()?.width?.takeIf { it > 1 } ?: defaultWidthPx.coerceAtLeast(640)
+
+    fun currentSurfaceHeightPx(): Int =
+        targetViewProvider()?.height?.takeIf { it > 1 } ?: defaultHeightPx.coerceAtLeast(480)
+
+    fun hideCursor() {
+        if (isPrimaryPressed) {
+            setPrimaryButton(false)
+        }
+        if (showVirtualCursorState.value) {
+            showVirtualCursorState.value = false
+        }
+    }
+
+    fun moveCursorBy(dxPx: Float, dyPx: Float) {
+        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
+        val cur = cursorPosState.value
+        val (nx, ny) = ExternalTrackpadPolicy.clampCursorPosition(
+            x = cur.x + dxPx,
+            y = cur.y + dyPx,
+            widthPx = currentSurfaceWidthPx(),
+            heightPx = currentSurfaceHeightPx(),
+        )
+        val next = Offset(nx, ny)
+        cursorPosState.value = next
+        onCursorChanged?.invoke(nx, ny)
+        if (isPrimaryPressed) {
+            dispatchPointerTouch(MotionEvent.ACTION_MOVE, nx, ny)
+        } else {
+            dispatchPointerHover(nx, ny)
+        }
+    }
+
+    fun setPrimaryButton(pressed: Boolean) {
+        if (!showVirtualCursorState.value && pressed) showVirtualCursorState.value = true
+        val pos = cursorPosState.value
+        if (pressed && !isPrimaryPressed) {
+            isPrimaryPressed = true
+            primaryDownTimeMs = SystemClock.uptimeMillis()
+            dispatchPointerTouch(MotionEvent.ACTION_DOWN, pos.x, pos.y)
+        } else if (!pressed && isPrimaryPressed) {
+            isPrimaryPressed = false
+            dispatchPointerTouch(MotionEvent.ACTION_UP, pos.x, pos.y)
+        }
+    }
+
+    fun tapPrimary() {
+        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
+        val pos = cursorPosState.value
+        val now = SystemClock.uptimeMillis()
+        isPrimaryPressed = false
+        primaryDownTimeMs = now
+        dispatchPointerTouch(MotionEvent.ACTION_DOWN, pos.x, pos.y, now)
+        dispatchPointerTouch(MotionEvent.ACTION_UP, pos.x, pos.y, now + 18L)
+    }
+
+    fun scrollAtCursor(hScroll: Float, vScroll: Float) {
+        val target = targetViewProvider() ?: return
+        if (!showVirtualCursorState.value) showVirtualCursorState.value = true
+        val pos = cursorPosState.value
+        val now = SystemClock.uptimeMillis()
+        val props = arrayOf(
+            MotionEvent.PointerProperties().apply {
+                id = 0
+                toolType = MotionEvent.TOOL_TYPE_MOUSE
+            },
+        )
+        val coords = arrayOf(
+            MotionEvent.PointerCoords().apply {
+                x = pos.x
+                y = pos.y
+                setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll)
+                setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll)
+            },
+        )
+        val ev = MotionEvent.obtain(
+            now, now, MotionEvent.ACTION_SCROLL, 1, props, coords,
+            0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0,
+        )
+        try {
+            target.dispatchGenericMotionEvent(ev)
+        } finally {
+            ev.recycle()
+        }
+    }
+
+    private fun dispatchPointerTouch(
+        action: Int,
+        x: Float,
+        y: Float,
+        eventTimeMs: Long = SystemClock.uptimeMillis(),
+    ) {
+        val target = targetViewProvider() ?: return
+        val downTime = if (primaryDownTimeMs > 0L) primaryDownTimeMs else eventTimeMs
+        val ev = MotionEvent.obtain(downTime, eventTimeMs, action, x, y, 0)
+        ev.source = InputDevice.SOURCE_TOUCHSCREEN
+        try {
+            target.dispatchTouchEvent(ev)
+        } finally {
+            ev.recycle()
+        }
+    }
+
+    private fun dispatchPointerHover(x: Float, y: Float) {
+        val target = targetViewProvider() ?: return
+        val now = SystemClock.uptimeMillis()
+        val ev = MotionEvent.obtain(now, now, MotionEvent.ACTION_HOVER_MOVE, x, y, 0)
+        ev.source = InputDevice.SOURCE_MOUSE
+        try {
+            target.dispatchGenericMotionEvent(ev)
+        } finally {
+            ev.recycle()
+        }
+    }
+}
+
+/**
+ * Container detecting native hardware Bluetooth/USB mouse events (`deviceId > 0`) on an external
+ * display so the synthetic trackpad cursor hides immediately with zero double-cursor artifacts.
+ */
+class HardwareMouseDetectingFrameLayout(
+    ctx: Context,
+    private val onHardwareMouseSeen: () -> Unit,
+) : FrameLayout(ctx) {
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (ev.deviceId > 0 && (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
+            onHardwareMouseSeen()
+        }
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.deviceId > 0 && (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE) {
+            onHardwareMouseSeen()
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+}
+
+/**
+ * Single launcher coordinating Display 0 phone trackpad activation across Presentation mode,
+ * Direct Extended Display mode, and Wireless/USB OpalCast sessions.
+ */
+object ExternalTrackpadLauncher {
+    fun openPhoneTrackpad(ctx: Context): Boolean {
+        if (BridgeClient.statusFlow.value.hostScreenOff) {
+            BridgeClient.setHostScreenPowerAsync(true)
+        }
+        val target = ExternalTrackpadPolicy.resolveTrackpadTarget(
+            remote = BridgeClient.remoteStatusFlow.value,
+            session = ExternalTrackpadBridge.sessionFlow.value,
+        )
+        return when (target) {
+            TrackpadTargetMode.PHYSICAL_PRESENTATION -> {
+                val intent = Intent(ctx, ExternalDesktopActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+                    )
+                    putExtra("targetDisplayId", ExternalTrackpadBridge.sessionFlow.value.displayId)
+                }
+                DisplayLaunchHelper.launchOnDisplay0(ctx, intent)
+            }
+            TrackpadTargetMode.PHYSICAL_DIRECT_EXTENDED,
+            TrackpadTargetMode.REMOTE_CAST,
+            -> {
+                val intent = Intent(ctx, RemoteTrackpadActivity::class.java).apply {
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+                    )
+                }
+                DisplayLaunchHelper.launchOnDisplay0(ctx, intent)
+            }
+            TrackpadTargetMode.NONE -> false
+        }
+    }
+}
