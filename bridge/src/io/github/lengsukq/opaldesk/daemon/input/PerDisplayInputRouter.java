@@ -29,6 +29,12 @@ import java.util.Map;
  */
 public final class PerDisplayInputRouter {
     private static final long UHID_SETTLE_MS = 50L;
+    private static final float TAP_SLOP_PX = 36f;
+
+    /** Callback notified after a clean short tap (ACTION_UP without drag) inside a live window. */
+    public interface TapUpListener {
+        void onWindowTapUp(int windowId, int displayId, long tapDownUptimeMs);
+    }
 
     private final AndroidServices services;
     private final DaemonConfig config;
@@ -36,11 +42,31 @@ public final class PerDisplayInputRouter {
     private final Map<Integer, UhidInputDevice> uhidByDisplay = new HashMap<>();
 
     private volatile boolean uhidAutoActivated = false;
+    private volatile boolean localImeActive = false;
     private volatile int lastInjectStatus = BridgeProtocol.INJECT_STATUS_SYSTEM;
+    private volatile TapUpListener tapUpListener;
+
+    private int lastDownWinId = -1;
+    private float lastDownX = 0f;
+    private float lastDownY = 0f;
+    private long lastDownUptimeMs = 0L;
+    private boolean tapMovedTooFar = false;
 
     public PerDisplayInputRouter(AndroidServices services, DaemonConfig config) {
         this.services = services;
         this.config = config;
+    }
+
+    public void setTapUpListener(TapUpListener listener) {
+        this.tapUpListener = listener;
+    }
+
+    public void setLocalImeActive(boolean active) {
+        this.localImeActive = active;
+    }
+
+    public boolean isLocalImeActive() {
+        return localImeActive;
     }
 
     public int getLastInjectStatus() {
@@ -99,6 +125,37 @@ public final class PerDisplayInputRouter {
         }
 
         int masked = action & MotionEvent.ACTION_MASK;
+        boolean triggerTapUpCheck = false;
+        long tapDownTs = 0L;
+        if (masked == MotionEvent.ACTION_DOWN) {
+            lastDownWinId = ws.windowId;
+            lastDownX = xs[0];
+            lastDownY = ys[0];
+            lastDownUptimeMs = SystemClock.uptimeMillis();
+            tapMovedTooFar = false;
+            if (!localImeActive) {
+                services.focusDisplay(ws.displayId);
+            }
+        } else if (masked == MotionEvent.ACTION_MOVE && ws.windowId == lastDownWinId && !tapMovedTooFar) {
+            float dx = xs[0] - lastDownX;
+            float dy = ys[0] - lastDownY;
+            if ((dx * dx + dy * dy) > (TAP_SLOP_PX * TAP_SLOP_PX)) {
+                tapMovedTooFar = true;
+            }
+        } else if (masked == MotionEvent.ACTION_UP) {
+            if (ws.windowId == lastDownWinId && !tapMovedTooFar) {
+                triggerTapUpCheck = !localImeActive;
+                tapDownTs = lastDownUptimeMs;
+                if (!localImeActive) {
+                    // Ensure target VirtualDisplay is top-focused right as EditText.onTouchEvent(ACTION_UP)
+                    // invokes InputMethodManager.showSoftInput().
+                    services.focusDisplay(ws.displayId);
+                }
+            }
+            lastDownWinId = -1;
+        } else if (masked == MotionEvent.ACTION_CANCEL) {
+            lastDownWinId = -1;
+        }
         boolean isScroll = (masked == MotionEvent.ACTION_SCROLL);
         int effSource = isScroll
                 ? InputDevice.SOURCE_MOUSE
@@ -148,7 +205,14 @@ public final class PerDisplayInputRouter {
             AndroidServices.setActionButton(ev, actionButton);
         }
         try {
-            return dispatchToDisplay(ev, ws.displayId, ws.vdUniqueId, ws.contentWidth, ws.contentHeight);
+            boolean ok = dispatchToDisplay(ev, ws.displayId, ws.vdUniqueId, ws.contentWidth, ws.contentHeight);
+            if (ok && triggerTapUpCheck) {
+                TapUpListener listener = tapUpListener;
+                if (listener != null) {
+                    listener.onWindowTapUp(ws.windowId, ws.displayId, tapDownTs);
+                }
+            }
+            return ok;
         } finally {
             ev.recycle();
         }
@@ -156,7 +220,11 @@ public final class PerDisplayInputRouter {
 
     public boolean injectWindowKey(WindowSession ws, int action, int keyCode, int metaState) {
         if (ws == null || !ws.isLive() || ws.displayId <= 0) return false;
-        services.focusDisplay(ws.displayId);
+        if (localImeActive) {
+            services.focusDisplayTaskOnly(ws.displayId);
+        } else {
+            services.focusDisplay(ws.displayId);
+        }
         long now = SystemClock.uptimeMillis();
         KeyEvent ev = new KeyEvent(
                 now, now, action, keyCode, 0, metaState,

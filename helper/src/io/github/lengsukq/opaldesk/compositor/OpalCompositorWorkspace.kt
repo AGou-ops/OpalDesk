@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -72,6 +73,7 @@ import io.github.lengsukq.opaldesk.ui.OpalGlyphButton
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
 import io.github.lengsukq.opaldesk.ui.OpalText
+import io.github.lengsukq.opaldesk.ui.PairingConsentModal
 import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
 import io.github.lengsukq.opaldesk.ui.onTapOrContextAction
 import kotlinx.coroutines.Dispatchers
@@ -132,6 +134,8 @@ fun OpalCompositorWorkspace(
     isExternalMonitor: Boolean,
     externalMonitorSummary: String = "",
     virtualCursorPx: Offset? = null,
+    imeActive: Boolean = false,
+    onToggleSoftKeyboard: (() -> Unit)? = null,
     onPickCustomWallpaper: () -> Unit = {},
     onOpenConsole: () -> Unit,
     onExitDesktop: () -> Unit,
@@ -142,6 +146,8 @@ fun OpalCompositorWorkspace(
 
     val status by BridgeClient.statusFlow.collectAsState()
     val scene by BridgeClient.sceneFlow.collectAsState()
+    val remote by BridgeClient.remoteStatusFlow.collectAsState()
+    val pendingPairing by BridgeClient.pendingPairingFlow.collectAsState()
 
     var allApps by remember { mutableStateOf<List<InstalledAppEntry>>(emptyList()) }
     val desktopPkgs by AppPrefs.desktopShortcutsFlow.collectAsState()
@@ -150,11 +156,11 @@ fun OpalCompositorWorkspace(
     val customWallpaperPath by AppPrefs.customWallpaperPathFlow.collectAsState()
     val themeMode by AppPrefs.themeModeFlow.collectAsState()
     val mouseTargetMode by AppPrefs.mouseTargetFlow.collectAsState()
+    val externalUiScale by AppPrefs.externalUiScaleFlow.collectAsState()
 
     var showAppDrawer by remember { mutableStateOf(false) }
     var showExposeOverview by remember { mutableStateOf(false) }
     var showControlCenter by remember { mutableStateOf(false) }
-    var showTilingMenu by remember { mutableStateOf(false) }
     var contextMenuTarget by remember { mutableStateOf<Triple<String, CompositorWindow?, Offset>?>(null) }
     var wallpaperMenuPos by remember { mutableStateOf<Offset?>(null) }
     var snapPreviewRect by remember { mutableStateOf<WindowRect?>(null) }
@@ -164,7 +170,6 @@ fun OpalCompositorWorkspace(
         showAppDrawer = false
         showExposeOverview = false
         showControlCenter = false
-        showTilingMenu = false
         contextMenuTarget = null
         wallpaperMenuPos = null
     }
@@ -180,16 +185,38 @@ fun OpalCompositorWorkspace(
         }
     }
 
+    // Keep hostScreenOff status indicator synced promptly if the user double-taps to wake the phone
+    LaunchedEffect(status.connected, status.hostScreenOff) {
+        if (status.connected && status.hostScreenOff) {
+            while (true) {
+                delay(2_500L)
+                withContext(Dispatchers.IO) {
+                    BridgeClient.refreshStatus()
+                }
+            }
+        }
+    }
+
     OpalAmbientBackdrop(modifier = Modifier.fillMaxSize(), wallpaperPreset = wallpaperPreset) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val canvasW = constraints.maxWidth
             val canvasH = constraints.maxHeight
+            val isCompactWidth = maxWidth < 600.dp
             val densityVal = density.density
-            val dpiInt = (densityVal * 160f).roundToInt().coerceIn(120, 480)
+            val dpiInt = (densityVal * 160f).roundToInt().coerceIn(120, 560)
+            val usableHeightDp = (maxHeight - (CompositorGeometry.TOP_BAR_DP + CompositorGeometry.DOCK_INSET_DP + 24f).dp)
+                .coerceAtLeast(180.dp)
+            val shortcutRowsPerCol = (usableHeightDp.value / 88f).toInt().coerceIn(3, 8)
+            val fullscreenWin = scene.visibleWindows.firstOrNull { it.isFullscreen }
+            val displaySummary = when {
+                remote.connected -> "${remote.channelLabel} · ${remote.peerName.ifBlank { "投屏端" }} · ${remote.width}×${remote.height} @ ${remote.fpsX100 / 100}Hz"
+                externalMonitorSummary.isNotBlank() -> externalMonitorSummary
+                else -> "桌面画布 · ${canvasW}×${canvasH}"
+            }
 
             // Sync physical canvas dimensions & effective DPI with daemon compositor
             LaunchedEffect(status.connected, canvasW, canvasH, dpiInt) {
-                if (status.connected && canvasW >= 640 && canvasH >= 480) {
+                if (status.connected && canvasW >= 360 && canvasH >= 360) {
                     BridgeClient.updateCompositorConfigAsync(
                         canvasW = canvasW,
                         canvasH = canvasH,
@@ -214,7 +241,7 @@ fun OpalCompositorWorkspace(
                 modifier = Modifier
                     .fillMaxSize()
                     .onTapOrContextAction(
-                        showAppDrawer, showExposeOverview, showControlCenter, showTilingMenu,
+                        showAppDrawer, showExposeOverview, showControlCenter,
                         contextMenuTarget, wallpaperMenuPos,
                         onPrimaryTap = { dismissAllPopovers() },
                         onContextAction = { pos ->
@@ -224,11 +251,12 @@ fun OpalCompositorWorkspace(
                     ),
             )
 
-            // Samsung DeX-style Left-Column Desktop App Shortcuts (always visible behind windows)
-            if (status.connected && allApps.isNotEmpty()) {
+            // Samsung DeX-style Left-Column Desktop App Shortcuts (hidden during true app fullscreen)
+            if (status.connected && allApps.isNotEmpty() && fullscreenWin == null) {
                 DesktopShortcutColumn(
                     allApps = allApps,
                     desktopPkgs = desktopPkgs,
+                    rowsPerColumn = shortcutRowsPerCol,
                     onLaunch = { entry ->
                         dismissAllPopovers()
                         scope.launch(Dispatchers.IO) {
@@ -244,23 +272,24 @@ fun OpalCompositorWorkspace(
                         .align(Alignment.TopStart)
                         .padding(
                             top = (CompositorGeometry.TOP_BAR_DP + 14f).dp,
-                            start = 16.dp,
+                            start = if (isCompactWidth) 10.dp else 16.dp,
                             bottom = (CompositorGeometry.DOCK_INSET_DP + 14f).dp,
                         ),
                 )
             }
 
             // Subtle macOS-style resting hint pill when no windows are currently visible
-            if (status.connected && scene.visibleWindows.isEmpty() && !showAppDrawer && !showExposeOverview) {
+            if (status.connected && scene.visibleWindows.isEmpty() && !showAppDrawer && !showExposeOverview && fullscreenWin == null) {
                 EmptyDesktopPill(
                     isExternalMonitor = isExternalMonitor,
+                    isCompactWidth = isCompactWidth,
                     onOpenDrawer = {
                         dismissAllPopovers()
                         showAppDrawer = true
                     },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 88.dp),
+                        .padding(start = 14.dp, end = 14.dp, bottom = 84.dp),
                 )
             }
 
@@ -297,116 +326,133 @@ fun OpalCompositorWorkspace(
                 }
             }
 
-            // Top 28dp Translucent macOS Liquid Glass Menu Bar
-            MacDesktopMenuBar(
-                focusedWindow = scene.focusedWindow,
-                activeVdCount = scene.activeVdCount,
-                maxVdCount = scene.maxVdCount,
-                isExternalMonitor = isExternalMonitor,
-                externalMonitorSummary = externalMonitorSummary,
-                showTilingMenu = showTilingMenu,
-                showControlCenter = showControlCenter,
-                onToggleTilingMenu = {
-                    val next = !showTilingMenu
-                    dismissAllPopovers()
-                    showTilingMenu = next
-                },
-                onToggleControlCenter = {
-                    val next = !showControlCenter
-                    dismissAllPopovers()
-                    showControlCenter = next
-                },
-                onOpenConsole = onOpenConsole,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .zIndex(10_000f),
-            )
-
-            // Top-Right Floating Liquid Frosted Glass Multi-Window Tiling Preset Popover
-            if (showTilingMenu) {
-                WindowTilingPopover(
-                    windowCount = scene.windows.size,
-                    onApplyLayout = ::applyTiling,
+            // Top 28dp Translucent macOS Liquid Glass Menu Bar (hidden during true app fullscreen)
+            if (fullscreenWin == null) {
+                MacDesktopMenuBar(
+                    focusedWindow = scene.focusedWindow,
+                    tray = trayInfo,
+                    isExternalMonitor = isExternalMonitor,
+                    hostScreenOff = status.hostScreenOff,
+                    isCompactWidth = isCompactWidth,
+                    showControlCenter = showControlCenter,
+                    onToggleFullscreen = {
+                        val focused = scene.focusedWindow ?: return@MacDesktopMenuBar
+                        dismissAllPopovers()
+                        BridgeClient.sendWindowActionAsync(
+                            focused.windowId,
+                            BridgeProtocol.WinAction.TOGGLE_FULLSCREEN,
+                        )
+                    },
+                    onToggleControlCenter = {
+                        val next = !showControlCenter
+                        dismissAllPopovers()
+                        showControlCenter = next
+                    },
+                    onOpenConsole = onOpenConsole,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .zIndex(10_000f),
+                )
+            } else {
+                // Unobtrusive top-center pull-down handle to exit fullscreen or return to desktop
+                FullscreenExitOverlay(
+                    windowTitle = fullscreenWin.title,
+                    onExitFullscreen = {
+                        dismissAllPopovers()
+                        BridgeClient.sendWindowActionAsync(
+                            fullscreenWin.windowId,
+                            BridgeProtocol.WinAction.TOGGLE_FULLSCREEN,
+                        )
+                    },
+                    onReturnToDesktop = {
+                        dismissAllPopovers()
+                        minimizeAllWindows()
+                    },
+                    onOpenControlCenter = {
+                        val next = !showControlCenter
+                        dismissAllPopovers()
+                        showControlCenter = next
+                    },
                     modifier = Modifier
                         .align(Alignment.TopEnd)
-                        .padding(top = (CompositorGeometry.TOP_BAR_DP + 8f).dp, end = 16.dp)
-                        .zIndex(10_020f),
+                        .padding(top = 6.dp, end = 12.dp)
+                        .zIndex(10_040f),
                 )
             }
 
-            // Bottom Floating Liquid Frosted Glass Dock & Status Capsule
-            DexMacTaskbar(
-                allApps = allApps,
-                dockPinnedPkgs = dockPinnedPkgs,
-                windows = scene.windows,
-                tray = trayInfo,
-                showAppDrawer = showAppDrawer,
-                showExpose = showExposeOverview,
-                showControlCenter = showControlCenter,
-                onToggleAppDrawer = {
-                    val next = !showAppDrawer
-                    dismissAllPopovers()
-                    showAppDrawer = next
-                },
-                onOpenSearch = {
-                    dismissAllPopovers()
-                    showAppDrawer = true
-                },
-                onToggleExpose = {
-                    val next = !showExposeOverview
-                    dismissAllPopovers()
-                    showExposeOverview = next
-                },
-                onToggleControlCenter = {
-                    val next = !showControlCenter
-                    dismissAllPopovers()
-                    showControlCenter = next
-                },
-                onSendBackToFocused = {
-                    val focused = scene.focusedWindow
-                    if (focused != null && !focused.isMinimized) {
-                        BridgeClient.sendWindowActionAsync(focused.windowId, BridgeProtocol.WinAction.SEND_BACK)
-                    }
-                },
-                onShowDesktopToggle = {
-                    dismissAllPopovers()
-                    if (scene.visibleWindows.isNotEmpty()) {
-                        minimizeAllWindows()
-                    } else {
-                        val lastMin = scene.windows.maxByOrNull { it.zOrder }
-                        if (lastMin != null) {
-                            BridgeClient.sendWindowActionAsync(lastMin.windowId, BridgeProtocol.WinAction.FOCUS)
+            // Bottom Centered Floating Liquid Frosted Glass Dock (hidden during true app fullscreen)
+            if (fullscreenWin == null) {
+                DexMacTaskbar(
+                    allApps = allApps,
+                    dockPinnedPkgs = dockPinnedPkgs,
+                    windows = scene.windows,
+                    showAppDrawer = showAppDrawer,
+                    showExpose = showExposeOverview,
+                    isCompactWidth = isCompactWidth,
+                    imeActive = imeActive,
+                    onToggleSoftKeyboard = onToggleSoftKeyboard,
+                    onToggleAppDrawer = {
+                        val next = !showAppDrawer
+                        dismissAllPopovers()
+                        showAppDrawer = next
+                    },
+                    onOpenSearch = {
+                        dismissAllPopovers()
+                        showAppDrawer = true
+                    },
+                    onToggleExpose = {
+                        val next = !showExposeOverview
+                        dismissAllPopovers()
+                        showExposeOverview = next
+                    },
+                    onSendBackToFocused = {
+                        val focused = scene.focusedWindow
+                        if (focused != null && !focused.isMinimized) {
+                            BridgeClient.sendWindowActionAsync(focused.windowId, BridgeProtocol.WinAction.SEND_BACK)
                         }
-                    }
-                },
-                onLaunchOrToggleApp = { pkg, cls ->
-                    dismissAllPopovers()
-                    val existing = scene.windows.firstOrNull { it.pkg == pkg }
-                    if (existing != null && existing.focused && !existing.isMinimized) {
-                        BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.MINIMIZE)
-                    } else if (existing != null) {
-                        BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.FOCUS)
-                    } else {
-                        scope.launch(Dispatchers.IO) {
-                            BridgeClient.openWindow(pkg, cls, BridgeProtocol.Profile.AUTO)
+                    },
+                    onShowDesktopToggle = {
+                        dismissAllPopovers()
+                        if (scene.visibleWindows.isNotEmpty()) {
+                            minimizeAllWindows()
+                        } else {
+                            val lastMin = scene.windows.maxByOrNull { it.zOrder }
+                            if (lastMin != null) {
+                                BridgeClient.sendWindowActionAsync(lastMin.windowId, BridgeProtocol.WinAction.FOCUS)
+                            }
                         }
-                    }
-                },
-                onContextApp = { pkg, win, rootPos ->
-                    dismissAllPopovers()
-                    contextMenuTarget = Triple(pkg, win, rootPos)
-                },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .zIndex(10_010f),
-            )
+                    },
+                    onLaunchOrToggleApp = { pkg, cls ->
+                        dismissAllPopovers()
+                        val existing = scene.windows.firstOrNull { it.pkg == pkg }
+                        if (existing != null && existing.focused && !existing.isMinimized) {
+                            BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.MINIMIZE)
+                        } else if (existing != null) {
+                            BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.FOCUS)
+                        } else {
+                            scope.launch(Dispatchers.IO) {
+                                BridgeClient.openWindow(pkg, cls, BridgeProtocol.Profile.AUTO)
+                            }
+                        }
+                    },
+                    onContextApp = { pkg, win, rootPos ->
+                        dismissAllPopovers()
+                        contextMenuTarget = Triple(pkg, win, rootPos)
+                    },
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .zIndex(10_010f),
+                )
+            }
 
             // Floating Rounded Glass App Launcher Popover above macOS Dock
             if (showAppDrawer) {
+                val drawerMaxH = (maxHeight - (CompositorGeometry.TOP_BAR_DP + 104f).dp).coerceIn(220.dp, 480.dp)
                 DexAppDrawerPopover(
                     apps = allApps,
                     desktopPkgs = desktopPkgs,
                     dockPinnedPkgs = dockPinnedPkgs,
+                    maxHeight = drawerMaxH,
                     onLaunch = { entry, profileCode ->
                         showAppDrawer = false
                         scope.launch(Dispatchers.IO) {
@@ -419,22 +465,54 @@ fun OpalCompositorWorkspace(
                     },
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
-                        .padding(bottom = 78.dp)
+                        .padding(start = 12.dp, end = 12.dp, bottom = 76.dp)
                         .zIndex(10_020f),
                 )
             }
 
-            // Bottom-Right macOS Control Center Popover
+            // Unified Top-Right macOS Control Center Popover
             if (showControlCenter) {
+                val ccMaxH = (maxHeight - (CompositorGeometry.TOP_BAR_DP + 24f).dp).coerceAtLeast(240.dp)
                 MacControlCenterPopover(
-                    activeVdCount = scene.activeVdCount,
-                    maxVdCount = scene.maxVdCount,
+                    tray = trayInfo,
                     totalWindows = scene.windows.size,
+                    displaySummary = displaySummary,
                     inputBackendLabel = status.injectBackendLabel,
+                    targetFps = status.targetFps,
+                    windowDpiScalePct = status.windowDpiScalePct,
+                    externalUiScale = externalUiScale,
                     themeMode = themeMode,
                     wallpaperPreset = wallpaperPreset,
                     mouseTargetMode = mouseTargetMode,
                     isExternalMonitor = isExternalMonitor,
+                    hostScreenOff = status.hostScreenOff,
+                    showHostScreenToggle = isExternalMonitor || remote.connected || status.hostScreenOff,
+                    maxHeight = ccMaxH,
+                    onSelectTargetFps = { fps ->
+                        BridgeClient.updateDisplayPrefsAsync(
+                            targetFps = fps,
+                            windowDpiScalePct = status.windowDpiScalePct,
+                        )
+                    },
+                    onSelectWindowDpiPct = { pct ->
+                        BridgeClient.updateDisplayPrefsAsync(
+                            targetFps = status.targetFps,
+                            windowDpiScalePct = pct,
+                        )
+                    },
+                    onSelectUiScale = { scale ->
+                        AppPrefs.setExternalUiScale(ctx, scale)
+                    },
+                    onToggleHostScreenPower = { screenOn ->
+                        BridgeClient.setHostScreenPowerAsync(screenOn) { ok ->
+                            val msg = when {
+                                !ok -> "当前设备暂不支持物理息屏控制"
+                                screenOn -> "已点亮原手机屏幕"
+                                else -> "已熄灭原手机屏幕（双击手机屏幕随时亮屏，断开也会自动亮屏）"
+                            }
+                            Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+                        }
+                    },
                     onSelectThemeMode = { mode ->
                         AppPrefs.setThemeMode(ctx, mode)
                     },
@@ -469,8 +547,8 @@ fun OpalCompositorWorkspace(
                         onExitDesktop()
                     },
                     modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(end = 14.dp, bottom = 78.dp)
+                        .align(Alignment.TopEnd)
+                        .padding(top = (CompositorGeometry.TOP_BAR_DP + 8f).dp, start = 12.dp, end = 12.dp)
                         .zIndex(10_020f),
                 )
             }
@@ -501,7 +579,7 @@ fun OpalCompositorWorkspace(
                         WallpaperStorage.clearCustomWallpaper(ctx)
                         Toast.makeText(ctx, "已恢复默认预设壁纸", Toast.LENGTH_SHORT).show()
                     },
-                    onOpenTilingMenu = { showTilingMenu = true },
+                    onOpenTilingMenu = { showControlCenter = true },
                     onOpenAppDrawer = { showAppDrawer = true },
                     onToggleLightDark = {
                         val next = if (isCurrentlyDark) AppPrefs.THEME_LIGHT else AppPrefs.THEME_DARK
@@ -612,6 +690,7 @@ fun OpalCompositorWorkspace(
                 Box(modifier = Modifier.fillMaxSize().zIndex(10_030f)) {
                     ExposeWindowSwitcherOverlay(
                         windows = scene.windows,
+                        isCompactWidth = isCompactWidth,
                         onSelectWindow = { win ->
                             showExposeOverview = false
                             BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.FOCUS)
@@ -639,6 +718,7 @@ fun OpalCompositorWorkspace(
                     onExit = onExitDesktop,
                     modifier = Modifier
                         .align(Alignment.Center)
+                        .padding(horizontal = 16.dp)
                         .zIndex(10_040f),
                 )
             }
@@ -649,6 +729,14 @@ fun OpalCompositorWorkspace(
                     MacVirtualPointerCursor(positionPx = pos)
                 }
             }
+
+            // Host-side interactive wireless pairing consent prompt (also active in Desktop mode)
+            pendingPairing?.let { req ->
+                PairingConsentModal(
+                    request = req,
+                    modifier = Modifier.zIndex(10_060f),
+                )
+            }
         }
     }
 }
@@ -657,6 +745,7 @@ fun OpalCompositorWorkspace(
 private fun DesktopShortcutColumn(
     allApps: List<InstalledAppEntry>,
     desktopPkgs: List<String>,
+    rowsPerColumn: Int = 5,
     onLaunch: (InstalledAppEntry) -> Unit,
     onContextApp: (String, Offset) -> Unit,
     modifier: Modifier = Modifier,
@@ -667,8 +756,8 @@ private fun DesktopShortcutColumn(
         desktopPkgs.mapNotNull { byPkg[it] }.take(15)
     }
 
-    // Wrap into vertical columns of 5 icons (classic DeX desktop layout)
-    val columns = shortcuts.chunked(5)
+    // Wrap into adaptive vertical columns based on portrait/landscape canvas height
+    val columns = shortcuts.chunked(rowsPerColumn.coerceIn(3, 8))
     Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         columns.forEach { colApps ->
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -729,6 +818,7 @@ private fun DesktopShortcutColumn(
 @Composable
 private fun EmptyDesktopPill(
     isExternalMonitor: Boolean,
+    isCompactWidth: Boolean = false,
     onOpenDrawer: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -741,7 +831,7 @@ private fun EmptyDesktopPill(
                 elevation = 16.dp,
             )
             .clickable(onClick = onOpenDrawer)
-            .padding(horizontal = 16.dp, vertical = 9.dp),
+            .padding(horizontal = if (isCompactWidth) 12.dp else 16.dp, vertical = 9.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -752,12 +842,12 @@ private fun EmptyDesktopPill(
                 .background(OpalPalette.AccentEmerald),
         )
         OpalText(
-            text = if (isExternalMonitor) {
-                "外接满屏桌面已就绪 · 点击桌面图标或底部 Dock 应用抽屉启动应用"
-            } else {
-                "桌面已就绪 · 点击桌面图标或底部 Dock 应用抽屉开启多窗口"
+            text = when {
+                isCompactWidth -> "桌面已就绪 · 点击打开应用抽屉"
+                isExternalMonitor -> "外接满屏桌面已就绪 · 点击桌面图标或底部 Dock 应用抽屉启动应用"
+                else -> "桌面已就绪 · 点击桌面图标或底部 Dock 应用抽屉开启多窗口"
             },
-            fontSize = 12.sp,
+            fontSize = if (isCompactWidth) 11.5.sp else 12.sp,
             color = OpalPalette.TextSecondary,
             maxLines = 1,
         )
@@ -767,6 +857,7 @@ private fun EmptyDesktopPill(
 @Composable
 private fun ExposeWindowSwitcherOverlay(
     windows: List<CompositorWindow>,
+    isCompactWidth: Boolean = false,
     onSelectWindow: (CompositorWindow) -> Unit,
     onCloseWindow: (CompositorWindow) -> Unit,
     onMinimizeAll: () -> Unit,
@@ -779,7 +870,10 @@ private fun ExposeWindowSwitcherOverlay(
             .fillMaxSize()
             .background(OpalPalette.ScrimColor)
             .clickable(onClick = onDismiss)
-            .padding(horizontal = 32.dp, vertical = 44.dp),
+            .padding(
+                horizontal = if (isCompactWidth) 16.dp else 32.dp,
+                vertical = if (isCompactWidth) 28.dp else 44.dp,
+            ),
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             Row(
@@ -787,12 +881,13 @@ private fun ExposeWindowSwitcherOverlay(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Column {
-                    OpalText(text = "调度中心", fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Column(modifier = Modifier.weight(1f)) {
+                    OpalText(text = "调度中心", fontSize = if (isCompactWidth) 17.sp else 20.sp, fontWeight = FontWeight.Bold)
                     OpalText(
                         text = "共 ${windows.size} 个应用窗口 · 点按卡片立即切换或唤醒",
-                        fontSize = 12.sp,
+                        fontSize = 11.5.sp,
                         color = OpalPalette.TextSecondary,
+                        maxLines = 1,
                     )
                 }
                 if (windows.isNotEmpty()) {
@@ -813,16 +908,16 @@ private fun ExposeWindowSwitcherOverlay(
                     }
                 }
             }
-            Spacer(Modifier.height(20.dp))
+            Spacer(Modifier.height(if (isCompactWidth) 14.dp else 20.dp))
             if (windows.isEmpty()) {
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     OpalText(text = "当前没有打开的窗口", color = OpalPalette.TextSecondary, fontSize = 14.sp)
                 }
             } else {
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 250.dp),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    columns = GridCells.Adaptive(minSize = if (isCompactWidth) 160.dp else 250.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
                     items(windows, key = { it.windowId }) { win ->
                         val icon = remember(win.pkg) { AppCatalogRepository.getAppIcon(ctx, win.pkg) }
@@ -911,7 +1006,7 @@ private fun OfflineDaemonPromptCard(
     modifier: Modifier = Modifier,
 ) {
     OpalGlassCard(
-        modifier = modifier.width(420.dp),
+        modifier = modifier.widthIn(max = 420.dp).fillMaxWidth(),
         cornerRadius = 20.dp,
         fillColor = OpalPalette.GlassPopover,
         contentPadding = PaddingValues(24.dp),

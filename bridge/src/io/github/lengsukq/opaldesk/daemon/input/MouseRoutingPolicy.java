@@ -12,6 +12,8 @@ public final class MouseRoutingPolicy {
     public static final int SOURCE_KEYBOARD = 0x00000101;
     /** Matches {@code android.view.InputDevice.SOURCE_TOUCHSCREEN} (0x00001002). */
     public static final int SOURCE_TOUCHSCREEN = 0x00001002;
+    /** Matches {@code android.view.InputDevice.KEYBOARD_TYPE_ALPHABETIC} (2). */
+    public static final int KEYBOARD_TYPE_ALPHABETIC = 2;
 
     public static final float MIN_SENSITIVITY = 0.50f;
     public static final float DEFAULT_SENSITIVITY = 1.45f;
@@ -21,10 +23,22 @@ public final class MouseRoutingPolicy {
 
     /** Decides whether an InputDevice represents a routable physical external mouse. */
     public static boolean shouldRouteDevice(String name, int sources, boolean isVirtual, boolean isExternal) {
+        return shouldRouteDevice(name, sources, 0, isVirtual, isExternal);
+    }
+
+    /**
+     * Decides whether an InputDevice represents a routable physical external mouse OR alphabetic
+     * external physical keyboard (excluding built-in keys, virtual UHID devices, and Bluetooth
+     * headphone non-alphabetic media-key devices).
+     */
+    public static boolean shouldRouteDevice(
+            String name, int sources, int keyboardType, boolean isVirtual, boolean isExternal) {
         if (isVirtual || !isExternal) return false;
-        if ((sources & SOURCE_MOUSE) != SOURCE_MOUSE) return false;
         if (name != null && name.startsWith("OpalDesk Virtual")) return false;
-        return true;
+        boolean isMouse = (sources & SOURCE_MOUSE) == SOURCE_MOUSE;
+        boolean isAlphaKeyboard = (sources & SOURCE_KEYBOARD) == SOURCE_KEYBOARD
+                && keyboardType == KEYBOARD_TYPE_ALPHABETIC;
+        return isMouse || isAlphaKeyboard;
     }
 
     /**

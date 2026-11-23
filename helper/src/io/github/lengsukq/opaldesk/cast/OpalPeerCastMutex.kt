@@ -31,11 +31,15 @@ object OpalPeerCastMutex {
     private val _roleFlow = MutableStateFlow(CastRoleState())
     val roleFlow: StateFlow<CastRoleState> = _roleFlow.asStateFlow()
 
+    private val activeReceiverTags = LinkedHashSet<String>()
+
     val isReceivingActive: Boolean
         get() = _roleFlow.value.role == Role.RECEIVING
 
-    fun beginReceiving(host: String, port: Int, peerName: String = ""): Boolean {
+    @Synchronized
+    fun beginReceiving(host: String, port: Int, peerName: String = "", sessionTag: String = "default"): Boolean {
         if (_roleFlow.value.role == Role.SENDING) return false
+        activeReceiverTags.add(sessionTag)
         _roleFlow.value = CastRoleState(
             role = Role.RECEIVING,
             peerName = peerName.ifBlank { host },
@@ -45,6 +49,7 @@ object OpalPeerCastMutex {
         return true
     }
 
+    @Synchronized
     fun updateReceivingPeerName(peerName: String) {
         val cur = _roleFlow.value
         if (cur.role == Role.RECEIVING && peerName.isNotBlank()) {
@@ -52,12 +57,15 @@ object OpalPeerCastMutex {
         }
     }
 
-    fun endReceiving() {
-        if (_roleFlow.value.role == Role.RECEIVING) {
+    @Synchronized
+    fun endReceiving(sessionTag: String = "default") {
+        activeReceiverTags.remove(sessionTag)
+        if (activeReceiverTags.isEmpty() && _roleFlow.value.role == Role.RECEIVING) {
             _roleFlow.value = CastRoleState(Role.IDLE)
         }
     }
 
+    @Synchronized
     fun syncDaemonSendingState(daemonSending: Boolean, peerName: String) {
         val cur = _roleFlow.value
         if (daemonSending) {

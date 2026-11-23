@@ -73,6 +73,7 @@ public final class OpalCastProtocol {
     // Session roles & transport hints (OpalCast v1.1 HELLO)
     public static final String SESSION_ROLE_DESKTOP = "desktop";
     public static final String SESSION_ROLE_STANDALONE_APP = "standalone_app";
+    public static final String SESSION_ROLE_APP_CATALOG = "app_catalog";
     public static final String TRANSPORT_HINT_USB = "usb";
     public static final String TRANSPORT_HINT_WIFI_ADB = "wifi_adb";
     public static final String TRANSPORT_HINT_WIFI_TLS = "wifi_tls";
@@ -495,13 +496,25 @@ public final class OpalCastProtocol {
         public final String message;
         public final String deviceName;
         public final String certFingerprint;
+        public final boolean permanent;
 
         public AuthResultMsg(boolean ok, String authToken, String message, String deviceName, String certFingerprint) {
+            this(ok, authToken, message, deviceName, certFingerprint, authToken != null && !authToken.isEmpty());
+        }
+
+        public AuthResultMsg(
+                boolean ok,
+                String authToken,
+                String message,
+                String deviceName,
+                String certFingerprint,
+                boolean permanent) {
             this.ok = ok;
             this.authToken = (authToken != null) ? authToken : "";
             this.message = (message != null) ? message : "";
             this.deviceName = (deviceName != null) ? deviceName : "";
             this.certFingerprint = (certFingerprint != null) ? certFingerprint : "";
+            this.permanent = permanent;
         }
     }
 
@@ -509,6 +522,7 @@ public final class OpalCastProtocol {
         String json = new SimpleJson.ObjectBuilder()
                 .put("ok", msg.ok)
                 .put("authToken", msg.authToken)
+                .put("permanent", msg.permanent)
                 .put("message", msg.message)
                 .put("deviceName", msg.deviceName)
                 .put("certFingerprint", msg.certFingerprint)
@@ -688,6 +702,10 @@ public final class OpalCastProtocol {
 
         public boolean isStandaloneApp() {
             return SESSION_ROLE_STANDALONE_APP.equalsIgnoreCase(sessionRole);
+        }
+
+        public boolean isAppCatalog() {
+            return SESSION_ROLE_APP_CATALOG.equalsIgnoreCase(sessionRole);
         }
     }
 

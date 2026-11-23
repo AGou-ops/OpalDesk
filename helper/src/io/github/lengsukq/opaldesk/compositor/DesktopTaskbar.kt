@@ -11,6 +11,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -21,6 +22,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,7 +33,9 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -64,7 +68,9 @@ import io.github.lengsukq.opaldesk.ui.OpalTextInput
 import io.github.lengsukq.opaldesk.ui.TilingLayoutPreviewIcon
 import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
 import io.github.lengsukq.opaldesk.ui.onTapOrContextAction
+import kotlinx.coroutines.delay
 import java.util.Locale
+import kotlin.math.abs
 
 data class SystemTrayInfo(
     val clockText: String = "",
@@ -110,17 +116,19 @@ fun querySystemTrayStatus(ctx: Context, clockText: String, dateText: String): Sy
 
 /**
  * Refined 28dp macOS translucent Menu Bar at the top edge of the workspace.
+ *
+ * Right side hosts the unified System Status & Control Center trigger (Wi-Fi, Battery,
+ * Control Center icon, Date/Clock, and Host-Screen-Off indicator).
  */
 @Composable
 fun MacDesktopMenuBar(
     focusedWindow: CompositorWindow?,
-    activeVdCount: Int,
-    maxVdCount: Int,
+    tray: SystemTrayInfo,
     isExternalMonitor: Boolean,
-    externalMonitorSummary: String,
-    showTilingMenu: Boolean,
+    hostScreenOff: Boolean,
+    isCompactWidth: Boolean,
     showControlCenter: Boolean,
-    onToggleTilingMenu: () -> Unit,
+    onToggleFullscreen: () -> Unit,
     onToggleControlCenter: () -> Unit,
     onOpenConsole: () -> Unit,
     modifier: Modifier = Modifier,
@@ -130,7 +138,7 @@ fun MacDesktopMenuBar(
             .fillMaxWidth()
             .height(CompositorGeometry.TOP_BAR_DP.dp)
             .background(OpalPalette.MenuBarFill)
-            .padding(horizontal = 14.dp),
+            .padding(horizontal = if (isCompactWidth) 8.dp else 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Row(
@@ -152,107 +160,151 @@ fun MacDesktopMenuBar(
                 fontSize = 12.sp,
                 fontWeight = FontWeight.Bold,
                 color = OpalPalette.TextPrimary,
-            )
-        }
-
-        Spacer(Modifier.width(12.dp))
-
-        if (focusedWindow != null) {
-            OpalText(
-                text = focusedWindow.title,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = OpalPalette.TextPrimary,
-                maxLines = 1,
-            )
-            Spacer(Modifier.width(10.dp))
-            OpalText(
-                text = "${focusedWindow.contentWidth}×${focusedWindow.contentHeight} · ${focusedWindow.contentDpi}dpi",
-                fontSize = 11.sp,
-                color = OpalPalette.TextMuted,
-                maxLines = 1,
-            )
-        } else {
-            OpalText(
-                text = if (isExternalMonitor) "外接桌面工作站" else "桌面工作站",
-                fontSize = 11.5.sp,
-                color = OpalPalette.TextSecondary,
                 maxLines = 1,
             )
         }
 
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.width(if (isCompactWidth) 6.dp else 12.dp))
 
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(6.dp))
-                .background(if (showTilingMenu) OpalPalette.ChipActiveFill else Color.Transparent)
-                .clickable(onClick = onToggleTilingMenu)
-                .padding(horizontal = 8.dp, vertical = 2.dp),
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            OpalText(
-                text = "分屏布局",
-                fontSize = 11.sp,
-                fontWeight = if (showTilingMenu) FontWeight.SemiBold else FontWeight.Medium,
-                color = if (showTilingMenu) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
-            )
+            if (focusedWindow != null) {
+                OpalText(
+                    text = focusedWindow.title,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OpalPalette.TextPrimary,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                Spacer(Modifier.width(if (isCompactWidth) 6.dp else 9.dp))
+                Row(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(OpalPalette.ChipFill)
+                        .clickable(onClick = onToggleFullscreen)
+                        .padding(horizontal = 7.dp, vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    OpalGlyphIcon(
+                        glyph = ChromeGlyph.MAXIMIZE,
+                        tint = OpalPalette.AccentBlue,
+                        size = 10.5.dp,
+                    )
+                    OpalText(
+                        text = "全屏",
+                        fontSize = 10.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OpalPalette.AccentBlue,
+                        maxLines = 1,
+                    )
+                }
+                if (!isCompactWidth) {
+                    Spacer(Modifier.width(9.dp))
+                    OpalText(
+                        text = "${focusedWindow.contentWidth}×${focusedWindow.contentHeight} · ${focusedWindow.contentDpi}dpi",
+                        fontSize = 10.5.sp,
+                        color = OpalPalette.TextMuted,
+                        maxLines = 1,
+                    )
+                }
+            } else if (!isCompactWidth) {
+                OpalText(
+                    text = if (isExternalMonitor) "外接桌面工作站" else "桌面工作站",
+                    fontSize = 11.5.sp,
+                    color = OpalPalette.TextSecondary,
+                    maxLines = 1,
+                )
+            }
         }
 
         Spacer(Modifier.width(8.dp))
 
-        if (isExternalMonitor && externalMonitorSummary.isNotEmpty()) {
-            OpalText(
-                text = externalMonitorSummary,
-                fontSize = 11.sp,
-                color = OpalPalette.AccentCyan,
-                maxLines = 1,
-            )
-            Spacer(Modifier.width(10.dp))
-        }
-
+        // Unified Top-Right Status Bar & Control Center Trigger
         Row(
             modifier = Modifier
-                .clip(RoundedCornerShape(6.dp))
+                .clip(RoundedCornerShape(7.dp))
                 .background(if (showControlCenter) OpalPalette.ChipActiveFill else Color.Transparent)
                 .clickable(onClick = onToggleControlCenter)
-                .padding(horizontal = 7.dp, vertical = 2.dp),
+                .padding(horizontal = if (isCompactWidth) 6.dp else 9.dp, vertical = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (isCompactWidth) 6.dp else 9.dp),
         ) {
-            Box(
-                modifier = Modifier
-                    .size(6.dp)
-                    .clip(CircleShape)
-                    .background(if (activeVdCount > 0) OpalPalette.AccentEmerald else OpalPalette.TextMuted),
+            if (hostScreenOff) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(OpalPalette.AccentEmerald.copy(alpha = 0.22f))
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
+                ) {
+                    OpalText(
+                        text = "息屏省电",
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OpalPalette.AccentEmerald,
+                        maxLines = 1,
+                    )
+                }
+            }
+            OpalGlyphIcon(
+                glyph = ChromeGlyph.WIFI,
+                tint = if (tray.wifiConnected) OpalPalette.TextPrimary else OpalPalette.TextMuted,
+                size = 13.dp,
             )
             OpalText(
-                text = "屏池 $activeVdCount/$maxVdCount",
+                text = if (tray.charging) "⚡${tray.batteryPct}%" else "${tray.batteryPct}%",
                 fontSize = 11.sp,
-                color = OpalPalette.TextSecondary,
+                fontWeight = FontWeight.Medium,
+                color = when {
+                    tray.charging -> OpalPalette.AccentEmerald
+                    tray.batteryPct <= 15 -> OpalPalette.AccentDanger
+                    else -> OpalPalette.TextPrimary
+                },
                 maxLines = 1,
             )
+            OpalGlyphIcon(
+                glyph = ChromeGlyph.CONTROL_CENTER,
+                tint = if (showControlCenter) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
+                size = 13.5.dp,
+            )
+            val timeLabel = if (!isCompactWidth && tray.dateText.isNotEmpty()) {
+                "${tray.dateText}  ${tray.clockText}"
+            } else {
+                tray.clockText
+            }
+            if (timeLabel.isNotEmpty()) {
+                OpalText(
+                    text = timeLabel,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OpalPalette.TextPrimary,
+                    maxLines = 1,
+                )
+            }
         }
     }
 }
 
 /**
- * Floating macOS Liquid Glass Dock (rounded large glass capsule with specular top rim & ambient shadow)
- * paired with a matching floating bottom-right Status Capsule, preserving Samsung DeX's intuitive
- * Launchpad + Running Apps + Back/Home/Recents + System Tray operation logic.
+ * Centered Floating macOS Liquid Glass Dock (adaptive for both wide tablet/monitor and compact
+ * portrait phone screens), preserving Samsung DeX's intuitive Launchpad + Running Apps + Navigation.
  */
 @Composable
 fun DexMacTaskbar(
     allApps: List<InstalledAppEntry>,
     dockPinnedPkgs: List<String>,
     windows: List<CompositorWindow>,
-    tray: SystemTrayInfo,
     showAppDrawer: Boolean,
     showExpose: Boolean,
-    showControlCenter: Boolean,
+    isCompactWidth: Boolean = false,
+    imeActive: Boolean = false,
+    onToggleSoftKeyboard: (() -> Unit)? = null,
     onToggleAppDrawer: () -> Unit,
     onOpenSearch: () -> Unit,
     onToggleExpose: () -> Unit,
-    onToggleControlCenter: () -> Unit,
     onSendBackToFocused: () -> Unit,
     onShowDesktopToggle: () -> Unit,
     onLaunchOrToggleApp: (String, String) -> Unit,
@@ -277,42 +329,54 @@ fun DexMacTaskbar(
         }
     }
 
-    val dockShape = RoundedCornerShape(22.dp)
-    val trayShape = RoundedCornerShape(20.dp)
+    val dockShape = RoundedCornerShape(if (isCompactWidth) 19.dp else 22.dp)
+    val leadBtnSize = if (isCompactWidth) 34.dp else 40.dp
+    val navBtnSize = if (isCompactWidth) 30.dp else 34.dp
+    val appTileSize = if (isCompactWidth) 40.dp else 46.dp
+    val appIconSize = if (isCompactWidth) 28.dp else 32.dp
 
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(start = 14.dp, end = 14.dp, bottom = 10.dp),
+            .padding(
+                start = if (isCompactWidth) 8.dp else 14.dp,
+                end = if (isCompactWidth) 8.dp else 14.dp,
+                bottom = if (isCompactWidth) 8.dp else 10.dp,
+            ),
     ) {
         // Center Iconic Floating macOS Liquid Frosted Glass Dock
         Row(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .widthIn(max = 760.dp)
+                .widthIn(max = 780.dp)
                 .liquidGlassSurface(
                     shape = dockShape,
                     fill = OpalPalette.LiquidDockFill,
                     rim = OpalPalette.LiquidGlassRim,
                     elevation = 22.dp,
                 )
-                .padding(horizontal = 10.dp, vertical = 6.dp),
+                .padding(
+                    horizontal = if (isCompactWidth) 7.dp else 10.dp,
+                    vertical = if (isCompactWidth) 5.dp else 6.dp,
+                ),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (isCompactWidth) 3.5.dp else 5.dp),
         ) {
-            // Left: Launchpad / App Drawer + Spotlight Search
+            // Left: Launchpad / App Drawer (+ Spotlight Search on wide screens)
             GlassDockButton(
                 glyph = ChromeGlyph.APPS_GRID,
                 active = showAppDrawer,
-                size = 40.dp,
+                size = leadBtnSize,
                 onClick = onToggleAppDrawer,
             )
-            GlassDockButton(
-                glyph = ChromeGlyph.SEARCH,
-                active = false,
-                size = 38.dp,
-                onClick = onOpenSearch,
-            )
+            if (!isCompactWidth) {
+                GlassDockButton(
+                    glyph = ChromeGlyph.SEARCH,
+                    active = false,
+                    size = 38.dp,
+                    onClick = onOpenSearch,
+                )
+            }
 
             GlassDockDivider()
 
@@ -322,7 +386,7 @@ fun DexMacTaskbar(
                     .weight(1f, fill = false)
                     .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                horizontalArrangement = Arrangement.spacedBy(if (isCompactWidth) 3.5.dp else 5.dp),
             ) {
                 taskbarEntries.forEach { (pkg, cls, label) ->
                     val icon = remember(pkg) { AppCatalogRepository.getAppIcon(ctx, pkg) }
@@ -333,8 +397,8 @@ fun DexMacTaskbar(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                         modifier = Modifier
-                            .size(width = 46.dp, height = 46.dp)
-                            .clip(RoundedCornerShape(14.dp))
+                            .size(width = appTileSize, height = appTileSize)
+                            .clip(RoundedCornerShape(if (isCompactWidth) 11.dp else 14.dp))
                             .background(
                                 when {
                                     isFocused -> OpalPalette.ChipActiveFill
@@ -345,7 +409,7 @@ fun DexMacTaskbar(
                             .border(
                                 width = if (isFocused) 0.85.dp else 0.dp,
                                 color = if (isFocused) OpalPalette.BorderFocused else Color.Transparent,
-                                shape = RoundedCornerShape(14.dp),
+                                shape = RoundedCornerShape(if (isCompactWidth) 11.dp else 14.dp),
                             )
                             .onTapOrContextAction(
                                 pkg, runningWin?.windowId, runningWin?.state, runningWin?.focused,
@@ -354,7 +418,7 @@ fun DexMacTaskbar(
                             ),
                     ) {
                         Box(
-                            modifier = Modifier.size(34.dp),
+                            modifier = Modifier.size(appIconSize + 2.dp),
                             contentAlignment = Alignment.Center,
                         ) {
                             if (icon != null) {
@@ -363,14 +427,14 @@ fun DexMacTaskbar(
                                     contentDescription = label,
                                     alpha = if (runningWin?.isMinimized == true) 0.56f else 1f,
                                     modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(RoundedCornerShape(9.dp)),
+                                        .size(appIconSize)
+                                        .clip(RoundedCornerShape(if (isCompactWidth) 8.dp else 9.dp)),
                                 )
                             } else {
                                 Box(
                                     modifier = Modifier
-                                        .size(32.dp)
-                                        .clip(RoundedCornerShape(9.dp))
+                                        .size(appIconSize)
+                                        .clip(RoundedCornerShape(if (isCompactWidth) 8.dp else 9.dp))
                                         .background(OpalPalette.BgElevated),
                                     contentAlignment = Alignment.Center,
                                 ) {
@@ -378,10 +442,10 @@ fun DexMacTaskbar(
                                 }
                             }
                         }
-                        Spacer(Modifier.height(2.5.dp))
+                        Spacer(Modifier.height(2.dp))
                         Box(
                             modifier = Modifier
-                                .size(width = if (isFocused) 12.dp else 4.5.dp, height = 3.dp)
+                                .size(width = if (isFocused) 11.dp else 4.dp, height = 2.8.dp)
                                 .clip(CircleShape)
                                 .background(
                                     when {
@@ -399,81 +463,33 @@ fun DexMacTaskbar(
 
             GlassDockDivider()
 
-            // Right of Dock: Compact Samsung DeX Navigation (Back / Show Desktop / Mission Control)
+            // Right of Dock: Optional Native IME button + Compact DeX Navigation (Back / Desktop / Mission Control)
+            if (onToggleSoftKeyboard != null) {
+                GlassDockButton(
+                    glyph = ChromeGlyph.KEYBOARD,
+                    active = imeActive,
+                    size = navBtnSize,
+                    onClick = onToggleSoftKeyboard,
+                )
+            }
             GlassDockButton(
                 glyph = ChromeGlyph.BACK,
                 active = false,
-                size = 34.dp,
+                size = navBtnSize,
                 onClick = onSendBackToFocused,
             )
             GlassDockButton(
                 glyph = ChromeGlyph.HOME_DESKTOP,
                 active = false,
-                size = 34.dp,
+                size = navBtnSize,
                 onClick = onShowDesktopToggle,
             )
             GlassDockButton(
                 glyph = ChromeGlyph.EXPOSE,
                 active = showExpose,
-                size = 34.dp,
+                size = navBtnSize,
                 onClick = onToggleExpose,
             )
-        }
-
-        // Bottom-Right Floating macOS Liquid Frosted Glass Status Capsule (opens Control Center)
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .liquidGlassSurface(
-                    shape = trayShape,
-                    fill = OpalPalette.LiquidDockFill,
-                    rim = if (showControlCenter) {
-                        Brush.verticalGradient(listOf(OpalPalette.AccentBlue.copy(alpha = 0.85f), OpalPalette.AccentCyan.copy(alpha = 0.45f)))
-                    } else {
-                        OpalPalette.LiquidGlassRim
-                    },
-                    elevation = 18.dp,
-                )
-                .clickable(onClick = onToggleControlCenter)
-                .padding(horizontal = 13.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(9.dp),
-        ) {
-            OpalGlyphIcon(
-                glyph = ChromeGlyph.WIFI,
-                tint = if (tray.wifiConnected) OpalPalette.TextPrimary else OpalPalette.TextMuted,
-                size = 14.dp,
-            )
-            OpalText(
-                text = if (tray.charging) "⚡${tray.batteryPct}%" else "${tray.batteryPct}%",
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.Medium,
-                color = when {
-                    tray.charging -> OpalPalette.AccentEmerald
-                    tray.batteryPct <= 15 -> OpalPalette.AccentDanger
-                    else -> OpalPalette.TextPrimary
-                },
-            )
-            OpalGlyphIcon(
-                glyph = ChromeGlyph.CONTROL_CENTER,
-                tint = if (showControlCenter) OpalPalette.AccentCyan else OpalPalette.TextSecondary,
-                size = 14.dp,
-            )
-            Column(horizontalAlignment = Alignment.End) {
-                OpalText(
-                    text = tray.clockText,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = OpalPalette.TextPrimary,
-                )
-                if (tray.dateText.isNotEmpty()) {
-                    OpalText(
-                        text = tray.dateText,
-                        fontSize = 9.5.sp,
-                        color = OpalPalette.TextSecondary,
-                    )
-                }
-            }
         }
     }
 }
@@ -528,6 +544,7 @@ fun DexAppDrawerPopover(
     dockPinnedPkgs: List<String>,
     onLaunch: (InstalledAppEntry, Int) -> Unit,
     onContextApp: (InstalledAppEntry, Offset) -> Unit,
+    maxHeight: Dp = 460.dp,
     modifier: Modifier = Modifier,
 ) {
     val ctx = LocalContext.current
@@ -556,8 +573,9 @@ fun DexAppDrawerPopover(
     val shape = RoundedCornerShape(24.dp)
     Column(
         modifier = modifier
-            .widthIn(min = 390.dp, max = 580.dp)
-            .height(460.dp)
+            .widthIn(max = 580.dp)
+            .fillMaxWidth()
+            .heightIn(max = maxHeight)
             .liquidGlassSurface(
                 shape = shape,
                 fill = OpalPalette.LiquidPopoverFill,
@@ -565,7 +583,7 @@ fun DexAppDrawerPopover(
                 elevation = 28.dp,
             )
             .pointerInput(Unit) { detectTapGestures {} }
-            .padding(18.dp),
+            .padding(16.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OpalTextInput(
@@ -740,18 +758,30 @@ private fun TilingPresetTile(
 }
 
 /**
- * Floating Rounded Liquid Frosted Glass macOS Control Center Popover anchored above bottom-right Status Capsule.
+ * Unified Top-Right macOS Control Center Popover consolidating former top-bar indicators
+ * (virtual display pool, active output summary, all tiling layouts), host phone screen-off power
+ * control, external keyboard & mouse target routing, appearance, and wallpapers.
  */
 @Composable
 fun MacControlCenterPopover(
-    activeVdCount: Int,
-    maxVdCount: Int,
+    tray: SystemTrayInfo,
     totalWindows: Int,
+    displaySummary: String,
     inputBackendLabel: String,
+    targetFps: Int,
+    windowDpiScalePct: Int,
+    externalUiScale: Float,
     themeMode: Int,
     wallpaperPreset: Int,
     mouseTargetMode: Int,
     isExternalMonitor: Boolean,
+    hostScreenOff: Boolean,
+    showHostScreenToggle: Boolean,
+    maxHeight: Dp = 640.dp,
+    onSelectTargetFps: (Int) -> Unit,
+    onSelectWindowDpiPct: (Int) -> Unit,
+    onSelectUiScale: (Float) -> Unit,
+    onToggleHostScreenPower: (Boolean) -> Unit,
     onSelectThemeMode: (Int) -> Unit,
     onSelectWallpaper: (Int) -> Unit,
     onPickCustomWallpaper: () -> Unit,
@@ -781,9 +811,12 @@ fun MacControlCenterPopover(
     }
 
     val shape = RoundedCornerShape(24.dp)
+    val infoCardShape = RoundedCornerShape(15.dp)
     Column(
         modifier = modifier
-            .width(356.dp)
+            .widthIn(max = 364.dp)
+            .fillMaxWidth()
+            .heightIn(max = maxHeight)
             .liquidGlassSurface(
                 shape = shape,
                 fill = OpalPalette.LiquidPopoverFill,
@@ -791,22 +824,154 @@ fun MacControlCenterPopover(
                 elevation = 28.dp,
             )
             .pointerInput(Unit) { detectTapGestures {} }
-            .padding(18.dp),
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+        // Unified Status Summary Header with always-visible 1-tap Exit DeX button
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(infoCardShape)
+                .background(OpalPalette.ChipFill)
+                .border(0.75.dp, OpalPalette.BorderHairline, infoCardShape)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
-            OpalText(text = "控制中心", fontSize = 14.5.sp, fontWeight = FontWeight.Bold)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(7.dp),
+                ) {
+                    OpalText(text = "控制中心", fontSize = 14.5.sp, fontWeight = FontWeight.Bold)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.5.dp)
+                                .clip(CircleShape)
+                                .background(if (totalWindows > 0) OpalPalette.AccentEmerald else OpalPalette.TextMuted),
+                        )
+                        OpalText(
+                            text = if (totalWindows > 0) "$totalWindows 窗口" else "桌面就绪",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = OpalPalette.AccentCyan,
+                            maxLines = 1,
+                        )
+                    }
+                }
+                OpalButton(
+                    label = "退出 DeX",
+                    compact = true,
+                    filled = false,
+                    accent = OpalPalette.AccentDanger,
+                    onClick = onExitDesktop,
+                )
+            }
+            if (displaySummary.isNotBlank()) {
+                OpalText(
+                    text = displaySummary,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = OpalPalette.TextPrimary,
+                    maxLines = 1,
+                )
+            }
+            val netLabel = if (tray.wifiConnected) "Wi-Fi 已连" else "未连 Wi-Fi"
+            val batLabel = if (tray.charging) "充电中 ${tray.batteryPct}%" else "电量 ${tray.batteryPct}%"
             OpalText(
-                text = "虚拟屏 $activeVdCount/$maxVdCount · $totalWindows 窗",
-                fontSize = 11.sp,
-                color = OpalPalette.AccentCyan,
+                text = "$inputBackendLabel · $netLabel · $batLabel",
+                fontSize = 10.5.sp,
+                color = OpalPalette.TextSecondary,
+                maxLines = 1,
             )
         }
-        Spacer(Modifier.height(4.dp))
-        OpalText(text = inputBackendLabel, fontSize = 11.5.sp, color = OpalPalette.TextSecondary)
+
+        // Host Phone Physical Screen Off / Power Saving Control (supports double-tap to wake!)
+        if (showHostScreenToggle || hostScreenOff) {
+            Spacer(Modifier.height(10.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(infoCardShape)
+                    .background(
+                        if (hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.14f) else OpalPalette.ChipFill,
+                    )
+                    .border(
+                        width = 0.8.dp,
+                        color = if (hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.42f) else OpalPalette.BorderHairline,
+                        shape = infoCardShape,
+                    )
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    OpalText(
+                        text = if (hostScreenOff) "手机屏幕已物理熄屏（省电中）" else "本机屏幕省电控制",
+                        fontSize = 12.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.TextPrimary,
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    OpalText(
+                        text = "熄屏后支持双击手机屏幕随时亮屏，断开投屏也会自动亮屏",
+                        fontSize = 10.5.sp,
+                        color = OpalPalette.TextSecondary,
+                    )
+                }
+                Spacer(Modifier.width(8.dp))
+                OpalButton(
+                    label = if (hostScreenOff) "点亮手机屏" else "熄灭手机屏",
+                    compact = true,
+                    filled = !hostScreenOff,
+                    accent = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
+                    onClick = { onToggleHostScreenPower(hostScreenOff) },
+                )
+            }
+        }
+
+        // Unified Live Display & Quality Quick Controls (FPS, Window DPI, UI Scale)
+        Spacer(Modifier.height(12.dp))
+        OpalText(text = "帧率设置（实时生效）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+        Spacer(Modifier.height(6.dp))
+        val fpsOpts = listOf(0, 60, 90, 120)
+        val fpsIdx = fpsOpts.indexOf(targetFps).let { if (it >= 0) it else 0 }
+        OpalSegmentedRow(
+            options = listOf("自动", "60Hz", "90Hz", "120Hz"),
+            selectedIndex = fpsIdx,
+            onSelect = { onSelectTargetFps(fpsOpts[it]) },
+        )
+
+        Spacer(Modifier.height(10.dp))
+        OpalText(text = "应用窗口密度 DPI（实时热刷新）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+        Spacer(Modifier.height(6.dp))
+        val dpiOpts = listOf(80, 100, 125)
+        val dpiIdx = dpiOpts.indexOfFirst { abs(it - windowDpiScalePct) <= 8 }.let { if (it >= 0) it else 1 }
+        OpalSegmentedRow(
+            options = listOf("紧凑 80%", "标准 100%", "大号 125%"),
+            selectedIndex = dpiIdx,
+            onSelect = { onSelectWindowDpiPct(dpiOpts[it]) },
+        )
+
+        if (isExternalMonitor) {
+            Spacer(Modifier.height(10.dp))
+            OpalText(text = "桌面界面缩放比例 (UI Scale)", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+            Spacer(Modifier.height(6.dp))
+            val scaleOpts = listOf(1.0f, 1.25f, 1.5f)
+            val scaleIdx = scaleOpts.indexOfFirst { abs(it - externalUiScale) < 0.08f }.let { if (it >= 0) it else 1 }
+            OpalSegmentedRow(
+                options = listOf("100%", "125%", "150%"),
+                selectedIndex = scaleIdx,
+                onSelect = { onSelectUiScale(scaleOpts[it]) },
+            )
+        }
 
         Spacer(Modifier.height(12.dp))
         OpalText(text = "液态毛玻璃外观", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
@@ -819,10 +984,15 @@ fun MacControlCenterPopover(
 
         if (isExternalMonitor) {
             Spacer(Modifier.height(12.dp))
-            OpalText(text = "物理鼠标输出位置", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+            OpalText(
+                text = "外接键鼠输出目标（优先投屏端）",
+                fontSize = 11.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = OpalPalette.TextSecondary,
+            )
             Spacer(Modifier.height(6.dp))
             OpalSegmentedRow(
-                options = listOf("跟随本机", "外接投屏端"),
+                options = listOf("跟随本机", "优先投屏端"),
                 selectedIndex = mouseTargetMode.coerceIn(AppPrefs.MOUSE_TARGET_LOCAL, AppPrefs.MOUSE_TARGET_EXTERNAL),
                 onSelect = onSelectMouseTarget,
             )
@@ -849,11 +1019,12 @@ fun MacControlCenterPopover(
         Spacer(Modifier.height(6.dp))
         val quickTiles = listOf(
             WindowTilingLayout.SPLIT_2_COLS,
-            WindowTilingLayout.SPLIT_3_COLS,
-            WindowTilingLayout.SPLIT_4_COLS,
             WindowTilingLayout.SPLIT_2_MAIN_SIDE,
+            WindowTilingLayout.SPLIT_3_COLS,
             WindowTilingLayout.SPLIT_3_MAIN_STACK,
+            WindowTilingLayout.SPLIT_4_COLS,
             WindowTilingLayout.SPLIT_4_GRID,
+            WindowTilingLayout.CASCADE,
         )
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
             quickTiles.chunked(3).forEach { row ->
@@ -865,6 +1036,9 @@ fun MacControlCenterPopover(
                             onClick = { onApplyTilingLayout(layout) },
                             modifier = Modifier.weight(1f),
                         )
+                    }
+                    repeat(3 - row.size) {
+                        Spacer(Modifier.weight(1f))
                     }
                 }
             }
@@ -942,16 +1116,14 @@ fun MacControlCenterPopover(
                     modifier = Modifier.weight(1f),
                 )
             }
-            if (!isExternalMonitor) {
-                OpalButton(
-                    label = "退出桌面",
-                    compact = true,
-                    filled = false,
-                    accent = OpalPalette.AccentDanger,
-                    onClick = onExitDesktop,
-                    modifier = Modifier.weight(1f),
-                )
-            }
+            OpalButton(
+                label = "退出 DeX",
+                compact = true,
+                filled = false,
+                accent = OpalPalette.AccentDanger,
+                onClick = onExitDesktop,
+                modifier = Modifier.weight(1f),
+            )
         }
     }
 }
@@ -1186,5 +1358,118 @@ private fun ContextMenuRow(
             .padding(horizontal = 10.dp, vertical = 8.dp),
     ) {
         OpalText(text = title, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = textColor)
+    }
+}
+
+/**
+ * Unobtrusive Top-Center Pull-Down / Tap Handle shown exclusively during True App Fullscreen mode
+ * (watching video / gaming), letting the user exit fullscreen, return to desktop, or open Control Center.
+ */
+@Composable
+fun FullscreenExitOverlay(
+    windowTitle: String,
+    onExitFullscreen: () -> Unit,
+    onReturnToDesktop: () -> Unit,
+    onOpenControlCenter: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    LaunchedEffect(expanded) {
+        if (expanded) {
+            delay(4_500L)
+            expanded = false
+        }
+    }
+
+    Box(
+        modifier = modifier,
+        contentAlignment = Alignment.TopEnd,
+    ) {
+        if (!expanded) {
+            Box(
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.28f))
+                    .border(0.6.dp, Color.White.copy(alpha = 0.34f), CircleShape)
+                    .pointerInput(Unit) {
+                        detectTapGestures { expanded = true }
+                    }
+                    .pointerInput(Unit) {
+                        detectVerticalDragGestures { _, dragAmount ->
+                            if (dragAmount > 6f) expanded = true
+                        }
+                    }
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                OpalText(
+                    text = "退出全屏",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color.White.copy(alpha = 0.76f),
+                    maxLines = 1,
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier
+                    .padding(top = 10.dp, start = 12.dp, end = 12.dp)
+                    .liquidGlassSurface(
+                        shape = CircleShape,
+                        fill = OpalPalette.LiquidPopoverFill,
+                        rim = OpalPalette.LiquidGlassRim,
+                        elevation = 22.dp,
+                    )
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OpalText(
+                    text = windowTitle,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OpalPalette.TextPrimary,
+                    maxLines = 1,
+                )
+                OpalButton(
+                    label = "退出全屏",
+                    compact = true,
+                    onClick = {
+                        expanded = false
+                        onExitFullscreen()
+                    },
+                )
+                OpalButton(
+                    label = "回到桌面",
+                    compact = true,
+                    filled = false,
+                    accent = OpalPalette.AccentCyan,
+                    onClick = {
+                        expanded = false
+                        onReturnToDesktop()
+                    },
+                )
+                OpalButton(
+                    label = "控制中心",
+                    compact = true,
+                    filled = false,
+                    onClick = {
+                        expanded = false
+                        onOpenControlCenter()
+                    },
+                )
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(OpalPalette.ChipFill)
+                        .clickable { expanded = false }
+                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                ) {
+                    OpalText(text = "隐藏", fontSize = 11.sp, color = OpalPalette.TextSecondary)
+                }
+            }
+        }
     }
 }

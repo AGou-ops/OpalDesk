@@ -150,8 +150,8 @@ public final class DisplayGeometryUtil {
      * Computes the usable desktop work area (excluding top menu bar and bottom floating dock).
      */
     public static IntRect computeWorkArea(int canvasW, int canvasH, int canvasDpi) {
-        int w = Math.max(640, canvasW);
-        int h = Math.max(480, canvasH);
+        int w = Math.max(360, canvasW);
+        int h = Math.max(360, canvasH);
         int topInset = dpToPx(TOP_BAR_HEIGHT_DP + 4, canvasDpi);
         int bottomInset = dpToPx(DOCK_RESERVED_BOTTOM_DP, canvasDpi);
         int padX = dpToPx(6, canvasDpi);
@@ -161,16 +161,29 @@ public final class DisplayGeometryUtil {
 
     /**
      * Computes staggered cascading initial frame for a newly opened window according to its profile.
+     * Adapts cleanly to both landscape desktop monitors and portrait phone canvases.
      */
     public static IntRect computeInitialWindowFrame(
             WindowProfile profile, int cascadeIndex, int canvasW, int canvasH, int canvasDpi) {
         IntRect work = computeWorkArea(canvasW, canvasH, canvasDpi);
         int workW = work.width();
         int workH = work.height();
+        boolean portraitCanvas = workH > workW;
 
         int targetW;
         int targetH;
-        if (profile == WindowProfile.PORTRAIT) {
+        if (portraitCanvas) {
+            if (profile == WindowProfile.PORTRAIT) {
+                targetW = Math.min(workW - dpToPx(12, canvasDpi), Math.round(workW * 0.90f));
+                targetH = Math.min(workH - dpToPx(16, canvasDpi), Math.round(workH * 0.72f));
+            } else if (profile == WindowProfile.TABLET) {
+                targetW = Math.min(workW - dpToPx(12, canvasDpi), Math.round(workW * 0.94f));
+                targetH = Math.min(workH - dpToPx(20, canvasDpi), Math.round(workH * 0.62f));
+            } else {
+                targetW = Math.min(workW - dpToPx(12, canvasDpi), Math.round(workW * 0.92f));
+                targetH = Math.min(workH - dpToPx(20, canvasDpi), Math.round(workH * 0.54f));
+            }
+        } else if (profile == WindowProfile.PORTRAIT) {
             targetH = Math.min(workH - dpToPx(16, canvasDpi), Math.max(dpToPx(420, canvasDpi), Math.round(workH * 0.86f)));
             int contentH = Math.max(240, targetH - dpToPx(WINDOW_CHROME_HEADER_DP, canvasDpi));
             targetW = Math.min(workW - dpToPx(24, canvasDpi), Math.max(dpToPx(280, canvasDpi), Math.round(contentH * 0.486f)));
@@ -186,11 +199,13 @@ public final class DisplayGeometryUtil {
         targetH = alignEven(targetH, MIN_WINDOW_EDGE_PX, Math.max(MIN_WINDOW_EDGE_PX, workH));
 
         int step = Math.max(0, cascadeIndex % 6);
-        int offsetStepPx = dpToPx(26, canvasDpi);
-        int baseLeft = work.left + Math.max(0, (workW - targetW) / 2) - dpToPx(40, canvasDpi);
-        int baseTop = work.top + Math.max(0, (workH - targetH) / 3);
+        int offsetStepPx = dpToPx(portraitCanvas ? 18 : 26, canvasDpi);
+        int baseLeft = portraitCanvas
+                ? work.left + Math.max(0, (workW - targetW) / 2)
+                : work.left + Math.max(0, (workW - targetW) / 2) - dpToPx(40, canvasDpi);
+        int baseTop = work.top + Math.max(0, (workH - targetH) / (portraitCanvas ? 4 : 3));
 
-        int left = baseLeft + step * offsetStepPx;
+        int left = baseLeft + (portraitCanvas ? 0 : step * offsetStepPx);
         int top = baseTop + step * offsetStepPx;
         return clampWindowFrame(new IntRect(left, top, left + targetW, top + targetH), canvasW, canvasH, canvasDpi);
     }
@@ -216,6 +231,11 @@ public final class DisplayGeometryUtil {
      * Computes exact snap-zone bounds inside the desktop work area.
      */
     public static IntRect computeSnapFrame(String presentation, int canvasW, int canvasH, int canvasDpi) {
+        if (BridgeProtocol.PRES_FULLSCREEN.equals(presentation)) {
+            int w = alignEven(Math.max(360, canvasW), 360, MAX_WINDOW_EDGE_PX);
+            int h = alignEven(Math.max(360, canvasH), 360, MAX_WINDOW_EDGE_PX);
+            return new IntRect(0, 0, w, h);
+        }
         IntRect work = computeWorkArea(canvasW, canvasH, canvasDpi);
         int gap = dpToPx(SNAP_GAP_DP, canvasDpi);
         int midX = work.left + work.width() / 2;
@@ -246,7 +266,15 @@ public final class DisplayGeometryUtil {
      * Computes the VirtualDisplay pixel dimensions for a window's client content area (excluding header bar).
      */
     public static int[] computeContentBufferSize(IntRect windowFrame, int canvasDpi) {
-        int headerPx = dpToPx(WINDOW_CHROME_HEADER_DP, canvasDpi);
+        return computeContentBufferSize(windowFrame, canvasDpi, false);
+    }
+
+    /**
+     * Computes the VirtualDisplay pixel dimensions for a window's client content area.
+     * When {@code fullscreen} is true, no header height is subtracted so video fills 100% edge-to-edge.
+     */
+    public static int[] computeContentBufferSize(IntRect windowFrame, int canvasDpi, boolean fullscreen) {
+        int headerPx = fullscreen ? 0 : dpToPx(WINDOW_CHROME_HEADER_DP, canvasDpi);
         int cw = alignEven(windowFrame.width(), 240, MAX_WINDOW_EDGE_PX);
         int ch = alignEven(Math.max(200, windowFrame.height() - headerPx), 200, MAX_WINDOW_EDGE_PX);
         return new int[]{cw, ch};

@@ -30,6 +30,8 @@ public final class WindowSession {
     public int zOrder = 0;
     public boolean focused = false;
     public long lastActiveAtMs = 0L;
+    public long lastLaunchAtMs = 0L;
+    public int emptyDisplayTicks = 0;
     public long snapshotVersion = 0L;
     public byte[] hibernatedSnapshotBytes;
 
@@ -59,6 +61,7 @@ public final class WindowSession {
         this.contentHeight = contentHeight;
         this.contentDpi = contentDpi;
         this.lastActiveAtMs = nowMs;
+        this.lastLaunchAtMs = nowMs;
     }
 
     public boolean isLive() {

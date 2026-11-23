@@ -7,8 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
@@ -40,12 +39,15 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.CompositorGeometry
@@ -59,6 +61,7 @@ import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.TrafficLightType
 import kotlinx.coroutines.delay
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 /**
@@ -98,14 +101,21 @@ fun CompositorWindowFrameNode(
     }
 
     val activeFrame = if (isInteracting || pendingCommitFrame != null) liveFrame else window.frame
-    val winShape = RoundedCornerShape(if (window.isMaximized) 8.dp else 14.dp)
+    val isFullscreen = window.isFullscreen
+    val winShape = RoundedCornerShape(
+        when {
+            isFullscreen -> 0.dp
+            window.isMaximized -> 8.dp
+            else -> 14.dp
+        },
+    )
     val borderColor = if (window.focused) OpalPalette.BorderFocused else OpalPalette.BorderHairline
     val headerBg = if (window.focused) OpalPalette.GlassHeaderFocused else OpalPalette.GlassHeaderUnfocused
     val appIcon = remember(window.pkg) { AppCatalogRepository.getAppIcon(ctx, window.pkg) }
 
     val frameWidthDp = with(density) { activeFrame.width.coerceAtLeast(220).toDp() }
     val frameHeightDp = with(density) { activeFrame.height.coerceAtLeast(220).toDp() }
-    val headerHeightPx = with(density) { CompositorGeometry.HEADER_HEIGHT_DP.dp.roundToPx() }
+    val headerHeightPx = if (isFullscreen) 0 else with(density) { CompositorGeometry.HEADER_HEIGHT_DP.dp.roundToPx() }
     val showCompactTools = frameWidthDp >= 430.dp
 
     Box(
@@ -113,7 +123,8 @@ fun CompositorWindowFrameNode(
             .offset { IntOffset(activeFrame.left, activeFrame.top) }
             .size(width = frameWidthDp, height = frameHeightDp)
             // Focus immediately on initial press (zero double-tap delay) and absorb any
-            // unconsumed pointer event on the bubble pass so clicks NEVER leak through to windows behind!
+            // leftover unconsumed pointer event on the bottom-up Main pass (NEVER Final, which is
+            // top-down and would cancel AndroidView TextureView ACTION_MOVE drags/scrolls!).
             .pointerInput(window.windowId, "focus_and_shield") {
                 awaitEachGesture {
                     val down = awaitPointerEvent(PointerEventPass.Initial)
@@ -133,15 +144,27 @@ fun CompositorWindowFrameNode(
                             BridgeClient.sendWindowActionAsync(currentWin.windowId, BridgeProtocol.WinAction.FOCUS)
                         }
                     }
-                    // Consume any unconsumed event on bubble (Final) pass so nothing leaks behind this window
+                    // Main pass runs bottom-up (children first, then parent): safely absorbs clicks
+                    // on empty chrome without interfering with AndroidView(TextureView) scrolling!
                     while (true) {
-                        val ev = awaitPointerEvent(PointerEventPass.Final)
+                        val ev = awaitPointerEvent(PointerEventPass.Main)
                         ev.changes.forEach { if (!it.isConsumed) it.consume() }
                         if (ev.changes.all { !it.pressed }) break
                     }
                 }
             },
     ) {
+        if (isFullscreen) {
+            WindowSurfaceHost(
+                window = window,
+                headerHeightPx = 0,
+                onTouchFocusRequested = {
+                    BridgeClient.sendWindowActionAsync(window.windowId, BridgeProtocol.WinAction.FOCUS)
+                },
+                modifier = Modifier.fillMaxSize(),
+            )
+            return@Box
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -154,118 +177,149 @@ fun CompositorWindowFrameNode(
                 .background(OpalPalette.WindowCanvasBg)
                 .border(0.9.dp, borderColor, winShape),
         ) {
-            // macOS 36dp Title Bar Chrome
+            // macOS 36dp Title Bar Chrome — unified root-space drag + tap/double-tap gesture
+            var titleCoords by remember(window.windowId) { mutableStateOf<LayoutCoordinates?>(null) }
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(CompositorGeometry.HEADER_HEIGHT_DP.dp)
                     .background(headerBg)
-                    .pointerInput(window.windowId) {
-                        detectTapGestures(
-                            onTap = {
-                                if (!currentWin.focused) {
-                                    BridgeClient.sendWindowActionAsync(currentWin.windowId, BridgeProtocol.WinAction.FOCUS)
-                                }
-                            },
-                            onDoubleTap = {
-                                BridgeClient.sendWindowActionAsync(
-                                    currentWin.windowId,
-                                    BridgeProtocol.WinAction.TOGGLE_MAXIMIZE,
-                                )
-                            },
-                        )
-                    }
+                    .onGloballyPositioned { titleCoords = it }
                     .pointerInput(window.windowId, canvasW, canvasH) {
-                        var startFrame = currentWin.frame
-                        var accDx = 0f
-                        var accDy = 0f
-                        var activeSnap: String? = null
-                        var lastMoveX = 0
-                        var lastMoveY = 0
+                        var lastTapMs = 0L
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = true)
+                            val startRoot = titleCoords?.localToRoot(down.position) ?: down.position
+                            val slop = viewConfiguration.touchSlop
+                            var dragging = false
+                            var startFrame = currentWin.frame
+                            var lastLive = startFrame
+                            var activeSnap: String? = null
+                            var committed = false
 
-                        detectDragGestures(
-                            onDragStart = { startOffset ->
-                                isInteracting = true
-                                pendingCommitFrame = null
-                                accDx = 0f
-                                accDy = 0f
-                                activeSnap = null
-                                startFrame = if (currentWin.presentation != BridgeProtocol.Presentation.FLOATING) {
-                                    val w = (canvasW * 0.56f).roundToInt().coerceAtLeast(480)
-                                    val h = (canvasH * 0.68f).roundToInt().coerceAtLeast(380)
-                                    val l = (currentWin.frame.left + startOffset.x.roundToInt() - w / 2)
-                                        .coerceIn(10, (canvasW - w - 10).coerceAtLeast(10))
-                                    val t = (currentWin.frame.top + 6).coerceAtLeast(
-                                        CompositorGeometry.dpToPx(CompositorGeometry.TOP_BAR_DP, densityVal),
-                                    )
-                                    WindowRect(l, t, l + w, t + h)
-                                } else {
-                                    currentWin.frame
-                                }
-                                liveFrame = startFrame
-                                lastMoveX = startFrame.left + startOffset.x.roundToInt()
-                                lastMoveY = startFrame.top + startOffset.y.roundToInt()
-                                if (!currentWin.focused) {
-                                    BridgeClient.sendWindowActionAsync(currentWin.windowId, BridgeProtocol.WinAction.FOCUS)
-                                }
-                            },
-                            onDrag = { change, dragAmount ->
-                                change.consume()
-                                accDx += dragAmount.x
-                                accDy += dragAmount.y
-                                val next = CompositorGeometry.clampMove(
-                                    startFrame,
-                                    accDx.roundToInt(),
-                                    accDy.roundToInt(),
-                                    canvasW,
-                                    canvasH,
-                                    densityVal,
-                                )
-                                liveFrame = next
-                                lastMoveX = (next.left + change.position.x.roundToInt()).coerceIn(0, canvasW)
-                                lastMoveY = (next.top + change.position.y.roundToInt()).coerceIn(0, canvasH)
+                            try {
+                                while (true) {
+                                    val ev = awaitPointerEvent(PointerEventPass.Main)
+                                    val change = ev.changes.firstOrNull { it.id == down.id }
+                                        ?: ev.changes.firstOrNull()
+                                        ?: break
+                                    val curRoot = titleCoords?.localToRoot(change.position) ?: change.position
+                                    val dx = curRoot.x - startRoot.x
+                                    val dy = curRoot.y - startRoot.y
 
-                                val snap = CompositorGeometry.detectSnapPresentation(
-                                    lastMoveX,
-                                    lastMoveY,
-                                    canvasW,
-                                    canvasH,
-                                    densityVal,
-                                )
-                                activeSnap = snap
-                                onSnapPreviewChanged(
-                                    snap?.let {
-                                        CompositorGeometry.computeSnapPreviewRect(it, canvasW, canvasH, densityVal)
-                                    },
-                                )
-                            },
-                            onDragEnd = {
-                                onSnapPreviewChanged(null)
-                                val snap = activeSnap
-                                val committed = if (snap != null) {
-                                    CompositorGeometry.computeSnapPreviewRect(snap, canvasW, canvasH, densityVal)
-                                } else {
-                                    liveFrame
+                                    if (!dragging && change.pressed && hypot(dx, dy) >= slop) {
+                                        dragging = true
+                                        isInteracting = true
+                                        pendingCommitFrame = null
+                                        activeSnap = null
+                                        startFrame = if (currentWin.presentation != BridgeProtocol.Presentation.FLOATING) {
+                                            val portraitCanvas = canvasH > canvasW
+                                            val w = (canvasW * (if (portraitCanvas) 0.90f else 0.56f))
+                                                .roundToInt().coerceAtLeast(320)
+                                            val h = (canvasH * (if (portraitCanvas) 0.54f else 0.68f))
+                                                .roundToInt().coerceAtLeast(300)
+                                            val l = (startRoot.x.roundToInt() - w / 2)
+                                                .coerceIn(10, (canvasW - w - 10).coerceAtLeast(10))
+                                            val t = (currentWin.frame.top + 6).coerceAtLeast(
+                                                CompositorGeometry.dpToPx(CompositorGeometry.TOP_BAR_DP, densityVal),
+                                            )
+                                            WindowRect(l, t, l + w, t + h)
+                                        } else {
+                                            currentWin.frame
+                                        }
+                                        lastLive = startFrame
+                                        liveFrame = startFrame
+                                        if (!currentWin.focused) {
+                                            BridgeClient.sendWindowActionAsync(
+                                                currentWin.windowId,
+                                                BridgeProtocol.WinAction.FOCUS,
+                                            )
+                                        }
+                                    }
+
+                                    if (dragging) {
+                                        if (change.pressed) {
+                                            change.consume()
+                                            val next = CompositorGeometry.clampMove(
+                                                startFrame,
+                                                dx.roundToInt(),
+                                                dy.roundToInt(),
+                                                canvasW,
+                                                canvasH,
+                                                densityVal,
+                                            )
+                                            lastLive = next
+                                            liveFrame = next
+
+                                            val snap = CompositorGeometry.detectSnapPresentation(
+                                                curRoot.x.roundToInt().coerceIn(0, canvasW),
+                                                curRoot.y.roundToInt().coerceIn(0, canvasH),
+                                                canvasW,
+                                                canvasH,
+                                                densityVal,
+                                            )
+                                            activeSnap = snap
+                                            onSnapPreviewChanged(
+                                                snap?.let {
+                                                    CompositorGeometry.computeSnapPreviewRect(
+                                                        it, canvasW, canvasH, densityVal,
+                                                    )
+                                                },
+                                            )
+                                        } else {
+                                            change.consume()
+                                            val snap = activeSnap
+                                            val finalFrame = if (snap != null) {
+                                                CompositorGeometry.computeSnapPreviewRect(
+                                                    snap, canvasW, canvasH, densityVal,
+                                                )
+                                            } else {
+                                                lastLive
+                                            }
+                                            liveFrame = finalFrame
+                                            pendingCommitFrame = finalFrame
+                                            committed = true
+                                            BridgeClient.updateWindowFrameAsync(
+                                                windowId = currentWin.windowId,
+                                                left = finalFrame.left,
+                                                top = finalFrame.top,
+                                                right = finalFrame.right,
+                                                bottom = finalFrame.bottom,
+                                                presentation = snap ?: BridgeProtocol.Presentation.FLOATING,
+                                            )
+                                            break
+                                        }
+                                    } else if (!change.pressed) {
+                                        if (!change.isConsumed) {
+                                            val now = SystemClock.uptimeMillis()
+                                            if (now - lastTapMs <= 280L) {
+                                                lastTapMs = 0L
+                                                BridgeClient.sendWindowActionAsync(
+                                                    currentWin.windowId,
+                                                    BridgeProtocol.WinAction.TOGGLE_MAXIMIZE,
+                                                )
+                                            } else {
+                                                lastTapMs = now
+                                                if (!currentWin.focused) {
+                                                    BridgeClient.sendWindowActionAsync(
+                                                        currentWin.windowId,
+                                                        BridgeProtocol.WinAction.FOCUS,
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        break
+                                    }
                                 }
-                                liveFrame = committed
-                                pendingCommitFrame = committed
-                                isInteracting = false
-                                BridgeClient.updateWindowFrameAsync(
-                                    windowId = currentWin.windowId,
-                                    left = committed.left,
-                                    top = committed.top,
-                                    right = committed.right,
-                                    bottom = committed.bottom,
-                                    presentation = snap ?: BridgeProtocol.Presentation.FLOATING,
-                                )
-                            },
-                            onDragCancel = {
+                            } finally {
                                 onSnapPreviewChanged(null)
-                                pendingCommitFrame = null
+                                if (dragging && !committed) {
+                                    pendingCommitFrame = null
+                                    liveFrame = currentWin.frame
+                                }
                                 isInteracting = false
-                                liveFrame = currentWin.frame
-                            },
-                        )
+                            }
+                        }
                     }
                     .padding(horizontal = 10.dp),
             ) {
@@ -301,7 +355,13 @@ fun CompositorWindowFrameNode(
                 Row(
                     modifier = Modifier
                         .align(Alignment.Center)
-                        .padding(horizontal = if (showCompactTools) 156.dp else 110.dp),
+                        .padding(
+                            horizontal = when {
+                                showCompactTools -> 156.dp
+                                frameWidthDp < 360.dp -> 88.dp
+                                else -> 110.dp
+                            },
+                        ),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     if (appIcon != null) {
@@ -404,7 +464,7 @@ fun CompositorWindowFrameNode(
             )
         }
 
-        // 8-Way Live Resize Handles (placed cleanly along outer edges so header buttons stay unobstructed)
+        // 8-Way Live GPU Resize Handles (pure GPU frame preview during drag; single atomic VirtualDisplay resize on commit)
         if (!window.isMaximized) {
             val onStart = {
                 isInteracting = true
@@ -421,14 +481,14 @@ fun CompositorWindowFrameNode(
                 liveFrame = currentWin.frame
             }
 
-            ResizeHandleZone(ResizeEdge.E, Alignment.CenterEnd, Modifier.width(8.dp).height((frameHeightDp - 44.dp).coerceAtLeast(40.dp)), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
-            ResizeHandleZone(ResizeEdge.W, Alignment.CenterStart, Modifier.width(8.dp).height((frameHeightDp - 44.dp).coerceAtLeast(40.dp)), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
-            ResizeHandleZone(ResizeEdge.S, Alignment.BottomCenter, Modifier.height(9.dp).width((frameWidthDp - 44.dp).coerceAtLeast(40.dp)), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
-            ResizeHandleZone(ResizeEdge.N, Alignment.TopCenter, Modifier.height(5.dp).width((frameWidthDp - 160.dp).coerceAtLeast(40.dp)), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
-            ResizeHandleZone(ResizeEdge.SE, Alignment.BottomEnd, Modifier.size(22.dp), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel, showGrip = window.focused)
-            ResizeHandleZone(ResizeEdge.SW, Alignment.BottomStart, Modifier.size(22.dp), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
-            ResizeHandleZone(ResizeEdge.NE, Alignment.TopEnd, Modifier.size(9.dp), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
-            ResizeHandleZone(ResizeEdge.NW, Alignment.TopStart, Modifier.size(9.dp), currentWin, canvasW, canvasH, densityVal, headerHeightPx, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.E, Alignment.CenterEnd, Modifier.width(14.dp).height((frameHeightDp - 68.dp).coerceAtLeast(36.dp)), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.W, Alignment.CenterStart, Modifier.width(14.dp).height((frameHeightDp - 68.dp).coerceAtLeast(36.dp)), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.S, Alignment.BottomCenter, Modifier.height(14.dp).width((frameWidthDp - 68.dp).coerceAtLeast(36.dp)), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.N, Alignment.TopCenter, Modifier.height(5.dp).width((frameWidthDp - 180.dp).coerceAtLeast(36.dp)), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.SE, Alignment.BottomEnd, Modifier.size(34.dp), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel, showGrip = true)
+            ResizeHandleZone(ResizeEdge.SW, Alignment.BottomStart, Modifier.size(34.dp), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.NE, Alignment.TopEnd, Modifier.size(16.dp), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
+            ResizeHandleZone(ResizeEdge.NW, Alignment.TopStart, Modifier.size(16.dp), currentWin, canvasW, canvasH, densityVal, onStart, { liveFrame = it }, onCommit, onCancel)
         }
     }
 }
@@ -463,7 +523,6 @@ private fun BoxScope.ResizeHandleZone(
     canvasW: Int,
     canvasH: Int,
     densityVal: Float,
-    headerHeightPx: Int,
     onDragStarted: () -> Unit,
     onLiveFrameChanged: (WindowRect) -> Unit,
     onCommitFrame: (WindowRect) -> Unit,
@@ -471,80 +530,102 @@ private fun BoxScope.ResizeHandleZone(
     showGrip: Boolean = false,
 ) {
     val latestWin by rememberUpdatedState(window)
+    val latestOnStart by rememberUpdatedState(onDragStarted)
+    val latestOnLive by rememberUpdatedState(onLiveFrameChanged)
+    val latestOnCommit by rememberUpdatedState(onCommitFrame)
+    val latestOnCancel by rememberUpdatedState(onDragCancelled)
+    var handleCoords by remember(window.windowId, edge) { mutableStateOf<LayoutCoordinates?>(null) }
 
     Box(
         modifier = Modifier
             .align(alignment)
+            .zIndex(20f)
             .then(sizeModifier)
+            .onGloballyPositioned { handleCoords = it }
             .pointerInput(window.windowId, edge, canvasW, canvasH) {
-                var base = latestWin.frame
-                var cur = base
-                var accX = 0f
-                var accY = 0f
-                var lastResizeRpcMs = 0L
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    // Consume immediately so TextureView underneath never steals corner/edge resize gestures
+                    down.consume()
+                    val startRoot = handleCoords?.localToRoot(down.position) ?: down.position
+                    val base = latestWin.frame
+                    var cur = base
+                    var moved = false
+                    var committed = false
 
-                detectDragGestures(
-                    onDragStart = {
-                        base = latestWin.frame
-                        cur = base
-                        accX = 0f
-                        accY = 0f
-                        onDragStarted()
-                        if (!latestWin.focused) {
-                            BridgeClient.sendWindowActionAsync(latestWin.windowId, BridgeProtocol.WinAction.FOCUS)
-                        }
-                    },
-                    onDrag = { change, dragAmount ->
-                        change.consume()
-                        accX += dragAmount.x
-                        accY += dragAmount.y
-                        cur = CompositorGeometry.computeResize(
-                            base,
-                            edge,
-                            accX.roundToInt(),
-                            accY.roundToInt(),
-                            canvasW,
-                            canvasH,
-                            densityVal,
-                        )
-                        onLiveFrameChanged(cur)
+                    latestOnStart()
+                    if (!latestWin.focused) {
+                        BridgeClient.sendWindowActionAsync(latestWin.windowId, BridgeProtocol.WinAction.FOCUS)
+                    }
 
-                        val now = SystemClock.uptimeMillis()
-                        if (now - lastResizeRpcMs >= 50L) {
-                            lastResizeRpcMs = now
-                            val cw = (cur.width and 1.inv()).coerceAtLeast(240)
-                            val ch = ((cur.height - headerHeightPx) and 1.inv()).coerceAtLeast(200)
-                            BridgeClient.resizeWindowDisplayOneway(latestWin.windowId, cw, ch)
+                    try {
+                        while (true) {
+                            val ev = awaitPointerEvent(PointerEventPass.Main)
+                            val change = ev.changes.firstOrNull { it.id == down.id }
+                                ?: ev.changes.firstOrNull()
+                                ?: break
+                            if (change.pressed) {
+                                change.consume()
+                                val curRoot = handleCoords?.localToRoot(change.position) ?: change.position
+                                val dx = (curRoot.x - startRoot.x).roundToInt()
+                                val dy = (curRoot.y - startRoot.y).roundToInt()
+                                if (!moved && hypot(dx.toDouble(), dy.toDouble()) >= 2.0) {
+                                    moved = true
+                                }
+                                if (moved) {
+                                    cur = CompositorGeometry.computeResize(
+                                        base,
+                                        edge,
+                                        dx,
+                                        dy,
+                                        canvasW,
+                                        canvasH,
+                                        densityVal,
+                                    )
+                                    // Smooth 120fps client GPU frame scaling during drag;
+                                    // avoid mid-drag VirtualDisplay.resize storms that desync SurfaceFlinger/WM.
+                                    latestOnLive(cur)
+                                }
+                            } else {
+                                change.consume()
+                                if (moved && cur != base) {
+                                    committed = true
+                                    latestOnCommit(cur)
+                                    BridgeClient.updateWindowFrameAsync(
+                                        windowId = latestWin.windowId,
+                                        left = cur.left,
+                                        top = cur.top,
+                                        right = cur.right,
+                                        bottom = cur.bottom,
+                                        presentation = BridgeProtocol.Presentation.FLOATING,
+                                    )
+                                }
+                                break
+                            }
                         }
-                    },
-                    onDragEnd = {
-                        onCommitFrame(cur)
-                        BridgeClient.updateWindowFrameAsync(
-                            windowId = latestWin.windowId,
-                            left = cur.left,
-                            top = cur.top,
-                            right = cur.right,
-                            bottom = cur.bottom,
-                            presentation = BridgeProtocol.Presentation.FLOATING,
-                        )
-                    },
-                    onDragCancel = {
-                        onDragCancelled()
-                    },
-                )
+                    } finally {
+                        if (!committed) {
+                            latestOnCancel()
+                        }
+                    }
+                }
             },
         contentAlignment = Alignment.BottomEnd,
     ) {
         if (showGrip) {
-            val gripColor = OpalPalette.TextMuted.copy(alpha = 0.55f)
+            val gripColor = if (window.focused) {
+                OpalPalette.TextSecondary.copy(alpha = 0.72f)
+            } else {
+                OpalPalette.TextMuted.copy(alpha = 0.42f)
+            }
             Canvas(
                 modifier = Modifier
-                    .padding(4.dp)
-                    .size(10.dp),
+                    .padding(6.dp)
+                    .size(11.dp),
             ) {
-                val stroke = 1.2.dp.toPx()
-                drawLine(gripColor, Offset(size.width * 0.30f, size.height), Offset(size.width, size.height * 0.30f), stroke, StrokeCap.Round)
-                drawLine(gripColor, Offset(size.width * 0.65f, size.height), Offset(size.width, size.height * 0.65f), stroke, StrokeCap.Round)
+                val stroke = 1.4.dp.toPx()
+                drawLine(gripColor, Offset(size.width * 0.22f, size.height), Offset(size.width, size.height * 0.22f), stroke, StrokeCap.Round)
+                drawLine(gripColor, Offset(size.width * 0.62f, size.height), Offset(size.width, size.height * 0.62f), stroke, StrokeCap.Round)
             }
         }
     }

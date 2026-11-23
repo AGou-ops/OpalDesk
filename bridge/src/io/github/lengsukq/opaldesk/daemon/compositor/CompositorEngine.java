@@ -16,6 +16,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.IntConsumer;
 
 /**
  * Core Wayland-style Universal Window Compositor Engine.
@@ -40,6 +41,23 @@ public final class CompositorEngine {
         /** Queries the active user taskId currently running on {@code displayId} (or {@code -1}). */
         int findTopTaskIdOnDisplay(int displayId, String expectedPkg);
 
+        /**
+         * Queries the currently visible & active taskId on {@code displayId} (returns {@code -1}
+         * when the app finished or moved itself to back on root Back press).
+         */
+        default int findTopVisibleTaskIdOnDisplay(int displayId, String expectedPkg) {
+            return findTopTaskIdOnDisplay(displayId, expectedPkg);
+        }
+
+        /**
+         * Returns {@code true} if the task is still alive with at least one running Activity
+         * (e.g. {@code moveTaskToBack(true)}), {@code false} if the app exited completely.
+         */
+        default boolean isTaskRunningWithActivities(int taskId, int displayId) {
+            Set<Integer> alive = collectAliveTaskIds();
+            return alive != null && alive.contains(taskId);
+        }
+
         /** Returns the set of all currently alive Android taskIds across the system. */
         Set<Integer> collectAliveTaskIds();
 
@@ -48,6 +66,9 @@ public final class CompositorEngine {
 
         /** Force-stops and relaunches an app cleanly inside its VirtualDisplay. */
         void forceStopPackage(String pkg);
+
+        /** Moves Android display focus onto {@code displayId} when resuming an existing lease. */
+        default void focusDisplay(int displayId) {}
 
         /** Releases any per-display UHID or input resources when a VirtualDisplay is torn down. */
         void onDisplayReleased(int displayId);
@@ -67,6 +88,7 @@ public final class CompositorEngine {
     private final AtomicInteger nextWindowId = new AtomicInteger(1);
     private final AtomicLong stateSeq = new AtomicLong(1L);
     private int nextZOrder = 1;
+    private volatile IntConsumer backReconcileScheduler;
 
     public CompositorEngine(
             DaemonConfig config,
@@ -77,6 +99,18 @@ public final class CompositorEngine {
         this.vdPool = vdPool;
         this.runtimeBridge = runtimeBridge;
         this.onSceneDirty = onSceneDirty;
+    }
+
+    public void setBackReconcileScheduler(IntConsumer scheduler) {
+        this.backReconcileScheduler = scheduler;
+    }
+
+    /** Notifies the engine that a Back key was dispatched to {@code windowId} so root-Back exit is detected immediately. */
+    public void notifyBackSent(int windowId) {
+        IntConsumer sched = this.backReconcileScheduler;
+        if (sched != null && windowId > 0) {
+            sched.accept(windowId);
+        }
     }
 
     public long getStateSeq() {
@@ -105,12 +139,29 @@ public final class CompositorEngine {
                 if (nextDpi != ws.contentDpi) {
                     ws.contentDpi = nextDpi;
                     vdPool.resizeIfActive(ws.windowId, ws.contentWidth, ws.contentHeight, nextDpi);
+                    System.out.println("OPALDESK_WINDOW_DPI_REAPPLIED wid=" + ws.windowId
+                            + " dpiPct=" + dpiPct + " nextDpi=" + nextDpi);
                     changed = true;
                 }
             }
             if (changed) {
                 markDirtyAndNotifyLocked();
             }
+        }
+    }
+
+    /** Updates live surface frame-rate hints on all currently open windows after target FPS changes. */
+    public void reapplyTargetFps(float autoFallbackFps) {
+        synchronized (lock) {
+            int cfgFps = config.getTargetFps();
+            float effFps = DisplayGeometryUtil.clampFps(cfgFps > 0 ? cfgFps : autoFallbackFps, 60f);
+            for (WindowSession ws : sessionsById.values()) {
+                Object surf = attachedSurfaces.get(ws.windowId);
+                if (surf != null && ws.isLive()) {
+                    vdPool.updateSurfaceFrameRateIfActive(ws.windowId, surf, effFps);
+                }
+            }
+            System.out.println("OPALDESK_WINDOW_FPS_REAPPLIED cfgFps=" + cfgFps + " effFps=" + effFps);
         }
     }
 
@@ -123,6 +174,21 @@ public final class CompositorEngine {
     public WindowSession getWindowSnapshot(int windowId) {
         synchronized (lock) {
             return sessionsById.get(windowId);
+        }
+    }
+
+    /** Returns the currently focused visible live window session, or {@code null} if none. */
+    public WindowSession getFocusedLiveWindow() {
+        synchronized (lock) {
+            WindowSession best = null;
+            for (WindowSession ws : sessionsById.values()) {
+                if (ws == null || ws.isMinimized() || !ws.isLive() || ws.displayId <= 0) continue;
+                if (ws.focused) return ws;
+                if (best == null || ws.zOrder > best.zOrder) {
+                    best = ws;
+                }
+            }
+            return best;
         }
     }
 
@@ -258,7 +324,10 @@ public final class CompositorEngine {
             ws.displayId = lease.displayId;
             ws.vdUniqueId = lease.uniqueId;
             ws.state = BridgeProtocol.STATE_LIVE;
-            ws.lastActiveAtMs = System.currentTimeMillis();
+            long nowMs = System.currentTimeMillis();
+            ws.lastActiveAtMs = nowMs;
+            ws.lastLaunchAtMs = nowMs;
+            ws.emptyDisplayTicks = 0;
 
             pkgToLaunch = ws.pkg;
             clsToLaunch = ws.activityClass;
@@ -267,15 +336,19 @@ public final class CompositorEngine {
             markDirtyAndNotifyLocked();
         }
 
-        // If re-attaching a TextureView to an already-active VirtualDisplay whose app is still on top,
-        // skip relaunching to prevent activity flicker.
+        // If re-attaching a TextureView to an already-active VirtualDisplay whose app is still visible on top,
+        // skip relaunching to prevent activity flicker; if the app previously moved to back, relaunch/bring forward!
         int existingTopTid = reusedExistingLease
-                ? runtimeBridge.findTopTaskIdOnDisplay(assignedDisplayId, pkgToLaunch)
+                ? runtimeBridge.findTopVisibleTaskIdOnDisplay(assignedDisplayId, pkgToLaunch)
                 : -1;
-        int launchedTid = (existingTopTid > 0)
-                ? existingTopTid
-                : runtimeBridge.launchOrMoveFullscreenApp(
-                        pkgToLaunch, clsToLaunch, assignedDisplayId, prevTaskId);
+        int launchedTid;
+        if (existingTopTid > 0) {
+            runtimeBridge.focusDisplay(assignedDisplayId);
+            launchedTid = existingTopTid;
+        } else {
+            launchedTid = runtimeBridge.launchOrMoveFullscreenApp(
+                    pkgToLaunch, clsToLaunch, assignedDisplayId, prevTaskId);
+        }
         if (launchedTid > 0) {
             synchronized (lock) {
                 WindowSession ws = sessionsById.get(windowId);
@@ -351,14 +424,17 @@ public final class CompositorEngine {
                 ws.restoreFrame = nextFrame;
             }
 
+            boolean wasFullscreen = BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation);
+            boolean nextFullscreen = BridgeProtocol.PRES_FULLSCREEN.equals(nextPres);
             boolean sizeChanged = nextFrame.width() != ws.frame.width()
-                    || nextFrame.height() != ws.frame.height();
+                    || nextFrame.height() != ws.frame.height()
+                    || wasFullscreen != nextFullscreen;
             ws.frame = nextFrame;
             ws.presentation = nextPres;
             focusWindowLocked(ws, System.currentTimeMillis());
 
             if (sizeChanged) {
-                int[] dims = DisplayGeometryUtil.computeContentBufferSize(nextFrame, canvasDpi);
+                int[] dims = DisplayGeometryUtil.computeContentBufferSize(nextFrame, canvasDpi, nextFullscreen);
                 int dpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
                 ws.contentWidth = dims[0];
                 ws.contentHeight = dims[1];
@@ -398,7 +474,8 @@ public final class CompositorEngine {
      */
     public boolean performWindowAction(int windowId, int action, byte[] optionalPreMinimizeSnapshot) {
         int taskToRemove = -1;
-        int displayToClean = -1;
+        int displayToRelease = -1;
+        String pkgToClose = null;
         String pkgToReload = null;
         int reloadDisplayId = -1;
         String reloadCls = "";
@@ -423,14 +500,28 @@ public final class CompositorEngine {
                         ws.hibernatedSnapshotBytes = optionalPreMinimizeSnapshot;
                         ws.snapshotVersion++;
                     }
+                    // Detach the client Surface ONLY (setting the VirtualDisplay to STATE_OFF) instead of
+                    // destroying the VirtualDisplay: keeps the app cleanly paused inside its own display
+                    // so Android NEVER reparents it onto the host phone's Display 0, and allows instant
+                    // zero-reload resume from the Dock (LRU eviction still reclaims minimized leases first).
                     if (ws.displayId > 0) {
-                        displayToClean = ws.displayId;
-                        vdPool.releaseLease(windowId);
-                        ws.displayId = -1;
-                        ws.vdUniqueId = "";
+                        vdPool.detachSurfaceOnly(windowId);
                     }
                     Object surf = attachedSurfaces.remove(windowId);
                     if (surf != null) runtimeBridge.releaseSurfaceHandle(surf);
+                    if (BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation)) {
+                        int canvasW = config.getCanvasWidth();
+                        int canvasH = config.getCanvasHeight();
+                        int canvasDpi = config.getCanvasDpi();
+                        ws.presentation = BridgeProtocol.PRES_FLOATING;
+                        ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
+                                ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
+                                : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
+                        int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, false);
+                        ws.contentWidth = dims[0];
+                        ws.contentHeight = dims[1];
+                        ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
+                    }
                     ws.state = BridgeProtocol.STATE_MINIMIZED;
                     ws.focused = false;
                     promoteTopVisibleFocusLocked(now);
@@ -441,7 +532,8 @@ public final class CompositorEngine {
                     int canvasW = config.getCanvasWidth();
                     int canvasH = config.getCanvasHeight();
                     int canvasDpi = config.getCanvasDpi();
-                    if (BridgeProtocol.PRES_MAXIMIZED.equals(ws.presentation)) {
+                    if (BridgeProtocol.PRES_MAXIMIZED.equals(ws.presentation)
+                            || BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation)) {
                         ws.presentation = BridgeProtocol.PRES_FLOATING;
                         ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
                                 ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
@@ -454,7 +546,34 @@ public final class CompositorEngine {
                         ws.frame = DisplayGeometryUtil.computeSnapFrame(
                                 BridgeProtocol.PRES_MAXIMIZED, canvasW, canvasH, canvasDpi);
                     }
-                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi);
+                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, false);
+                    ws.contentWidth = dims[0];
+                    ws.contentHeight = dims[1];
+                    ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
+                    vdPool.resizeIfActive(windowId, dims[0], dims[1], ws.contentDpi);
+                    focusWindowLocked(ws, now);
+                    markDirtyAndNotifyLocked();
+                    return true;
+                }
+                case BridgeProtocol.WIN_ACTION_TOGGLE_FULLSCREEN: {
+                    int canvasW = config.getCanvasWidth();
+                    int canvasH = config.getCanvasHeight();
+                    int canvasDpi = config.getCanvasDpi();
+                    boolean enterFs = !BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation);
+                    if (enterFs) {
+                        if (BridgeProtocol.PRES_FLOATING.equals(ws.presentation)) {
+                            ws.restoreFrame = ws.frame;
+                        }
+                        ws.presentation = BridgeProtocol.PRES_FULLSCREEN;
+                        ws.frame = DisplayGeometryUtil.computeSnapFrame(
+                                BridgeProtocol.PRES_FULLSCREEN, canvasW, canvasH, canvasDpi);
+                    } else {
+                        ws.presentation = BridgeProtocol.PRES_FLOATING;
+                        ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
+                                ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
+                                : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
+                    }
+                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, enterFs);
                     ws.contentWidth = dims[0];
                     ws.contentHeight = dims[1];
                     ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
@@ -468,8 +587,9 @@ public final class CompositorEngine {
                     Object surf = attachedSurfaces.remove(windowId);
                     if (surf != null) runtimeBridge.releaseSurfaceHandle(surf);
                     if (ws.displayId > 0) {
-                        displayToClean = ws.displayId;
-                        vdPool.releaseLease(windowId);
+                        vdPool.detachSurfaceOnly(windowId);
+                        displayToRelease = ws.displayId;
+                        pkgToClose = ws.pkg;
                     }
                     taskToRemove = ws.taskId;
                     promoteTopVisibleFocusLocked(now);
@@ -504,11 +624,17 @@ public final class CompositorEngine {
             }
         }
 
-        if (displayToClean > 0) {
-            runtimeBridge.onDisplayReleased(displayToClean);
+        // Remove the Android task BEFORE releasing its VirtualDisplay so WindowManager never bounces
+        // the closing task onto the host phone's Display 0 even on ROMs without DESTROY_CONTENT_ON_REMOVAL.
+        if (taskToRemove <= 0 && displayToRelease > 0 && pkgToClose != null) {
+            taskToRemove = runtimeBridge.findTopTaskIdOnDisplay(displayToRelease, pkgToClose);
         }
         if (taskToRemove > 0) {
             runtimeBridge.removeTask(taskToRemove);
+        }
+        if (displayToRelease > 0) {
+            vdPool.releaseLease(windowId);
+            runtimeBridge.onDisplayReleased(displayToRelease);
         }
         if (pkgToReload != null && !pkgToReload.isEmpty()) {
             runtimeBridge.forceStopPackage(pkgToReload);
@@ -547,12 +673,54 @@ public final class CompositorEngine {
     }
 
     /**
+     * Checks whether a Back key caused the app inside {@code windowId} to exit or move to back
+     * (leaving an empty white/blank VirtualDisplay). If the app is still visible, does nothing;
+     * if it moved to back (still alive), cleanly minimizes to Dock; if it exited, cleanly closes!
+     */
+    public void reconcileWindowAfterBack(int windowId) {
+        int displayId;
+        int taskId;
+        String pkg;
+        synchronized (lock) {
+            WindowSession ws = sessionsById.get(windowId);
+            if (ws == null || !ws.isLive() || ws.displayId <= 0) return;
+            displayId = ws.displayId;
+            taskId = ws.taskId;
+            pkg = ws.pkg;
+        }
+        int visibleTid = runtimeBridge.findTopVisibleTaskIdOnDisplay(displayId, pkg);
+        if (visibleTid > 0) {
+            synchronized (lock) {
+                WindowSession ws = sessionsById.get(windowId);
+                if (ws != null) {
+                    ws.emptyDisplayTicks = 0;
+                    if (ws.taskId != visibleTid) {
+                        ws.taskId = visibleTid;
+                        markDirtyAndNotifyLocked();
+                    }
+                }
+            }
+            return;
+        }
+        boolean stillRunningInBg = runtimeBridge.isTaskRunningWithActivities(taskId, displayId);
+        if (stillRunningInBg) {
+            System.out.println("OPALDESK_BACK_MOVED_TO_BG_MINIMIZE wid=" + windowId + " pkg=" + pkg);
+            performWindowAction(windowId, BridgeProtocol.WIN_ACTION_MINIMIZE, null);
+        } else {
+            System.out.println("OPALDESK_BACK_EXITED_CLOSE wid=" + windowId + " pkg=" + pkg);
+            performWindowAction(windowId, BridgeProtocol.WIN_ACTION_CLOSE, null);
+        }
+    }
+
+    /**
      * Reconciles live Android tasks with managed window sessions: binds newly spawned taskIds on
-     * active VirtualDisplays and auto-closes windows whose underlying task exited cleanly.
+     * active VirtualDisplays and auto-closes/minimizes windows whose underlying Activity exited or
+     * moved to background (preventing blank white zombie windows).
      */
     public void reconcileWithSystemTasks() {
         List<Integer> checkWindowIds = new ArrayList<>();
         List<Integer> checkDisplayIds = new ArrayList<>();
+        List<Integer> checkTaskIds = new ArrayList<>();
         List<String> checkPkgs = new ArrayList<>();
 
         synchronized (lock) {
@@ -561,63 +729,112 @@ public final class CompositorEngine {
                 if (ws.isLive() && ws.displayId > 0) {
                     checkWindowIds.add(ws.windowId);
                     checkDisplayIds.add(ws.displayId);
+                    checkTaskIds.add(ws.taskId);
                     checkPkgs.add(ws.pkg);
                 }
             }
         }
 
         Set<Integer> aliveTids = runtimeBridge.collectAliveTaskIds();
-        Map<Integer, Integer> discoveredDisplayTasks = new LinkedHashMap<>();
+        Map<Integer, Integer> discoveredVisibleTasks = new LinkedHashMap<>();
+        Map<Integer, Boolean> stillRunningBg = new LinkedHashMap<>();
         for (int i = 0; i < checkWindowIds.size(); i++) {
-            int topTid = runtimeBridge.findTopTaskIdOnDisplay(checkDisplayIds.get(i), checkPkgs.get(i));
-            if (topTid > 0) {
-                discoveredDisplayTasks.put(checkWindowIds.get(i), topTid);
+            int wid = checkWindowIds.get(i);
+            int dId = checkDisplayIds.get(i);
+            int topVisibleTid = runtimeBridge.findTopVisibleTaskIdOnDisplay(dId, checkPkgs.get(i));
+            if (topVisibleTid > 0) {
+                discoveredVisibleTasks.put(wid, topVisibleTid);
+            } else {
+                stillRunningBg.put(wid, runtimeBridge.isTaskRunningWithActivities(checkTaskIds.get(i), dId));
             }
         }
 
-        List<Integer> releasedDisplays = new ArrayList<>();
+        List<Integer> toMinimize = new ArrayList<>();
+        List<Integer> toClose = new ArrayList<>();
         synchronized (lock) {
             boolean dirty = false;
             long now = System.currentTimeMillis();
-            List<Integer> deadWindows = new ArrayList<>();
 
             for (WindowSession ws : sessionsById.values()) {
-                Integer liveTid = discoveredDisplayTasks.get(ws.windowId);
-                if (liveTid != null && liveTid > 0 && ws.taskId != liveTid) {
-                    ws.taskId = liveTid;
-                    dirty = true;
+                Integer liveTid = discoveredVisibleTasks.get(ws.windowId);
+                if (liveTid != null && liveTid > 0) {
+                    ws.emptyDisplayTicks = 0;
+                    if (ws.taskId != liveTid) {
+                        ws.taskId = liveTid;
+                        dirty = true;
+                    }
                 } else if (ws.taskId > 0
                         && aliveTids != null
                         && !aliveTids.isEmpty()
                         && !aliveTids.contains(ws.taskId)
                         && (now - ws.lastActiveAtMs) > 2200L) {
-                    deadWindows.add(ws.windowId);
-                }
-            }
-
-            for (int winId : deadWindows) {
-                WindowSession removed = sessionsById.remove(winId);
-                if (removed != null) {
-                    Object surf = attachedSurfaces.remove(winId);
-                    if (surf != null) runtimeBridge.releaseSurfaceHandle(surf);
-                    if (removed.displayId > 0) {
-                        releasedDisplays.add(removed.displayId);
-                        vdPool.releaseLease(winId);
+                    toClose.add(ws.windowId);
+                } else if (ws.isLive() && ws.displayId > 0 && (now - ws.lastLaunchAtMs) > 2500L) {
+                    boolean runningBg = Boolean.TRUE.equals(stillRunningBg.get(ws.windowId));
+                    ws.emptyDisplayTicks++;
+                    if (!runningBg && ws.taskId > 0 && (now - ws.lastActiveAtMs) > 1500L) {
+                        toClose.add(ws.windowId);
+                    } else if (ws.emptyDisplayTicks >= 2) {
+                        if (runningBg) {
+                            toMinimize.add(ws.windowId);
+                        } else {
+                            toClose.add(ws.windowId);
+                        }
                     }
-                    dirty = true;
                 }
-            }
-
-            if (!deadWindows.isEmpty()) {
-                promoteTopVisibleFocusLocked(now);
             }
             if (dirty) {
                 markDirtyAndNotifyLocked();
             }
         }
 
-        for (int dispId : releasedDisplays) {
-            runtimeBridge.onDisplayReleased(dispId);
+        for (int wid : toMinimize) {
+            performWindowAction(wid, BridgeProtocol.WIN_ACTION_MINIMIZE, null);
+        }
+        for (int wid : toClose) {
+            performWindowAction(wid, BridgeProtocol.WIN_ACTION_CLOSE, null);
+        }
+    }
+
+    /**
+     * Minimizes all visible windows cleanly (e.g. remote {@code SYS_HOME} / "Show Desktop")
+     * while keeping their isolated VirtualDisplay leases alive so apps stay paused in the Dock
+     * and never get closed or reparented onto the host phone's Display 0.
+     */
+    public void minimizeAllWindows() {
+        List<Object> surfacesToRelease = new ArrayList<>();
+        synchronized (lock) {
+            boolean changed = false;
+            int canvasW = config.getCanvasWidth();
+            int canvasH = config.getCanvasHeight();
+            int canvasDpi = config.getCanvasDpi();
+            for (WindowSession ws : sessionsById.values()) {
+                if (ws.isMinimized()) continue;
+                if (ws.displayId > 0) {
+                    vdPool.detachSurfaceOnly(ws.windowId);
+                }
+                Object surf = attachedSurfaces.remove(ws.windowId);
+                if (surf != null) surfacesToRelease.add(surf);
+                if (BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation)) {
+                    ws.presentation = BridgeProtocol.PRES_FLOATING;
+                    ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
+                            ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
+                            : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
+                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, false);
+                    ws.contentWidth = dims[0];
+                    ws.contentHeight = dims[1];
+                    ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
+                }
+                ws.state = BridgeProtocol.STATE_MINIMIZED;
+                ws.focused = false;
+                changed = true;
+            }
+            if (changed) {
+                markDirtyAndNotifyLocked();
+            }
+        }
+        for (Object s : surfacesToRelease) {
+            runtimeBridge.releaseSurfaceHandle(s);
         }
     }
 
@@ -628,19 +845,22 @@ public final class CompositorEngine {
 
         synchronized (lock) {
             for (WindowSession ws : sessionsById.values()) {
-                if (ws.displayId > 0) displaysToClean.add(ws.displayId);
+                if (ws.displayId > 0) {
+                    vdPool.detachSurfaceOnly(ws.windowId);
+                    displaysToClean.add(ws.displayId);
+                }
                 if (removeUnderlyingTasks && ws.taskId > 0) tasksToRemove.add(ws.taskId);
             }
             surfacesToRelease.addAll(attachedSurfaces.values());
             attachedSurfaces.clear();
             sessionsById.clear();
-            vdPool.releaseAll();
             markDirtyAndNotifyLocked();
         }
 
         for (Object s : surfacesToRelease) runtimeBridge.releaseSurfaceHandle(s);
-        for (int d : displaysToClean) runtimeBridge.onDisplayReleased(d);
         for (int t : tasksToRemove) runtimeBridge.removeTask(t);
+        vdPool.releaseAll();
+        for (int d : displaysToClean) runtimeBridge.onDisplayReleased(d);
     }
 
     public String toSceneJson() {

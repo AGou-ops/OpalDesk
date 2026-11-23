@@ -1,5 +1,6 @@
 package io.github.lengsukq.opaldesk.daemon;
 
+import io.github.lengsukq.opaldesk.daemon.compositor.WindowProfile;
 import io.github.lengsukq.opaldesk.daemon.util.AtomicFiles;
 import io.github.lengsukq.opaldesk.daemon.util.CryptoHex;
 import io.github.lengsukq.opaldesk.daemon.util.ShellCommand;
@@ -103,5 +104,25 @@ public class UtilTest {
         assertFalse(timedOut.isSuccess());
         assertTrue("Command should report timedOut=true", timedOut.timedOut);
         assertTrue("Timeout should kill child promptly (was " + elapsedMs + "ms)", elapsedMs < 2000L);
+    }
+
+    @Test
+    public void testPortraitPhoneWorkAreaAndInitialWindowFrame() {
+        int canvasW = 1080;
+        int canvasH = 2400;
+        int dpi = 440;
+        DisplayGeometryUtil.IntRect work = DisplayGeometryUtil.computeWorkArea(canvasW, canvasH, dpi);
+        assertTrue(work.left >= 0 && work.right <= canvasW);
+        assertTrue(work.bottom > work.top);
+        assertTrue(work.height() > work.width());
+
+        DisplayGeometryUtil.IntRect frame = DisplayGeometryUtil.computeInitialWindowFrame(
+                WindowProfile.DESKTOP, 0, canvasW, canvasH, dpi);
+        int fw = frame.width();
+        int fh = frame.height();
+        assertEquals(0, fw % 2);
+        assertEquals(0, fh % 2);
+        assertTrue("Portrait initial frame must fit inside phone width", frame.left >= 0 && frame.right <= canvasW);
+        assertTrue("Portrait initial frame must fit inside work height", frame.top >= work.top && frame.bottom <= work.bottom);
     }
 }

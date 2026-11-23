@@ -17,11 +17,17 @@ object BridgeProtocol {
     const val PROVIDER_AUTHORITY = "io.github.lengsukq.opaldesk.provider"
     const val PROVIDER_METHOD_SET_BINDER = "setBinder"
     const val PROVIDER_METHOD_SYNC_SCENE = "syncScene"
+    const val PROVIDER_METHOD_PAIRING_EVENT = "pairingEvent"
+    const val PROVIDER_METHOD_IME_REQUEST = "imeRequest"
 
     const val EXTRA_CALLBACK_BINDER = "cb"
     const val EXTRA_PROC_TOKEN = "proc"
     const val EXTRA_SYNC_SCENE_JSON = "sceneJson"
     const val EXTRA_SYNC_STATE_SEQ = "stateSeq"
+    const val EXTRA_PAIRING_JSON = "pairingJson"
+    const val EXTRA_IME_WINDOW_ID = "windowId"
+    const val EXTRA_IME_SHOW = "show"
+    const val EXTRA_IME_INPUT_TYPE = "inputType"
 
     object Tx {
         const val GET_DAEMON_STATUS = 10
@@ -45,7 +51,19 @@ object BridgeProtocol {
         const val UPDATE_DISPLAY_PREFS = 28
         const val SET_MOUSE_TARGET = 29
         const val SET_POINTER_SPEED = 30
+        const val SET_HOST_SCREEN_POWER = 31
+        const val SET_LOCAL_IME_FOCUS = 32
+        const val GET_TRUSTED_PEERS = 33
+        const val REVOKE_TRUSTED_PEER = 34
+        const val GET_PENDING_PAIRING = 35
+        const val RESPOND_PAIRING = 36
         const val SHUTDOWN = 99
+    }
+
+    object PairingDecision {
+        const val REJECT = 0
+        const val APPROVE_ONCE = 1
+        const val APPROVE_PERMANENT = 2
     }
 
     object MouseTarget {
@@ -69,6 +87,7 @@ object BridgeProtocol {
     object Presentation {
         const val FLOATING = "FLOATING"
         const val MAXIMIZED = "MAXIMIZED"
+        const val FULLSCREEN = "FULLSCREEN"
         const val SNAP_LEFT = "SNAP_LEFT"
         const val SNAP_RIGHT = "SNAP_RIGHT"
         const val SNAP_TL = "SNAP_TL"
@@ -88,6 +107,7 @@ object BridgeProtocol {
         const val SET_PROFILE_PORTRAIT = 8
         const val SET_PROFILE_TABLET = 9
         const val RELOAD_APP = 10
+        const val TOGGLE_FULLSCREEN = 11
     }
 
     object InputBackend {

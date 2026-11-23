@@ -5,6 +5,7 @@ import android.os.IBinder;
 import android.os.Parcel;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.view.KeyEvent;
 import android.view.Surface;
 
 import io.github.lengsukq.opaldesk.daemon.DaemonConfig;
@@ -88,6 +89,7 @@ public final class BridgeBinderService extends Binder {
                     reply.writeInt(mouseRouter != null ? mouseRouter.getBoundMouseCount() : 0);
                     reply.writeInt(mouseRouter != null ? mouseRouter.getConnectedMouseCount() : 0);
                     reply.writeInt(mouseRouter != null ? mouseRouter.getBoundDisplayId() : -1);
+                    reply.writeInt(services != null && services.isHostScreenOff() ? 1 : 0);
                 }
                 return true;
             }
@@ -161,6 +163,9 @@ public final class BridgeBinderService extends Binder {
                 WindowSession ws = compositor.getWindowSnapshot(winId);
                 if (action == BridgeProtocol.WIN_ACTION_SEND_BACK) {
                     boolean ok = inputRouter.sendBackToWindow(ws);
+                    if (ok && ws != null) {
+                        compositor.notifyBackSent(ws.windowId);
+                    }
                     if (reply != null) reply.writeInt(ok ? 1 : 0);
                     return true;
                 }
@@ -213,6 +218,9 @@ public final class BridgeBinderService extends Binder {
                 int metaState = data.readInt();
                 WindowSession ws = compositor.getWindowSnapshot(winId);
                 boolean ok = inputRouter.injectWindowKey(ws, action, keyCode, metaState);
+                if (ok && ws != null && keyCode == KeyEvent.KEYCODE_BACK && action == KeyEvent.ACTION_UP) {
+                    compositor.notifyBackSent(ws.windowId);
+                }
                 if (reply != null) reply.writeInt(ok ? 1 : 0);
                 return true;
             }
@@ -255,7 +263,7 @@ public final class BridgeBinderService extends Binder {
             case BridgeProtocol.TX_GET_REMOTE_STREAM_STATUS: {
                 OpalCastCompositorBridge.RemoteStatusSnapshot st = (remoteBridge != null)
                         ? remoteBridge.getStatusSnapshot()
-                        : new OpalCastCompositorBridge.RemoteStatusSnapshot(false, 0, "", 0, 0, 0, 0, false, 0, "", "", "");
+                        : new OpalCastCompositorBridge.RemoteStatusSnapshot(false, 0, "", 0, 0, 0, 0, false, 0, "", false, 0, "");
                 if (reply != null) {
                     reply.writeInt(st.connected ? 1 : 0);
                     reply.writeInt(st.sinkType);
@@ -267,7 +275,8 @@ public final class BridgeBinderService extends Binder {
                     reply.writeInt(st.wifiEnabled ? 1 : 0);
                     reply.writeInt(st.wifiPort);
                     reply.writeString(st.certFingerprint);
-                    reply.writeString(st.activePin);
+                    reply.writeInt(st.activeSessionPermanent ? 1 : 0);
+                    reply.writeInt(st.trustedCount);
                     reply.writeString(st.lanIp);
                 }
                 return true;
@@ -276,22 +285,19 @@ public final class BridgeBinderService extends Binder {
                 boolean enable = data.readInt() != 0;
                 int port = data.readInt();
                 RemoteStreamServer.WifiConfigStatus st = (remoteBridge != null)
-                        ? remoteBridge.configureWifi(enable, port, false)
-                        : new RemoteStreamServer.WifiConfigStatus(false, 0, "", "");
+                        ? remoteBridge.configureWifi(enable, port)
+                        : new RemoteStreamServer.WifiConfigStatus(false, 0, "");
                 if (reply != null) {
                     reply.writeInt(st.enabled ? 1 : 0);
                     reply.writeInt(st.port);
                     reply.writeString(st.certFingerprint);
-                    reply.writeString(st.activePin);
                 }
                 return true;
             }
             case BridgeProtocol.TX_REGENERATE_WIFI_PIN: {
-                RemoteStreamServer.WifiConfigStatus st = (remoteBridge != null)
-                        ? remoteBridge.configureWifi(true, RemoteStreamServer.DEFAULT_WIFI_PORT, true)
-                        : new RemoteStreamServer.WifiConfigStatus(false, 0, "", "");
+                // Legacy no-op: static 6-digit PIN pairing has been replaced by interactive consent.
                 if (reply != null) {
-                    reply.writeString(st.activePin);
+                    reply.writeString("");
                 }
                 return true;
             }
@@ -305,22 +311,47 @@ public final class BridgeBinderService extends Binder {
                 int reqW = data.readInt();
                 int reqH = data.readInt();
                 int fpsX100 = data.readInt();
-                boolean ok = services != null
-                        && services.setExternalDisplayMode(displayId, reqW, reqH, fpsX100 / 100f);
+                float reqFps = fpsX100 / 100f;
+                boolean ok;
+                if (remoteBridge != null && remoteBridge.hasActiveDesktopSession()
+                        && (displayId <= 0 || displayId == remoteBridge.getActiveDesktopDisplayId())) {
+                    ok = remoteBridge.reconfigureActiveDesktop(reqW, reqH, reqFps);
+                } else {
+                    ok = services != null
+                            && services.setExternalDisplayMode(displayId, reqW, reqH, reqFps);
+                }
                 if (reply != null) reply.writeInt(ok ? 1 : 0);
                 return true;
             }
             case BridgeProtocol.TX_UPDATE_DISPLAY_PREFS: {
                 int targetFps = data.readInt();
                 int dpiScalePct = data.readInt();
+                int prevFps = config.getTargetFps();
+                int prevDpi = config.getWindowDpiScalePct();
                 config.updateDisplayPrefs(targetFps, dpiScalePct);
-                compositor.reapplyWindowDpiScale();
+                int nextFps = config.getTargetFps();
+                int nextDpi = config.getWindowDpiScalePct();
+                if (nextDpi != prevDpi) {
+                    compositor.reapplyWindowDpiScale();
+                }
+                if (nextFps != prevFps) {
+                    float autoFallback = (remoteBridge != null && remoteBridge.hasActiveDesktopSession())
+                            ? remoteBridge.getActiveNativeFps() : 60f;
+                    compositor.reapplyTargetFps(autoFallback);
+                    if (remoteBridge != null) {
+                        remoteBridge.applyTargetFpsIfActive(nextFps);
+                    }
+                }
                 if (reply != null) reply.writeInt(1);
                 return true;
             }
             case BridgeProtocol.TX_SET_MOUSE_TARGET: {
                 int targetMode = data.readInt();
                 int externalDisplayId = data.readInt();
+                if (externalDisplayId <= 0 && targetMode == BridgeProtocol.MOUSE_TARGET_EXTERNAL
+                        && remoteBridge != null && remoteBridge.hasActiveDesktopSession()) {
+                    externalDisplayId = remoteBridge.getActiveDesktopDisplayId();
+                }
                 int boundCount = (mouseRouter != null)
                         ? mouseRouter.setMouseTarget(targetMode, externalDisplayId)
                         : 0;
@@ -333,6 +364,49 @@ public final class BridgeBinderService extends Binder {
             case BridgeProtocol.TX_SET_POINTER_SPEED: {
                 float sensitivity = data.readFloat();
                 boolean ok = mouseRouter != null && mouseRouter.applyHardwarePointerSpeed(sensitivity);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            }
+            case BridgeProtocol.TX_SET_HOST_SCREEN_POWER: {
+                boolean screenOn = data.readInt() != 0;
+                boolean ok = services != null && services.setPrimaryPhysicalDisplayPower(screenOn);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            }
+            case BridgeProtocol.TX_SET_LOCAL_IME_FOCUS: {
+                boolean focused = data.readInt() != 0;
+                if (inputRouter != null) {
+                    inputRouter.setLocalImeActive(focused);
+                }
+                if (remoteBridge != null) {
+                    remoteBridge.setLocalHostTextFieldFocused(focused);
+                }
+                if (focused && services != null) {
+                    services.focusDisplay(android.view.Display.DEFAULT_DISPLAY);
+                }
+                if (reply != null) reply.writeInt(1);
+                return true;
+            }
+            case BridgeProtocol.TX_GET_TRUSTED_PEERS: {
+                String json = (remoteBridge != null) ? remoteBridge.getTrustedPeersJson() : "[]";
+                if (reply != null) reply.writeString(json);
+                return true;
+            }
+            case BridgeProtocol.TX_REVOKE_TRUSTED_PEER: {
+                String clientId = data.readString();
+                boolean ok = remoteBridge != null && remoteBridge.revokeTrustedClient(clientId);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            }
+            case BridgeProtocol.TX_GET_PENDING_PAIRING: {
+                String json = (remoteBridge != null) ? remoteBridge.getPendingPairingJson() : "";
+                if (reply != null) reply.writeString(json);
+                return true;
+            }
+            case BridgeProtocol.TX_RESPOND_PAIRING: {
+                String requestId = data.readString();
+                int decision = data.readInt();
+                boolean ok = remoteBridge != null && remoteBridge.respondToPairing(requestId, decision);
                 if (reply != null) reply.writeInt(ok ? 1 : 0);
                 return true;
             }

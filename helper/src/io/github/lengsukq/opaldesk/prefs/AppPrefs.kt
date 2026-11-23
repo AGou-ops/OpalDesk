@@ -268,4 +268,9 @@ object AppPrefs {
         if (host.isBlank() || token.isBlank()) return
         prefs(ctx)?.edit()?.putString("peer_tok_${host.trim()}", token)?.apply()
     }
+
+    fun clearPeerAuthToken(ctx: Context?, host: String) {
+        if (host.isBlank()) return
+        prefs(ctx)?.edit()?.remove("peer_tok_${host.trim()}")?.apply()
+    }
 }

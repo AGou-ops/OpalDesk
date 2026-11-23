@@ -170,9 +170,9 @@ public final class DaemonConfig {
             if (maxVd >= MIN_MAX_VD && maxVd <= HARD_MAX_VD) {
                 this.maxActiveDisplays = maxVd;
             }
-            if (workW >= 640 && workH >= 480) {
-                this.canvasWidth = DisplayGeometryUtil.alignEven(workW, 640, 4096);
-                this.canvasHeight = DisplayGeometryUtil.alignEven(workH, 480, 4096);
+            if (workW >= 360 && workH >= 360) {
+                this.canvasWidth = DisplayGeometryUtil.alignEven(workW, 360, 4096);
+                this.canvasHeight = DisplayGeometryUtil.alignEven(workH, 360, 4096);
             }
             if (workDpi >= DisplayGeometryUtil.MIN_DPI && workDpi <= DisplayGeometryUtil.MAX_DPI) {
                 this.canvasDpi = workDpi;
@@ -212,9 +212,9 @@ public final class DaemonConfig {
             int maxVd = Integer.parseInt(parts[3].trim());
             int inMode = Integer.parseInt(parts[4].trim());
             synchronized (lock) {
-                if (w >= 640 && h >= 480) {
-                    canvasWidth = DisplayGeometryUtil.alignEven(w, 640, 4096);
-                    canvasHeight = DisplayGeometryUtil.alignEven(h, 480, 4096);
+                if (w >= 360 && h >= 360) {
+                    canvasWidth = DisplayGeometryUtil.alignEven(w, 360, 4096);
+                    canvasHeight = DisplayGeometryUtil.alignEven(h, 360, 4096);
                 }
                 canvasDpi = DisplayGeometryUtil.clampDpi(dpi);
                 maxActiveDisplays = Math.max(MIN_MAX_VD, Math.min(HARD_MAX_VD, maxVd));

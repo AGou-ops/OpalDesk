@@ -22,9 +22,15 @@ public final class BridgeProtocol {
 
     public static final String PROVIDER_METHOD_SET_BINDER = "setBinder";
     public static final String PROVIDER_METHOD_SYNC_SCENE = "syncScene";
+    public static final String PROVIDER_METHOD_PAIRING_EVENT = "pairingEvent";
+    public static final String PROVIDER_METHOD_IME_REQUEST = "imeRequest";
 
     public static final String EXTRA_SYNC_SCENE_JSON = "sceneJson";
     public static final String EXTRA_SYNC_STATE_SEQ = "stateSeq";
+    public static final String EXTRA_PAIRING_JSON = "pairingJson";
+    public static final String EXTRA_IME_WINDOW_ID = "windowId";
+    public static final String EXTRA_IME_SHOW = "show";
+    public static final String EXTRA_IME_INPUT_TYPE = "inputType";
 
     public static final String CTL_CMD_SHUTDOWN = "SHUTDOWN";
     public static final String CTL_CMD_NEED_BINDER = "NEED_BINDER";
@@ -53,7 +59,18 @@ public final class BridgeProtocol {
     public static final int TX_UPDATE_DISPLAY_PREFS = 28;
     public static final int TX_SET_MOUSE_TARGET = 29;
     public static final int TX_SET_POINTER_SPEED = 30;
+    public static final int TX_SET_HOST_SCREEN_POWER = 31;
+    public static final int TX_SET_LOCAL_IME_FOCUS = 32;
+    public static final int TX_GET_TRUSTED_PEERS = 33;
+    public static final int TX_REVOKE_TRUSTED_PEER = 34;
+    public static final int TX_GET_PENDING_PAIRING = 35;
+    public static final int TX_RESPOND_PAIRING = 36;
     public static final int TX_SHUTDOWN = 99;
+
+    // ---- Interactive Pairing Approval Decisions (TX_RESPOND_PAIRING) ----
+    public static final int PAIRING_DECISION_REJECT = 0;
+    public static final int PAIRING_DECISION_APPROVE_ONCE = 1;
+    public static final int PAIRING_DECISION_APPROVE_PERMANENT = 2;
 
     // ---- Physical External Mouse Output Routing Targets ----
     public static final int MOUSE_TARGET_LOCAL = 0;
@@ -66,14 +83,19 @@ public final class BridgeProtocol {
     /** VIRTUAL_DISPLAY_FLAG_PUBLIC (1<<0) | VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY (1<<3) */
     public static final int VD_FLAGS_BASE_PUBLIC = (1 << 0) | (1 << 3);
     /**
-     * Trusted VirtualDisplay flags granted to {@code com.android.shell} (uid=2000):
-     * PUBLIC (0x1) | OWN_CONTENT_ONLY (0x8) | SUPPORTS_TOUCH (0x40) | TRUSTED (0x400)
-     * | OWN_FOCUS (0x4000) | STEAL_TOP_FOCUS_DISABLED (0x10000).
+     * Trusted VirtualDisplay flags granted to {@code com.android.shell} (uid=2000) that participate
+     * in Android's global focus & InputMethodManagerService handoff:
+     * PUBLIC (0x1) | OWN_CONTENT_ONLY (0x8) | SUPPORTS_TOUCH (0x40) | TRUSTED (0x400).
+     * Intentionally omits OWN_FOCUS (0x4000) and STEAL_TOP_FOCUS_DISABLED (0x10000) so tapping any
+     * EditText inside an isolated app window transfers IMMS client focus and opens the system IME.
      * Excludes PRESENTATION (0x2) so video apps never show "casting to external screen" placeholders.
      */
+    public static final int VD_FLAGS_TRUSTED_IME = 0x00449;
     public static final int VD_FLAGS_TRUSTED_ISOLATED = 0x14449;
     public static final int VD_FLAGS_TRUSTED_FOCUS = 0x04449;
     public static final int VD_FLAG_SECURE = 0x0004;
+    /** DisplayManager.VIRTUAL_DISPLAY_FLAG_DESTROY_CONTENT_ON_REMOVAL (1<<8): never dump tasks onto Display 0. */
+    public static final int VD_FLAG_DESTROY_CONTENT_ON_REMOVAL = 1 << 8;
 
     // ---- Window Profiles (Per-Window Independent Resolution & DPI) ----
     public static final int PROFILE_AUTO = 0;
@@ -89,6 +111,7 @@ public final class BridgeProtocol {
     // ---- Window Presentations / Snap States ----
     public static final String PRES_FLOATING = "FLOATING";
     public static final String PRES_MAXIMIZED = "MAXIMIZED";
+    public static final String PRES_FULLSCREEN = "FULLSCREEN";
     public static final String PRES_SNAP_LEFT = "SNAP_LEFT";
     public static final String PRES_SNAP_RIGHT = "SNAP_RIGHT";
     public static final String PRES_SNAP_TL = "SNAP_TL";
@@ -107,6 +130,7 @@ public final class BridgeProtocol {
     public static final int WIN_ACTION_SET_PROFILE_PORTRAIT = 8;
     public static final int WIN_ACTION_SET_PROFILE_TABLET = 9;
     public static final int WIN_ACTION_RELOAD_APP = 10;
+    public static final int WIN_ACTION_TOGGLE_FULLSCREEN = 11;
 
     // ---- Input Backends & Status ----
     public static final int INPUT_BACKEND_AUTO = 0;

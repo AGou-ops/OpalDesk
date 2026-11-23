@@ -13,19 +13,24 @@ import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -43,11 +48,15 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
+import io.github.lengsukq.opaldesk.ui.NativeImeBridgeHost
+import io.github.lengsukq.opaldesk.ui.NativeImeHostController
 import io.github.lengsukq.opaldesk.ui.OpalButton
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTheme
+import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
 import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
+import io.github.lengsukq.opaldesk.ui.rememberNativeImeHostController
 
 /**
  * Fullscreen hardware-accelerated Android <-> Android OpalCast v1.1 Peer Receiver Workstation.
@@ -58,13 +67,22 @@ import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
  */
 class PeerCastViewerActivity : ComponentActivity() {
     companion object {
+        private const val MUTEX_TAG = "desktop_viewer"
         const val EXTRA_HOST = "peer_host"
         const val EXTRA_PORT = "peer_port"
-        const val EXTRA_PIN = "peer_pin"
         const val EXTRA_LABEL = "peer_label"
     }
 
     private var client: OpalCastPeerClient? = null
+    private var activeSurface: android.view.Surface? = null
+    private var targetHost: String = ""
+    private var targetPort: Int = 19878
+    private var targetLabel: String = ""
+    private var reqWidth: Int = 1920
+    private var reqHeight: Int = 1080
+    private var reqDpi: Int = 240
+    private var reqFps: Int = 60
+
     private var peerName by mutableStateOf("")
     private var statusText by mutableStateOf("正在建立 TLS 加密连接…")
     private var connected by mutableStateOf(false)
@@ -72,7 +90,11 @@ class PeerCastViewerActivity : ComponentActivity() {
     private var videoH by mutableIntStateOf(1080)
     private var videoFps by mutableIntStateOf(60)
     private var toolbarExpanded by mutableStateOf(true)
+    private var imeVisible by mutableStateOf(false)
+    private var composingText by mutableStateOf("")
     private var errorText by mutableStateOf("")
+    private var showAppPicker by mutableStateOf(false)
+    private var remoteApps by mutableStateOf<List<OpalCastPeerClient.RemoteAppEntry>>(emptyList())
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -82,8 +104,10 @@ class PeerCastViewerActivity : ComponentActivity() {
 
         val host = intent.getStringExtra(EXTRA_HOST).orEmpty().trim()
         val port = intent.getIntExtra(EXTRA_PORT, 19878).coerceIn(1, 65535)
-        val pin = intent.getStringExtra(EXTRA_PIN).orEmpty().trim()
         val label = intent.getStringExtra(EXTRA_LABEL).orEmpty().ifBlank { host }
+        targetHost = host
+        targetPort = port
+        targetLabel = label
         peerName = label
 
         // Strict one-way guard: refuse if currently sending out or targeting self
@@ -94,7 +118,7 @@ class PeerCastViewerActivity : ComponentActivity() {
             targetHost = host,
             selfLanIp = remoteSt.lanIp,
         )
-        if (!check.allowed || !OpalPeerCastMutex.beginReceiving(host, port, label)) {
+        if (!check.allowed || !OpalPeerCastMutex.beginReceiving(host, port, label, MUTEX_TAG)) {
             Toast.makeText(this, check.reason.ifBlank { "当前不可建立反向投屏" }, Toast.LENGTH_LONG).show()
             finish()
             return
@@ -107,34 +131,165 @@ class PeerCastViewerActivity : ComponentActivity() {
         }
 
         val dm = resources.displayMetrics
-        val reqW = (dm.widthPixels.coerceAtLeast(dm.heightPixels) and 1.inv()).coerceIn(1280, 2560)
-        val reqH = (dm.widthPixels.coerceAtMost(dm.heightPixels) and 1.inv()).coerceIn(720, 1600)
-        val reqDpi = dm.densityDpi.coerceIn(160, 320)
-        val reqFps = (display?.mode?.refreshRate?.toInt() ?: 60).coerceIn(60, 120)
-        videoW = reqW
-        videoH = reqH
+        val isPortrait = dm.heightPixels > dm.widthPixels
+        reqWidth = if (isPortrait) {
+            (dm.widthPixels and 1.inv()).coerceIn(720, 1600)
+        } else {
+            (dm.widthPixels and 1.inv()).coerceIn(1280, 2560)
+        }
+        reqHeight = if (isPortrait) {
+            (dm.heightPixels and 1.inv()).coerceIn(1280, 2560)
+        } else {
+            (dm.heightPixels and 1.inv()).coerceIn(720, 1600)
+        }
+        reqDpi = dm.densityDpi.coerceIn(160, 360)
+        reqFps = (display?.mode?.refreshRate?.toInt() ?: 60).coerceIn(60, 120)
+        videoW = reqWidth
+        videoH = reqHeight
+
+        startPeerSession()
+
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (showAppPicker) {
+                        showAppPicker = false
+                    } else if (connected) {
+                        client?.sendSystemAction(OpalCastPeerClient.SYS_BACK)
+                    } else {
+                        finish()
+                    }
+                }
+            },
+        )
+
+        setContent {
+            OpalTheme {
+                val imeController = rememberNativeImeHostController()
+                LaunchedEffect(connected) {
+                    if (connected && toolbarExpanded) {
+                        kotlinx.coroutines.delay(2_200L)
+                        toolbarExpanded = false
+                    }
+                }
+                Box(modifier = Modifier.fillMaxSize()) {
+                    PeerCastViewerContent(
+                        peerName = peerName,
+                        statusText = statusText,
+                        errorText = errorText,
+                        connected = connected,
+                        videoW = videoW,
+                        videoH = videoH,
+                        toolbarExpanded = toolbarExpanded,
+                        imeVisible = imeVisible,
+                        composingText = composingText,
+                        imeController = imeController,
+                        onToggleToolbar = { toolbarExpanded = !toolbarExpanded },
+                        onToggleIme = { imeController.toggleKeyboard(imeVisible) },
+                        onImeVisibilityChanged = { vis ->
+                            imeVisible = vis
+                            if (!vis) composingText = ""
+                        },
+                        onComposingChanged = { composingText = it },
+                        onSendImeKey = { action, keyCode, meta ->
+                            client?.sendKeyEvent(action, keyCode, meta, 0)
+                        },
+                        onCommitImeText = { txt ->
+                            client?.sendTextEvent(txt, commitPaste = true)
+                        },
+                        onSurfaceCreated = { s ->
+                            activeSurface = s
+                            client?.attachSurface(s)
+                        },
+                        onSurfaceDestroyed = {
+                            activeSurface = null
+                            client?.attachSurface(null)
+                        },
+                        onDispatchTouch = { ev, w, h ->
+                            val c = client ?: return@PeerCastViewerContent
+                            if (c.isMouseMotion(ev)) c.sendMouseEvent(ev, w, h) else c.sendTouchEvent(ev, w, h)
+                        },
+                        onDispatchGenericMotion = { ev, w, h ->
+                            val c = client ?: return@PeerCastViewerContent
+                            if (c.isMouseMotion(ev)) c.sendMouseEvent(ev, w, h)
+                        },
+                        onOpenFloatingPicker = {
+                            client?.requestAppList()
+                            showAppPicker = true
+                        },
+                        onRetryConnect = { startPeerSession() },
+                        onSendBack = { client?.sendSystemAction(OpalCastPeerClient.SYS_BACK) },
+                        onSendHome = { client?.sendSystemAction(OpalCastPeerClient.SYS_HOME) },
+                        onToggleMode = { client?.sendSystemAction(OpalCastPeerClient.SYS_TOGGLE_DISPLAY_MODE) },
+                        onRequestIdr = { client?.requestKeyFrame() },
+                        onDisconnect = { finish() },
+                    )
+
+                    if (showAppPicker) {
+                        RemoteAppPickerModal(
+                            host = targetHost,
+                            port = targetPort,
+                            peerLabel = peerName,
+                            preloadedApps = remoteApps.takeIf { it.isNotEmpty() },
+                            onDismiss = { showAppPicker = false },
+                            onFloatingLaunched = { showAppPicker = false },
+                        )
+                    }
+                }
+            }
+        }
+        applyImmersiveFullscreen()
+    }
+
+    private fun startPeerSession() {
+        client?.stop()
+        client = null
+        connected = false
+        errorText = ""
+        statusText = "正在建立 TLS 加密连接…"
 
         val peerClient = OpalCastPeerClient(
-            host = host,
-            port = port,
-            pinCode = pin,
-            savedAuthToken = AppPrefs.getPeerAuthToken(this, host),
+            host = targetHost,
+            port = targetPort,
+            savedAuthToken = AppPrefs.getPeerAuthToken(this, targetHost),
             clientId = AppPrefs.getOrCreatePeerClientId(this),
-            reqWidth = reqW,
-            reqHeight = reqH,
+            reqWidth = reqWidth,
+            reqHeight = reqHeight,
             reqDpi = reqDpi,
             reqFps = reqFps,
+            sessionRole = OpalCastPeerClient.SESSION_ROLE_DESKTOP,
+            audioEnabled = true,
             listener = object : OpalCastPeerClient.Listener {
-                override fun onAuthenticated(peerName: String, authToken: String, certFingerprint: String) {
-                    if (authToken.isNotBlank()) {
-                        AppPrefs.savePeerAuthToken(this@PeerCastViewerActivity, host, authToken)
+                override fun onWaitingForApproval() {
+                    runOnUiThread {
+                        statusText = "等待对方设备点击「允许」…"
+                    }
+                }
+
+                override fun onAuthenticated(
+                    peerName: String,
+                    authToken: String,
+                    permanent: Boolean,
+                    certFingerprint: String,
+                ) {
+                    if (permanent && authToken.isNotBlank()) {
+                        AppPrefs.savePeerAuthToken(this@PeerCastViewerActivity, targetHost, authToken)
+                    } else if (!permanent) {
+                        AppPrefs.clearPeerAuthToken(this@PeerCastViewerActivity, targetHost)
                     }
                     OpalPeerCastMutex.updateReceivingPeerName(peerName)
                     runOnUiThread {
-                        this@PeerCastViewerActivity.peerName = peerName.ifBlank { label }
+                        this@PeerCastViewerActivity.peerName = peerName.ifBlank { targetLabel }
                         connected = true
                         errorText = ""
                         statusText = "已连接 · 等待画面关键帧"
+                    }
+                }
+
+                override fun onAppListReceived(apps: List<OpalCastPeerClient.RemoteAppEntry>) {
+                    runOnUiThread {
+                        remoteApps = apps
                     }
                 }
 
@@ -150,7 +305,7 @@ class PeerCastViewerActivity : ComponentActivity() {
                 override fun onError(message: String) {
                     runOnUiThread {
                         errorText = message
-                        statusText = "连接中断：$message"
+                        statusText = message
                     }
                 }
 
@@ -163,74 +318,53 @@ class PeerCastViewerActivity : ComponentActivity() {
             },
         )
         client = peerClient
-        peerClient.start()
-
-        onBackPressedDispatcher.addCallback(
-            this,
-            object : OnBackPressedCallback(true) {
-                override fun handleOnBackPressed() {
-                    if (connected) {
-                        client?.sendSystemAction(OpalCastPeerClient.SYS_BACK)
-                    } else {
-                        finish()
-                    }
-                }
-            },
-        )
-
-        setContent {
-            OpalTheme {
-                PeerCastViewerContent(
-                    peerName = peerName,
-                    statusText = statusText,
-                    errorText = errorText,
-                    connected = connected,
-                    videoW = videoW,
-                    videoH = videoH,
-                    toolbarExpanded = toolbarExpanded,
-                    onToggleToolbar = { toolbarExpanded = !toolbarExpanded },
-                    onSurfaceCreated = { client?.attachSurface(it) },
-                    onSurfaceDestroyed = { client?.attachSurface(null) },
-                    onDispatchTouch = { ev, w, h ->
-                        val c = client ?: return@PeerCastViewerContent
-                        if (c.isMouseMotion(ev)) c.sendMouseEvent(ev, w, h) else c.sendTouchEvent(ev, w, h)
-                    },
-                    onDispatchGenericMotion = { ev, w, h ->
-                        val c = client ?: return@PeerCastViewerContent
-                        if (c.isMouseMotion(ev)) c.sendMouseEvent(ev, w, h)
-                    },
-                    onSendBack = { client?.sendSystemAction(OpalCastPeerClient.SYS_BACK) },
-                    onSendHome = { client?.sendSystemAction(OpalCastPeerClient.SYS_HOME) },
-                    onToggleMode = { client?.sendSystemAction(OpalCastPeerClient.SYS_TOGGLE_DISPLAY_MODE) },
-                    onRequestIdr = { client?.requestKeyFrame() },
-                    onDisconnect = { finish() },
-                )
-            }
+        activeSurface?.let { s ->
+            if (s.isValid) peerClient.attachSurface(s)
         }
-        applyImmersiveFullscreen()
+        peerClient.start()
     }
 
     override fun onDestroy() {
         client?.stop()
         client = null
-        OpalPeerCastMutex.endReceiving()
+        OpalPeerCastMutex.endReceiving(MUTEX_TAG)
         super.onDestroy()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (connected && (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)) {
-            if (event.keyCode != KeyEvent.KEYCODE_VOLUME_UP &&
-                event.keyCode != KeyEvent.KEYCODE_VOLUME_DOWN &&
-                event.keyCode != KeyEvent.KEYCODE_POWER
-            ) {
-                client?.sendKeyEvent(event.action, event.keyCode, event.metaState, event.repeatCount)
+            if (!WorkstationKeyDispatcher.isForwardableKey(event.keyCode)) {
+                return super.dispatchKeyEvent(event)
+            }
+            // When user intentionally opened the receiver tablet's built-in IME (e.g. Chinese Pinyin),
+            // let non-shortcut keys flow through the IME InputConnection first while keeping Alt/Ctrl shortcuts direct.
+            val isDirectShortcut = event.isAltPressed || event.isCtrlPressed || event.keyCode == KeyEvent.KEYCODE_ESCAPE
+            if (imeVisible && !isDirectShortcut && super.dispatchKeyEvent(event)) {
                 return true
             }
+            client?.sendKeyEvent(event.action, event.keyCode, event.metaState, event.repeatCount)
+            return true
         }
         return super.dispatchKeyEvent(event)
     }
 
     private fun applyImmersiveFullscreen() {
+        // Lock peak display refresh rate so OEM power governors (e.g. HyperOS MI-SF) never drop
+        // the tablet panel down to 30Hz during static desktop frames.
+        try {
+            val disp = display
+            val cur = disp?.mode
+            val peak = disp?.supportedModes
+                ?.filter { cur == null || (it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight) }
+                ?.maxByOrNull { it.refreshRate }
+            if (peak != null) {
+                val lp = window.attributes
+                lp.preferredDisplayModeId = peak.modeId
+                lp.preferredRefreshRate = peak.refreshRate
+                window.attributes = lp
+            }
+        } catch (_: Throwable) {
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowCompat.getInsetsController(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
@@ -249,29 +383,52 @@ private fun PeerCastViewerContent(
     videoW: Int,
     videoH: Int,
     toolbarExpanded: Boolean,
+    imeVisible: Boolean,
+    composingText: String,
+    imeController: NativeImeHostController,
     onToggleToolbar: () -> Unit,
+    onToggleIme: () -> Unit,
+    onImeVisibilityChanged: (Boolean) -> Unit,
+    onComposingChanged: (String) -> Unit,
+    onSendImeKey: (Int, Int, Int) -> Unit,
+    onCommitImeText: (String) -> Unit,
     onSurfaceCreated: (android.view.Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
     onDispatchTouch: (android.view.MotionEvent, Int, Int) -> Unit,
     onDispatchGenericMotion: (android.view.MotionEvent, Int, Int) -> Unit,
+    onOpenFloatingPicker: () -> Unit,
+    onRetryConnect: () -> Unit,
     onSendBack: () -> Unit,
     onSendHome: () -> Unit,
     onToggleMode: () -> Unit,
     onRequestIdr: () -> Unit,
     onDisconnect: () -> Unit,
 ) {
-    val ratio = (videoW.toFloat() / videoH.coerceAtLeast(1).toFloat()).coerceIn(0.45f, 3.0f)
+    val ratio = (videoW.toFloat() / videoH.coerceAtLeast(1).toFloat()).coerceIn(0.42f, 3.0f)
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(Color(0xFF06080D)),
         contentAlignment = Alignment.Center,
     ) {
+        val containerRatio = (maxWidth.value / maxHeight.value.coerceAtLeast(1f)).coerceAtLeast(0.1f)
+        val fitHeightFirst = containerRatio > ratio
+
+        // Invisible native IME host so the receiver tablet/phone's built-in IME pops up seamlessly
+        NativeImeBridgeHost(
+            controller = imeController,
+            onSendKey = onSendImeKey,
+            onCommitText = onCommitImeText,
+            onComposingChanged = onComposingChanged,
+            onImeVisibilityChanged = onImeVisibilityChanged,
+            modifier = Modifier.align(Alignment.BottomStart),
+        )
+
         AndroidView(
             modifier = Modifier
                 .fillMaxSize()
-                .aspectRatio(ratio, matchHeightConstraintsFirst = false),
+                .aspectRatio(ratio, matchHeightConstraintsFirst = fitHeightFirst),
             factory = { ctx ->
                 SurfaceView(ctx).apply {
                     setBackgroundColor(AndroidColor.TRANSPARENT)
@@ -321,25 +478,61 @@ private fun PeerCastViewerContent(
                     color = if (errorText.isNotBlank()) OpalPalette.AccentDanger else OpalPalette.TextSecondary,
                 )
                 Spacer(Modifier.height(4.dp))
-                OpalButton(label = "返回主控制台", compact = true, onClick = onDisconnect)
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (errorText.isNotBlank()) {
+                        OpalButton(
+                            label = "重新请求连接",
+                            accent = OpalPalette.AccentBlue,
+                            compact = true,
+                            onClick = onRetryConnect,
+                        )
+                    }
+                    OpalButton(label = "返回主控制台", filled = errorText.isBlank(), compact = true, onClick = onDisconnect)
+                }
             }
         }
 
-        // Top floating Liquid Frosted Glass remote control pill
+        // Live IME composing preview pill just above the tablet/phone soft keyboard
+        if (composingText.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .imePadding()
+                    .padding(bottom = 12.dp)
+                    .liquidGlassSurface(
+                        shape = CircleShape,
+                        fill = OpalPalette.LiquidPopoverFill,
+                        rim = OpalPalette.LiquidGlassRim,
+                        elevation = 16.dp,
+                    )
+                    .padding(horizontal = 16.dp, vertical = 7.dp),
+            ) {
+                OpalText(
+                    text = composingText,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OpalPalette.AccentBlue,
+                    maxLines = 1,
+                )
+            }
+        }
+
+        // Top floating Liquid Frosted Glass remote control pill (TopCenter so it never blocks Top-Right Status Bar)
         if (toolbarExpanded) {
             Row(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
-                    .padding(top = 12.dp)
+                    .padding(top = 10.dp, start = 12.dp, end = 12.dp)
                     .liquidGlassSurface(
                         shape = CircleShape,
                         fill = OpalPalette.LiquidDockFill,
                         rim = OpalPalette.LiquidGlassRim,
                         elevation = 18.dp,
                     )
-                    .padding(horizontal = 14.dp, vertical = 7.dp),
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 13.dp, vertical = 7.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
             ) {
                 Box(
                     modifier = Modifier
@@ -353,6 +546,13 @@ private fun PeerCastViewerContent(
                     fontWeight = FontWeight.SemiBold,
                     maxLines = 1,
                 )
+                PillChip(
+                    label = if (imeVisible) "收起输入法" else "输入法",
+                    tint = if (imeVisible) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                    active = imeVisible,
+                    onClick = onToggleIme,
+                )
+                PillChip("应用悬浮窗", tint = OpalPalette.AccentBlue, onClick = onOpenFloatingPicker)
                 PillChip("返回", onClick = onSendBack)
                 PillChip("桌面", onClick = onSendHome)
                 PillChip("镜像/桌面", onClick = onToggleMode)
@@ -361,20 +561,27 @@ private fun PeerCastViewerContent(
                 PillChip("断开", tint = OpalPalette.AccentDanger, onClick = onDisconnect)
             }
         } else {
-            Box(
+            Row(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = 10.dp, end = 12.dp)
+                    .align(Alignment.TopCenter)
+                    .padding(top = 2.dp)
                     .liquidGlassSurface(
                         shape = CircleShape,
                         fill = OpalPalette.LiquidDockFill,
                         rim = OpalPalette.LiquidGlassRim,
                         elevation = 12.dp,
                     )
-                    .clickable(onClick = onToggleToolbar)
-                    .padding(horizontal = 12.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
             ) {
-                OpalText(text = "投屏控制", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                PillChip(
+                    label = if (imeVisible) "收起输入法" else "输入法",
+                    tint = if (imeVisible) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                    active = imeVisible,
+                    onClick = onToggleIme,
+                )
+                PillChip("投屏控制", onClick = onToggleToolbar)
             }
         }
     }
@@ -384,12 +591,13 @@ private fun PeerCastViewerContent(
 private fun PillChip(
     label: String,
     tint: Color = OpalPalette.TextPrimary,
+    active: Boolean = false,
     onClick: () -> Unit,
 ) {
     Box(
         modifier = Modifier
             .clip(CircleShape)
-            .background(OpalPalette.ChipFill)
+            .background(if (active) OpalPalette.ChipActiveFill else OpalPalette.ChipFill)
             .clickable(onClick = onClick)
             .padding(horizontal = 9.dp, vertical = 4.dp),
     ) {

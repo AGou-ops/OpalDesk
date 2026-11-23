@@ -36,6 +36,8 @@ public final class VirtualDisplayPool {
 
         void setVirtualDisplaySurface(Object handle, Object surface);
 
+        default void setSurfaceFrameRate(Object surface, float fps) {}
+
         void releaseVirtualDisplay(Object handle, int displayId);
 
         byte[] captureTaskSnapshotBytes(int taskId);
@@ -148,6 +150,14 @@ public final class VirtualDisplayPool {
         Lease lease = activeLeases.get(windowId);
         if (lease != null) {
             driver.resizeVirtualDisplay(lease.handle, width, height, dpi);
+        }
+    }
+
+    public synchronized void updateSurfaceFrameRateIfActive(int windowId, Object surface, float fps) {
+        Lease lease = activeLeases.get(windowId);
+        if (lease != null && surface != null) {
+            driver.setSurfaceFrameRate(surface, fps);
+            driver.setVirtualDisplaySurface(lease.handle, surface);
         }
     }
 

@@ -28,6 +28,7 @@ data class DaemonStatus(
     val boundMouseCount: Int = 0,
     val connectedMouseCount: Int = 0,
     val mouseRoutedDisplayId: Int = -1,
+    val hostScreenOff: Boolean = false,
 ) {
     val injectBackendLabel: String
         get() = when {
@@ -56,7 +57,8 @@ data class RemoteStreamStatus(
     val wifiEnabled: Boolean = false,
     val wifiPort: Int = 19878,
     val certFingerprint: String = "",
-    val activePin: String = "",
+    val activeSessionPermanent: Boolean = false,
+    val trustedCount: Int = 0,
     val lanIp: String = "",
 ) {
     val shortCertFingerprint: String
@@ -71,8 +73,152 @@ data class RemoteStreamStatus(
             2 -> "USB 有线直连"
             4 -> "无线 ADB 隧道"
             3 -> "Wi-Fi TLS 直连"
-            else -> "Mac 投屏"
+            else -> "无线投屏"
         }
+}
+
+data class PendingPairingRequest(
+    val requestId: String,
+    val clientId: String,
+    val clientName: String,
+    val peerIp: String,
+    val createdAtMs: Long,
+    val expiresAtMs: Long,
+)
+
+data class TrustedPeerEntry(
+    val clientId: String,
+    val clientName: String,
+    val createdAtMs: Long,
+)
+
+object PairingJsonParser {
+    private val strFieldRegex = Regex(""""([^"\\]+)"\s*:\s*"((?:\\.|[^"\\])*)"""")
+    private val numFieldRegex = Regex(""""([^"\\]+)"\s*:\s*(-?\d+)""")
+
+    private fun extractFlatObjects(json: String): List<String> {
+        val out = ArrayList<String>()
+        var inStr = false
+        var escape = false
+        var depth = 0
+        var start = -1
+        for (i in json.indices) {
+            val ch = json[i]
+            if (escape) {
+                escape = false
+                continue
+            }
+            if (inStr) {
+                if (ch == '\\') escape = true
+                else if (ch == '"') inStr = false
+                continue
+            }
+            when (ch) {
+                '"' -> inStr = true
+                '{' -> {
+                    if (depth == 0) start = i
+                    depth++
+                }
+                '}' -> {
+                    if (depth > 0) {
+                        depth--
+                        if (depth == 0 && start >= 0) {
+                            out.add(json.substring(start, i + 1))
+                            start = -1
+                        }
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    private fun unescapeJson(raw: String): String {
+        if (!raw.contains('\\')) return raw
+        val sb = StringBuilder(raw.length)
+        var i = 0
+        while (i < raw.length) {
+            val ch = raw[i]
+            if (ch == '\\' && i + 1 < raw.length) {
+                when (val next = raw[i + 1]) {
+                    '"', '\\', '/' -> sb.append(next)
+                    'n' -> sb.append('\n')
+                    'r' -> sb.append('\r')
+                    't' -> sb.append('\t')
+                    'u' -> {
+                        if (i + 5 < raw.length) {
+                            val code = raw.substring(i + 2, i + 6).toIntOrNull(16)
+                            if (code != null) {
+                                sb.append(code.toChar())
+                                i += 6
+                                continue
+                            }
+                        }
+                        sb.append(next)
+                    }
+                    else -> sb.append(next)
+                }
+                i += 2
+            } else {
+                sb.append(ch)
+                i++
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun extractStrings(obj: String): Map<String, String> {
+        val map = HashMap<String, String>()
+        strFieldRegex.findAll(obj).forEach { m ->
+            map[m.groupValues[1]] = unescapeJson(m.groupValues[2])
+        }
+        return map
+    }
+
+    private fun extractLongs(obj: String): Map<String, Long> {
+        val map = HashMap<String, Long>()
+        numFieldRegex.findAll(obj).forEach { m ->
+            m.groupValues[2].toLongOrNull()?.let { map[m.groupValues[1]] = it }
+        }
+        return map
+    }
+
+    fun parsePending(json: String?): PendingPairingRequest? {
+        if (json.isNullOrBlank()) return null
+        val trimmed = json.trim()
+        if (!trimmed.startsWith("{")) return null
+        val strs = extractStrings(trimmed)
+        val reqId = strs["requestId"].orEmpty().trim()
+        if (reqId.isEmpty()) return null
+        val nums = extractLongs(trimmed)
+        return PendingPairingRequest(
+            requestId = reqId,
+            clientId = strs["clientId"].orEmpty(),
+            clientName = strs["clientName"].orEmpty().ifBlank { "未知设备" },
+            peerIp = strs["peerIp"].orEmpty(),
+            createdAtMs = nums["createdAtMs"] ?: 0L,
+            expiresAtMs = nums["expiresAtMs"] ?: 0L,
+        )
+    }
+
+    fun parseTrustedPeers(json: String?): List<TrustedPeerEntry> {
+        if (json.isNullOrBlank()) return emptyList()
+        val out = ArrayList<TrustedPeerEntry>()
+        for (rawObj in extractFlatObjects(json)) {
+            val strs = extractStrings(rawObj)
+            val cid = strs["clientId"].orEmpty().trim()
+            if (cid.isEmpty()) continue
+            val nums = extractLongs(rawObj)
+            out.add(
+                TrustedPeerEntry(
+                    clientId = cid,
+                    clientName = strs["clientName"].orEmpty().ifBlank { cid },
+                    createdAtMs = nums["createdAtMs"] ?: 0L,
+                ),
+            )
+        }
+        return out
+    }
 }
 
 data class WindowRect(
@@ -110,6 +256,7 @@ data class CompositorWindow(
     val isHibernated: Boolean get() = state == BridgeProtocol.WinState.HIBERNATED
     val isMinimized: Boolean get() = state == BridgeProtocol.WinState.MINIMIZED
     val isMaximized: Boolean get() = presentation == BridgeProtocol.Presentation.MAXIMIZED
+    val isFullscreen: Boolean get() = presentation == BridgeProtocol.Presentation.FULLSCREEN
     val isPortraitProfile: Boolean get() = profileCode == BridgeProtocol.Profile.PORTRAIT
 }
 
@@ -247,8 +394,8 @@ object CompositorGeometry {
         canvasH: Int,
         density: Float,
     ): WindowRect {
-        val minW = dpToPx(MIN_WIN_W_DP, density)
-        val minH = dpToPx(MIN_WIN_H_DP, density)
+        val minW = min(dpToPx(MIN_WIN_W_DP, density), max(220, canvasW - 12))
+        val minH = min(dpToPx(MIN_WIN_H_DP, density), max(220, canvasH - dpToPx(TOP_BAR_DP + 20f, density)))
         val minTop = dpToPx(TOP_BAR_DP, density)
         val maxBottom = max(minTop + minH, canvasH - dpToPx(12f, density))
 
@@ -351,16 +498,17 @@ object CompositorGeometry {
         val wb = max(wt + 240, canvasH - botInset)
         val workW = wr - wl
         val workH = wb - wt
+        val isPortraitCanvas = workH > workW
 
         fun alignedRect(left: Int, top: Int, right: Int, bottom: Int): WindowRect {
-            val w = max(260, (right - left) and 1.inv())
-            val h = max(240, (bottom - top) and 1.inv())
+            val w = max(240, (right - left) and 1.inv())
+            val h = max(220, (bottom - top) and 1.inv())
             return WindowRect(left, top, left + w, top + h)
         }
 
         fun splitColumns(colCount: Int): List<WindowRect> {
             val totalGaps = gap * (colCount - 1)
-            val colW = max(260, ((workW - totalGaps) / colCount) and 1.inv())
+            val colW = max(240, ((workW - totalGaps) / colCount) and 1.inv())
             val out = ArrayList<WindowRect>(slots)
             for (i in 0 until slots) {
                 val l = wl + i * (colW + gap)
@@ -370,24 +518,65 @@ object CompositorGeometry {
             return out
         }
 
+        fun splitRows(rowCount: Int): List<WindowRect> {
+            val totalGaps = gap * (rowCount - 1)
+            val rowH = max(220, ((workH - totalGaps) / rowCount) and 1.inv())
+            val out = ArrayList<WindowRect>(slots)
+            for (i in 0 until slots) {
+                val t = wt + i * (rowH + gap)
+                val b = if (i == rowCount - 1) wb else min(wb, t + rowH)
+                out.add(alignedRect(wl, t, wr, b))
+            }
+            return out
+        }
+
         return when (layout) {
-            WindowTilingLayout.SPLIT_2_COLS -> splitColumns(2)
-            WindowTilingLayout.SPLIT_3_COLS -> splitColumns(3)
-            WindowTilingLayout.SPLIT_4_COLS -> splitColumns(4)
+            WindowTilingLayout.SPLIT_2_COLS -> if (isPortraitCanvas) splitRows(2) else splitColumns(2)
+            WindowTilingLayout.SPLIT_3_COLS -> if (isPortraitCanvas) splitRows(3) else splitColumns(3)
+            WindowTilingLayout.SPLIT_4_COLS -> if (isPortraitCanvas) {
+                // 2x2 grid is far more usable than 4 skinny vertical strips on a portrait phone
+                val midX = wl + (workW - gap) / 2
+                val midY = wt + (workH - gap) / 2
+                listOf(
+                    alignedRect(wl, wt, midX, midY),
+                    alignedRect(midX + gap, wt, wr, midY),
+                    alignedRect(wl, midY + gap, midX, wb),
+                    alignedRect(midX + gap, midY + gap, wr, wb),
+                ).take(slots)
+            } else {
+                splitColumns(4)
+            }
             WindowTilingLayout.SPLIT_2_MAIN_SIDE -> {
-                val mainW = (((workW - gap) * 0.65f).roundToInt() and 1.inv()).coerceIn(260, max(260, workW - gap - 260))
-                val r1 = alignedRect(wl, wt, wl + mainW, wb)
-                if (slots == 1) listOf(r1)
-                else listOf(r1, alignedRect(wl + mainW + gap, wt, wr, wb))
+                if (isPortraitCanvas) {
+                    val mainH = (((workH - gap) * 0.62f).roundToInt() and 1.inv()).coerceIn(240, max(240, workH - gap - 220))
+                    val r1 = alignedRect(wl, wt, wr, wt + mainH)
+                    if (slots == 1) listOf(r1)
+                    else listOf(r1, alignedRect(wl, wt + mainH + gap, wr, wb))
+                } else {
+                    val mainW = (((workW - gap) * 0.65f).roundToInt() and 1.inv()).coerceIn(260, max(260, workW - gap - 260))
+                    val r1 = alignedRect(wl, wt, wl + mainW, wb)
+                    if (slots == 1) listOf(r1)
+                    else listOf(r1, alignedRect(wl + mainW + gap, wt, wr, wb))
+                }
             }
             WindowTilingLayout.SPLIT_3_MAIN_STACK -> {
-                val mainW = (((workW - gap) * 0.56f).roundToInt() and 1.inv()).coerceIn(260, max(260, workW - gap - 260))
-                val midY = wt + (workH - gap) / 2
-                val out = ArrayList<WindowRect>(slots)
-                out.add(alignedRect(wl, wt, wl + mainW, wb))
-                if (slots >= 2) out.add(alignedRect(wl + mainW + gap, wt, wr, midY))
-                if (slots >= 3) out.add(alignedRect(wl + mainW + gap, midY + gap, wr, wb))
-                out
+                if (isPortraitCanvas) {
+                    val mainH = (((workH - gap) * 0.54f).roundToInt() and 1.inv()).coerceIn(240, max(240, workH - gap - 220))
+                    val midX = wl + (workW - gap) / 2
+                    val out = ArrayList<WindowRect>(slots)
+                    out.add(alignedRect(wl, wt, wr, wt + mainH))
+                    if (slots >= 2) out.add(alignedRect(wl, wt + mainH + gap, midX, wb))
+                    if (slots >= 3) out.add(alignedRect(midX + gap, wt + mainH + gap, wr, wb))
+                    out
+                } else {
+                    val mainW = (((workW - gap) * 0.56f).roundToInt() and 1.inv()).coerceIn(260, max(260, workW - gap - 260))
+                    val midY = wt + (workH - gap) / 2
+                    val out = ArrayList<WindowRect>(slots)
+                    out.add(alignedRect(wl, wt, wl + mainW, wb))
+                    if (slots >= 2) out.add(alignedRect(wl + mainW + gap, wt, wr, midY))
+                    if (slots >= 3) out.add(alignedRect(wl + mainW + gap, midY + gap, wr, wb))
+                    out
+                }
             }
             WindowTilingLayout.SPLIT_4_GRID -> {
                 val midX = wl + (workW - gap) / 2
@@ -401,14 +590,14 @@ object CompositorGeometry {
                 all.take(slots)
             }
             WindowTilingLayout.CASCADE -> {
-                val winW = ((workW * 0.62f).roundToInt() and 1.inv()).coerceIn(320, workW)
-                val winH = ((workH * 0.74f).roundToInt() and 1.inv()).coerceIn(280, workH)
-                val step = dpToPx(32f, density)
-                val baseL = wl + max(0, (workW - winW - step * max(0, slots - 1)) / 2)
-                val baseT = wt + max(0, (workH - winH - step * max(0, slots - 1)) / 2)
+                val winW = ((workW * (if (isPortraitCanvas) 0.90f else 0.62f)).roundToInt() and 1.inv()).coerceIn(280, workW)
+                val winH = ((workH * (if (isPortraitCanvas) 0.56f else 0.74f)).roundToInt() and 1.inv()).coerceIn(260, workH)
+                val step = dpToPx(if (isPortraitCanvas) 20f else 32f, density)
+                val baseL = wl + max(0, (workW - winW - (if (isPortraitCanvas) 0 else step * max(0, slots - 1))) / 2)
+                val baseT = wt + max(0, (workH - winH - step * max(0, slots - 1)) / (if (isPortraitCanvas) 3 else 2))
                 val out = ArrayList<WindowRect>(slots)
                 for (i in 0 until slots) {
-                    val l = min(max(wl, baseL + i * step), max(wl, wr - winW))
+                    val l = min(max(wl, baseL + (if (isPortraitCanvas) 0 else i * step)), max(wl, wr - winW))
                     val t = min(max(wt, baseT + i * step), max(wt, wb - winH))
                     out.add(alignedRect(l, t, l + winW, t + winH))
                 }

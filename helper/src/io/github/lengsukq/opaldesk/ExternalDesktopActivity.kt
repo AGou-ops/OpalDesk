@@ -18,23 +18,27 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Density
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.github.lengsukq.opaldesk.compositor.OpalCompositorWorkspace
-import io.github.lengsukq.opaldesk.compositor.applyWindowTilingLayout
 import io.github.lengsukq.opaldesk.external.DexTrackpadScreen
 import io.github.lengsukq.opaldesk.external.ExternalMonitorPresentation
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
-import io.github.lengsukq.opaldesk.protocol.WindowTilingLayout
+import io.github.lengsukq.opaldesk.ui.OpalImeFocusTracker
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalTheme
+import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
 import kotlin.math.roundToInt
 
 /**
@@ -85,7 +89,7 @@ class ExternalDesktopActivity : ComponentActivity() {
         override fun onDisplayAdded(displayId: Int) = Unit
         override fun onDisplayChanged(displayId: Int) = Unit
         override fun onDisplayRemoved(displayId: Int) {
-            if (runningInPresentationMode && displayId == targetDisplayId) {
+            if (targetDisplayId > Display.DEFAULT_DISPLAY && displayId == targetDisplayId) {
                 dismissPresentation()
                 finish()
             }
@@ -189,25 +193,44 @@ class ExternalDesktopActivity : ComponentActivity() {
                         onExitExternal = { finish() },
                     )
                 } else {
+                    val uiScale by AppPrefs.externalUiScaleFlow.collectAsState()
+                    val baseDensity = LocalDensity.current
+                    val effDensity = Density(
+                        density = (baseDensity.density * uiScale).coerceIn(0.85f, 3.5f),
+                        fontScale = baseDensity.fontScale,
+                    )
                     val curMode = display?.mode
                     val summary = if (curMode != null) {
                         "${display?.name ?: "外接屏"} · ${curMode.physicalWidth}×${curMode.physicalHeight} @ ${curMode.refreshRate.toInt()}Hz"
                     } else {
                         ""
                     }
-                    OpalCompositorWorkspace(
-                        isExternalMonitor = true,
-                        externalMonitorSummary = summary,
-                        onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
-                        onOpenConsole = ::openConsoleOnPrimaryDisplay,
-                        onExitDesktop = { finish() },
-                    )
+                    CompositionLocalProvider(LocalDensity provides effDensity) {
+                        OpalCompositorWorkspace(
+                            isExternalMonitor = true,
+                            externalMonitorSummary = summary,
+                            onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
+                            onOpenConsole = ::openConsoleOnPrimaryDisplay,
+                            onExitDesktop = { finish() },
+                        )
+                    }
                 }
             }
         }
 
         if (!runningInPresentationMode) {
             applyImmersiveFullscreen()
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val currentDisplayId = display?.displayId ?: Display.DEFAULT_DISPLAY
+        if (!runningInPresentationMode && currentDisplayId > Display.DEFAULT_DISPLAY) {
+            targetDisplayId = currentDisplayId
+            activeExternalDisplayId = currentDisplayId
+            syncExternalMouseRouting(currentDisplayId)
         }
     }
 
@@ -235,66 +258,28 @@ class ExternalDesktopActivity : ComponentActivity() {
         displayManager?.unregisterDisplayListener(displayListener)
         displayManager = null
         dismissPresentation()
+        if (BridgeClient.statusFlow.value.hostScreenOff) {
+            BridgeClient.setHostScreenPowerAsync(true)
+        }
         super.onDestroy()
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        val scene = BridgeClient.sceneFlow.value
-        val focused = scene.focusedWindow
+        if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
 
-        if (event.action == KeyEvent.ACTION_DOWN) {
-            if (event.isAltPressed && event.keyCode == KeyEvent.KEYCODE_TAB) {
-                val candidates = scene.windows.filter { !it.isMinimized }
-                if (candidates.size >= 2) {
-                    val idx = candidates.indexOfFirst { it.focused }
-                    val next = candidates[(idx + 1) % candidates.size]
-                    BridgeClient.sendWindowActionAsync(next.windowId, BridgeProtocol.WinAction.FOCUS)
-                }
-                return true
-            }
-            if (event.isAltPressed) {
-                val layout = when (event.keyCode) {
-                    KeyEvent.KEYCODE_2 -> WindowTilingLayout.SPLIT_2_COLS
-                    KeyEvent.KEYCODE_3 -> WindowTilingLayout.SPLIT_3_COLS
-                    KeyEvent.KEYCODE_4 -> WindowTilingLayout.SPLIT_4_COLS
-                    KeyEvent.KEYCODE_G -> WindowTilingLayout.SPLIT_4_GRID
-                    else -> null
-                }
-                if (layout != null) {
-                    val st = BridgeClient.statusFlow.value
-                    applyWindowTilingLayout(
-                        layout = layout,
-                        scene = scene,
-                        canvasW = st.canvasWidth,
-                        canvasH = st.canvasHeight,
-                        density = (st.canvasDpi / 160f).coerceIn(0.8f, 3.5f),
-                    )
-                    return true
-                }
-            }
-            if (event.isCtrlPressed && event.keyCode == KeyEvent.KEYCODE_W && focused != null) {
-                BridgeClient.sendWindowActionAsync(focused.windowId, BridgeProtocol.WinAction.CLOSE)
-                return true
-            }
+        // Allow Display 0 inline IME box or App Drawer search box to consume keys when explicitly focused
+        if (OpalImeFocusTracker.localComposeTextFieldFocused) {
+            if (super.dispatchKeyEvent(event)) return true
+            if (presentation?.dispatchKeyEventToPresentation(event) == true) return true
         }
 
-        // Allow Display 0 inline IME box (in trackpad mode) to consume keys first
-        if (super.dispatchKeyEvent(event)) return true
-
-        // Allow Presentation Compose UI (e.g. App Drawer search box) to consume keys next
-        if (presentation?.dispatchKeyEventToPresentation(event) == true) return true
-
-        if (focused != null && !focused.isMinimized && isForwardableKey(event.keyCode) &&
-            (event.action == KeyEvent.ACTION_DOWN || event.action == KeyEvent.ACTION_UP)
-        ) {
-            BridgeClient.injectWindowKeyAsync(
-                windowId = focused.windowId,
-                action = event.action,
-                keyCode = event.keyCode,
-                metaState = event.metaState,
-            )
+        // Prioritize forwarding physical / remote keyboard keystrokes directly to the focused app window
+        if (WorkstationKeyDispatcher.forwardToFocusedWindow(event)) {
             return true
         }
+
+        if (super.dispatchKeyEvent(event)) return true
+        if (presentation?.dispatchKeyEventToPresentation(event) == true) return true
         return false
     }
 
@@ -361,18 +346,6 @@ class ExternalDesktopActivity : ComponentActivity() {
             } catch (_: Throwable) {
             }
         }
-    }
-
-    private fun isForwardableKey(keyCode: Int): Boolean = when (keyCode) {
-        KeyEvent.KEYCODE_VOLUME_UP,
-        KeyEvent.KEYCODE_VOLUME_DOWN,
-        KeyEvent.KEYCODE_VOLUME_MUTE,
-        KeyEvent.KEYCODE_POWER,
-        KeyEvent.KEYCODE_SLEEP,
-        KeyEvent.KEYCODE_WAKEUP,
-        KeyEvent.KEYCODE_HOME,
-        KeyEvent.KEYCODE_APP_SWITCH -> false
-        else -> true
     }
 
     private fun openConsoleOnPrimaryDisplay() {

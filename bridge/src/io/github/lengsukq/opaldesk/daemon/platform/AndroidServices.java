@@ -7,18 +7,30 @@ import android.content.Intent;
 import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.ParcelFileDescriptor;
+import android.os.RemoteException;
 import android.view.Display;
 import android.view.InputEvent;
 import android.view.MotionEvent;
 
+import io.github.lengsukq.opaldesk.daemon.input.ImmsDumpInspector;
+import io.github.lengsukq.opaldesk.daemon.util.ShellCommand;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * OEM-agnostic Android system service binder facade for {@code OpalDeskDaemon} ({@code uid=2000}).
@@ -33,6 +45,11 @@ public final class AndroidServices {
     private static volatile Method sSetActionButtonMethod;
     private static volatile boolean sSetActionButtonChecked;
     private static final Object CLIPBOARD_LOCK = new Object();
+    private static final ExecutorService IMMS_DUMP_WRITER = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "OpalImmsDumpWriter");
+        t.setDaemon(true);
+        return t;
+    });
     private static volatile boolean sClipboardInitAttempted;
     private static volatile Object sIClipboard;
     private static volatile Method sSetPrimaryClipMethod;
@@ -57,6 +74,15 @@ public final class AndroidServices {
     public final Method moveDisplayToTopMethod;
     public final Method setDisplayImePolicyMethod;
     public final Method shouldShowSystemDecorsMethod;
+    public final Method setIgnoreOrientationRequestMethod;
+    public final Method setRemoveContentModeMethod;
+
+    private final Object displayPowerLock = new Object();
+    private final HostScreenWakeMonitor wakeMonitor = new HostScreenWakeMonitor();
+    private volatile boolean hostScreenOff = false;
+    private volatile boolean displayControlResolved = false;
+    private volatile Class<?> displayControlClass;
+    private volatile Method surfaceControlSetPowerModeMethod;
 
     public AndroidServices(
             Context context,
@@ -88,6 +114,12 @@ public final class AndroidServices {
                 : null;
         this.shouldShowSystemDecorsMethod = (iWindowManager != null)
                 ? findMethodOrNull(iWindowManager.getClass(), "setShouldShowSystemDecors", int.class, boolean.class)
+                : null;
+        this.setIgnoreOrientationRequestMethod = (iWindowManager != null)
+                ? findMethodOrNull(iWindowManager.getClass(), "setIgnoreOrientationRequest", int.class, boolean.class)
+                : null;
+        this.setRemoveContentModeMethod = (iWindowManager != null)
+                ? findMethodOrNull(iWindowManager.getClass(), "setRemoveContentMode", int.class, int.class)
                 : null;
     }
 
@@ -185,19 +217,228 @@ public final class AndroidServices {
             } catch (ReflectiveOperationException | RuntimeException ignored) {
             }
         }
-    }
-
-    public void focusDisplay(int displayId) {
-        if (displayId <= 0) return;
-        if (focusTopTaskMethod != null && iActivityTaskManager != null) {
+        if (setIgnoreOrientationRequestMethod != null) {
             try {
-                focusTopTaskMethod.invoke(iActivityTaskManager, displayId);
+                setIgnoreOrientationRequestMethod.invoke(iWindowManager, displayId, true);
             } catch (ReflectiveOperationException | RuntimeException ignored) {
             }
         }
+        if (setRemoveContentModeMethod != null) {
+            try {
+                // WindowManager.REMOVE_CONTENT_MODE_DESTROY = 1: never bounce tasks to Phone Display 0.
+                setRemoveContentModeMethod.invoke(iWindowManager, displayId, 1);
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+            }
+        }
+    }
+
+    public boolean isHostScreenOff() {
+        return hostScreenOff;
+    }
+
+    /**
+     * Toggles the physical power state of built-in Display 0 via AOSP {@code SurfaceControl.setDisplayPowerMode}
+     * without locking or suspending Android, so remote casting and external monitors stay awake at full FPS
+     * while the host OLED/LCD panel draws zero power.
+     */
+    public boolean setPrimaryPhysicalDisplayPower(boolean screenOn) {
+        final int powerMode = screenOn ? 2 /* POWER_MODE_NORMAL */ : 0 /* POWER_MODE_OFF */;
+        boolean ok = false;
+        synchronized (displayPowerLock) {
+            IBinder token = resolvePrimaryPhysicalDisplayTokenLocked();
+            Method setPowerMode = resolveSetDisplayPowerModeLocked();
+            if (token != null && setPowerMode != null) {
+                try {
+                    setPowerMode.invoke(null, token, powerMode);
+                    ok = true;
+                } catch (ReflectiveOperationException | RuntimeException e) {
+                    System.err.println("OPALDESK_HOST_SCREEN_POWER_ERR mode=" + powerMode + ": " + unwrapMessage(e));
+                }
+            }
+            if (!ok && screenOn) {
+                // Fail-safe wake fallback on Android 14+
+                ShellCommand.runOutput("cmd", "display", "power-reset", "0");
+                ok = true;
+            }
+            if (ok) {
+                hostScreenOff = !screenOn;
+            }
+        }
+        if (ok) {
+            if (!screenOn) {
+                wakeMonitor.start(() -> setPrimaryPhysicalDisplayPower(true));
+            } else {
+                wakeMonitor.stop();
+            }
+        }
+        System.out.println("OPALDESK_HOST_SCREEN_POWER on=" + screenOn + " ok=" + ok);
+        return ok;
+    }
+
+    private Method resolveSetDisplayPowerModeLocked() {
+        if (surfaceControlSetPowerModeMethod != null) return surfaceControlSetPowerModeMethod;
+        try {
+            Class<?> sc = Class.forName("android.view.SurfaceControl");
+            Method m = sc.getDeclaredMethod("setDisplayPowerMode", IBinder.class, int.class);
+            m.setAccessible(true);
+            surfaceControlSetPowerModeMethod = m;
+            return m;
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_SC_POWER_METHOD_WARN: " + unwrapMessage(e));
+            return null;
+        }
+    }
+
+    private IBinder resolvePrimaryPhysicalDisplayTokenLocked() {
+        long preferredPhysicalId = queryDefaultPhysicalDisplayId();
+        // 1. Android 14-17: com.android.server.display.DisplayControl inside /system/framework/services.jar
+        if (Build.VERSION.SDK_INT >= 34) {
+            IBinder tok = resolveTokenFromDisplayControlLocked(preferredPhysicalId);
+            if (tok != null) return tok;
+        }
+        // 2. Android 11-13 (and fallback): android.view.SurfaceControl static token helpers
+        try {
+            Class<?> sc = Class.forName("android.view.SurfaceControl");
+            if (preferredPhysicalId != 0L) {
+                try {
+                    Method getTok = sc.getDeclaredMethod("getPhysicalDisplayToken", long.class);
+                    getTok.setAccessible(true);
+                    IBinder tok = (IBinder) getTok.invoke(null, preferredPhysicalId);
+                    if (tok != null) return tok;
+                } catch (ReflectiveOperationException ignored) {
+                }
+            }
+            try {
+                Method getIds = sc.getDeclaredMethod("getPhysicalDisplayIds");
+                Method getTok = sc.getDeclaredMethod("getPhysicalDisplayToken", long.class);
+                getIds.setAccessible(true);
+                getTok.setAccessible(true);
+                long[] ids = (long[]) getIds.invoke(null);
+                if (ids != null && ids.length > 0) {
+                    IBinder tok = (IBinder) getTok.invoke(null, ids[0]);
+                    if (tok != null) return tok;
+                }
+            } catch (ReflectiveOperationException ignored) {
+            }
+            try {
+                Method getInternal = sc.getDeclaredMethod("getInternalDisplayToken");
+                getInternal.setAccessible(true);
+                IBinder tok = (IBinder) getInternal.invoke(null);
+                if (tok != null) return tok;
+            } catch (ReflectiveOperationException ignored) {
+            }
+        } catch (ReflectiveOperationException | RuntimeException e) {
+            System.err.println("OPALDESK_SC_TOKEN_WARN: " + unwrapMessage(e));
+        }
+        return null;
+    }
+
+    private IBinder resolveTokenFromDisplayControlLocked(long preferredPhysicalId) {
+        try {
+            Class<?> dc = ensureDisplayControlClassLocked();
+            if (dc == null) return null;
+            Method getTok = dc.getDeclaredMethod("getPhysicalDisplayToken", long.class);
+            getTok.setAccessible(true);
+            if (preferredPhysicalId != 0L) {
+                IBinder tok = (IBinder) getTok.invoke(null, preferredPhysicalId);
+                if (tok != null) return tok;
+            }
+            Method getIds = dc.getDeclaredMethod("getPhysicalDisplayIds");
+            getIds.setAccessible(true);
+            long[] ids = (long[]) getIds.invoke(null);
+            if (ids != null && ids.length > 0) {
+                return (IBinder) getTok.invoke(null, ids[0]);
+            }
+        } catch (ReflectiveOperationException | RuntimeException | UnsatisfiedLinkError e) {
+            System.err.println("OPALDESK_DISPLAY_CONTROL_WARN: " + unwrapMessage(e));
+        }
+        return null;
+    }
+
+    private Class<?> ensureDisplayControlClassLocked() {
+        if (displayControlResolved) return displayControlClass;
+        displayControlResolved = true;
+        try {
+            Class<?> clFactoryCls = Class.forName("com.android.internal.os.ClassLoaderFactory");
+            Method createCl = clFactoryCls.getDeclaredMethod(
+                    "createClassLoader",
+                    String.class, String.class, String.class,
+                    ClassLoader.class, int.class, boolean.class, String.class);
+            createCl.setAccessible(true);
+            ClassLoader cl = (ClassLoader) createCl.invoke(
+                    null,
+                    "/system/framework/services.jar",
+                    null,
+                    null,
+                    ClassLoader.getSystemClassLoader(),
+                    Build.VERSION.SDK_INT,
+                    true,
+                    null);
+            Class<?> dc = cl.loadClass("com.android.server.display.DisplayControl");
+            loadAndroidServersNativeLib(dc);
+            displayControlClass = dc;
+            return dc;
+        } catch (Throwable t) {
+            System.err.println("OPALDESK_DISPLAY_CONTROL_INIT_WARN: " + unwrapMessage(t));
+            return null;
+        }
+    }
+
+    private static void loadAndroidServersNativeLib(Class<?> displayControlCls) {
+        try {
+            Method m = Runtime.class.getDeclaredMethod("loadLibrary0", Class.class, String.class);
+            m.setAccessible(true);
+            m.invoke(Runtime.getRuntime(), displayControlCls, "android_servers");
+            return;
+        } catch (ReflectiveOperationException ignored) {
+        }
+        try {
+            Method m = Runtime.class.getDeclaredMethod("loadLibrary0", ClassLoader.class, Class.class, String.class);
+            m.setAccessible(true);
+            m.invoke(Runtime.getRuntime(), displayControlCls.getClassLoader(), displayControlCls, "android_servers");
+            return;
+        } catch (ReflectiveOperationException ignored) {
+        }
+        try {
+            System.loadLibrary("android_servers");
+        } catch (UnsatisfiedLinkError ignored) {
+        }
+    }
+
+    private long queryDefaultPhysicalDisplayId() {
+        if (displayManager == null) return 0L;
+        try {
+            Display d0 = displayManager.getDisplay(Display.DEFAULT_DISPLAY);
+            if (d0 == null) return 0L;
+            String uid = VirtualDisplayFactory.getUniqueId(d0);
+            if (uid != null && uid.startsWith("local:")) {
+                return Long.parseLong(uid.substring("local:".length()).trim());
+            }
+        } catch (RuntimeException ignored) {
+        }
+        return 0L;
+    }
+
+    public void focusDisplay(int displayId) {
+        if (displayId < 0) return;
+        focusDisplayTaskOnly(displayId);
         if (moveDisplayToTopMethod != null && iWindowManager != null) {
             try {
                 moveDisplayToTopMethod.invoke(iWindowManager, displayId, "OpalDesk");
+            } catch (ReflectiveOperationException | RuntimeException ignored) {
+            }
+        }
+    }
+
+    /**
+     * Focuses the top task inside {@code displayId} without moving that VirtualDisplay above
+     * Display 0, preserving Display 0 window focus whenever a local IME bridge or search box is active.
+     */
+    public void focusDisplayTaskOnly(int displayId) {
+        if (displayId < 0) return;
+        if (focusTopTaskMethod != null && iActivityTaskManager != null) {
+            try {
+                focusTopTaskMethod.invoke(iActivityTaskManager, displayId);
             } catch (ReflectiveOperationException | RuntimeException ignored) {
             }
         }
@@ -504,6 +745,44 @@ public final class AndroidServices {
                     }
                 }
             }
+        }
+    }
+
+    /**
+     * Queries the live {@code input_method} system service in-process via {@link IBinder#dump}
+     * using an OS pipe drained concurrently so large view-hierarchy dumps never deadlock.
+     */
+    public static ImmsDumpInspector.Snapshot inspectInputMethodService(int targetDisplayId) {
+        if (targetDisplayId <= 0) return null;
+        IBinder immsBinder = getServiceBinder("input_method");
+        if (immsBinder == null) return null;
+        ParcelFileDescriptor[] pipe = null;
+        try {
+            pipe = ParcelFileDescriptor.createPipe();
+            final ParcelFileDescriptor readEnd = pipe[0];
+            final ParcelFileDescriptor writeEnd = pipe[1];
+            IMMS_DUMP_WRITER.execute(() -> {
+                try {
+                    immsBinder.dump(writeEnd.getFileDescriptor(), new String[0]);
+                } catch (RemoteException | RuntimeException ignored) {
+                } finally {
+                    try {
+                        writeEnd.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            });
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new ParcelFileDescriptor.AutoCloseInputStream(readEnd), StandardCharsets.UTF_8),
+                    8192)) {
+                return ImmsDumpInspector.parseReader(br, targetDisplayId);
+            }
+        } catch (IOException | RuntimeException e) {
+            if (pipe != null) {
+                try { pipe[0].close(); } catch (IOException ignored) {}
+                try { pipe[1].close(); } catch (IOException ignored) {}
+            }
+            return null;
         }
     }
 

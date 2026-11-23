@@ -128,6 +128,56 @@ public final class TaskApiAdapter {
         return fallbackTid;
     }
 
+    /**
+     * Returns the taskId on {@code displayId} ONLY if the task is currently visible, running,
+     * and still hosts at least one active Activity. Returns {@code -1} when the app has finished
+     * or called {@code moveTaskToBack(true)} (which otherwise leaves a blank VirtualDisplay).
+     */
+    public int findTopVisibleTaskIdOnDisplay(int displayId, String expectedPkg) {
+        if (displayId <= 0) return -1;
+        List<?> running = getTasks();
+        if (running == null) return -1;
+        int fallbackTid = -1;
+        for (Object t : running) {
+            if (t == null || readIntField(t, "displayId", -1) != displayId) continue;
+            if (!isTaskVisibleAndActive(t)) continue;
+            int tid = extractTaskId(t);
+            if (tid <= 0) continue;
+            String p = extractTaskPkg(t);
+            if (expectedPkg != null && expectedPkg.equals(p)) return tid;
+            if (fallbackTid <= 0) fallbackTid = tid;
+        }
+        return fallbackTid;
+    }
+
+    /**
+     * Returns {@code true} if {@code taskId} (or another task on {@code displayId}) is still in
+     * {@code getTasks()} with {@code isRunning && numActivities > 0} (e.g. moved to back rather than
+     * exited). Ignores {@code getRecentTasks()}, which retains finished/dead tasks indefinitely.
+     */
+    public boolean isTaskRunningWithActivities(int taskId, int displayId) {
+        List<?> running = getTasks();
+        if (running == null) return false;
+        for (Object t : running) {
+            if (t == null) continue;
+            int tid = extractTaskId(t);
+            int dId = readIntField(t, "displayId", -1);
+            boolean matches = (taskId > 0 && tid == taskId) || (displayId > 0 && dId == displayId);
+            if (!matches) continue;
+            if (readBooleanField(t, "isRunning", true) && readIntField(t, "numActivities", 1) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isTaskVisibleAndActive(Object taskInfo) {
+        if (!readBooleanField(taskInfo, "isVisible", true)) return false;
+        if (!readBooleanField(taskInfo, "isRunning", true)) return false;
+        if (readIntField(taskInfo, "numActivities", 1) <= 0) return false;
+        return readObjField(taskInfo, "topActivity") != null;
+    }
+
     public boolean moveRootTaskToDisplay(int taskId, int targetDisplayId) {
         if (taskId <= 0 || targetDisplayId <= 0 || atm == null) return false;
         try {
@@ -362,6 +412,23 @@ public final class TaskApiAdapter {
                 Field f = c.getDeclaredField(name);
                 f.setAccessible(true);
                 return f.getInt(obj);
+            } catch (NoSuchFieldException ignored) {
+                c = c.getSuperclass();
+            } catch (IllegalAccessException | IllegalArgumentException e) {
+                return def;
+            }
+        }
+        return def;
+    }
+
+    public static boolean readBooleanField(Object obj, String name, boolean def) {
+        if (obj == null) return def;
+        Class<?> c = obj.getClass();
+        while (c != null && c != Object.class) {
+            try {
+                Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.getBoolean(obj);
             } catch (NoSuchFieldException ignored) {
                 c = c.getSuperclass();
             } catch (IllegalAccessException | IllegalArgumentException e) {

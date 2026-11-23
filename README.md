@@ -1,8 +1,38 @@
-# OpalDesk (`v1.0.0` · Universal Compositor Edition)
+# OpalDesk (`v1.0.1` · Universal Compositor Edition)
 
 > **全品牌安卓通用 · 免 Root 优先 · Wayland 式「一窗一独立虚拟屏」120fps 液态毛玻璃多窗合成工作站**
 
-**OpalDesk v1.0.0** 完成了自项目启动以来最彻底的一次底层架构重写。我们完全摒弃了早期基于系统自由小窗（Freeform）与悬浮窗贴片拼接的传统路线，从零打造了一套面向 **Android 11–17** 的 **Wayland 式独立虚拟屏池 + 客户端 GPU 统一合成引擎**，并配套全新设计的 **macOS 液态毛玻璃（Liquid Frosted Glass）桌面环境**、**物理键鼠全局跨屏路由**、**多列 Pro 分屏工作流** 以及 **Android ↔ Mac / Android ↔ Android 跨设备单向互投**。
+**OpalDesk** 是一套面向 **Android 11–17** 的 **Wayland 式独立虚拟屏池 + 客户端 GPU 统一合成工作站**，彻底摒弃厂商私有 Freeform 小窗与分体悬浮标题栏路线，集 **macOS 液态毛玻璃多窗桌面**、**外接 2K/4K 高刷显示器工作站**、**物理键鼠全局跨屏路由**、**跨设备单应用悬浮窗** 与 **Android ↔ Mac / Android ↔ Android 局域网单向互投** 于一体。经过多轮真机实测与专项打磨，**v1.0.1** 在功能完整度与日常可用性上进一步趋于成熟稳定，核心链路均配套全量 JVM 单元测试与实机回归验证，力求做到**开箱即用、功能齐全、少 Bug、稳如原生**。
+
+---
+
+## 🆕 v1.0.1 功能完善、性能优化与稳定性修复
+
+相比 `v1.0.0` 架构首发版，`v1.0.1` 围绕**日常高频交互、跨设备互联、输入法与焦点稳定性、低功耗投屏**完成了大量细节打磨与边界 Bug 清零：
+
+### 1. 无 PIN 交互式授权配对 & 信任设备即时撤销
+- **彻底移除 6 位 PIN 码**：跨设备投屏发起连接后，宿主端直接通过**应用内毛玻璃授权弹窗**或**高优先级系统通知栏操作按钮**一键选择 **「永久允许」**、**「仅本次允许」** 或 **「拒绝」**，零记忆负担、秒连即用。
+- **可控的信任管理**：主控台新增「已永久信任设备」列表，支持按设备**单项随时撤销**或**一键全部撤销**，撤销后立即清除凭据并断开会话。
+
+### 2. 跨设备单应用全局悬浮窗（macOS 风格独立窗口投射）
+- **边用本机、边控远端应用**：新增接收端单应用悬浮窗模式（按需请求 `SYSTEM_ALERT_WINDOW` 权限），可从已配对手机/平板的应用目录中任选单个应用，以**独立系统悬浮窗**形式悬浮在本机其他应用之上运行。
+- **桌面级自由操控**：支持标题栏拖拽移动、边角实时缩放并自动重协商远端虚拟屏分辨率、横竖屏一键切换、返回键、内联输入条、一键折叠收纳为悬浮球，以及远端应用退出后自动清理关闭。
+- **并发与互斥保护**：升级引用计数式单向互斥锁（`OpalPeerCastMutex`），多单应用浮窗与全屏互投并行稳定，依然严格杜绝双向互投死循环。
+
+### 3. Android 11–17 跨屏输入法与双屏焦点保持全面重构
+- **攻克 Android 17（SDK 37）输入法闪退/弹不出难题**：针对 Android 17 `InsetsController` 重构导致跨屏回退键盘被 `RemoteInsetsControlTarget` 瞬间中止的问题，新增纯 AOSP、零子进程开销的 `ImmsDumpInspector` 监听机制，在原生跨屏键盘未弹出时自动桥接宿主全宽输入法（支持中文拼音、手写、语音及最长 64 字符 ASCII 硬件键值直通），同时在原生跨屏输入法工作正常的系统（如 Android 16）上零干预放行。
+- **双屏独立焦点，光标不再丢失**：虚拟屏采用 `VD_FLAGS_TRUSTED_FOCUS`（保留 `VIRTUAL_DISPLAY_FLAG_OWN_FOCUS`），无论直接点击微信等应用输入框还是点击底部 Dock 键盘按钮，受管应用均**持续保持窗口焦点与闪烁光标**，告别「一点键盘就失焦」的痛点。
+- **密码框防黑屏 & 键盘类型智能适配**：自动识别数字/验证码输入框并拉起数字键盘；将密码框安全映射至宿主全宽普通文本键盘，彻底解决部分 ROM 安全输入法（`FLAG_SECURE`）渲染进非安全虚拟屏导致整窗黑屏的问题。
+
+### 4. 外接屏 / 投屏物理熄屏省电 & 双击亮屏唤醒
+- 控制中心支持一键调用标准 AOSP `SurfaceControl.setDisplayPowerMode` **物理熄灭本机屏幕**，系统与虚拟屏渲染保持 120fps 全速运行不休眠，显著降低 OLED 发热与续航消耗。
+- 内置低开销双击唤醒检测（`HostScreenWakeMonitor` / `DoubleTapWakeDetector`），熄屏期间**双击本机屏幕即可随时亮屏**，断开外接屏或投屏时亦会自动安全恢复亮屏。
+
+### 5. 高频体验细节优化与边界 Bug 清零
+- **反复返回键残留白屏修复**：通过 `TaskApiAdapter` 精准核验虚拟屏内顶层可见任务与 Activity 存活状态，应用连续按返回键退出至根页或退入后台时自动回收虚拟屏并关闭空窗，不再出现点不动的白屏残影。
+- **控制中心顶部常显「退出 DeX」按钮**：将红色高亮的「退出 DeX」按钮直接置顶于右上角控制中心标题栏（打开免滚动一键触达），并全面开放至本地桌面、外接显示器与投屏工作站全部模式。
+- **视频全屏顶边空白修复 & 实时画质热切换**：修复哔哩哔哩等视频应用全屏投屏时顶部状态栏区域留白问题；控制中心新增 **自动 / 60Hz / 90Hz / 120Hz 实时帧率切换**、**紧凑 80% / 标准 100% / 大号 125% 窗口 DPI 热刷新** 与面板峰值刷新率锁定，避免动态降帧卡顿。
+- **崩溃隐患排查与测试加固**：修复 Android ICU 正则语法差异引发的配对 JSON 解析崩溃；新增 `ImmsDumpInspectorTest`、`PairingApprovalCoordinatorTest`、`TrustStoreManagerTest`、`ExternalMouseRouterTest`、`CompositorEngineTest` 与 `OpalPeerCastMutexTest` 等全量 JVM 单元测试，保障多场景长期稳定运行。
 
 ---
 
@@ -72,7 +102,7 @@ flowchart LR
 
 ---
 
-## ✨ v1.0.0 核心特性
+## ✨ 核心特性一览
 
 ### 1. Wayland 式 `VirtualDisplayPool` + LRU `TaskSnapshot` 智能休眠
 - **彻底告别厂商小窗限制**：每个受管应用在各自的 `OpalWin-<id>` 虚拟屏中以原生全屏运行，无系统强加白边、无弹窗劫持、无焦点乱跳。
@@ -115,22 +145,23 @@ flowchart LR
 │   │   ├── DaemonConfig.java                  # 无厂商耦合配置与单应用窗口偏好持久化
 │   │   ├── DisplayGeometryUtil.java           # 偶数像素对齐、吸附分区、DPI 与层叠几何算法
 │   │   ├── compositor/                        # WindowProfile / WindowSession / VirtualDisplayPool / CompositorEngine
-│   │   ├── input/                             # PerDisplayInputRouter (IInputManager+/dev/uhid) & ExternalMouseRouter
+│   │   ├── input/                             # PerDisplayInputRouter / ImmsDumpInspector / ExternalMouseRouter / DoubleTapWakeDetector
 │   │   ├── ipc/                               # BridgeProtocol (v2) / UID+APK签名校验 Binder IPC / 单实例 Socket
-│   │   ├── platform/                          # 隔离的 AOSP 隐藏 API 反射适配层与可选 RootEnhancer
-│   │   └── stream/                            # OpalCastCompositorBridge / 64位 Linux UHID 协议 / 轻量 JSON
+│   │   ├── platform/                          # 隔离的 AOSP 隐藏 API 反射适配层 / HostScreenWakeMonitor / 可选 RootEnhancer
+│   │   ├── security/                          # TrustStoreManager & PairingApprovalCoordinator (无 PIN 交互授权)
+│   │   └── stream/                            # OpalCastCompositorBridge / RemoteStreamServer / 64位 Linux UHID / 轻量 JSON
 │   └── test/                                  # 纯 JVM JUnit 4 单元测试（零真机依赖）
 ├── helper/                                    # Android 客户端 (:helper, Kotlin 21 + Compose Foundation)
 │   ├── src/io/github/lengsukq/opaldesk/
 │   │   ├── MainActivity.kt                    # 液态毛玻璃主控台
-│   │   ├── DesktopActivity.kt                 # 本机 120fps 全屏沉浸多窗工作站与快捷键
+│   │   ├── DesktopActivity.kt                 # 本机 120fps 全屏沉浸多窗工作站、快捷键与自动 IME 桥接
 │   │   ├── ExternalDesktopActivity.kt         # Type-C / HDMI 外接独立桌面管理与精密触控板宿主
 │   │   ├── compositor/                        # OpalCompositorWorkspace / CompositorWindowNode / WindowSurfaceHost / DesktopTaskbar
 │   │   ├── external/                          # ExternalMonitorPresentation (独立生命周期) & DexTrackpadScreen
-│   │   ├── cast/                              # OpalPeerCastMutex / OpalPeerDiscovery / OpalCastPeerClient / PeerCastViewerActivity
+│   │   ├── cast/                              # OpalPeerCastMutex / OpalPeerDiscovery / PeerCastViewerActivity / PeerFloatingAppService / RemoteAppPickerModal
 │   │   ├── prefs/                             # AppPrefs & WallpaperStorage (自定义相册壁纸持久化)
 │   │   ├── protocol/                          # BridgeProtocol & CompositorModels (多列分屏 & 光标锚点算法)
-│   │   ├── ui/                                # 无厂商耦合 OpalPrimitives 液态毛玻璃组件库 / ConsoleTabs / ActivationModal
+│   │   ├── ui/                                # OpalPrimitives / NativeImeBridge / PairingConsentModal / ConsoleTabs / ActivationModal
 │   │   └── adb/                               # 内置无线 ADB 三级投递、mDNS 自动发现与 Shizuku 引导
 │   └── test/                                  # 几何算法、防互投互斥锁与引导安全单元测试
 ├── macos/OpalDeskMac/                         # 原生 Swift 6 macOS 伴侣接收端与单元测试
@@ -142,9 +173,9 @@ flowchart LR
 
 ## 📦 下载与安装
 
-前往 **[GitHub Releases](https://github.com/lengsukq/OpalDesk/releases)** 获取 `v1.0.0` 官方构建产物：
-- **Android 端**：`OpalDesk_v1.0.0.apk`（已内嵌对应签名的守护进程 `opaldesk.jar`）
-- **macOS 伴侣端**：`OpalDesk_v1.0.0-macos.zip`（Apple Silicon / macOS 14+ 原生 Swift 6 应用）
+前往 **[GitHub Releases](https://github.com/lengsukq/OpalDesk/releases)** 获取 `v1.0.1` 官方构建产物：
+- **Android 端**：`OpalDesk_v1.0.1.apk`（已内嵌对应签名的守护进程 `opaldesk.jar`）
+- **macOS 伴侣端**：`OpalDesk_v1.0.1-macos.zip`（Apple Silicon / macOS 14+ 原生 Swift 6 应用）
 
 安装 APK 后，打开 App 可直接通过 **内置无线调试（免电脑）** 或 **Shizuku** 一键激活；也可以连接电脑执行下方跨平台单行 ADB 命令：
 

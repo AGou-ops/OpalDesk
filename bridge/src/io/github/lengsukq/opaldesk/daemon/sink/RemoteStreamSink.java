@@ -396,13 +396,9 @@ public final class RemoteStreamSink implements DisplaySink {
                         MediaFormat fmt = buildVideoFormat(mime, w, h, fps, bitrateKbps, lowLatency);
                         codec.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                         surf = codec.createInputSurface();
-                        if (surf != null && Build.VERSION.SDK_INT >= 30) {
-                            try {
-                                surf.setFrameRate(fps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
-                            } catch (RuntimeException e) {
-                                System.err.println("OPALDESK_ENCODER_FPS_HINT_WARN: " + e.getMessage());
-                            }
-                        }
+                        // Do NOT call surf.setFrameRate(fps, FIXED_SOURCE) on MediaCodec's GraphicBufferSource:
+                        // on Android 14-16 / HyperOS it pins VirtualDisplay refreshRateOverride to `fps`, which
+                        // stalls SurfaceFlinger output to 0 FPS whenever Display 0 switches to 120Hz Touch Boost.
                         codec.start();
                         System.out.println("OPALDESK_ENCODER_STARTED mime=" + mime
                                 + " codec=" + (selected.codecName != null ? selected.codecName : "default")
@@ -515,21 +511,32 @@ public final class RemoteStreamSink implements DisplaySink {
         fmt.setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1000);
         int targetFps = Math.max(15, Math.round(fps));
         fmt.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps);
-        // Longer GOP interval avoids periodic giant IDR stutter spikes on desktop content;
+        // Balanced GOP interval avoids giant IDR spikes while keeping recovery snappy;
         // on-demand REQUEST_IDR handles instant recovery when needed.
-        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 10);
-        // Keepalive repeat at 2Hz on static desktop to save Wi-Fi/USB bandwidth.
-        fmt.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 500_000L);
+        fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 5);
+        // Keepalive repeat at 10Hz on static desktop: tiny HEVC skip frames (<50 kbps) that prevent
+        // receiver panels (e.g. HyperOS MiMediaCodec) from throttling refresh rate down to 30Hz.
+        fmt.setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L);
         if (lowLatency) {
             fmt.setInteger(MediaFormat.KEY_PRIORITY, 0);
-            fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, Math.max(60, targetFps));
+            fmt.setInteger(MediaFormat.KEY_OPERATING_RATE, Math.max(120, targetFps));
+            if (Build.VERSION.SDK_INT >= 30) {
+                // Critical on Qualcomm C2 (c2.qti.hevc.encoder): disables CVPFilter/evaDme 4-frame
+                // lookahead buffering (~400ms latency) and unlocks true zero-lookahead encoding.
+                fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+            }
             if (Build.VERSION.SDK_INT >= 26) {
-                fmt.setInteger(MediaFormat.KEY_LATENCY, 0);
+                // MediaFormat.KEY_LATENCY is 1-based ("emit 1 output frame after N input frames"):
+                // passing 0 is ignored by Qualcomm C2 (leaving 4-6 frame CVP lookahead); 1 requests
+                // immediate frame-by-frame output with zero lookahead.
+                fmt.setInteger(MediaFormat.KEY_LATENCY, 1);
             }
             if (Build.VERSION.SDK_INT >= 29) {
                 fmt.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0);
             }
-            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
+            // CBR disables Qualcomm C2 CVPFilter/evaDme 4-frame lookahead (output delay 4 -> 0)
+            // and prevents 30fps EVA DSP throttling on 2560x1600 high-FPS streams.
+            fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
         }
         return fmt;
     }

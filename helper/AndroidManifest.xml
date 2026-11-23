@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Strictly optional, user-granted overlay permission used ONLY by receiver-side PeerFloatingAppService -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <queries>
         <intent>
@@ -54,15 +56,15 @@
             android:label="OpalDesk 桌面工作站"
             android:launchMode="singleTask"
             android:taskAffinity="io.github.lengsukq.opaldesk.workstation"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="unspecified"
             android:resizeableActivity="true"
-            android:windowSoftInputMode="adjustNothing|stateHidden"
+            android:windowSoftInputMode="adjustNothing|stateUnchanged"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
             android:name=".ExternalDesktopActivity"
-            android:exported="false"
+            android:exported="true"
             android:label="OpalDesk 外接屏工作站"
             android:launchMode="singleInstance"
             android:taskAffinity="io.github.lengsukq.opaldesk.external"
@@ -76,7 +78,7 @@
             android:exported="false"
             android:label="OpalDesk 设备互投接收端"
             android:launchMode="singleTask"
-            android:screenOrientation="sensorLandscape"
+            android:screenOrientation="unspecified"
             android:resizeableActivity="true"
             android:windowSoftInputMode="adjustNothing|stateHidden"
             android:theme="@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
@@ -91,8 +93,21 @@
                 android:value="Universal Android multi-window compositor session and external display host" />
         </service>
 
+        <service
+            android:name=".cast.PeerFloatingAppService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Receiver-side standalone remote app floating window overlay" />
+        </service>
+
         <receiver
             android:name=".AdbPairingReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".PairingActionReceiver"
             android:exported="false" />
 
         <provider

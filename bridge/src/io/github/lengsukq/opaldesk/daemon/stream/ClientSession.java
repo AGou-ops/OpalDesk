@@ -42,6 +42,7 @@ final class ClientSession {
     final int sessionId;
     final int sinkType;
     final boolean isAdbLocalSocket;
+    final boolean permanentTrust;
     final String sessionRole;
     final String appPackage;
     final String clientId;
@@ -65,6 +66,7 @@ final class ClientSession {
             int sessionId,
             int sinkType,
             boolean isAdbLocalSocket,
+            boolean permanentTrust,
             String sessionRole,
             String appPackage,
             String clientId,
@@ -75,6 +77,7 @@ final class ClientSession {
         this.sessionId = sessionId;
         this.sinkType = sinkType;
         this.isAdbLocalSocket = isAdbLocalSocket;
+        this.permanentTrust = permanentTrust;
         this.sessionRole = (sessionRole != null && !sessionRole.isEmpty())
                 ? sessionRole : OpalCastProtocol.SESSION_ROLE_DESKTOP;
         this.appPackage = (appPackage != null) ? appPackage : "";

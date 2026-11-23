@@ -37,7 +37,9 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import io.github.lengsukq.opaldesk.compositor.OpalCompositorWorkspace
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
+import io.github.lengsukq.opaldesk.ui.OpalImeFocusTracker
 import io.github.lengsukq.opaldesk.ui.OpalTheme
+import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
 import kotlin.math.max
 import kotlin.math.min
 
@@ -230,6 +232,13 @@ class ExternalMonitorPresentation(
         } finally {
             ev.recycle()
         }
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
+        if (OpalImeFocusTracker.localComposeTextFieldFocused && super.dispatchKeyEvent(event)) return true
+        if (WorkstationKeyDispatcher.forwardToFocusedWindow(event)) return true
+        return super.dispatchKeyEvent(event)
     }
 
     fun dispatchKeyEventToPresentation(event: KeyEvent): Boolean {

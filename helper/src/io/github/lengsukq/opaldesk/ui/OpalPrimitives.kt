@@ -32,6 +32,7 @@ import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -48,6 +49,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -571,10 +573,22 @@ fun OpalTextInput(
 ) {
     val colors = LocalOpalColors.current
     val shape = RoundedCornerShape(11.dp)
+    var fieldFocused by remember { mutableStateOf(false) }
+    DisposableEffect(Unit) {
+        onDispose {
+            if (fieldFocused) {
+                OpalImeFocusTracker.setLocalTextFieldFocused(false)
+            }
+        }
+    }
     BasicTextField(
         value = value,
         onValueChange = onValueChange,
         singleLine = singleLine,
+        modifier = Modifier.onFocusChanged { st ->
+            fieldFocused = st.isFocused
+            OpalImeFocusTracker.setLocalTextFieldFocused(st.isFocused)
+        },
         textStyle = TextStyle(
             color = colors.textPrimary,
             fontSize = 13.5.sp,

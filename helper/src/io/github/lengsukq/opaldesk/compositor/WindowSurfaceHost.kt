@@ -184,9 +184,11 @@ fun WindowSurfaceHost(
                             }
 
                             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                                val alignedW = (width and 1.inv()).coerceAtLeast(240)
-                                val alignedH = (height and 1.inv()).coerceAtLeast(200)
-                                holderState.updateBufferSize(alignedW, alignedH)
+                                // Keep buffer dimensions strictly synced with the daemon's committed VirtualDisplay
+                                // resolution so transient GPU resize drags never fight SurfaceFlinger's BufferQueue.
+                                val cw = currentWin.contentWidth.coerceAtLeast(240)
+                                val ch = currentWin.contentHeight.coerceAtLeast(200)
+                                holderState.updateBufferSize(cw, ch)
                             }
 
                             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
@@ -203,6 +205,9 @@ fun WindowSurfaceHost(
                         }
 
                         setOnTouchListener { v, ev ->
+                            if (ev?.actionMasked == MotionEvent.ACTION_DOWN) {
+                                v.parent?.requestDisallowInterceptTouchEvent(true)
+                            }
                             forwardMotionEventToWindow(
                                 v.width, v.height, ev, currentWin, currentHeaderPx, currentFocusCb,
                             )

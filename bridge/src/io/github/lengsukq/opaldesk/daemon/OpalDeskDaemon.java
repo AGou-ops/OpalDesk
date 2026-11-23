@@ -11,7 +11,9 @@ import android.os.SystemClock;
 
 import io.github.lengsukq.opaldesk.daemon.compositor.CompositorEngine;
 import io.github.lengsukq.opaldesk.daemon.compositor.VirtualDisplayPool;
+import io.github.lengsukq.opaldesk.daemon.compositor.WindowSession;
 import io.github.lengsukq.opaldesk.daemon.input.ExternalMouseRouter;
+import io.github.lengsukq.opaldesk.daemon.input.ImmsDumpInspector;
 import io.github.lengsukq.opaldesk.daemon.input.PerDisplayInputRouter;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeBinderService;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
@@ -31,6 +33,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Entry point and lifecycle coordinator for the OpalDesk v2 Universal Compositor Shell Daemon.
@@ -57,6 +61,8 @@ public final class OpalDeskDaemon implements Runnable {
     private final TaskStackObserver taskStackObserver;
 
     private final AtomicBoolean shutdownDone = new AtomicBoolean(false);
+    private final AtomicLong imeProbeGen = new AtomicLong(0L);
+    private final AtomicInteger lastHandledImmsShowSeq = new AtomicInteger(-1);
     private volatile long lastNeedBinderRxMs = 0L;
 
     private OpalDeskDaemon(AndroidServices services, RootEnhancer.EnhancementReport rootReport) {
@@ -90,12 +96,19 @@ public final class OpalDeskDaemon implements Runnable {
                 vdPool,
                 displayDriver,
                 this::pushSceneSnapshotAsync);
+        this.compositor.setBackReconcileScheduler(winId -> {
+            mainHandler.postDelayed(() -> bgExec.execute(() -> compositor.reconcileWindowAfterBack(winId)), 240L);
+            mainHandler.postDelayed(() -> bgExec.execute(() -> compositor.reconcileWindowAfterBack(winId)), 560L);
+        });
+        this.inputRouter.setTapUpListener(this::scheduleImeFallbackProbe);
         this.remoteBridge = new OpalCastCompositorBridge(
                 services,
                 config,
                 compositor,
                 displayDriver,
-                inputRouter);
+                inputRouter,
+                mouseRouter);
+        this.remoteBridge.setPairingEventConsumer(helperBridge::pushPairingEvent);
         this.taskStackObserver = new TaskStackObserver(
                 services.iActivityTaskManager,
                 mainHandler,
@@ -112,6 +125,12 @@ public final class OpalDeskDaemon implements Runnable {
                 remoteBridge,
                 this::performShutdownCleanup);
         helperBridge.setControlBinder(binderService);
+        helperBridge.setOnHelperBound(() -> {
+            String pending = remoteBridge.getPendingPairingJson();
+            if (pending != null && !pending.isEmpty()) {
+                helperBridge.pushPairingEvent(pending);
+            }
+        });
         helperBridge.setOnHelperDeath(() -> {
             // Detach orphaned surfaces & restore hardware mice to Display 0 when client UI exits
             mouseRouter.releaseToLocal();
@@ -204,9 +223,60 @@ public final class OpalDeskDaemon implements Runnable {
         helperBridge.pushSceneState(compositor.toSceneJson(), compositor.getStateSeq());
     }
 
+    private void scheduleImeFallbackProbe(int windowId, int displayId, long tapDownUptimeMs) {
+        if (config.shuttingDown || windowId <= 0 || displayId <= 0 || inputRouter.isLocalImeActive()) return;
+        final long gen = imeProbeGen.incrementAndGet();
+        mainHandler.postDelayed(
+                () -> bgExec.execute(() -> runImeFallbackProbe(gen, windowId, displayId, tapDownUptimeMs)),
+                110L);
+        mainHandler.postDelayed(
+                () -> bgExec.execute(() -> runImeFallbackProbe(gen, windowId, displayId, tapDownUptimeMs)),
+                260L);
+    }
+
+    private void runImeFallbackProbe(long gen, int windowId, int displayId, long tapDownUptimeMs) {
+        if (config.shuttingDown || imeProbeGen.get() != gen || inputRouter.isLocalImeActive()) return;
+        WindowSession ws = compositor.getWindowSnapshot(windowId);
+        if (ws == null || !ws.isLive() || !ws.focused || ws.displayId != displayId) return;
+
+        ImmsDumpInspector.Snapshot snap = AndroidServices.inspectInputMethodService(displayId);
+        if (snap == null || imeProbeGen.get() != gen) return;
+
+        if (snap.inputShown) {
+            // Native cross-display fallback IME opened cleanly (e.g. Android 16) — do not interfere.
+            if (snap.latestShowSeq > lastHandledImmsShowSeq.get()) {
+                lastHandledImmsShowSeq.set(snap.latestShowSeq);
+            }
+            imeProbeGen.compareAndSet(gen, gen + 1L);
+            return;
+        }
+
+        long nowUptime = SystemClock.uptimeMillis();
+        if (ImmsDumpInspector.shouldTriggerHostImeBridge(
+                snap, displayId, lastHandledImmsShowSeq.get(), tapDownUptimeMs, nowUptime)) {
+            lastHandledImmsShowSeq.set(snap.latestShowSeq);
+            imeProbeGen.compareAndSet(gen, gen + 1L);
+            int rawType = snap.effectiveInputType(displayId);
+            int hostType = ImmsDumpInspector.sanitizeHostInputType(rawType);
+            System.out.println("OPALDESK_IME_AUTO_BRIDGE win=" + windowId
+                    + " display=" + displayId
+                    + " seq=" + snap.latestShowSeq
+                    + " reason=" + snap.latestShowReason
+                    + " rawType=0x" + Integer.toHexString(rawType)
+                    + " hostType=0x" + Integer.toHexString(hostType));
+            helperBridge.pushImeRequest(windowId, true, hostType);
+        }
+    }
+
     private void performShutdownCleanup() {
         config.shuttingDown = true;
         if (!shutdownDone.compareAndSet(false, true)) return;
+        try {
+            if (services != null && services.isHostScreenOff()) {
+                services.setPrimaryPhysicalDisplayPower(true);
+            }
+        } catch (RuntimeException ignored) {
+        }
         try {
             remoteBridge.shutdown();
         } catch (RuntimeException ignored) {

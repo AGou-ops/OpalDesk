@@ -30,6 +30,8 @@ class BridgeProvider : ContentProvider() {
         return when (method) {
             BridgeProtocol.PROVIDER_METHOD_SET_BINDER -> handleSetBinder(extras)
             BridgeProtocol.PROVIDER_METHOD_SYNC_SCENE -> handleSyncScene(extras)
+            BridgeProtocol.PROVIDER_METHOD_PAIRING_EVENT -> handlePairingEvent(extras)
+            BridgeProtocol.PROVIDER_METHOD_IME_REQUEST -> handleImeRequest(extras)
             else -> Bundle()
         }
     }
@@ -57,6 +59,25 @@ class BridgeProvider : ContentProvider() {
             if (sceneJson.isNotEmpty()) {
                 BridgeClient.onPushedSceneJson(sceneJson, seq)
             }
+        }
+        return Bundle().apply { putBoolean("ok", true) }
+    }
+
+    private fun handlePairingEvent(extras: Bundle?): Bundle {
+        if (!BridgeService.sUserStopping && extras != null) {
+            val pairingJson = extras.getString(BridgeProtocol.EXTRA_PAIRING_JSON).orEmpty()
+            val pending = BridgeClient.onPushedPairingJson(pairingJson)
+            BridgeService.updatePairingNotification(context, pending)
+        }
+        return Bundle().apply { putBoolean("ok", true) }
+    }
+
+    private fun handleImeRequest(extras: Bundle?): Bundle {
+        if (!BridgeService.sUserStopping && extras != null) {
+            val windowId = extras.getInt(BridgeProtocol.EXTRA_IME_WINDOW_ID, -1)
+            val show = extras.getBoolean(BridgeProtocol.EXTRA_IME_SHOW, true)
+            val inputType = extras.getInt(BridgeProtocol.EXTRA_IME_INPUT_TYPE, 0)
+            BridgeClient.onPushedImeRequest(windowId, show, inputType)
         }
         return Bundle().apply { putBoolean("ok", true) }
     }

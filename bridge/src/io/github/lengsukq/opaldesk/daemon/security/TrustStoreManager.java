@@ -2,6 +2,7 @@ package io.github.lengsukq.opaldesk.daemon.security;
 
 import io.github.lengsukq.opaldesk.daemon.util.AtomicFiles;
 import io.github.lengsukq.opaldesk.daemon.util.CryptoHex;
+import io.github.lengsukq.opaldesk.daemon.stream.SimpleJson;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -11,15 +12,21 @@ import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
 /**
- * Manages 6-digit one-time pairing PINs, anti-bruteforce exponential backoff,
- * constant-time credential verification, 32-byte hex authToken issuance, and
- * atomic trusted-client persistence at /data/local/tmp/opaldesk_trusted_peers.conf.
+ * Manages trusted wireless peer credentials (32-byte random hex authTokens stored strictly as
+ * SHA-256 hashes at {@code /data/local/tmp/opaldesk_trusted_clients.conf}), single-use in-memory
+ * handover tokens for one-time catalog->floating-app transitions, and anti-spam rejection backoff.
+ *
+ * <p>Replaces legacy 6-digit static PIN pairing with explicit host consent (allow once / allow
+ * permanently / reject) plus instant per-device revocation.
  */
 public final class TrustStoreManager {
     public static final String DEFAULT_STORE_PATH = "/data/local/tmp/opaldesk_trusted_peers.conf";
@@ -28,6 +35,7 @@ public final class TrustStoreManager {
     public static final long BASE_LOCKOUT_MS = 30_000L;
     public static final long MAX_LOCKOUT_MS = 300_000L;
     public static final long FAILURE_WINDOW_RESET_MS = 10L * 60_000L;
+    public static final long EPHEMERAL_HANDOVER_TTL_MS = 90_000L;
 
     public interface Clock {
         long nowMs();
@@ -47,36 +55,64 @@ public final class TrustStoreManager {
         }
     }
 
-    public static final class AuthResult {
-        public final boolean ok;
-        public final boolean pairedWithPin;
-        public final boolean rateLimited;
-        public final String issuedToken;
+    public static final class TokenVerifyResult {
+        public static final int STATUS_VALID_PERMANENT = 1;
+        public static final int STATUS_VALID_EPHEMERAL = 2;
+        public static final int STATUS_NEEDS_APPROVAL = 0;
+        public static final int STATUS_RATE_LIMITED = -1;
+        public static final int STATUS_INVALID_CLIENT = -2;
+
+        public final int status;
         public final String message;
 
-        private AuthResult(boolean ok, boolean pairedWithPin, boolean rateLimited, String issuedToken, String message) {
-            this.ok = ok;
-            this.pairedWithPin = pairedWithPin;
-            this.rateLimited = rateLimited;
-            this.issuedToken = issuedToken != null ? issuedToken : "";
-            this.message = message != null ? message : "";
+        private TokenVerifyResult(int status, String message) {
+            this.status = status;
+            this.message = (message != null) ? message : "";
         }
 
-        public static AuthResult okToken() {
-            return new AuthResult(true, false, false, "", "Authenticated with trusted token");
+        public boolean isAuthenticated() {
+            return status == STATUS_VALID_PERMANENT || status == STATUS_VALID_EPHEMERAL;
         }
 
-        public static AuthResult okPaired(String newToken) {
-            return new AuthResult(true, true, false, newToken, "Paired with one-time PIN");
+        public boolean isPermanent() {
+            return status == STATUS_VALID_PERMANENT;
         }
 
-        public static AuthResult rejected(String message) {
-            return new AuthResult(false, false, false, "", message);
+        public boolean isRateLimited() {
+            return status == STATUS_RATE_LIMITED;
         }
 
-        public static AuthResult rateLimited(long retryAfterMs) {
+        public static TokenVerifyResult validPermanent() {
+            return new TokenVerifyResult(STATUS_VALID_PERMANENT, "Authenticated with permanent trusted token");
+        }
+
+        public static TokenVerifyResult validEphemeral() {
+            return new TokenVerifyResult(STATUS_VALID_EPHEMERAL, "Authenticated with one-time session transfer token");
+        }
+
+        public static TokenVerifyResult needsApproval() {
+            return new TokenVerifyResult(STATUS_NEEDS_APPROVAL, "Host approval required");
+        }
+
+        public static TokenVerifyResult invalidClient(String msg) {
+            return new TokenVerifyResult(STATUS_INVALID_CLIENT, msg);
+        }
+
+        public static TokenVerifyResult rateLimited(long retryAfterMs) {
             long sec = Math.max(1L, (retryAfterMs + 999L) / 1000L);
-            return new AuthResult(false, false, true, "", "Too many failed attempts; retry in " + sec + "s");
+            return new TokenVerifyResult(STATUS_RATE_LIMITED, "请求过于频繁，请 " + sec + " 秒后重试");
+        }
+    }
+
+    private static final class EphemeralHandover {
+        final String clientId;
+        final String tokenSha256;
+        final long expiresAtMs;
+
+        EphemeralHandover(String clientId, String tokenSha256, long expiresAtMs) {
+            this.clientId = clientId;
+            this.tokenSha256 = tokenSha256;
+            this.expiresAtMs = expiresAtMs;
         }
     }
 
@@ -91,9 +127,9 @@ public final class TrustStoreManager {
     private final Clock clock;
     private final Object lock = new Object();
     private final LinkedHashMap<String, TrustedPeer> peers = new LinkedHashMap<>();
+    private final Map<String, EphemeralHandover> ephemeralHandovers = new HashMap<>();
     private final Map<String, FailureBucket> failureBuckets = new HashMap<>();
     private final FailureBucket globalFailures = new FailureBucket();
-    private String activePin;
 
     public TrustStoreManager() {
         this(new File(DEFAULT_STORE_PATH), new SecureRandom(), System::currentTimeMillis);
@@ -107,120 +143,77 @@ public final class TrustStoreManager {
         this.storeFile = storeFile;
         this.rng = (rng != null) ? rng : new SecureRandom();
         this.clock = (clock != null) ? clock : System::currentTimeMillis;
-        this.activePin = generateRandomPin();
         loadFromDisk();
     }
 
-    public String getActivePin() {
-        synchronized (lock) {
-            if (activePin == null || activePin.length() != 6) {
-                activePin = generateRandomPin();
-            }
-            return activePin;
-        }
-    }
-
-    public String regeneratePin() {
-        synchronized (lock) {
-            activePin = generateRandomPin();
-            return activePin;
-        }
-    }
-
     /**
-     * Authenticates a Wi-Fi client using either an existing trusted authToken or the active 6-digit PIN.
+     * Checks whether {@code providedToken} grants immediate authentication for {@code rawClientId},
+     * or whether the request is currently rate-limited, or needs interactive host approval.
+     *
+     * <p>A revoked or stale token gracefully falls through to {@link TokenVerifyResult#needsApproval()}
+     * instead of permanently blocking the user after revocation.
      */
-    public AuthResult authenticate(
+    public TokenVerifyResult verifyTokenOrCheckRateLimit(
             String rawClientId,
             String rawClientName,
             String providedToken,
-            String providedPin,
             String peerRateLimitKey) {
         String clientId = sanitizeClientId(rawClientId);
         if (clientId.isEmpty()) {
-            return AuthResult.rejected("Missing or invalid clientId");
+            return TokenVerifyResult.invalidClient("Missing or invalid clientId");
         }
         String clientName = sanitizeClientName(rawClientName, clientId);
-        String bucketKey = (peerRateLimitKey == null || peerRateLimitKey.trim().isEmpty())
-                ? "unknown" : peerRateLimitKey.trim();
+        String bucketKey = normalizeBucketKey(peerRateLimitKey);
 
         synchronized (lock) {
             long now = clock.nowMs();
+            pruneExpiredEphemeralsLocked(now);
 
-            // 1. Check trusted token first (allowed when client already paired).
             if (providedToken != null && !providedToken.isEmpty()) {
+                String providedHash = CryptoHex.sha256Hex(providedToken);
+                // 1. Check permanent trusted peer store
                 TrustedPeer existing = peers.get(clientId);
-                if (existing != null) {
-                    String providedHash = CryptoHex.sha256Hex(providedToken);
-                    if (constantTimeEquals(existing.tokenSha256, providedHash)) {
-                        clearFailuresLocked(bucketKey);
-                        if (!existing.clientName.equals(clientName)) {
-                            peers.put(clientId, new TrustedPeer(
-                                    clientId, clientName, existing.tokenSha256, existing.createdAtMs));
-                            saveToDiskLocked();
-                        }
-                        return AuthResult.okToken();
+                if (existing != null && constantTimeEquals(existing.tokenSha256, providedHash)) {
+                    clearFailuresLocked(bucketKey);
+                    if (!existing.clientName.equals(clientName)) {
+                        peers.put(clientId, new TrustedPeer(
+                                clientId, clientName, existing.tokenSha256, existing.createdAtMs));
+                        saveToDiskLocked();
                     }
+                    return TokenVerifyResult.validPermanent();
                 }
-                // If token is invalid and no PIN was provided, reject & count failure to deter token probing.
-                if (providedPin == null || providedPin.isEmpty()) {
-                    long lockWait = checkLockoutLocked(bucketKey, now);
-                    if (lockWait > 0) {
-                        return AuthResult.rateLimited(lockWait);
-                    }
-                    recordFailureLocked(bucketKey, now);
-                    return AuthResult.rejected("Invalid or revoked authToken");
+
+                // 2. Check single-use in-memory handover token (consumed immediately on match)
+                EphemeralHandover eph = ephemeralHandovers.get(clientId);
+                if (eph != null && eph.expiresAtMs >= now && constantTimeEquals(eph.tokenSha256, providedHash)) {
+                    ephemeralHandovers.remove(clientId);
+                    clearFailuresLocked(bucketKey);
+                    return TokenVerifyResult.validEphemeral();
                 }
             }
 
-            // 2. Check lockout before PIN verification.
             long lockWait = checkLockoutLocked(bucketKey, now);
-            if (lockWait > 0) {
-                return AuthResult.rateLimited(lockWait);
+            if (lockWait > 0L) {
+                return TokenVerifyResult.rateLimited(lockWait);
             }
-
-            // 3. Verify 6-digit one-time PIN in constant time.
-            String pin = (providedPin == null) ? "" : providedPin.trim();
-            if (pin.isEmpty()) {
-                return AuthResult.rejected("Pairing PIN required");
-            }
-            if (!constantTimeEquals(activePin, pin)) {
-                recordFailureLocked(bucketKey, now);
-                long postWait = checkLockoutLocked(bucketKey, now);
-                if (postWait > 0) {
-                    return AuthResult.rateLimited(postWait);
-                }
-                return AuthResult.rejected("Invalid pairing PIN");
-            }
-
-            // 4. PIN accepted: issue fresh 32-byte random hex token, persist, and rotate one-time PIN!
-            clearFailuresLocked(bucketKey);
-            String newToken = generateRandomTokenHex(32);
-            String tokenHash = CryptoHex.sha256Hex(newToken);
-            if (!peers.containsKey(clientId) && peers.size() >= MAX_TRUSTED_CLIENTS) {
-                // Evict oldest trusted client to keep store bounded.
-                String oldestKey = peers.keySet().iterator().next();
-                peers.remove(oldestKey);
-            }
-            peers.put(clientId, new TrustedPeer(clientId, clientName, tokenHash, now));
-            saveToDiskLocked();
-            activePin = generateRandomPin();
-            return AuthResult.okPaired(newToken);
+            return TokenVerifyResult.needsApproval();
         }
     }
 
     /**
-     * Issues and persists a fresh trusted 32-byte hex authToken for a peer that was already
-     * authenticated over a trusted USB/ADB LocalSocket channel (used by REQUEST_WIFI_UPGRADE).
+     * Persists permanent trust for {@code rawClientId} after explicit host consent ("永久允许")
+     * and returns a fresh 64-char hex authToken (only its SHA-256 hash is stored on disk).
      */
-    public String issueTokenForAuthenticatedPeer(String rawClientId, String rawClientName) {
+    public String grantPermanentTrust(String rawClientId, String rawClientName, String peerRateLimitKey) {
         String clientId = sanitizeClientId(rawClientId);
-        if (clientId.isEmpty()) {
-            return "";
-        }
+        if (clientId.isEmpty()) return "";
         String clientName = sanitizeClientName(rawClientName, clientId);
+        String bucketKey = normalizeBucketKey(peerRateLimitKey);
+
         synchronized (lock) {
             long now = clock.nowMs();
+            clearFailuresLocked(bucketKey);
+            ephemeralHandovers.remove(clientId);
             String newToken = generateRandomTokenHex(32);
             String tokenHash = CryptoHex.sha256Hex(newToken);
             if (!peers.containsKey(clientId) && peers.size() >= MAX_TRUSTED_CLIENTS) {
@@ -230,6 +223,50 @@ public final class TrustStoreManager {
             peers.put(clientId, new TrustedPeer(clientId, clientName, tokenHash, now));
             saveToDiskLocked();
             return newToken;
+        }
+    }
+
+    /**
+     * Issues a single-use, in-memory-only transfer token valid for {@link #EPHEMERAL_HANDOVER_TTL_MS}
+     * (never written to disk) so an "allow once" app-catalog lookup can launch one chosen floating
+     * app without prompting the host twice.
+     */
+    public String issueSingleUseHandoverToken(String rawClientId, String peerRateLimitKey) {
+        String clientId = sanitizeClientId(rawClientId);
+        if (clientId.isEmpty()) return "";
+        String bucketKey = normalizeBucketKey(peerRateLimitKey);
+        synchronized (lock) {
+            long now = clock.nowMs();
+            clearFailuresLocked(bucketKey);
+            pruneExpiredEphemeralsLocked(now);
+            String tok = generateRandomTokenHex(32);
+            ephemeralHandovers.put(clientId, new EphemeralHandover(
+                    clientId, CryptoHex.sha256Hex(tok), now + EPHEMERAL_HANDOVER_TTL_MS));
+            return tok;
+        }
+    }
+
+    /**
+     * Issues and persists a fresh trusted 32-byte hex authToken for a peer that was already
+     * authenticated over a trusted USB/ADB LocalSocket channel (used by REQUEST_WIFI_UPGRADE).
+     */
+    public String issueTokenForAuthenticatedPeer(String rawClientId, String rawClientName) {
+        return grantPermanentTrust(rawClientId, rawClientName, "adb");
+    }
+
+    /** Records an explicit host rejection to deter LAN pairing popup spam. */
+    public void recordRejection(String peerRateLimitKey) {
+        String bucketKey = normalizeBucketKey(peerRateLimitKey);
+        synchronized (lock) {
+            recordFailureLocked(bucketKey, clock.nowMs());
+        }
+    }
+
+    /** Clears failure counters when the host grants temporary or permanent access. */
+    public void clearFailures(String peerRateLimitKey) {
+        String bucketKey = normalizeBucketKey(peerRateLimitKey);
+        synchronized (lock) {
+            clearFailuresLocked(bucketKey);
         }
     }
 
@@ -247,8 +284,28 @@ public final class TrustStoreManager {
         }
     }
 
+    public List<TrustedPeer> listTrustedPeers() {
+        synchronized (lock) {
+            return new ArrayList<>(peers.values());
+        }
+    }
+
+    public String toTrustedPeersJson() {
+        synchronized (lock) {
+            SimpleJson.ArrayBuilder arr = new SimpleJson.ArrayBuilder();
+            for (TrustedPeer p : peers.values()) {
+                arr.addRaw(new SimpleJson.ObjectBuilder()
+                        .put("clientId", p.clientId)
+                        .put("clientName", p.clientName)
+                        .put("createdAtMs", p.createdAtMs)
+                        .build());
+            }
+            return arr.build();
+        }
+    }
+
     /**
-     * Formats trusted clients per Binder code 46 contract: {@code clientId=clientName;...}
+     * Formats trusted clients per summary contract: {@code clientId=clientName;...}
      */
     public String listTrustedClientsSummary() {
         synchronized (lock) {
@@ -270,11 +327,13 @@ public final class TrustStoreManager {
         synchronized (lock) {
             if ("*".equals(trimmed)) {
                 peers.clear();
+                ephemeralHandovers.clear();
                 saveToDiskLocked();
                 return true;
             }
             String cid = sanitizeClientId(trimmed);
             if (cid.isEmpty()) return false;
+            ephemeralHandovers.remove(cid);
             boolean removed = (peers.remove(cid) != null);
             if (removed) {
                 saveToDiskLocked();
@@ -324,7 +383,7 @@ public final class TrustStoreManager {
 
     public static String sanitizeClientName(String raw, String fallback) {
         if (raw == null || raw.trim().isEmpty()) {
-            return fallback != null ? fallback : "Mac";
+            return fallback != null ? fallback : "Device";
         }
         StringBuilder sb = new StringBuilder(Math.min(raw.length(), 64));
         for (int i = 0; i < raw.length() && sb.length() < 64; i++) {
@@ -336,18 +395,27 @@ public final class TrustStoreManager {
             }
         }
         String cleaned = sb.toString().trim();
-        return cleaned.isEmpty() ? (fallback != null ? fallback : "Mac") : cleaned;
+        return cleaned.isEmpty() ? (fallback != null ? fallback : "Device") : cleaned;
     }
 
-    private String generateRandomPin() {
-        int val = rng.nextInt(1_000_000);
-        return String.format(Locale.US, "%06d", val);
+    private static String normalizeBucketKey(String key) {
+        return (key == null || key.trim().isEmpty()) ? "unknown" : key.trim();
     }
 
     private String generateRandomTokenHex(int numBytes) {
         byte[] buf = new byte[numBytes];
         rng.nextBytes(buf);
         return CryptoHex.toHex(buf);
+    }
+
+    private void pruneExpiredEphemeralsLocked(long now) {
+        if (ephemeralHandovers.isEmpty()) return;
+        Iterator<Map.Entry<String, EphemeralHandover>> it = ephemeralHandovers.entrySet().iterator();
+        while (it.hasNext()) {
+            if (it.next().getValue().expiresAtMs < now) {
+                it.remove();
+            }
+        }
     }
 
     private long checkLockoutLocked(String bucketKey, long now) {
@@ -361,14 +429,9 @@ public final class TrustStoreManager {
         FailureBucket peer = failureBuckets.computeIfAbsent(bucketKey, k -> new FailureBucket());
         incrementBucket(peer, now);
         incrementBucket(globalFailures, now);
-        // Prevent unbounded map growth from spoofed keys
         if (failureBuckets.size() > 128) {
             failureBuckets.entrySet().removeIf(e ->
                     e.getValue().lockedUntilMs <= now && (now - e.getValue().lastFailureMs) > FAILURE_WINDOW_RESET_MS);
-        }
-        // Rotate PIN after severe global brute-force pressure
-        if (globalFailures.consecutiveFailures >= MAX_FAILURES_BEFORE_LOCKOUT * 2) {
-            activePin = generateRandomPin();
         }
     }
 
@@ -411,9 +474,7 @@ public final class TrustStoreManager {
                     if (parts.length >= 4) {
                         try {
                             created = Long.parseLong(parts[3].trim());
-                        } catch (NumberFormatException nfe) {
-                            System.err.println("OPALDESK_TRUSTSTORE_BAD_TS clientId=" + cid
-                                    + " raw=" + parts[3].trim());
+                        } catch (NumberFormatException ignored) {
                         }
                     }
                     if (!cid.isEmpty() && tokenHash.length() == 64 && peers.size() < MAX_TRUSTED_CLIENTS) {

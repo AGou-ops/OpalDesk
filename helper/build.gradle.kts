@@ -25,8 +25,8 @@ android {
         applicationId = "io.github.lengsukq.opaldesk"
         minSdk = 30
         targetSdk = 37
-        versionCode = 10000
-        versionName = "1.0.0"
+        versionCode = 10001
+        versionName = "1.0.1"
         ndk {
             abiFilters += "arm64-v8a"
         }

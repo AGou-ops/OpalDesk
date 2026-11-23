@@ -44,7 +44,7 @@ public class ClientSessionTest {
         };
 
         ClientSession session = new ClientSession(
-                1, DisplaySink.SINK_REMOTE_USB, true, OpalCastProtocol.SESSION_ROLE_DESKTOP,
+                1, DisplaySink.SINK_REMOTE_USB, true, true, OpalCastProtocol.SESSION_ROLE_DESKTOP,
                 "", "cid", "Mac", transport, out, null);
         sessionRef[0] = session;
 

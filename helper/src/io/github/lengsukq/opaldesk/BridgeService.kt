@@ -16,6 +16,8 @@ import android.os.Looper
 import android.util.Log
 import android.view.Display
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
+import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
+import io.github.lengsukq.opaldesk.protocol.PendingPairingRequest
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -32,6 +34,71 @@ class BridgeService : Service() {
         private const val TAG = "OpalBridgeService"
         private const val CHANNEL_ID = "opaldesk_compositor_session"
         private const val NOTIF_ID = 3910
+        private const val PAIRING_CHANNEL_ID = "opaldesk_pairing_requests"
+        private const val PAIRING_NOTIF_ID = 3915
+
+        fun updatePairingNotification(ctx: Context?, pending: PendingPairingRequest?) {
+            val appCtx = ctx?.applicationContext ?: return
+            val nm = appCtx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+            if (pending == null) {
+                nm.cancel(PAIRING_NOTIF_ID)
+                return
+            }
+            val channel = NotificationChannel(
+                PAIRING_CHANNEL_ID,
+                "无线投屏连接确认",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "当局域网内其他设备请求连接投屏时立即弹出确认横幅"
+                enableVibration(true)
+            }
+            nm.createNotificationChannel(channel)
+
+            val openIntent = Intent(appCtx, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            val openPi = PendingIntent.getActivity(
+                appCtx,
+                3916,
+                openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+
+            fun buildAction(code: Int, decision: Int, label: String): Notification.Action {
+                val i = Intent(appCtx, PairingActionReceiver::class.java).apply {
+                    action = PairingActionReceiver.ACTION_PAIRING_DECISION
+                    putExtra(PairingActionReceiver.EXTRA_REQUEST_ID, pending.requestId)
+                    putExtra(PairingActionReceiver.EXTRA_DECISION, decision)
+                }
+                val pi = PendingIntent.getBroadcast(
+                    appCtx,
+                    code,
+                    i,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                )
+                return Notification.Action.Builder(null, label, pi).build()
+            }
+
+            val remainingMs = (pending.expiresAtMs - System.currentTimeMillis()).coerceIn(5_000L, 65_000L)
+            val peerDesc = if (pending.peerIp.isNotBlank()) "${pending.clientName} (${pending.peerIp})" else pending.clientName
+            val notif = Notification.Builder(appCtx, PAIRING_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_stat_opaldesk)
+                .setContentTitle("收到投屏连接请求")
+                .setContentText("$peerDesc 请求连接本机，是否允许？")
+                .setCategory(Notification.CATEGORY_MESSAGE)
+                .setContentIntent(openPi)
+                .setAutoCancel(false)
+                .setTimeoutAfter(remainingMs)
+                .addAction(buildAction(3921, BridgeProtocol.PairingDecision.APPROVE_PERMANENT, "永久允许"))
+                .addAction(buildAction(3922, BridgeProtocol.PairingDecision.APPROVE_ONCE, "仅本次允许"))
+                .addAction(buildAction(3923, BridgeProtocol.PairingDecision.REJECT, "拒绝"))
+                .build()
+            try {
+                nm.notify(PAIRING_NOTIF_ID, notif)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Failed to post pairing notification: ${t.message}")
+            }
+        }
 
         @Volatile
         var sUserStopping: Boolean = false

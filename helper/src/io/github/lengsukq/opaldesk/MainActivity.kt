@@ -40,6 +40,7 @@ import io.github.lengsukq.opaldesk.adb.ShizukuBootstrap
 import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
 import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
 import io.github.lengsukq.opaldesk.cast.PeerCastViewerActivity
+import io.github.lengsukq.opaldesk.cast.RemoteAppPickerModal
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
@@ -53,6 +54,7 @@ import io.github.lengsukq.opaldesk.ui.OpalSegmentedRow
 import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTheme
+import io.github.lengsukq.opaldesk.ui.PairingConsentModal
 
 /**
  * OpalDesk v1.0.0 macOS Liquid Glass Control Console.
@@ -122,6 +124,9 @@ class MainActivity : ComponentActivity() {
             BridgeClient.refreshStatus()
             BridgeClient.refreshSceneSnapshot()
             val r = BridgeClient.refreshRemoteStatus()
+            BridgeClient.refreshTrustedPeers()
+            val pending = BridgeClient.refreshPendingPairing()
+            BridgeService.updatePairingNotification(this, pending)
             OpalPeerCastMutex.syncDaemonSendingState(r.connected, r.peerName)
             OpalPeerDiscovery.syncAdvertise(this, r.wifiEnabled, r.wifiPort, r.shortCertFingerprint)
             OpalPeerDiscovery.startBrowsing(this, r.lanIp)
@@ -133,7 +138,7 @@ class MainActivity : ComponentActivity() {
         super.onPause()
     }
 
-    private fun launchPeerCastViewer(host: String, port: Int, pin: String, label: String) {
+    private fun launchPeerCastViewer(host: String, port: Int, label: String) {
         val remote = BridgeClient.remoteStatusFlow.value
         val check = OpalPeerCastMutex.validateStartReceiving(
             daemonSending = remote.connected,
@@ -149,7 +154,6 @@ class MainActivity : ComponentActivity() {
             Intent(this, PeerCastViewerActivity::class.java).apply {
                 putExtra(PeerCastViewerActivity.EXTRA_HOST, host)
                 putExtra(PeerCastViewerActivity.EXTRA_PORT, port)
-                putExtra(PeerCastViewerActivity.EXTRA_PIN, pin)
                 putExtra(PeerCastViewerActivity.EXTRA_LABEL, label)
             },
         )
@@ -205,17 +209,20 @@ class MainActivity : ComponentActivity() {
 private fun OpalConsoleScreen(
     onEnterDesktop: () -> Unit,
     onProjectExternalOrTrackpad: (Int) -> Unit,
-    onConnectPeerCast: (String, Int, String, String) -> Unit,
+    onConnectPeerCast: (String, Int, String) -> Unit,
     onPickCustomWallpaper: () -> Unit,
     onStopEngine: () -> Unit,
 ) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
     val status by BridgeClient.statusFlow.collectAsState()
     val scene by BridgeClient.sceneFlow.collectAsState()
     val remote by BridgeClient.remoteStatusFlow.collectAsState()
+    val pendingPairing by BridgeClient.pendingPairingFlow.collectAsState()
     val extDisplay by BridgeService.externalDisplayFlow.collectAsState()
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var showActivationModal by remember { mutableStateOf(false) }
+    var floatingPickerTarget by remember { mutableStateOf<Triple<String, Int, String>?>(null) }
     val wallpaperPreset by AppPrefs.wallpaperPresetFlow.collectAsState()
 
     OpalAmbientBackdrop(modifier = Modifier.fillMaxSize(), wallpaperPreset = wallpaperPreset) {
@@ -242,7 +249,7 @@ private fun OpalConsoleScreen(
                     Column {
                         OpalText(text = "OpalDesk", fontSize = 24.sp, fontWeight = FontWeight.Bold)
                         OpalText(
-                            text = "macOS 液态毛玻璃 × DeX 多窗合成工作站 · v1.0.0",
+                            text = "macOS 液态毛玻璃 × DeX 多窗合成工作站 · v1.0.1",
                             fontSize = 12.sp,
                             color = OpalPalette.TextSecondary,
                         )
@@ -274,10 +281,24 @@ private fun OpalConsoleScreen(
                         onEnterLocalDesktop = onEnterDesktop,
                         onOpenExternalOrTrackpad = onProjectExternalOrTrackpad,
                         onConnectPeerCast = onConnectPeerCast,
+                        onOpenFloatingAppPicker = { host, port, label ->
+                            val check = OpalPeerCastMutex.validateStartReceiving(
+                                daemonSending = remote.connected,
+                                sendingPeerName = remote.peerName,
+                                targetHost = host,
+                                selfLanIp = remote.lanIp,
+                            )
+                            if (!check.allowed) {
+                                Toast.makeText(ctx, check.reason, Toast.LENGTH_LONG).show()
+                            } else {
+                                floatingPickerTarget = Triple(host, port, label)
+                            }
+                        },
                         onOpenActivation = { showActivationModal = true },
                     )
                     1 -> ConsoleDisplaySettingsTab(
                         status = status,
+                        remote = remote,
                         extDisplay = extDisplay,
                         onPickCustomWallpaper = onPickCustomWallpaper,
                     )
@@ -294,6 +315,20 @@ private fun OpalConsoleScreen(
                 onDismiss = { showActivationModal = false },
                 onActivated = { showActivationModal = false },
             )
+        }
+
+        floatingPickerTarget?.let { (host, port, label) ->
+            RemoteAppPickerModal(
+                host = host,
+                port = port,
+                peerLabel = label,
+                onDismiss = { floatingPickerTarget = null },
+                onFloatingLaunched = { floatingPickerTarget = null },
+            )
+        }
+
+        pendingPairing?.let { req ->
+            PairingConsentModal(request = req)
         }
     }
 }

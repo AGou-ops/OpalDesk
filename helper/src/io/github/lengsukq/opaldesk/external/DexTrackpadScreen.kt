@@ -162,68 +162,72 @@ fun DexTrackpadScreen(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            // Top Control Bar
+            // Top Control Bar (horizontally scrollable for compact portrait phones)
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    OpalStatusBadge(
-                        label = "独立满屏 · $monitorSummary",
-                        color = OpalPalette.AccentEmerald,
-                    )
-                    OpalText(
-                        text = "($cursorX, $cursorY)",
-                        fontSize = 11.sp,
-                        fontFamily = FontFamily.Monospace,
-                        color = OpalPalette.TextMuted,
-                    )
-                }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                    OpalButton(
-                        label = if (imeBarVisible) "收起键盘" else "键盘输入",
-                        compact = true,
-                        filled = imeBarVisible,
-                        onClick = { imeBarVisible = !imeBarVisible },
-                    )
-                    OpalButton(
-                        label = "暗屏触控",
-                        compact = true,
-                        filled = false,
-                        onClick = { oledDimMode = true },
-                    )
-                    OpalButton(
-                        label = "主控制台",
-                        compact = true,
-                        filled = false,
-                        onClick = onOpenConsole,
-                    )
-                    OpalButton(
-                        label = "切回本机",
-                        compact = true,
-                        filled = false,
-                        accent = OpalPalette.AccentCyan,
-                        onClick = onSwitchToLocalDesktop,
-                    )
-                    OpalButton(
-                        label = "退出投射",
-                        compact = true,
-                        filled = false,
-                        accent = OpalPalette.AccentDanger,
-                        onClick = onExitExternal,
-                    )
-                }
+                OpalStatusBadge(
+                    label = "独立满屏 · $monitorSummary",
+                    color = OpalPalette.AccentEmerald,
+                )
+                OpalText(
+                    text = "($cursorX, $cursorY)",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = OpalPalette.TextMuted,
+                    maxLines = 1,
+                )
+                OpalButton(
+                    label = if (imeBarVisible) "收起键盘" else "键盘输入",
+                    compact = true,
+                    filled = imeBarVisible,
+                    onClick = { imeBarVisible = !imeBarVisible },
+                )
+                OpalButton(
+                    label = "暗屏触控",
+                    compact = true,
+                    filled = false,
+                    onClick = { oledDimMode = true },
+                )
+                OpalButton(
+                    label = if (status.hostScreenOff) "点亮本机屏" else "物理息屏",
+                    compact = true,
+                    filled = false,
+                    accent = OpalPalette.AccentEmerald,
+                    onClick = { BridgeClient.setHostScreenPowerAsync(status.hostScreenOff) },
+                )
+                OpalButton(
+                    label = "主控制台",
+                    compact = true,
+                    filled = false,
+                    onClick = onOpenConsole,
+                )
+                OpalButton(
+                    label = "切回本机",
+                    compact = true,
+                    filled = false,
+                    accent = OpalPalette.AccentCyan,
+                    onClick = onSwitchToLocalDesktop,
+                )
+                OpalButton(
+                    label = "退出投射",
+                    compact = true,
+                    filled = false,
+                    accent = OpalPalette.AccentDanger,
+                    onClick = onExitExternal,
+                )
             }
 
-            // External Display Scaling + Physical Mouse Target + Stepless Continuous Pointer Speed Slider
+            // External Display Scaling + External Keyboard/Mouse Target + Stepless Pointer Speed (portrait-safe)
             Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 InlineOptionStrip(
@@ -233,7 +237,6 @@ fun DexTrackpadScreen(
                     onSelect = { next ->
                         AppPrefs.setExternalUiScale(ctx, next)
                     },
-                    modifier = Modifier.weight(0.85f),
                 )
                 val mouseOnExternal = mouseTarget == AppPrefs.MOUSE_TARGET_EXTERNAL
                 val mousePillShape = RoundedCornerShape(14.dp)
@@ -247,7 +250,7 @@ fun DexTrackpadScreen(
                     horizontalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
                     OpalText(
-                        text = if (status.connectedMouseCount > 0) "物理鼠标(${status.connectedMouseCount})" else "物理鼠标",
+                        text = if (status.connectedMouseCount > 0) "外接键鼠(${status.connectedMouseCount})" else "外接键鼠",
                         fontSize = 11.5.sp,
                         color = OpalPalette.TextSecondary,
                     )
@@ -283,7 +286,7 @@ fun DexTrackpadScreen(
                 }
                 Row(
                     modifier = Modifier
-                        .weight(1.25f)
+                        .width(230.dp)
                         .clip(RoundedCornerShape(14.dp))
                         .background(OpalPalette.LiquidDockFill)
                         .border(0.9.dp, OpalPalette.LiquidGlassRim, RoundedCornerShape(14.dp))
@@ -586,7 +589,7 @@ private fun InlineOptionStrip(
         horizontalArrangement = Arrangement.spacedBy(5.dp),
     ) {
         OpalText(text = title, fontSize = 11.5.sp, color = OpalPalette.TextSecondary)
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.width(4.dp))
         options.forEach { (value, label) ->
             val selected = abs(selectedValue - value) < 0.08f
             Box(

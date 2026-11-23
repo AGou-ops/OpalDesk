@@ -54,29 +54,41 @@ public final class AndroidDisplayDriver
 
         if (Build.VERSION.SDK_INT >= 30) {
             try {
-                surface.setFrameRate(fps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+                surface.setFrameRate(fps, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
             } catch (RuntimeException ignored) {
             }
         }
 
         int secBit = allowSecure ? BridgeProtocol.VD_FLAG_SECURE : 0;
+        int dcor = BridgeProtocol.VD_FLAG_DESTROY_CONTENT_ON_REMOVAL;
+        // Prefer VD_FLAGS_TRUSTED_FOCUS (0x04449: includes OWN_FOCUS, omits STEAL_TOP_FOCUS_DISABLED)
+        // so both Display 0 (host IME bridge / Dock) and each OpalWin-* maintain independent
+        // mCurrentFocus simultaneously — opening the host soft keyboard never strips cursor focus
+        // from the managed app, while tapping inside the app still registers IMMS client requests.
         int[] candidates = allowSecure
                 ? new int[]{
-                        BridgeProtocol.VD_FLAGS_TRUSTED_ISOLATED | secBit,
-                        BridgeProtocol.VD_FLAGS_TRUSTED_ISOLATED,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_FOCUS | dcor | secBit,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_FOCUS | dcor,
                         BridgeProtocol.VD_FLAGS_TRUSTED_FOCUS | secBit,
                         BridgeProtocol.VD_FLAGS_TRUSTED_FOCUS,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_IME | dcor | secBit,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_IME | dcor,
+                        BridgeProtocol.VD_FLAGS_BASE_PUBLIC | dcor | secBit,
                         BridgeProtocol.VD_FLAGS_BASE_PUBLIC | secBit,
                         BridgeProtocol.VD_FLAGS_BASE_PUBLIC
                 }
                 : new int[]{
-                        BridgeProtocol.VD_FLAGS_TRUSTED_ISOLATED,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_FOCUS | dcor,
                         BridgeProtocol.VD_FLAGS_TRUSTED_FOCUS,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_IME | dcor,
+                        BridgeProtocol.VD_FLAGS_TRUSTED_IME,
+                        BridgeProtocol.VD_FLAGS_BASE_PUBLIC | dcor,
                         BridgeProtocol.VD_FLAGS_BASE_PUBLIC
                 };
 
+        float vdRefreshRate = (fps > 60.5f) ? fps : 0f;
         VirtualDisplay vd = VirtualDisplayFactory.createWithFlagFallback(
-                services.displayManager, name, width, height, dpi, candidates, fps, surface, null);
+                services.displayManager, name, width, height, dpi, candidates, vdRefreshRate, surface, null);
         if (vd == null || vd.getDisplay() == null) {
             return null;
         }
@@ -84,6 +96,10 @@ public final class AndroidDisplayDriver
         Display disp = vd.getDisplay();
         int displayId = disp.getDisplayId();
         String uniqueId = VirtualDisplayFactory.getUniqueId(disp);
+        // Combined with VD_FLAGS_TRUSTED_IME (no OWN_FOCUS / STEAL_TOP_FOCUS_DISABLED),
+        // DISPLAY_IME_POLICY_FALLBACK_DISPLAY routes the app's real InputConnection directly to
+        // Display 0's IME (full width, works even with FLAG_SECURE password keyboards without
+        // ever blanking the non-secure VirtualDisplay surface!).
         services.configureVirtualDisplayWindowing(displayId, BridgeProtocol.DISPLAY_IME_POLICY_FALLBACK_DISPLAY);
         return new CreatedDisplay(vd, displayId, uniqueId);
     }
@@ -106,6 +122,17 @@ public final class AndroidDisplayDriver
             ((VirtualDisplay) handle).setSurface(surf);
         } catch (RuntimeException e) {
             System.err.println("OPALDESK_VD_SET_SURF_WARN: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void setSurfaceFrameRate(Object surfaceObj, float fps) {
+        if (Build.VERSION.SDK_INT < 30 || !(surfaceObj instanceof Surface)) return;
+        Surface surf = (Surface) surfaceObj;
+        if (!surf.isValid()) return;
+        try {
+            surf.setFrameRate(fps, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+        } catch (RuntimeException ignored) {
         }
     }
 
@@ -178,6 +205,16 @@ public final class AndroidDisplayDriver
     }
 
     @Override
+    public int findTopVisibleTaskIdOnDisplay(int displayId, String expectedPkg) {
+        return taskApi.findTopVisibleTaskIdOnDisplay(displayId, expectedPkg);
+    }
+
+    @Override
+    public boolean isTaskRunningWithActivities(int taskId, int displayId) {
+        return taskApi.isTaskRunningWithActivities(taskId, displayId);
+    }
+
+    @Override
     public Set<Integer> collectAliveTaskIds() {
         return taskApi.collectAliveTaskIds();
     }
@@ -192,6 +229,13 @@ public final class AndroidDisplayDriver
         if (PackagePolicy.isBlockedWindowPkg(pkg)) return;
         ShellCommand.runOutput("am", "force-stop", pkg);
         SystemClock.sleep(90L);
+    }
+
+    @Override
+    public void focusDisplay(int displayId) {
+        if (displayId > 0) {
+            services.focusDisplay(displayId);
+        }
     }
 
     @Override

@@ -132,6 +132,28 @@ class CompositorGeometryAndSceneTest {
         val partial = CompositorGeometry.computeTilingFrames(WindowTilingLayout.SPLIT_4_COLS, 2, w, h, d)
         assertEquals(2, partial.size)
         assertTrue(partial[1].left > partial[0].right)
+
+        // Portrait phone canvas stacks vertically cleanly without overlapping
+        val pw = 1080
+        val ph = 2400
+        val pd = 2.75f
+        val portrait2 = CompositorGeometry.computeTilingFrames(WindowTilingLayout.SPLIT_2_COLS, 2, pw, ph, pd)
+        assertEquals(2, portrait2.size)
+        assertTrue("Portrait 2-split should stack vertically", portrait2[1].top > portrait2[0].bottom)
+        assertEquals(0, portrait2[0].width % 2)
+        assertEquals(0, portrait2[0].height % 2)
+
+        val portraitResize = CompositorGeometry.computeResize(
+            base = WindowRect(20, 120, 1000, 1400),
+            edge = ResizeEdge.SE,
+            dx = -900,
+            dy = -1200,
+            canvasW = pw,
+            canvasH = ph,
+            density = pd,
+        )
+        assertTrue(portraitResize.width in 240..pw)
+        assertTrue(portraitResize.height in 240..ph)
     }
 
     @Test

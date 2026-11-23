@@ -6,6 +6,7 @@ import android.net.LocalSocket;
 import android.os.Build;
 import android.os.SystemClock;
 
+import io.github.lengsukq.opaldesk.daemon.security.PairingApprovalCoordinator;
 import io.github.lengsukq.opaldesk.daemon.security.SelfSignedCertGenerator;
 import io.github.lengsukq.opaldesk.daemon.security.TrustStoreManager;
 import io.github.lengsukq.opaldesk.daemon.sink.DisplaySink;
@@ -88,13 +89,11 @@ public final class RemoteStreamServer {
         public final boolean enabled;
         public final int port;
         public final String certFingerprint;
-        public final String activePin;
 
-        public WifiConfigStatus(boolean enabled, int port, String certFingerprint, String activePin) {
+        public WifiConfigStatus(boolean enabled, int port, String certFingerprint) {
             this.enabled = enabled;
             this.port = port;
             this.certFingerprint = (certFingerprint != null) ? certFingerprint : "";
-            this.activePin = (activePin != null) ? activePin : "";
         }
     }
 
@@ -104,6 +103,7 @@ public final class RemoteStreamServer {
 
     private final SessionListener listener;
     private final TrustStoreManager trustStore;
+    private final PairingApprovalCoordinator pairingCoordinator = new PairingApprovalCoordinator();
     private final File certStoreFile;
     private final String deviceName;
 
@@ -160,8 +160,41 @@ public final class RemoteStreamServer {
         return (id != null && id.certFingerprintSha256 != null) ? id.certFingerprintSha256 : "";
     }
 
-    public String getActivePairingPin() {
-        return wifiEnabled ? trustStore.getActivePin() : "";
+    public PairingApprovalCoordinator getPairingCoordinator() {
+        return pairingCoordinator;
+    }
+
+    public void setPairingChangeListener(PairingApprovalCoordinator.ChangeListener listener) {
+        pairingCoordinator.setChangeListener(listener);
+    }
+
+    public int getTrustedCount() {
+        return trustStore.getTrustedCount();
+    }
+
+    public String getTrustedPeersJson() {
+        return trustStore.toTrustedPeersJson();
+    }
+
+    public String getPendingPairingJson() {
+        return pairingCoordinator.getActivePendingRequestJson();
+    }
+
+    public boolean respondToPairing(String requestId, int decision) {
+        return pairingCoordinator.respond(requestId, decision);
+    }
+
+    public boolean isActiveSessionPermanent() {
+        ClientSession d = desktopSession;
+        if (d != null && !d.isClosed()) {
+            return d.permanentTrust;
+        }
+        synchronized (sessionLock) {
+            for (ClientSession s : standaloneSessions.values()) {
+                if (s != null && !s.isClosed()) return s.permanentTrust;
+            }
+        }
+        return false;
     }
 
     public boolean hasDesktopSession() {
@@ -226,29 +259,26 @@ public final class RemoteStreamServer {
     }
 
     /**
-     * Configures the on-demand wireless TLS 1.2/1.3 server (Binder code 45 or ADB Wi-Fi upgrade).
+     * Configures the on-demand wireless TLS 1.2/1.3 server (Binder TX 24 or ADB Wi-Fi upgrade).
      */
-    public WifiConfigStatus configureWifi(boolean enable, int requestedPort, boolean regeneratePin) {
+    public WifiConfigStatus configureWifi(boolean enable, int requestedPort) {
         synchronized (lifecycleLock) {
             if (requestedPort >= 1024 && requestedPort <= 65535) {
                 wifiPort = requestedPort;
             }
-            if (regeneratePin) {
-                trustStore.regeneratePin();
-            }
             if (!enable) {
                 stopWifiListenerLocked();
                 disconnectMatchingSessions(s -> s.sinkType == DisplaySink.SINK_REMOTE_WIFI, "Wi-Fi server disabled");
-                return new WifiConfigStatus(false, wifiPort, getCertFingerprint(), "");
+                return new WifiConfigStatus(false, wifiPort, getCertFingerprint());
             }
 
             if (stopped) {
-                return new WifiConfigStatus(false, wifiPort, getCertFingerprint(), "");
+                return new WifiConfigStatus(false, wifiPort, getCertFingerprint());
             }
 
             if (wifiEnabled && wifiServerSocket != null && !wifiServerSocket.isClosed()
                     && wifiServerSocket.getLocalPort() == wifiPort) {
-                return new WifiConfigStatus(true, wifiPort, getCertFingerprint(), trustStore.getActivePin());
+                return new WifiConfigStatus(true, wifiPort, getCertFingerprint());
             }
 
             stopWifiListenerLocked();
@@ -273,7 +303,7 @@ public final class RemoteStreamServer {
                 System.err.println("OPALDESK_WIFI_TLS_START_FAILED: " + t);
                 stopWifiListenerLocked();
             }
-            return new WifiConfigStatus(wifiEnabled, wifiPort, getCertFingerprint(), getActivePairingPin());
+            return new WifiConfigStatus(wifiEnabled, wifiPort, getCertFingerprint());
         }
     }
 
@@ -294,26 +324,17 @@ public final class RemoteStreamServer {
     }
 
     public void disconnectActiveClient(String reason) {
-        List<ClientSession> toClose = new ArrayList<>();
-        synchronized (sessionLock) {
-            if (desktopSession != null) toClose.add(desktopSession);
-            toClose.addAll(standaloneSessions.values());
-        }
+        List<ClientSession> toClose = new ArrayList<>(allSessions.values());
         for (ClientSession s : toClose) {
-            s.close(reason);
+            if (s != null) s.close(reason);
         }
     }
 
     private void disconnectMatchingSessions(Predicate<ClientSession> pred, String reason) {
         List<ClientSession> toClose = new ArrayList<>();
-        synchronized (sessionLock) {
-            if (desktopSession != null && pred.test(desktopSession)) {
-                toClose.add(desktopSession);
-            }
-            for (ClientSession s : standaloneSessions.values()) {
-                if (s != null && pred.test(s)) {
-                    toClose.add(s);
-                }
+        for (ClientSession s : allSessions.values()) {
+            if (s != null && pred.test(s)) {
+                toClose.add(s);
             }
         }
         for (ClientSession s : toClose) {
@@ -330,6 +351,7 @@ public final class RemoteStreamServer {
                 usbServerSocket = null;
             }
         }
+        pairingCoordinator.cancelAll();
         disconnectActiveClient("Daemon shutting down");
     }
 
@@ -500,6 +522,7 @@ public final class RemoteStreamServer {
 
     private void stopWifiListenerLocked() {
         wifiEnabled = false;
+        pairingCoordinator.cancelAll();
         SSLServerSocket ss = wifiServerSocket;
         wifiServerSocket = null;
         ClientSession.closeTransportQuietly(ss);
@@ -531,7 +554,7 @@ public final class RemoteStreamServer {
                     : "USB ADB channel authenticated";
 
             completeHandshakeAndRun(
-                    sinkType, true, clientId, clientName, "", authMsg,
+                    sinkType, true, true, clientId, clientName, "", authMsg, true,
                     hello, sock, () -> sock.setSoTimeout(0), in, out);
         } catch (Throwable t) {
             System.err.println("OPALDESK_USB_CLIENT_ERR: " + t.getMessage());
@@ -556,20 +579,53 @@ public final class RemoteStreamServer {
             OpalCastProtocol.HelloMsg hello = readAndValidateHello(in, out, sock);
             if (hello == null) return;
 
-            TrustStoreManager.AuthResult auth = trustStore.authenticate(
-                    hello.clientId, hello.clientName, hello.authToken, hello.pinCode, peerIp);
-            if (!auth.ok) {
-                sendAuthFailureAndClose(out, sock, auth.message);
+            TrustStoreManager.TokenVerifyResult verify = trustStore.verifyTokenOrCheckRateLimit(
+                    hello.clientId, hello.clientName, hello.authToken, peerIp);
+            if (verify.status == TrustStoreManager.TokenVerifyResult.STATUS_INVALID_CLIENT
+                    || verify.isRateLimited()) {
+                sendAuthFailureAndClose(out, sock, verify.message);
                 return;
             }
 
             String clientId = TrustStoreManager.sanitizeClientId(hello.clientId);
-            String clientName = TrustStoreManager.sanitizeClientName(hello.clientName, "Mac (Wi-Fi)");
+            String clientName = TrustStoreManager.sanitizeClientName(hello.clientName, "OpalDesk 设备");
 
-            completeHandshakeAndRun(
-                    DisplaySink.SINK_REMOTE_WIFI, false, clientId, clientName,
-                    auth.issuedToken, auth.message,
-                    hello, sock, () -> sock.setSoTimeout(0), in, out);
+            if (verify.isAuthenticated()) {
+                boolean permanent = verify.isPermanent();
+                completeHandshakeAndRun(
+                        DisplaySink.SINK_REMOTE_WIFI, false, permanent, clientId, clientName,
+                        "", verify.message, permanent,
+                        hello, sock, () -> sock.setSoTimeout(0), in, out);
+                return;
+            }
+
+            // Interactive host-side consent (replaces legacy 6-digit PIN)
+            sock.setSoTimeout((int) PairingApprovalCoordinator.DEFAULT_TIMEOUT_MS + 10_000);
+            int decision = pairingCoordinator.requestAndAwait(
+                    clientId, clientName, peerIp, PairingApprovalCoordinator.DEFAULT_TIMEOUT_MS);
+            if (decision == PairingApprovalCoordinator.DECISION_APPROVE_PERMANENT) {
+                String permanentToken = trustStore.grantPermanentTrust(clientId, clientName, peerIp);
+                completeHandshakeAndRun(
+                        DisplaySink.SINK_REMOTE_WIFI, false, true, clientId, clientName,
+                        permanentToken, "已永久允许此设备连接", true,
+                        hello, sock, () -> sock.setSoTimeout(0), in, out);
+            } else if (decision == PairingApprovalCoordinator.DECISION_APPROVE_ONCE) {
+                trustStore.clearFailures(peerIp);
+                String handoverToken = hello.isAppCatalog()
+                        ? trustStore.issueSingleUseHandoverToken(clientId, peerIp)
+                        : "";
+                completeHandshakeAndRun(
+                        DisplaySink.SINK_REMOTE_WIFI, false, false, clientId, clientName,
+                        handoverToken, "已临时允许本次连接", false,
+                        hello, sock, () -> sock.setSoTimeout(0), in, out);
+            } else if (decision == PairingApprovalCoordinator.DECISION_REJECT) {
+                trustStore.recordRejection(peerIp);
+                sendAuthFailureAndClose(out, sock, "对方已拒绝此次投屏请求");
+            } else if (decision == PairingApprovalCoordinator.DECISION_TIMED_OUT) {
+                sendAuthFailureAndClose(out, sock, "等待对方确认超时，请重试");
+            } else {
+                sendAuthFailureAndClose(out, sock, "对方正忙或已关闭无线接收服务");
+            }
         } catch (Throwable t) {
             System.err.println("OPALDESK_WIFI_CLIENT_ERR: " + t.getMessage());
             ClientSession.closeTransportQuietly(sock);
@@ -598,10 +654,12 @@ public final class RemoteStreamServer {
     private void completeHandshakeAndRun(
             int sinkType,
             boolean isAdbLocalSocket,
+            boolean permanentTrust,
             String clientId,
             String clientName,
             String issuedToken,
             String authMsg,
+            boolean permanentTokenFlag,
             OpalCastProtocol.HelloMsg hello,
             Closeable sock,
             TimeoutClearer clearTimeout,
@@ -614,10 +672,10 @@ public final class RemoteStreamServer {
         }
 
         OpalCastProtocol.AuthResultMsg okMsg = new OpalCastProtocol.AuthResultMsg(
-                true, issuedToken, authMsg, deviceName, getCertFingerprint());
+                true, issuedToken, authMsg, deviceName, getCertFingerprint(), permanentTokenFlag);
         writeAuthResultImmediate(out, okMsg);
         clearTimeout.clear();
-        runAuthenticatedSession(sinkType, isAdbLocalSocket, clientId, clientName, hello, sock, in, out);
+        runAuthenticatedSession(sinkType, isAdbLocalSocket, permanentTrust, clientId, clientName, hello, sock, in, out);
     }
 
     private boolean hasCapacityForSession(OpalCastProtocol.HelloMsg hello) {
@@ -635,6 +693,7 @@ public final class RemoteStreamServer {
     private void runAuthenticatedSession(
             int sinkType,
             boolean isAdbLocalSocket,
+            boolean permanentTrust,
             String clientId,
             String clientName,
             OpalCastProtocol.HelloMsg hello,
@@ -643,14 +702,17 @@ public final class RemoteStreamServer {
             OutputStream out) {
         int sessionId = nextSessionId.incrementAndGet();
         boolean isStandalone = hello.isStandaloneApp();
+        boolean isCatalog = hello.isAppCatalog();
         ClientSession current = new ClientSession(
-                sessionId, sinkType, isAdbLocalSocket, hello.sessionRole, hello.appPackage,
+                sessionId, sinkType, isAdbLocalSocket, permanentTrust, hello.sessionRole, hello.appPackage,
                 clientId, clientName, transport, out, listener);
 
         ClientSession replaced = null;
         boolean capacityExceeded = false;
         synchronized (sessionLock) {
-            if (isStandalone) {
+            if (isCatalog) {
+                allSessions.put(sessionId, current);
+            } else if (isStandalone) {
                 for (ClientSession existing : standaloneSessions.values()) {
                     if (existing != null && hello.appPackage.equals(existing.appPackage)) {
                         replaced = existing;
@@ -707,7 +769,7 @@ public final class RemoteStreamServer {
                     if (standaloneSessions.get(sessionId) == current) {
                         standaloneSessions.remove(sessionId);
                     }
-                } else if (desktopSession == current) {
+                } else if (!isCatalog && desktopSession == current) {
                     desktopSession = null;
                 }
             }
@@ -804,7 +866,7 @@ public final class RemoteStreamServer {
             return;
         }
 
-        WifiConfigStatus st = configureWifi(true, wifiPort, false);
+        WifiConfigStatus st = configureWifi(true, wifiPort);
         if (!st.enabled) {
             OpalCastProtocol.WifiUpgradeReadyMsg err = new OpalCastProtocol.WifiUpgradeReadyMsg(
                     false, "", st.port, st.certFingerprint, "", "Failed to start Wi-Fi TLS listener");

@@ -189,7 +189,8 @@ public final class ExternalMouseRouter {
             if (ids == null) return 0;
             for (int id : ids) {
                 InputDevice dev = services.inputManager.getInputDevice(id);
-                if (dev != null && shouldRouteDevice(dev.getName(), dev.getSources(), dev.isVirtual(), dev.isExternal())) {
+                if (dev != null && shouldRouteDevice(
+                        dev.getName(), dev.getSources(), dev.getKeyboardType(), dev.isVirtual(), dev.isExternal())) {
                     count++;
                 }
             }
@@ -204,9 +205,15 @@ public final class ExternalMouseRouter {
         return services.setHardwarePointerSpeed(androidSpeed);
     }
 
-    /** Pure JVM-testable filter deciding whether an InputDevice is a routable physical mouse. */
+    /** Pure JVM-testable filter deciding whether an InputDevice is a routable physical mouse or keyboard. */
     public static boolean shouldRouteDevice(String name, int sources, boolean isVirtual, boolean isExternal) {
         return MouseRoutingPolicy.shouldRouteDevice(name, sources, isVirtual, isExternal);
+    }
+
+    /** Pure JVM-testable filter deciding whether an InputDevice is a routable physical mouse or keyboard. */
+    public static boolean shouldRouteDevice(
+            String name, int sources, int keyboardType, boolean isVirtual, boolean isExternal) {
+        return MouseRoutingPolicy.shouldRouteDevice(name, sources, keyboardType, isVirtual, isExternal);
     }
 
     /** Maps continuous pointer sensitivity to Android's hardware pointer speed ({@code -7..+7}). */
@@ -234,7 +241,8 @@ public final class ExternalMouseRouter {
                 for (int id : ids) {
                     InputDevice dev = services.inputManager.getInputDevice(id);
                     if (dev == null) continue;
-                    if (!shouldRouteDevice(dev.getName(), dev.getSources(), dev.isVirtual(), dev.isExternal())) {
+                    if (!shouldRouteDevice(
+                            dev.getName(), dev.getSources(), dev.getKeyboardType(), dev.isVirtual(), dev.isExternal())) {
                         continue;
                     }
                     String descriptor = dev.getDescriptor();

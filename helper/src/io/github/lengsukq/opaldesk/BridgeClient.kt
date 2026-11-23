@@ -18,7 +18,10 @@ import io.github.lengsukq.opaldesk.protocol.CompositorScene
 import io.github.lengsukq.opaldesk.protocol.CompositorSceneParser
 import io.github.lengsukq.opaldesk.protocol.DaemonStatus
 import io.github.lengsukq.opaldesk.protocol.IpcTrustVerifier
+import io.github.lengsukq.opaldesk.protocol.PairingJsonParser
+import io.github.lengsukq.opaldesk.protocol.PendingPairingRequest
 import io.github.lengsukq.opaldesk.protocol.RemoteStreamStatus
+import io.github.lengsukq.opaldesk.protocol.TrustedPeerEntry
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -57,6 +60,23 @@ object BridgeClient {
     private val _remoteStatusFlow = MutableStateFlow(RemoteStreamStatus())
     val remoteStatusFlow: StateFlow<RemoteStreamStatus> = _remoteStatusFlow.asStateFlow()
 
+    private val _pendingPairingFlow = MutableStateFlow<PendingPairingRequest?>(null)
+    val pendingPairingFlow: StateFlow<PendingPairingRequest?> = _pendingPairingFlow.asStateFlow()
+
+    private val _trustedPeersFlow = MutableStateFlow<List<TrustedPeerEntry>>(emptyList())
+    val trustedPeersFlow: StateFlow<List<TrustedPeerEntry>> = _trustedPeersFlow.asStateFlow()
+
+    data class ImeBridgeRequest(
+        val windowId: Int,
+        val show: Boolean,
+        val inputType: Int,
+        val seq: Long,
+    )
+
+    private val imeReqSeq = java.util.concurrent.atomic.AtomicLong(0L)
+    private val _imeBridgeRequestFlow = MutableStateFlow<ImeBridgeRequest?>(null)
+    val imeBridgeRequestFlow: StateFlow<ImeBridgeRequest?> = _imeBridgeRequestFlow.asStateFlow()
+
     private val binderReadyListeners = CopyOnWriteArraySet<Runnable>()
     private val snapshotCache = object : LruCache<String, Bitmap>(24) {}
 
@@ -92,8 +112,25 @@ object BridgeClient {
             refreshStatus()
             refreshSceneSnapshot()
             refreshRemoteStatus()
+            refreshTrustedPeers()
+            refreshPendingPairing()
         }
         binderReadyListeners.forEach { mainHandler.post(it) }
+    }
+
+    fun onPushedPairingJson(pairingJson: String?): PendingPairingRequest? {
+        val parsed = PairingJsonParser.parsePending(pairingJson)
+        _pendingPairingFlow.value = parsed
+        return parsed
+    }
+
+    fun onPushedImeRequest(windowId: Int, show: Boolean, inputType: Int) {
+        _imeBridgeRequestFlow.value = ImeBridgeRequest(
+            windowId = windowId,
+            show = show,
+            inputType = inputType,
+            seq = imeReqSeq.incrementAndGet(),
+        )
     }
 
     fun onPushedSceneJson(sceneJson: String, pushedSeq: Long) {
@@ -172,6 +209,7 @@ object BridgeClient {
                 boundMouseCount = if (reply.dataAvail() >= 4) reply.readInt() else 0,
                 connectedMouseCount = if (reply.dataAvail() >= 4) reply.readInt() else 0,
                 mouseRoutedDisplayId = if (reply.dataAvail() >= 4) reply.readInt() else -1,
+                hostScreenOff = if (reply.dataAvail() >= 4) reply.readInt() != 0 else false,
             )
         }?.also { _statusFlow.value = it } ?: DaemonStatus(connected = false).also { _statusFlow.value = it }
     }
@@ -195,7 +233,8 @@ object BridgeClient {
                 wifiEnabled = r.readInt() != 0,
                 wifiPort = r.readInt(),
                 certFingerprint = r.readString().orEmpty(),
-                activePin = r.readString().orEmpty(),
+                activeSessionPermanent = r.readInt() != 0,
+                trustedCount = r.readInt(),
                 lanIp = r.readString().orEmpty(),
             )
         }?.also { _remoteStatusFlow.value = it } ?: _remoteStatusFlow.value
@@ -217,22 +256,88 @@ object BridgeClient {
                     r.readInt()
                     r.readInt()
                     r.readString()
-                    r.readString()
                 }
                 refreshRemoteStatus()
+                refreshPendingPairing()
             }
             if (onDone != null) mainHandler.post(onDone)
         }
     }
 
-    fun regenerateWifiPinAsync(onDone: (() -> Unit)? = null) {
+    fun refreshTrustedPeers(): List<TrustedPeerEntry> {
+        val svc = getService()
+        if (svc == null) {
+            _trustedPeersFlow.value = emptyList()
+            return emptyList()
+        }
+        val json = transact(svc, BridgeProtocol.Tx.GET_TRUSTED_PEERS, oneway = false, writeArgs = {}) { r ->
+            r.readString().orEmpty()
+        } ?: "[]"
+        return PairingJsonParser.parseTrustedPeers(json).also { _trustedPeersFlow.value = it }
+    }
+
+    fun refreshPendingPairing(): PendingPairingRequest? {
+        val svc = getService()
+        if (svc == null) {
+            _pendingPairingFlow.value = null
+            return null
+        }
+        val json = transact(svc, BridgeProtocol.Tx.GET_PENDING_PAIRING, oneway = false, writeArgs = {}) { r ->
+            r.readString().orEmpty()
+        } ?: ""
+        return PairingJsonParser.parsePending(json).also { _pendingPairingFlow.value = it }
+    }
+
+    fun respondToPairingAsync(
+        requestId: String,
+        decision: Int,
+        ctx: Context? = null,
+        onDone: ((Boolean) -> Unit)? = null,
+    ) {
+        if (ctx != null) {
+            BridgeService.updatePairingNotification(ctx, null)
+        }
         ioExec.execute {
             val svc = getService()
-            if (svc != null) {
-                transact(svc, BridgeProtocol.Tx.REGENERATE_WIFI_PIN, oneway = false, writeArgs = {}) { it.readString() }
-                refreshRemoteStatus()
+            val ok = if (svc != null) {
+                transact(
+                    svc,
+                    BridgeProtocol.Tx.RESPOND_PAIRING,
+                    oneway = false,
+                    writeArgs = { d ->
+                        d.writeString(requestId)
+                        d.writeInt(decision)
+                    },
+                ) { it.readInt() != 0 } ?: false
+            } else {
+                false
             }
-            if (onDone != null) mainHandler.post(onDone)
+            val nextPending = refreshPendingPairing()
+            if (ctx != null) {
+                BridgeService.updatePairingNotification(ctx, nextPending)
+            }
+            refreshTrustedPeers()
+            refreshRemoteStatus()
+            if (onDone != null) mainHandler.post { onDone(ok) }
+        }
+    }
+
+    fun revokeTrustedPeerAsync(clientId: String, onDone: ((Boolean) -> Unit)? = null) {
+        ioExec.execute {
+            val svc = getService()
+            val ok = if (svc != null) {
+                transact(
+                    svc,
+                    BridgeProtocol.Tx.REVOKE_TRUSTED_PEER,
+                    oneway = false,
+                    writeArgs = { d -> d.writeString(clientId) },
+                ) { it.readInt() != 0 } ?: false
+            } else {
+                false
+            }
+            refreshTrustedPeers()
+            refreshRemoteStatus()
+            if (onDone != null) mainHandler.post { onDone(ok) }
         }
     }
 
@@ -262,6 +367,28 @@ object BridgeClient {
             } else {
                 false
             }
+            if (ok) {
+                refreshRemoteStatus()
+                refreshStatus()
+            }
+            if (onDone != null) mainHandler.post { onDone(ok) }
+        }
+    }
+
+    fun setHostScreenPowerAsync(screenOn: Boolean, onDone: ((Boolean) -> Unit)? = null) {
+        ioExec.execute {
+            val svc = getService()
+            val ok = if (svc != null) {
+                transact(
+                    svc,
+                    BridgeProtocol.Tx.SET_HOST_SCREEN_POWER,
+                    oneway = false,
+                    writeArgs = { d -> d.writeInt(if (screenOn) 1 else 0) },
+                ) { it.readInt() != 0 } ?: false
+            } else {
+                false
+            }
+            refreshStatus()
             if (onDone != null) mainHandler.post { onDone(ok) }
         }
     }
@@ -521,6 +648,19 @@ object BridgeClient {
                     d.writeInt(keyCode)
                     d.writeInt(metaState)
                 },
+                readReply = { Unit },
+            )
+        }
+    }
+
+    fun setLocalTextFieldFocusedOneway(focused: Boolean) {
+        inputExec.execute {
+            val svc = getService() ?: return@execute
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_LOCAL_IME_FOCUS,
+                oneway = true,
+                writeArgs = { d -> d.writeInt(if (focused) 1 else 0) },
                 readReply = { Unit },
             )
         }

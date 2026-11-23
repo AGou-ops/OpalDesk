@@ -58,6 +58,7 @@ public final class HelperClientBridge {
     private volatile IBinder ctlBinder;
     private volatile IBinder helperProcToken;
     private volatile Runnable onHelperDeath;
+    private volatile Runnable onHelperBound;
     private volatile int verifiedHelperUid = -1;
     private volatile long lastHelperUidVerifyMs = 0L;
     private volatile boolean preferExternalProviderCall = false;
@@ -101,6 +102,7 @@ public final class HelperClientBridge {
 
     public void setControlBinder(IBinder binder) { this.ctlBinder = binder; }
     public void setOnHelperDeath(Runnable callback) { this.onHelperDeath = callback; }
+    public void setOnHelperBound(Runnable callback) { this.onHelperBound = callback; }
 
     public int getVerifiedHelperUid() {
         if (services.context == null) return -1;
@@ -243,6 +245,39 @@ public final class HelperClientBridge {
         });
     }
 
+    /**
+     * Pushes an interactive wireless pairing approval event (or empty string when cleared) directly
+     * into {@code BridgeProvider} so the Helper can immediately present a heads-up notification or
+     * in-app consent modal even if it was idling in the background.
+     */
+    public void pushPairingEvent(String pairingJson) {
+        if (config.shuttingDown) return;
+        final String payload = (pairingJson != null) ? pairingJson : "";
+        scenePushExec.execute(() -> {
+            if (config.shuttingDown) return;
+            Bundle extras = new Bundle();
+            extras.putString(BridgeProtocol.EXTRA_PAIRING_JSON, payload);
+            callHelperProvider(BridgeProtocol.PROVIDER_METHOD_PAIRING_EVENT, extras);
+        });
+    }
+
+    /**
+     * Pushes a host-side IME bridge request into {@code BridgeProvider} when an app inside an
+     * isolated VirtualDisplay requests soft input but Android's cross-display fallback IME fails
+     * to appear (e.g. Android 17 {@code RemoteInsetsControlTarget} fallback abort).
+     */
+    public void pushImeRequest(int windowId, boolean show, int inputType) {
+        if (config.shuttingDown || !isHelperAlive()) return;
+        scenePushExec.execute(() -> {
+            if (config.shuttingDown || !isHelperAlive()) return;
+            Bundle extras = new Bundle();
+            extras.putInt(BridgeProtocol.EXTRA_IME_WINDOW_ID, windowId);
+            extras.putBoolean(BridgeProtocol.EXTRA_IME_SHOW, show);
+            extras.putInt(BridgeProtocol.EXTRA_IME_INPUT_TYPE, inputType);
+            callHelperProvider(BridgeProtocol.PROVIDER_METHOD_IME_REQUEST, extras);
+        });
+    }
+
     public void grantHelperPrivileges() {
         if (getVerifiedHelperUid() <= 0) return;
         // Standard AOSP background & notification grants (zero SYSTEM_ALERT_WINDOW or MIUI ops needed!)
@@ -264,6 +299,8 @@ public final class HelperClientBridge {
                     ? callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SET_BINDER, b) : null;
             if (res != null && res.getBoolean("ok", false)) {
                 linkHelperProcessToken(res.getBinder("proc"));
+                Runnable boundCb = onHelperBound;
+                if (boundCb != null) boundCb.run();
             }
         } catch (RuntimeException e) {
             System.err.println("OPALDESK_PUSH_BINDER_WARN: " + e.getMessage());
