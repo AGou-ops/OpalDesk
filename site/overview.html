@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="pure-frost">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpalDesk — 2D 真机实拍画廊、多窗模拟器与架构详解</title>
+  <meta name="description" content="OpalDesk 全品牌安卓通用 Wayland 式 120fps 液态毛玻璃多窗工作站：浏览小米平板 8 Pro & 小米 14 Pro 真实实机截图、在线体验多窗分屏模拟器、架构对比与四通道免 Root 激活指南。" />
+  <meta property="og:title" content="OpalDesk — 全品牌安卓通用 120fps 液态毛玻璃多窗工作站" />
+  <meta property="og:description" content="一窗一独立虚拟屏 · 120fps 单 RenderNode 皮肉合一 · VirtualDisplayPool LRU 快照休眠 · 跨设备无线投屏与独立悬浮小窗 · 原生 Swift 6 Mac 伴侣端。" />
+  <meta property="og:type" content="website" />
+  <link rel="icon" type="image/svg+xml" href="./assets/icon.svg" />
+  <script>
+    (function () {
+      try {
+        var saved = window.localStorage.getItem('opaldesk-showcase-theme-v1');
+        var theme = saved === 'pure-frost' || saved === 'prism-pulse'
+          ? saved
+          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'prism-pulse' : 'pure-frost');
+        document.documentElement.setAttribute('data-theme', theme);
+        var savedLang = window.localStorage.getItem('opaldesk-showcase-lang-v1');
+        if (savedLang === 'en') document.documentElement.lang = 'en';
+      } catch (_) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="scroll-beam" id="scrollBeam" aria-hidden="true"></div>
+
+  <!-- Subtle Flowing Liquid Silk Backdrop -->
+  <div class="liquid-ambient-field" aria-hidden="true">
+    <div class="silk-wave silk-wave-a"></div>
+    <div class="silk-wave silk-wave-b"></div>
+  </div>
+
+  <!-- Floating Liquid Glass Toast Island -->
+  <div class="glass-toast-island" id="glassToastIsland" role="status" aria-live="polite" aria-atomic="true">
+    <span class="toast-icon" aria-hidden="true">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+    </span>
+    <span class="toast-text" id="glassToastText"></span>
+  </div>
+
+  <!-- Floating Liquid Glass Capsule Navbar -->
+  <header class="site-header">
+    <nav class="nav-capsule liquid-glass-layer" aria-label="主导航">
+      <a href="#simulator" class="brand-link">
+        <img src="./assets/icon.svg" alt="OpalDesk Icon" class="brand-icon" width="28" height="28" />
+        <span class="brand-title">OpalDesk</span>
+        <span class="brand-tag mono">Wayland Compositor</span>
+      </a>
+
+      <div class="nav-links" id="navLinks">
+        <span class="nav-glider" id="navGlider" aria-hidden="true"></span>
+        <a href="#simulator" class="active" data-i18n="nav_sim">多窗模拟</a>
+        <a href="#gallery" data-i18n="nav_gallery">真机实拍</a>
+        <a href="#compare" data-i18n="nav_compare">路线对比</a>
+        <a href="#features" data-i18n="nav_features">核心特性</a>
+        <a href="#architecture" data-i18n="nav_arch">三端架构</a>
+        <a href="#download" data-i18n="nav_dl">下载激活</a>
+      </div>
+
+      <div class="nav-actions">
+        <a href="./index.html" class="nav-3d-pill" title="前往 3D 交互舞台主页">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.5 3.5 7.25v9.5L12 21.5l8.5-4.75v-9.5L12 2.5Z"/><path d="M3.5 7.25 12 12l8.5-4.75"/><path d="M12 21.5V12"/></svg>
+          <span data-i18n="nav_3d">3D 舞台</span>
+        </a>
+        <button type="button" class="pill-btn theme-pill-btn" id="themeToggleBtn" title="切换晴霜浅色 / 曜石暗色主题">
+          <span class="theme-icon-wrap" aria-hidden="true">
+            <svg class="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5M12 19.5V22M4.93 4.93l1.77 1.77M17.3 17.3l1.77 1.77M2 12h2.5M19.5 12H22M4.93 19.07l1.77-1.77M17.3 6.7l1.77-1.77"/></svg>
+            <svg class="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 14.5A8 8 0 0 1 9.5 4.5a8 8 0 1 0 10 10Z"/></svg>
+          </span>
+          <span id="themeToggleLabel" data-i18n="theme_light">晴霜浅色</span>
+        </button>
+        <button type="button" class="pill-btn mono" id="langToggleBtn" title="Switch Language / 切换语言">EN</button>
+        <a href="https://github.com/lengsukq/OpalDesk/releases/latest" target="_blank" rel="noopener noreferrer" class="btn-primary-sm">
+          <span data-i18n="nav_get">下载 APK</span>
+        </a>
+      </div>
+    </nav>
+
+    <nav class="mobile-section-bar liquid-glass-layer" aria-label="快捷导航">
+      <a href="#simulator" class="active" data-i18n="nav_sim">多窗模拟</a>
+      <a href="#gallery" data-i18n="nav_gallery">真机实拍</a>
+      <a href="#compare" data-i18n="nav_compare">路线对比</a>
+      <a href="#features" data-i18n="nav_features">核心特性</a>
+      <a href="#architecture" data-i18n="nav_arch">三端架构</a>
+      <a href="#download" data-i18n="nav_dl">下载激活</a>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ACT I · HERO & INTERACTIVE 120FPS MULTI-WINDOW COMPOSITOR SIMULATOR -->
+    <section class="hero-section" id="simulator">
+      <div class="container">
+        <div class="hero-copy">
+          <div class="hero-status-row">
+            <span class="hero-status-capsule">
+              <i class="status-live-dot" aria-hidden="true"></i>
+              <span class="mono" data-i18n="hero_badge">ANDROID 11–17 · 95%+ 免 ROOT · 120FPS GPU 合成 · MIT 开源</span>
+            </span>
+          </div>
+
+          <h1 class="hero-title">
+            <span class="hero-title-primary" data-i18n="hero_t1">一窗一独立虚拟屏，</span><br />
+            <span class="hero-title-accent" data-i18n="hero_t2">全品牌安卓通用桌面工作站。</span>
+          </h1>
+
+          <p class="hero-subtitle" data-i18n="hero_sub">
+            彻底告别厂商私有 Freeform 小窗与撕裂悬浮标题栏。120fps 单 RenderNode 皮肉合一液态毛玻璃桌面、LRU 快照休眠、外接 2K/4K 满屏与手机↔平板↔Mac 无线互联。
+          </p>
+
+          <div class="hero-cta-row">
+            <a href="#download" class="btn-hero-primary">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span data-i18n="cta_dl">获取最新 APK / Mac 伴侣端</span>
+            </a>
+            <a href="#gallery" class="btn-hero-secondary">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="18" x2="12" y2="21"/></svg>
+              <span data-i18n="cta_gallery">浏览双机真机实拍</span>
+            </a>
+            <a href="./index.html" class="hero-text-link">
+              <span data-i18n="cta_3d">前往 3D 交互舞台 →</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- Interactive Multi-Window Layout Controls -->
+        <div class="sim-controls" role="tablist" aria-label="交互式多窗布局切换">
+          <span class="sim-controls-label" data-i18n="sim_label">在线试玩多窗合成器：</span>
+          <button type="button" class="preset-chip active" data-layout="split2" data-i18n="lay_split2">左右二分</button>
+          <button type="button" class="preset-chip" data-layout="master21" data-i18n="lay_master">主副 2:1</button>
+          <button type="button" class="preset-chip" data-layout="cols3" data-i18n="lay_cols3">三列分屏</button>
+          <button type="button" class="preset-chip" data-layout="grid4" data-i18n="lay_grid4">四宫格</button>
+          <button type="button" class="preset-chip" data-layout="cascade" data-i18n="lay_cascade">阶梯自由层叠</button>
+          <button type="button" class="preset-chip chip-emerald" id="simHibernateBtn" data-i18n="lay_hib">模拟 LRU 快照休眠 / 唤醒</button>
+        </div>
+
+        <!-- Live Interactive 120fps OpalDesk Desktop Simulator -->
+        <div class="sim-frame liquid-glass-layer" id="simFrame">
+          <div class="sim-menubar">
+            <div class="sim-menubar-left">
+              <span class="sim-dot"></span>
+              <strong>OpalDesk</strong>
+              <span class="sim-muted" id="simFocusedApp">桌面工作站</span>
+              <span class="sim-pill mono" id="simResPill">3040×1904 · 120Hz</span>
+            </div>
+            <div class="sim-menubar-right mono">
+              <span id="simTelemetry">RenderNode: 120fps · Drag IPC: 0 · Active VD: 3/6</span>
+              <span>11/23 14:51</span>
+            </div>
+          </div>
+
+          <div class="sim-canvas" id="simCanvas">
+            <!-- Dynamically rendered & draggable Liquid Glass windows -->
+          </div>
+
+          <div class="sim-dock-wrap">
+            <div class="sim-dock liquid-glass-layer" id="simDock">
+              <button type="button" class="dock-btn" data-dock-win="clock" title="世界时钟">🕒</button>
+              <button type="button" class="dock-btn" data-dock-win="calc" title="科学计算器">🧮</button>
+              <button type="button" class="dock-btn" data-dock-win="browser" title="OpalDesk 浏览器">🌐</button>
+              <button type="button" class="dock-btn" data-dock-win="phone" title="跨设备悬浮小窗">📱</button>
+              <span class="dock-sep"></span>
+              <button type="button" class="dock-action mono" id="simResetBtn" data-i18n="sim_reset">重置排布</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ACT II · REAL-DEVICE SCREENSHOT GALLERY (XIAOMI PAD 8 PRO + XIAOMI 14 PRO) -->
+    <section class="gallery-section section-band" id="gallery">
+      <div class="container">
+        <div class="section-head">
+          <span class="section-eyebrow mono" data-i18n="gal_eyebrow">REAL HARDWARE CAPTURES · ZERO MOCKUPS</span>
+          <h2 class="section-title" data-i18n="gal_title">双机真机实拍，所见即所得</h2>
+          <p class="section-desc" data-i18n="gal_desc">
+            以下 9 组画面全部直采自 <strong>Xiaomi Pad 8 Pro（Android 17）</strong> 与 <strong>Xiaomi 14 Pro（Android 16）</strong> 运行 OpalDesk 的真实屏幕，点击任意截图可放大细看像素级液态毛玻璃细节。
+          </p>
+        </div>
+
+        <!-- Featured Dual-Hardware Showcase (Interactive Tablet + Phone Frame) -->
+        <div class="featured-hardware-grid">
+          <div class="hw-stage-card elevated-surface">
+            <div class="hw-card-top">
+              <div>
+                <span class="hw-badge mono">Xiaomi Pad 8 Pro · 3040×1904 · Android 17</span>
+                <h3 data-i18n="hw_tab_title">本机 120fps 液态毛玻璃多窗工作站</h3>
+              </div>
+              <div class="hw-switcher" role="tablist" aria-label="切换平板实拍视图">
+                <button type="button" class="hw-tab active" data-hw-tablet="light" data-i18n="hw_tab_light">晴空浅色</button>
+                <button type="button" class="hw-tab" data-hw-tablet="dark" data-i18n="hw_tab_dark">曜石深色</button>
+                <button type="button" class="hw-tab" data-hw-tablet="ctrl" data-i18n="hw_tab_ctrl">控制中心</button>
+                <button type="button" class="hw-tab" data-hw-tablet="cast" data-i18n="hw_tab_cast">无线投屏</button>
+                <button type="button" class="hw-tab" data-hw-tablet="float" data-i18n="hw_tab_float">独立小窗</button>
+              </div>
+            </div>
+            <div class="device-bezel bezel-tablet" id="featuredTabletWrap">
+              <img
+                id="featuredTabletImg"
+                src="./assets/screenshots/dex-workstation-light.jpg"
+                alt="Xiaomi Pad 8 Pro OpalDesk 液态毛玻璃多窗工作站实拍"
+                loading="eager"
+              />
+            </div>
+            <p class="hw-caption" id="featuredTabletCaption" data-i18n="hw_tab_cap_light">
+              世界时钟与科学计算器 50/50 左右分屏运行在各自独立 VirtualDisplay 中，单 RenderNode 合成红黄绿 macOS 顶栏与外扩散阴影。
+            </p>
+          </div>
+
+          <div class="hw-stage-card hw-phone-card elevated-surface">
+            <div class="hw-card-top hw-card-top-col">
+              <span class="hw-badge mono">Xiaomi 14 Pro · 1440×3200</span>
+              <h3 data-i18n="hw_ph_title">手机端精密触控板 &amp; 投屏中枢</h3>
+              <div class="hw-switcher" role="tablist" aria-label="切换手机实拍视图">
+                <button type="button" class="hw-tab active" data-hw-phone="trackpad" data-i18n="hw_ph_tp">精密触控板</button>
+                <button type="button" class="hw-tab" data-hw-phone="casting" data-i18n="hw_ph_cast">投屏态主控</button>
+              </div>
+            </div>
+            <div class="device-bezel bezel-phone" id="featuredPhoneWrap">
+              <img
+                id="featuredPhoneImg"
+                src="./assets/screenshots/phone-trackpad.jpg"
+                alt="Xiaomi 14 Pro OpalDesk 液态毛玻璃精密触控板实拍"
+                loading="eager"
+              />
+            </div>
+            <p class="hw-caption" id="featuredPhoneCaption" data-i18n="hw_ph_cap_tp">
+              投屏期间手机秒变 120Hz 精密触控板：50/50 硬件按键条 +「拖拽锁定 | 显示桌面 | 一键息屏」，支持外接键鼠自由切本机/投屏端。
+            </p>
+          </div>
+        </div>
+
+        <!-- Filterable Full Screenshot Masonry Grid -->
+        <div class="gallery-filters" role="tablist" aria-label="按场景筛选真机截图">
+          <button type="button" class="filter-pill active" data-filter="all" data-i18n="flt_all">全部实拍 (9)</button>
+          <button type="button" class="filter-pill" data-filter="dex" data-i18n="flt_dex">本机多窗桌面 (3)</button>
+          <button type="button" class="filter-pill" data-filter="cast" data-i18n="flt_cast">跨设备互投 &amp; 小窗 (3)</button>
+          <button type="button" class="filter-pill" data-filter="console" data-i18n="flt_console">主控台 &amp; 设置 (3)</button>
+        </div>
+
+        <div class="shot-grid" id="shotGrid">
+          <!-- Populated cleanly from app.js with full i18n & lightbox -->
+        </div>
+      </div>
+    </section>
+
+    <!-- ACT III · WHY OPALDESK: ARCHITECTURE COMPARISON MATRIX -->
+    <section class="compare-section" id="compare">
+      <div class="container">
+        <div class="section-head">
+          <span class="section-eyebrow mono" data-i18n="cmp_eyebrow">ARCHITECTURE COMPARISON · 告别路线妥协</span>
+          <h2 class="section-title" data-i18n="cmp_title">为什么彻底抛弃 Freeform + 悬浮壳？</h2>
+          <p class="section-desc" data-i18n="cmp_desc">
+            从早期实战踩坑中彻底重构为 Wayland 式独立虚拟屏合成器，从根源消灭碎片化、拖拽撕裂、外接屏失活与高权限依赖。
+          </p>
+        </div>
+
+        <div class="compare-card elevated-surface">
+          <div class="compare-table-wrap">
+            <table class="compare-table">
+              <thead>
+                <tr>
+                  <th data-i18n="cmp_h_dim">对比维度</th>
+                  <th class="col-highlight" data-i18n="cmp_h_opal">OpalDesk（Wayland 式通用合成器）</th>
+                  <th data-i18n="cmp_h_old">传统 Freeform + 悬浮壳方案</th>
+                  <th data-i18n="cmp_h_oem">厂商私有桌面模式（DeX / 电脑模式）</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td class="row-dim" data-i18n="cmp_r1_d">窗口运行模式</td>
+                  <td class="col-highlight" data-i18n="cmp_r1_o"><strong>100% 标准 AOSP FULLSCREEN (1)</strong>，一窗一独立 VirtualDisplay</td>
+                  <td data-i18n="cmp_r1_old">魔改 Freeform (5) / ITaskOrganizer，升级即易失效</td>
+                  <td data-i18n="cmp_r1_oem">深度绑定特定厂商框架，换品牌即不可用</td>
+                </tr>
+                <tr>
+                  <td class="row-dim" data-i18n="cmp_r2_d">画面与标题栏合成</td>
+                  <td class="col-highlight" data-i18n="cmp_r2_o"><strong>单 RenderNode 皮肉合一</strong>：纯拖拽 0 IPC、0 虚拟屏重绘</td>
+                  <td data-i18n="cmp_r2_old">悬浮窗外挂标题栏，拖拽撕裂、掉帧、热区错位</td>
+                  <td data-i18n="cmp_r2_oem">系统自带，但外观/阴影/分屏模板难以自由定制</td>
+                </tr>
+                <tr>
+                  <td class="row-dim" data-i18n="cmp_r3_d">多窗并发上限</td>
+                  <td class="col-highlight" data-i18n="cmp_r3_o"><strong>VirtualDisplayPool LRU 休眠</strong>：突破 Android 14+ 配额，点击 150ms 唤醒</td>
+                  <td data-i18n="cmp_r3_old">受系统小窗数硬上限约束，容易互相挤掉</td>
+                  <td data-i18n="cmp_r3_oem">多为固定 3–5 窗，不支持自定义快照池容量</td>
+                </tr>
+                <tr>
+                  <td class="row-dim" data-i18n="cmp_r4_d">跨设备无线互联</td>
+                  <td class="col-highlight" data-i18n="cmp_r4_o"><strong>手机↔平板桌面/独立小窗 + 原生 Swift 6 Mac 伴侣端</strong> + 远端输入法自动转发</td>
+                  <td data-i18n="cmp_r4_old">几乎无原生跨端协议，依赖第三方投屏拼凑</td>
+                  <td data-i18n="cmp_r4_oem">仅限同生态全家桶，跨品牌安卓与 Mac 受限</td>
+                </tr>
+                <tr>
+                  <td class="row-dim" data-i18n="cmp_r5_d">外接屏与物理键鼠</td>
+                  <td class="col-highlight" data-i18n="cmp_r5_o"><strong>2K/4K 100Hz+ 满屏不中断</strong> + 鼠标一键切本机/投屏端 + <code>/dev/uhid</code> 回退</td>
+                  <td data-i18n="cmp_r5_old">切出 App 外接屏即黑屏，跨屏鼠标常被 ROM 拦截</td>
+                  <td data-i18n="cmp_r5_oem">部分机型仅支持 60Hz 镜像或缺少硬件鼠标切换</td>
+                </tr>
+                <tr>
+                  <td class="row-dim" data-i18n="cmp_r6_d">权限与安全模型</td>
+                  <td class="col-highlight" data-i18n="cmp_r6_o"><strong>零无障碍 · 95%+ 免 Root</strong>，守护进程强制降权 <code>uid=2000</code> + APK SHA-256 校验</td>
+                  <td data-i18n="cmp_r6_old">强依赖敏感无障碍服务与常驻悬浮窗权限</td>
+                  <td data-i18n="cmp_r6_oem">闭源系统内置，不开放架构与源码审计</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ACT IV · SIX CORE CAPABILITIES BENTO GRID -->
+    <section class="bento-section section-band" id="features">
+      <div class="container">
+        <div class="section-head">
+          <span class="section-eyebrow mono" data-i18n="feat_eyebrow">UNIVERSAL COMPOSITOR ARCHITECTURE</span>
+          <h2 class="section-title" data-i18n="feat_title">六大核心能力，稳如原生系统</h2>
+          <p class="section-desc" data-i18n="feat_desc">
+            每一项特性均围绕真实高频痛点迭代，配套纯 JVM 确定性单元测试与多机型实机回归验证。
+          </p>
+        </div>
+
+        <div class="bento-grid">
+          <article class="bento-card elevated-surface">
+            <div class="bento-icon icon-blue">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="3" y="4" width="18" height="14" rx="3"/><line x1="9" y1="4" x2="9" y2="18"/><line x1="3" y1="9" x2="21" y2="9"/></svg>
+            </div>
+            <h3 data-i18n="f1_t">宿主 DPI 超采样 · 小窗清晰零裁切</h3>
+            <p data-i18n="f1_d">新增 <code>resolveWindowBufferSpec</code> 与 <code>resolveStandaloneStreamSpec</code>，在保持逻辑 dp 不变的前提下按比例向宿主机密度超采样，彻底解决微信等兼容应用字体 2× 爆炸与拼多多小窗极小字/闪动问题。</p>
+            <span class="bento-tag mono">DisplayGeometryUtil · 1:1 Sharp</span>
+          </article>
+
+          <article class="bento-card elevated-surface">
+            <div class="bento-icon icon-emerald">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+            </div>
+            <h3 data-i18n="f2_t">VirtualDisplayPool LRU 智能休眠</h3>
+            <p data-i18n="f2_d">动态探测严苛 ROM 单 UID 虚拟屏上限，前台窗口持有实时屏幕，后台旧窗自动捕获 <code>HardwareBuffer</code> 高清快照并释放槽位；点击休眠卡片 150ms 原地挂载无缝续跑。</p>
+            <span class="bento-tag mono">3–8 Live Slots · 150ms Wake</span>
+          </article>
+
+          <article class="bento-card elevated-surface">
+            <div class="bento-icon icon-indigo">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="2" y="4" width="13" height="10" rx="2"/><rect x="14" y="10" width="8" height="10" rx="2"/><path d="M7 18h4"/></svg>
+            </div>
+            <h3 data-i18n="f3_t">跨设备无线投屏 &amp; 单应用全局悬浮小窗</h3>
+            <p data-i18n="f3_d">免 PIN 交互弹窗授权 + TLS 1.3 直连与 <code>OpalPeerCastMutex</code> 单向防环锁；手机↔平板支持完整桌面投屏或任选单个应用以 macOS 液态毛玻璃小窗悬浮运行，自带 <code>TYPE_IME_REQUEST</code> 远端输入法自动转发。</p>
+            <span class="bento-tag mono">2560×1600 @ 120Hz · TLS 1.3</span>
+          </article>
+
+          <article class="bento-card elevated-surface">
+            <div class="bento-icon icon-cyan">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="5" y="2" width="14" height="20" rx="3"/><line x1="5" y1="15" x2="19" y2="15"/><line x1="12" y1="15" x2="12" y2="22"/></svg>
+            </div>
+            <h3 data-i18n="f4_t">液态毛玻璃精密触控板 + 一键物理息屏</h3>
+            <p data-i18n="f4_d">无线或 USB-C 投屏时本机即刻化为 120Hz 精密触控板，配备 50/50「左键·按住拖拽 | 右键·返回」硬件按键条与「拖拽锁定 | 显示桌面 | 一键息屏」胶囊，支持 <code>SurfaceControl</code> 物理灭屏省电与双击亮屏。</p>
+            <span class="bento-tag mono">120Hz Oneway · Double-Tap Wake</span>
+          </article>
+
+          <article class="bento-card elevated-surface">
+            <div class="bento-icon icon-amber">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5l5 5"/><path d="M14.5 9.5l-5 5"/></svg>
+            </div>
+            <h3 data-i18n="f5_t">全局物理鼠标跨屏路由 &amp; /dev/uhid 内核回退</h3>
+            <p data-i18n="f5_d">蓝牙/USB 物理鼠标一键自由切换归属本机或投屏端，0.50×–3.00× 无级变速并自动隐藏虚拟光标；遇 OEM 封锁跨屏触摸注入时自动创建 Linux <code>/dev/uhid</code> 内核虚拟外设穿透限制。</p>
+            <span class="bento-tag mono">ExternalMouseRouter · /dev/uhid</span>
+          </article>
+
+          <article class="bento-card elevated-surface">
+            <div class="bento-icon icon-rose">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><polyline points="9 12 11 14 15 10"/></svg>
+            </div>
+            <h3 data-i18n="f6_t">95%+ 免 Root 降权 + GitHub 直连安全更新</h3>
+            <p data-i18n="f6_d">内置无线调试（<code>libadb.so</code>）免电脑激活，守护进程 fail-closed 降权至 <code>uid=2000</code> 并严格校验 APK 签名；内置应用更新直连 GitHub Releases，自动执行 SHA-256 摘要与包名双重校验。</p>
+            <span class="bento-tag mono">uid=2000 · SHA-256 Verified OTA</span>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ACT V · INTERACTIVE THREE-TIER ARCHITECTURE BLUEPRINT -->
+    <section class="arch-section" id="architecture">
+      <div class="container">
+        <div class="section-head">
+          <span class="section-eyebrow mono" data-i18n="arch_eyebrow">CLEAN MODULAR ARCHITECTURE</span>
+          <h2 class="section-title" data-i18n="arch_title">三端分层架构蓝图（点击模块查看详情）</h2>
+          <p class="section-desc" data-i18n="arch_desc">
+            核心几何、虚拟屏池、排序器与防环锁完全剥离 Android 单例依赖，保证高确定性纯 JVM 单元测试覆盖。
+          </p>
+        </div>
+
+        <div class="arch-layout">
+          <div class="arch-diagram elevated-surface">
+            <div class="arch-tier">
+              <span class="tier-label mono">DAEMON · :bridge (Java 11 · uid=2000)</span>
+              <div class="tier-nodes">
+                <button type="button" class="arch-node active" data-arch="daemon">
+                  <strong>OpalDeskDaemon</strong>
+                  <span class="mono">dropRootFailClosed()</span>
+                </button>
+                <button type="button" class="arch-node" data-arch="pool">
+                  <strong>VirtualDisplayPool</strong>
+                  <span class="mono">LRU TaskSnapshot</span>
+                </button>
+                <button type="button" class="arch-node" data-arch="input">
+                  <strong>PerDisplayInputRouter</strong>
+                  <span class="mono">IInputManager + /dev/uhid</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="arch-bus mono" data-i18n="arch_bus_ipc">↕ 签名 SHA-256 双向鉴权 Binder IPC · GL_TEXTURE_EXTERNAL_OES 零拷贝 ↕</div>
+
+            <div class="arch-tier">
+              <span class="tier-label mono">ANDROID CLIENT · :helper (Kotlin 21 · Compose Foundation)</span>
+              <div class="tier-nodes">
+                <button type="button" class="arch-node" data-arch="compositor">
+                  <strong>OpalCompositorWorkspace</strong>
+                  <span class="mono">120fps 单 RenderNode</span>
+                </button>
+                <button type="button" class="arch-node" data-arch="cast">
+                  <strong>OpalCast &amp; Floating</strong>
+                  <span class="mono">TLS 1.3 · TYPE_IME_REQUEST</span>
+                </button>
+                <button type="button" class="arch-node" data-arch="updater">
+                  <strong>AppUpdateManager</strong>
+                  <span class="mono">GitHub OTA · SHA-256</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="arch-bus mono" data-i18n="arch_bus_stream">↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / USB ADB 端口转发 ↕</div>
+
+            <div class="arch-tier">
+              <span class="tier-label mono">MACOS COMPANION · macos/OpalDeskMac (Swift 6)</span>
+              <div class="tier-nodes">
+                <button type="button" class="arch-node arch-node-wide" data-arch="macos">
+                  <strong>OpalDeskMac (Apple Silicon · macOS 14+)</strong>
+                  <span class="mono">HEVC 硬解 · 剪贴板图文同步 · Command→Ctrl 映射 · 文件互传</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <aside class="arch-inspector elevated-surface" id="archInspector">
+            <span class="inspector-badge mono" id="archPath">bridge/src/.../OpalDeskDaemon.java</span>
+            <h3 id="archTitle">OpalDeskDaemon · 免 Root 降权守护进程</h3>
+            <p id="archDesc">
+              以 Pure Java 11 编译为仅 165 KB 的 <code>assets/opaldesk.jar</code>。即便通过 Root 拉起，也会在打开 Socket 或注册 Binder 前立即执行 <code>dropRootFailClosed()</code> 降权至 <code>uid=2000 (u:r:shell:s0)</code>，并通过抽象命名空间单实例锁与 APK 签名证书 SHA-256 双向验证确保安全边界。
+            </p>
+            <ul class="inspector-bullets" id="archBullets"></ul>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <!-- ACT VI · DOWNLOAD & 4-CHANNEL ACTIVATION CODE STUDIO -->
+    <section class="download-section section-band" id="download">
+      <div class="container">
+        <div class="section-head">
+          <span class="section-eyebrow mono" data-i18n="dl_eyebrow">FREE · MIT OPEN SOURCE · ZERO SUBSCRIPTION</span>
+          <h2 class="section-title" data-i18n="dl_title">下载 OpalDesk 最新版，30 秒免 Root 激活</h2>
+          <p class="section-desc" data-i18n="dl_desc">
+            支持 Android 11–17 全品牌手机与平板（内置无线调试免电脑激活）以及 Apple Silicon macOS 14+ 原生伴侣端。
+          </p>
+        </div>
+
+        <div class="dl-cards-grid">
+          <div class="dl-card elevated-surface">
+            <div class="dl-card-head">
+              <span class="dl-platform mono">ANDROID 11–17</span>
+              <span class="dl-size mono">~5.4 MB · V3 Signed</span>
+            </div>
+            <h3 data-i18n="dl_android_t">OpalDesk Android 安装包 (APK)</h3>
+            <p data-i18n="dl_android_d">已内嵌同签名守护进程 <code>opaldesk.jar</code>，支持手机/平板本机多窗、外接显示器、跨设备互投及应用内 GitHub 直连自动校验更新。</p>
+            <a href="https://github.com/lengsukq/OpalDesk/releases/latest" target="_blank" rel="noopener noreferrer" class="btn-hero-primary dl-btn">
+              <span data-i18n="dl_android_btn">前往 Releases 下载最新 APK</span>
+            </a>
+          </div>
+
+          <div class="dl-card elevated-surface">
+            <div class="dl-card-head">
+              <span class="dl-platform mono">MACOS 14+ · SWIFT 6</span>
+              <span class="dl-size mono">~2.4 MB · Native</span>
+            </div>
+            <h3 data-i18n="dl_mac_t">OpalDesk macOS 伴侣端 (ZIP)</h3>
+            <p data-i18n="dl_mac_d">纯原生 Swift 6 macOS 接收伴侣端，支持 USB / Wi-Fi TLS 低延迟 HEVC 视频与 AAC 音频串流、双向剪贴板与快捷映射。</p>
+            <a href="https://github.com/lengsukq/OpalDesk/releases/latest" target="_blank" rel="noopener noreferrer" class="btn-hero-secondary dl-btn">
+              <span data-i18n="dl_mac_btn">前往 Releases 下载 macOS 伴侣端</span>
+            </a>
+          </div>
+        </div>
+
+        <!-- Adaptive Code Studio: 4-Channel Activation & Local Build -->
+        <div class="code-studio">
+          <div class="studio-header">
+            <div class="studio-dots" aria-hidden="true"><span></span><span></span><span></span></div>
+            <div class="studio-tabs" role="tablist" aria-label="激活与构建方式">
+              <button type="button" class="studio-tab active" data-code="wireless" data-i18n="tab_wireless">① 内置无线调试（推荐）</button>
+              <button type="button" class="studio-tab" data-code="shizuku" data-i18n="tab_shizuku">② Shizuku / Sui</button>
+              <button type="button" class="studio-tab" data-code="adb" data-i18n="tab_adb">③ 电脑单行 ADB</button>
+              <button type="button" class="studio-tab" data-code="build" data-i18n="tab_build">④ 源码编译测试</button>
+            </div>
+            <button type="button" class="studio-copy-btn mono" id="copyCodeBtn" data-i18n="btn_copy">复制命令</button>
+          </div>
+          <pre class="studio-body"><code id="studioCodeBlock" class="mono"></code></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <div class="footer-brand">
+        <img src="./assets/icon.svg" alt="OpalDesk" width="22" height="22" />
+        <span><strong>OpalDesk</strong> · Universal Wayland-Style Compositor</span>
+      </div>
+      <div class="footer-links">
+        <a href="./index.html" data-i18n="ft_3d">3D 舞台主页</a>
+        <a href="https://github.com/lengsukq/OpalDesk" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <a href="https://github.com/lengsukq/OpalDesk/releases" target="_blank" rel="noopener noreferrer">Releases</a>
+        <a href="https://github.com/lengsukq/OpalDesk/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">MIT License</a>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Fullscreen Liquid Glass Screenshot Lightbox -->
+  <div class="lightbox-backdrop" id="lightbox" role="dialog" aria-modal="true" aria-label="真机截图预览" hidden>
+    <div class="lightbox-shell liquid-glass-layer">
+      <div class="lightbox-top">
+        <div>
+          <strong id="lbTitle"></strong>
+          <span class="mono lb-device" id="lbDevice"></span>
+        </div>
+        <div class="lightbox-controls">
+          <button type="button" class="lb-btn" id="lbPrev" aria-label="上一张">←</button>
+          <button type="button" class="lb-btn" id="lbNext" aria-label="下一张">→</button>
+          <button type="button" class="lb-btn lb-close" id="lbClose" aria-label="关闭">✕</button>
+        </div>
+      </div>
+      <div class="lightbox-media">
+        <img id="lbImg" src="" alt="" />
+      </div>
+      <p class="lightbox-caption" id="lbCaption"></p>
+    </div>
+  </div>
+
+  <script src="./sound.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
