@@ -1,6 +1,6 @@
 # <img src="site/assets/icon.svg" alt="OpalDesk Icon" width="44" height="44" align="top" /> OpalDesk
 
-> **在线体验**：[3D 交互舞台](https://lengsukq.github.io/OpalDesk/) ｜ [2D 实拍与多窗模拟器](https://lengsukq.github.io/OpalDesk/overview.html) ｜ [使用指南](docs/USER_GUIDE.md) ｜ [架构设计](docs/ANDROID_WINDOW_ENGINE_DESIGN.md) ｜ [下载最新 Release](https://github.com/lengsukq/OpalDesk/releases/latest)
+> **在线体验**：[3D 交互舞台](https://lengsukq.github.io/OpalDesk/) ｜ [2D 实拍与多窗模拟器](https://lengsukq.github.io/OpalDesk/overview.html) ｜ [**Web 被投屏端 & 局域网激活**](https://lengsukq.github.io/OpalDesk/cast/) ｜ [使用指南](docs/USER_GUIDE.md) ｜ [架构设计](docs/ANDROID_WINDOW_ENGINE_DESIGN.md) ｜ [下载最新 Release](https://github.com/lengsukq/OpalDesk/releases/latest)
 
 **全品牌安卓通用、免 Root 优先的 Wayland 式「一窗一独立虚拟屏」120fps 液态毛玻璃多窗合成工作站。**
 

@@ -233,6 +233,49 @@ public final class OpalCastProtocol {
         header[0] = (byte) first;
         readFully(in, header, 1, HEADER_SIZE - 1);
 
+        DecodedHeader dh = parseHeader(header);
+        byte[] payload = (dh.payloadLen == 0) ? EMPTY_BYTES : new byte[dh.payloadLen];
+        if (dh.payloadLen > 0) {
+            readFully(in, payload, 0, dh.payloadLen);
+        }
+        return new Frame(dh.type, dh.flags, dh.timestampUs, payload);
+    }
+
+    /**
+     * Decodes a complete in-memory OpalCast v1 frame (18-byte header + exact payload),
+     * used when receiving one OpalCast frame per RFC 6455 WebSocket Binary Message.
+     */
+    public static Frame decodeFrameBytes(byte[] raw) throws ProtocolException {
+        if (raw == null || raw.length < HEADER_SIZE) {
+            throw new ProtocolException("Truncated OpalCast WebSocket frame: " + (raw == null ? 0 : raw.length));
+        }
+        DecodedHeader dh = parseHeader(raw);
+        if (raw.length != HEADER_SIZE + dh.payloadLen) {
+            throw new ProtocolException("OpalCast WebSocket frame length mismatch: expected "
+                    + (HEADER_SIZE + dh.payloadLen) + ", got " + raw.length);
+        }
+        byte[] payload = (dh.payloadLen == 0) ? EMPTY_BYTES : new byte[dh.payloadLen];
+        if (dh.payloadLen > 0) {
+            System.arraycopy(raw, HEADER_SIZE, payload, 0, dh.payloadLen);
+        }
+        return new Frame(dh.type, dh.flags, dh.timestampUs, payload);
+    }
+
+    private static final class DecodedHeader {
+        final int type;
+        final int flags;
+        final int payloadLen;
+        final long timestampUs;
+
+        DecodedHeader(int type, int flags, int payloadLen, long timestampUs) {
+            this.type = type;
+            this.flags = flags;
+            this.payloadLen = payloadLen;
+            this.timestampUs = timestampUs;
+        }
+    }
+
+    private static DecodedHeader parseHeader(byte[] header) throws ProtocolException {
         if (header[0] != MAGIC_0 || header[1] != MAGIC_1
                 || header[2] != MAGIC_2 || header[3] != MAGIC_3) {
             throw new ProtocolException(String.format(
@@ -261,12 +304,7 @@ public final class OpalCastProtocol {
                 | ((long) (header[15] & 0xFF) << 16)
                 | ((long) (header[16] & 0xFF) << 8)
                 | ((long) (header[17] & 0xFF));
-
-        byte[] payload = (payloadLen == 0) ? EMPTY_BYTES : new byte[payloadLen];
-        if (payloadLen > 0) {
-            readFully(in, payload, 0, payloadLen);
-        }
-        return new Frame(type, flags, timestampUs, payload);
+        return new DecodedHeader(type, flags, payloadLen, timestampUs);
     }
 
     private static void readFully(InputStream in, byte[] buf, int off, int len) throws IOException {

@@ -83,10 +83,19 @@ public final class SelfSignedCertGenerator {
      * a fresh ECDSA P-256 self-signed identity and saves it atomically with 0600 permissions.
      */
     public static ServerIdentity loadOrCreate(File storeFile, String commonName) throws Exception {
-        return loadOrCreate(storeFile, commonName, DEFAULT_PASSWORD);
+        return loadOrCreate(storeFile, commonName, DEFAULT_PASSWORD, null);
+    }
+
+    public static ServerIdentity loadOrCreate(File storeFile, String commonName, List<String> extraSanIps) throws Exception {
+        return loadOrCreate(storeFile, commonName, DEFAULT_PASSWORD, extraSanIps);
     }
 
     public static ServerIdentity loadOrCreate(File storeFile, String commonName, char[] password) throws Exception {
+        return loadOrCreate(storeFile, commonName, password, null);
+    }
+
+    public static ServerIdentity loadOrCreate(
+            File storeFile, String commonName, char[] password, List<String> extraSanIps) throws Exception {
         char[] pass = (password != null && password.length > 0) ? password : DEFAULT_PASSWORD;
         if (storeFile != null && storeFile.isFile() && storeFile.length() > 0) {
             try {
@@ -101,7 +110,7 @@ public final class SelfSignedCertGenerator {
                         + " regenerating: " + t.getMessage());
             }
         }
-        ServerIdentity fresh = generate(commonName, pass, null);
+        ServerIdentity fresh = generate(commonName, pass, extraSanIps);
         if (storeFile != null) {
             saveAtomic(fresh.keyStore, storeFile, pass);
         }

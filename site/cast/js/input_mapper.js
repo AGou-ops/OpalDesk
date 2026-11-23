@@ -1,0 +1,377 @@
+/**
+ * Browser Mouse, Multi-Touch, Keyboard (DOM KeyboardEvent.code -> Android KeyEvent.KEYCODE_*),
+ * Chinese/CJK IME bridge, Clipboard paste, and Drag-and-Drop File Transfer input controller.
+ */
+
+import {
+  BUTTON_BACK,
+  BUTTON_FORWARD,
+  BUTTON_PRIMARY,
+  BUTTON_SECONDARY,
+  BUTTON_TERTIARY,
+  KEY_DOWN,
+  KEY_UP,
+  MOUSE_BUTTON_DOWN,
+  MOUSE_BUTTON_UP,
+  MOUSE_HOVER_EXIT,
+  MOUSE_MOVE_ABS,
+  MOUSE_SCROLL,
+  TOUCH_CANCEL,
+  TOUCH_DOWN,
+  TOUCH_MOVE,
+  TOUCH_POINTER_DOWN,
+  TOUCH_POINTER_UP,
+  TOUCH_UP,
+} from './protocol.js';
+
+// Android android.view.KeyEvent META_* masks
+export const META_SHIFT_ON = 0x00000001;
+export const META_ALT_ON = 0x00000002;
+export const META_ALT_LEFT_ON = 0x00000010;
+export const META_SHIFT_LEFT_ON = 0x00000040;
+export const META_CTRL_ON = 0x00001000;
+export const META_CTRL_LEFT_ON = 0x00002000;
+export const META_META_ON = 0x00010000;
+export const META_META_LEFT_ON = 0x00020000;
+export const META_CAPS_LOCK_ON = 0x00100000;
+
+// DOM KeyboardEvent.code -> Android KeyEvent.KEYCODE_*
+export const DOM_CODE_TO_ANDROID_KEYCODE = {
+  Digit0: 7, Digit1: 8, Digit2: 9, Digit3: 10, Digit4: 11,
+  Digit5: 12, Digit6: 13, Digit7: 14, Digit8: 15, Digit9: 16,
+  KeyA: 29, KeyB: 30, KeyC: 31, KeyD: 32, KeyE: 33, KeyF: 34, KeyG: 35,
+  KeyH: 36, KeyI: 37, KeyJ: 38, KeyK: 39, KeyL: 40, KeyM: 41, KeyN: 42,
+  KeyO: 43, KeyP: 44, KeyQ: 45, KeyR: 46, KeyS: 47, KeyT: 48, KeyU: 49,
+  KeyV: 50, KeyW: 51, KeyX: 52, KeyY: 53, KeyZ: 54,
+  Comma: 55, Period: 56, AltLeft: 57, AltRight: 58, ShiftLeft: 59, ShiftRight: 60,
+  Tab: 61, Space: 62, Enter: 66, Backspace: 67, Backquote: 68, Minus: 69,
+  Equal: 70, BracketLeft: 71, BracketRight: 72, Backslash: 73, Semicolon: 74,
+  Quote: 75, Slash: 76,
+  Escape: 111, Delete: 112, ControlLeft: 113, ControlRight: 114, CapsLock: 115,
+  MetaLeft: 117, MetaRight: 118,
+  Home: 122, End: 123, Insert: 124, PageUp: 92, PageDown: 93,
+  ArrowUp: 19, ArrowDown: 20, ArrowLeft: 21, ArrowRight: 22,
+  F1: 131, F2: 132, F3: 133, F4: 134, F5: 135, F6: 136,
+  F7: 137, F8: 138, F9: 139, F10: 140, F11: 141, F12: 142,
+  Numpad0: 144, Numpad1: 145, Numpad2: 146, Numpad3: 147, Numpad4: 148,
+  Numpad5: 149, Numpad6: 150, Numpad7: 151, Numpad8: 152, Numpad9: 153,
+  NumpadDivide: 154, NumpadMultiply: 155, NumpadSubtract: 156, NumpadAdd: 157,
+  NumpadDecimal: 158, NumpadEnter: 160,
+};
+
+const MAC_CMD_TO_CTRL_CODES = new Set([
+  'KeyA', 'KeyB', 'KeyC', 'KeyF', 'KeyI', 'KeyK', 'KeyL', 'KeyN',
+  'KeyO', 'KeyP', 'KeyR', 'KeyS', 'KeyT', 'KeyU', 'KeyV', 'KeyW',
+  'KeyX', 'KeyY', 'KeyZ', 'Equal', 'Minus', 'Digit0',
+]);
+
+export function mapDomKeyboardEvent(ev, mapMacCommandToCtrl = true) {
+  const androidKeyCode = DOM_CODE_TO_ANDROID_KEYCODE[ev.code];
+  if (!androidKeyCode) return null;
+
+  const promoteCmd = mapMacCommandToCtrl && ev.metaKey && !ev.ctrlKey && MAC_CMD_TO_CTRL_CODES.has(ev.code);
+  let meta = 0;
+  if (ev.shiftKey) meta |= META_SHIFT_ON | META_SHIFT_LEFT_ON;
+  if (ev.altKey) meta |= META_ALT_ON | META_ALT_LEFT_ON;
+  if (ev.ctrlKey || promoteCmd) meta |= META_CTRL_ON | META_CTRL_LEFT_ON;
+  if (ev.metaKey && !promoteCmd) meta |= META_META_ON | META_META_LEFT_ON;
+  if (ev.getModifierState && ev.getModifierState('CapsLock')) meta |= META_CAPS_LOCK_ON;
+
+  return { androidKeyCode, metaState: meta };
+}
+
+function domButtonToAndroidMask(button) {
+  switch (button) {
+    case 0: return BUTTON_PRIMARY;
+    case 2: return BUTTON_SECONDARY;
+    case 1: return BUTTON_TERTIARY;
+    case 3: return BUTTON_BACK;
+    case 4: return BUTTON_FORWARD;
+    default: return BUTTON_PRIMARY;
+  }
+}
+
+function domButtonsToAndroidMask(buttons) {
+  let mask = 0;
+  if (buttons & 1) mask |= BUTTON_PRIMARY;
+  if (buttons & 2) mask |= BUTTON_SECONDARY;
+  if (buttons & 4) mask |= BUTTON_TERTIARY;
+  if (buttons & 8) mask |= BUTTON_BACK;
+  if (buttons & 16) mask |= BUTTON_FORWARD;
+  return mask;
+}
+
+export class OpalInputController {
+  constructor(canvas, imeInput, {
+    getRemoteSize,
+    onMouse,
+    onTouch,
+    onKey,
+    onText,
+    onImageClipboard,
+    onFileDrop,
+    onUserGesture,
+  }) {
+    this.canvas = canvas;
+    this.imeInput = imeInput;
+    this.getRemoteSize = getRemoteSize;
+    this.onMouse = onMouse;
+    this.onTouch = onTouch;
+    this.onKey = onKey;
+    this.onText = onText;
+    this.onImageClipboard = onImageClipboard;
+    this.onFileDrop = onFileDrop;
+    this.onUserGesture = onUserGesture || (() => {});
+
+    this.enabled = false;
+    this.composing = false;
+    this.isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+    this.touchMap = new Map();
+    this.boundHandlers = [];
+  }
+
+  attach() {
+    const add = (el, type, fn, opts) => {
+      el.addEventListener(type, fn, opts);
+      this.boundHandlers.push([el, type, fn, opts]);
+    };
+
+    add(this.canvas, 'contextmenu', (e) => {
+      if (this.enabled) e.preventDefault();
+    });
+
+    add(this.canvas, 'pointerdown', (e) => {
+      if (!this.enabled || e.pointerType === 'touch') return;
+      this.onUserGesture();
+      e.preventDefault();
+      this.canvas.setPointerCapture(e.pointerId);
+      const pt = this.mapClientPoint(e.clientX, e.clientY);
+      if (!pt) return;
+      this.onMouse(
+        MOUSE_BUTTON_DOWN,
+        pt.x,
+        pt.y,
+        domButtonsToAndroidMask(e.buttons) || domButtonToAndroidMask(e.button),
+        domButtonToAndroidMask(e.button),
+        0,
+        0
+      );
+      if (document.activeElement !== this.imeInput) {
+        this.imeInput.focus({ preventScroll: true });
+      }
+    });
+
+    add(this.canvas, 'pointermove', (e) => {
+      if (!this.enabled || e.pointerType === 'touch') return;
+      const pt = this.mapClientPoint(e.clientX, e.clientY);
+      if (!pt) return;
+      this.onMouse(MOUSE_MOVE_ABS, pt.x, pt.y, domButtonsToAndroidMask(e.buttons), 0, 0, 0);
+    });
+
+    add(this.canvas, 'pointerup', (e) => {
+      if (!this.enabled || e.pointerType === 'touch') return;
+      e.preventDefault();
+      const pt = this.mapClientPoint(e.clientX, e.clientY);
+      if (!pt) return;
+      this.onMouse(
+        MOUSE_BUTTON_UP,
+        pt.x,
+        pt.y,
+        domButtonsToAndroidMask(e.buttons),
+        domButtonToAndroidMask(e.button),
+        0,
+        0
+      );
+    });
+
+    add(this.canvas, 'pointerleave', (e) => {
+      if (!this.enabled || e.pointerType === 'touch' || e.buttons !== 0) return;
+      const pt = this.mapClientPoint(e.clientX, e.clientY);
+      if (pt) this.onMouse(MOUSE_HOVER_EXIT, pt.x, pt.y, 0, 0, 0, 0);
+    });
+
+    add(
+      this.canvas,
+      'wheel',
+      (e) => {
+        if (!this.enabled) return;
+        e.preventDefault();
+        const pt = this.mapClientPoint(e.clientX, e.clientY);
+        if (!pt) return;
+        // Android AXIS_VSCROLL positive scrolls up; invert DOM deltaY and normalize tick size
+        const scale = e.deltaMode === 1 ? 1.0 : 1 / 48;
+        const hScroll = Math.max(-8, Math.min(8, -e.deltaX * scale));
+        const vScroll = Math.max(-8, Math.min(8, -e.deltaY * scale));
+        this.onMouse(MOUSE_SCROLL, pt.x, pt.y, 0, 0, hScroll, vScroll);
+      },
+      { passive: false }
+    );
+
+    // Multi-touch support for touchscreens / tablets
+    const emitTouch = (ev, type) => {
+      if (!this.enabled) return;
+      this.onUserGesture();
+      ev.preventDefault();
+      const activeList = [];
+      for (let i = 0; i < ev.touches.length; i++) {
+        const t = ev.touches[i];
+        const pt = this.mapClientPoint(t.clientX, t.clientY);
+        if (pt) activeList.push({ pointerId: t.identifier, x: pt.x, y: pt.y, pressure: t.force || 1.0 });
+      }
+      if (type === 'start') {
+        for (let i = 0; i < ev.changedTouches.length; i++) {
+          const ct = ev.changedTouches[i];
+          const idx = activeList.findIndex((p) => p.pointerId === ct.identifier);
+          if (idx < 0) continue;
+          const action = activeList.length === 1 ? TOUCH_DOWN : TOUCH_POINTER_DOWN;
+          this.onTouch(action, idx, activeList);
+        }
+      } else if (type === 'move') {
+        if (activeList.length > 0) this.onTouch(TOUCH_MOVE, 0, activeList);
+      } else {
+        // On touchend/cancel, include the lifted touch in pointers array per Android MotionEvent semantics
+        for (let i = 0; i < ev.changedTouches.length; i++) {
+          const ct = ev.changedTouches[i];
+          const pt = this.mapClientPoint(ct.clientX, ct.clientY);
+          if (!pt) continue;
+          const all = activeList.concat([{ pointerId: ct.identifier, x: pt.x, y: pt.y, pressure: 0 }]);
+          const idx = all.length - 1;
+          const action = type === 'cancel' ? TOUCH_CANCEL : all.length === 1 ? TOUCH_UP : TOUCH_POINTER_UP;
+          this.onTouch(action, idx, all);
+        }
+      }
+    };
+    add(this.canvas, 'touchstart', (e) => emitTouch(e, 'start'), { passive: false });
+    add(this.canvas, 'touchmove', (e) => emitTouch(e, 'move'), { passive: false });
+    add(this.canvas, 'touchend', (e) => emitTouch(e, 'end'), { passive: false });
+    add(this.canvas, 'touchcancel', (e) => emitTouch(e, 'cancel'), { passive: false });
+
+    // Keyboard & CJK IME bridge
+    add(this.imeInput, 'compositionstart', () => {
+      this.composing = true;
+    });
+    add(this.imeInput, 'compositionend', (e) => {
+      this.composing = false;
+      const text = e.data || this.imeInput.value;
+      this.imeInput.value = '';
+      if (this.enabled && text) {
+        this.onText(text, true);
+      }
+    });
+    add(this.imeInput, 'input', () => {
+      if (this.composing || !this.enabled) return;
+      const val = this.imeInput.value;
+      if (val) {
+        this.imeInput.value = '';
+        // Non-ASCII / IME committed text (e.g. mobile soft keyboard or voice dictation)
+        if (/[^\x20-\x7e]/.test(val)) {
+          this.onText(val, true);
+        }
+      }
+    });
+    add(this.imeInput, 'paste', async (e) => {
+      if (!this.enabled) return;
+      const dt = e.clipboardData;
+      if (!dt) return;
+      const imgItem = Array.from(dt.items || []).find((it) => it.type && it.type.startsWith('image/png'));
+      if (imgItem && this.onImageClipboard) {
+        e.preventDefault();
+        const file = imgItem.getAsFile();
+        if (file) {
+          const buf = new Uint8Array(await file.arrayBuffer());
+          this.onImageClipboard(buf);
+        }
+        return;
+      }
+      const text = dt.getData('text/plain');
+      if (text) {
+        e.preventDefault();
+        this.onText(text, true);
+      }
+    });
+
+    const handleKey = (ev, action) => {
+      if (!this.enabled) return;
+      // Do not steal keystrokes if user is typing in modal search/input fields
+      const active = document.activeElement;
+      if (active && active !== this.imeInput && active !== document.body && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {
+        return;
+      }
+      if (this.composing || ev.isComposing || ev.keyCode === 229) return;
+      // Let browser handle paste event cleanly when Ctrl/Cmd+V is pressed inside imeInput
+      if (action === KEY_DOWN && (ev.ctrlKey || ev.metaKey) && ev.code === 'KeyV' && active === this.imeInput) {
+        return;
+      }
+      const mapped = mapDomKeyboardEvent(ev, this.isMac);
+      if (!mapped) return;
+      ev.preventDefault();
+      this.onKey(action, mapped.androidKeyCode, mapped.metaState, ev.repeat ? 1 : 0);
+    };
+    add(window, 'keydown', (e) => handleKey(e, KEY_DOWN));
+    add(window, 'keyup', (e) => handleKey(e, KEY_UP));
+
+    // Drag & Drop File Upload onto Canvas
+    add(this.canvas, 'dragover', (e) => {
+      if (!this.enabled) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    });
+    add(this.canvas, 'drop', (e) => {
+      if (!this.enabled) return;
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer?.files || []);
+      if (files.length > 0 && this.onFileDrop) {
+        this.onFileDrop(files);
+      }
+    });
+  }
+
+  setEnabled(enabled) {
+    this.enabled = Boolean(enabled);
+    if (this.enabled) {
+      this.imeInput.focus({ preventScroll: true });
+    }
+  }
+
+  handleRemoteImeRequest(show) {
+    if (!this.enabled) return;
+    if (show) {
+      this.imeInput.focus({ preventScroll: true });
+    }
+  }
+
+  mapClientPoint(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const { width: rw, height: rh } = this.getRemoteSize();
+    if (rw <= 0 || rh <= 0) return null;
+
+    // Account for `object-fit: contain` letterboxing inside canvas element
+    const elemRatio = rect.width / rect.height;
+    const videoRatio = rw / rh;
+    let drawW = rect.width;
+    let drawH = rect.height;
+    let offsetX = 0;
+    let offsetY = 0;
+    if (elemRatio > videoRatio) {
+      drawW = rect.height * videoRatio;
+      offsetX = (rect.width - drawW) / 2;
+    } else {
+      drawH = rect.width / videoRatio;
+      offsetY = (rect.height - drawH) / 2;
+    }
+
+    const relX = (clientX - rect.left - offsetX) / drawW;
+    const relY = (clientY - rect.top - offsetY) / drawH;
+    const x = Math.max(0, Math.min(rw - 1, relX * rw));
+    const y = Math.max(0, Math.min(rh - 1, relY * rh));
+    return { x, y };
+  }
+
+  detach() {
+    for (const [el, type, fn, opts] of this.boundHandlers) {
+      el.removeEventListener(type, fn, opts);
+    }
+    this.boundHandlers.length = 0;
+  }
+}

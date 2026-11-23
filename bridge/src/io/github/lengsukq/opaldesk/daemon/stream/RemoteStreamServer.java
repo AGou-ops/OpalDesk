@@ -25,6 +25,7 @@ import java.net.NetworkInterface;
 import java.net.Socket;
 import java.net.SocketException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Enumeration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -284,7 +285,11 @@ public final class RemoteStreamServer {
             stopWifiListenerLocked();
             try {
                 if (tlsIdentity == null) {
-                    tlsIdentity = SelfSignedCertGenerator.loadOrCreate(certStoreFile, deviceName);
+                    String lanIp = detectLanIpv4Address();
+                    List<String> extraSans = (lanIp != null && !lanIp.isEmpty())
+                            ? Collections.singletonList(lanIp)
+                            : null;
+                    tlsIdentity = SelfSignedCertGenerator.loadOrCreate(certStoreFile, deviceName, extraSans);
                 }
                 SSLContext sslCtx = SelfSignedCertGenerator.createServerSSLContext(tlsIdentity);
                 SSLServerSocket ss = (SSLServerSocket) sslCtx.getServerSocketFactory().createServerSocket();
@@ -538,16 +543,49 @@ public final class RemoteStreamServer {
 
     // ---- Shared Handshake & Transport Handlers ----
 
+    private OpalCastFrameTransport negotiateFrameTransport(
+            BufferedInputStream in,
+            OutputStream out,
+            boolean isTls,
+            int listenPort) throws IOException {
+        in.mark(8);
+        byte[] prefix = new byte[4];
+        int got = 0;
+        while (got < 4) {
+            int n = in.read(prefix, got, 4 - got);
+            if (n < 0) {
+                return null;
+            }
+            got += n;
+        }
+        in.reset();
+
+        if (WebSocketHttpHandler.isHttpRequestPrefix(prefix)) {
+            String fullFp = getCertFingerprint();
+            String shortFp = (fullFp.length() >= 12) ? fullFp.substring(0, 12) : fullFp;
+            WebSocketHttpHandler.ServerMeta meta =
+                    new WebSocketHttpHandler.ServerMeta(deviceName, shortFp, listenPort, isTls);
+            return WebSocketHttpHandler.handle(in, out, meta);
+        }
+        return OpalCastFrameTransport.raw(in, out);
+    }
+
     private void handleUsbClient(LocalSocket sock) {
         try {
             try { sock.setSendBufferSize(SOCKET_SEND_BUF_BYTES); } catch (IOException ignored) {}
             try { sock.setReceiveBufferSize(SOCKET_IO_BUFFER_BYTES); } catch (IOException ignored) {}
             sock.setSoTimeout(HANDSHAKE_TIMEOUT_MS);
 
-            InputStream in = new BufferedInputStream(sock.getInputStream(), SOCKET_IO_BUFFER_BYTES);
+            BufferedInputStream in = new BufferedInputStream(sock.getInputStream(), SOCKET_IO_BUFFER_BYTES);
             OutputStream out = new BufferedOutputStream(sock.getOutputStream(), SOCKET_IO_BUFFER_BYTES);
 
-            OpalCastProtocol.HelloMsg hello = readAndValidateHello(in, out, sock);
+            OpalCastFrameTransport frameTransport = negotiateFrameTransport(in, out, false, wifiPort);
+            if (frameTransport == null) {
+                ClientSession.closeTransportQuietly(sock);
+                return;
+            }
+
+            OpalCastProtocol.HelloMsg hello = readAndValidateHello(frameTransport, sock);
             if (hello == null) return;
 
             int sinkType = OpalCastProtocol.TRANSPORT_HINT_WIFI_ADB.equalsIgnoreCase(hello.transportHint)
@@ -563,7 +601,7 @@ public final class RemoteStreamServer {
 
             completeHandshakeAndRun(
                     sinkType, true, true, clientId, clientName, "", authMsg, true,
-                    hello, sock, () -> sock.setSoTimeout(0), in, out);
+                    hello, sock, () -> sock.setSoTimeout(0), frameTransport);
         } catch (Throwable t) {
             System.err.println("OPALDESK_USB_CLIENT_ERR: " + t.getMessage());
             ClientSession.closeTransportQuietly(sock);
@@ -581,17 +619,23 @@ public final class RemoteStreamServer {
             sock.startHandshake();
 
             String peerIp = (sock.getInetAddress() != null) ? sock.getInetAddress().getHostAddress() : "unknown";
-            InputStream in = new BufferedInputStream(sock.getInputStream(), SOCKET_IO_BUFFER_BYTES);
+            BufferedInputStream in = new BufferedInputStream(sock.getInputStream(), SOCKET_IO_BUFFER_BYTES);
             OutputStream out = new BufferedOutputStream(sock.getOutputStream(), SOCKET_IO_BUFFER_BYTES);
 
-            OpalCastProtocol.HelloMsg hello = readAndValidateHello(in, out, sock);
+            OpalCastFrameTransport frameTransport = negotiateFrameTransport(in, out, true, wifiPort);
+            if (frameTransport == null) {
+                ClientSession.closeTransportQuietly(sock);
+                return;
+            }
+
+            OpalCastProtocol.HelloMsg hello = readAndValidateHello(frameTransport, sock);
             if (hello == null) return;
 
             TrustStoreManager.TokenVerifyResult verify = trustStore.verifyTokenOrCheckRateLimit(
                     hello.clientId, hello.clientName, hello.authToken, peerIp);
             if (verify.status == TrustStoreManager.TokenVerifyResult.STATUS_INVALID_CLIENT
                     || verify.isRateLimited()) {
-                sendAuthFailureAndClose(out, sock, verify.message);
+                sendAuthFailureAndClose(frameTransport, sock, verify.message);
                 return;
             }
 
@@ -603,7 +647,7 @@ public final class RemoteStreamServer {
                 completeHandshakeAndRun(
                         DisplaySink.SINK_REMOTE_WIFI, false, permanent, clientId, clientName,
                         "", verify.message, permanent,
-                        hello, sock, () -> sock.setSoTimeout(0), in, out);
+                        hello, sock, () -> sock.setSoTimeout(0), frameTransport);
                 return;
             }
 
@@ -616,7 +660,7 @@ public final class RemoteStreamServer {
                 completeHandshakeAndRun(
                         DisplaySink.SINK_REMOTE_WIFI, false, true, clientId, clientName,
                         permanentToken, "已永久允许此设备连接", true,
-                        hello, sock, () -> sock.setSoTimeout(0), in, out);
+                        hello, sock, () -> sock.setSoTimeout(0), frameTransport);
             } else if (decision == PairingApprovalCoordinator.DECISION_APPROVE_ONCE) {
                 trustStore.clearFailures(peerIp);
                 String handoverToken = hello.isAppCatalog()
@@ -625,14 +669,14 @@ public final class RemoteStreamServer {
                 completeHandshakeAndRun(
                         DisplaySink.SINK_REMOTE_WIFI, false, false, clientId, clientName,
                         handoverToken, "已临时允许本次连接", false,
-                        hello, sock, () -> sock.setSoTimeout(0), in, out);
+                        hello, sock, () -> sock.setSoTimeout(0), frameTransport);
             } else if (decision == PairingApprovalCoordinator.DECISION_REJECT) {
                 trustStore.recordRejection(peerIp);
-                sendAuthFailureAndClose(out, sock, "对方已拒绝此次投屏请求");
+                sendAuthFailureAndClose(frameTransport, sock, "对方已拒绝此次投屏请求");
             } else if (decision == PairingApprovalCoordinator.DECISION_TIMED_OUT) {
-                sendAuthFailureAndClose(out, sock, "等待对方确认超时，请重试");
+                sendAuthFailureAndClose(frameTransport, sock, "等待对方确认超时，请重试");
             } else {
-                sendAuthFailureAndClose(out, sock, "对方正忙或已关闭无线接收服务");
+                sendAuthFailureAndClose(frameTransport, sock, "对方正忙或已关闭无线接收服务");
             }
         } catch (Throwable t) {
             System.err.println("OPALDESK_WIFI_CLIENT_ERR: " + t.getMessage());
@@ -640,20 +684,20 @@ public final class RemoteStreamServer {
         }
     }
 
-    private OpalCastProtocol.HelloMsg readAndValidateHello(InputStream in, OutputStream out, Closeable sock)
+    private OpalCastProtocol.HelloMsg readAndValidateHello(OpalCastFrameTransport frameTransport, Closeable sock)
             throws IOException {
-        OpalCastProtocol.Frame first = OpalCastProtocol.readFrame(in);
+        OpalCastProtocol.Frame first = frameTransport.readFrame();
         if (first == null || first.type != OpalCastProtocol.TYPE_HELLO) {
-            sendAuthFailureAndClose(out, sock, "Expected HELLO frame");
+            sendAuthFailureAndClose(frameTransport, sock, "Expected HELLO frame");
             return null;
         }
         OpalCastProtocol.HelloMsg hello = OpalCastProtocol.decodeHello(first.payload);
         if (hello.protocolVersion != OpalCastProtocol.PROTOCOL_VERSION) {
-            sendAuthFailureAndClose(out, sock, "Unsupported protocolVersion: " + hello.protocolVersion);
+            sendAuthFailureAndClose(frameTransport, sock, "Unsupported protocolVersion: " + hello.protocolVersion);
             return null;
         }
         if (hello.isStandaloneApp() && hello.appPackage.isEmpty()) {
-            sendAuthFailureAndClose(out, sock, "Missing appPackage for standalone_app session");
+            sendAuthFailureAndClose(frameTransport, sock, "Missing appPackage for standalone_app session");
             return null;
         }
         return hello;
@@ -671,19 +715,19 @@ public final class RemoteStreamServer {
             OpalCastProtocol.HelloMsg hello,
             Closeable sock,
             TimeoutClearer clearTimeout,
-            InputStream in,
-            OutputStream out) throws IOException {
+            OpalCastFrameTransport frameTransport) throws IOException {
         if (!hasCapacityForSession(hello)) {
-            sendAuthFailureAndClose(out, sock,
+            sendAuthFailureAndClose(frameTransport, sock,
                     "Maximum " + MAX_STANDALONE_SESSIONS + " standalone app sessions active");
             return;
         }
 
         OpalCastProtocol.AuthResultMsg okMsg = new OpalCastProtocol.AuthResultMsg(
                 true, issuedToken, authMsg, deviceName, getCertFingerprint(), permanentTokenFlag);
-        writeAuthResultImmediate(out, okMsg);
+        writeAuthResultImmediate(frameTransport, okMsg);
         clearTimeout.clear();
-        runAuthenticatedSession(sinkType, isAdbLocalSocket, permanentTrust, clientId, clientName, hello, sock, in, out);
+        runAuthenticatedSession(
+                sinkType, isAdbLocalSocket, permanentTrust, clientId, clientName, hello, sock, frameTransport);
     }
 
     private boolean hasCapacityForSession(OpalCastProtocol.HelloMsg hello) {
@@ -706,14 +750,13 @@ public final class RemoteStreamServer {
             String clientName,
             OpalCastProtocol.HelloMsg hello,
             Closeable transport,
-            InputStream in,
-            OutputStream out) {
+            OpalCastFrameTransport frameTransport) {
         int sessionId = nextSessionId.incrementAndGet();
         boolean isStandalone = hello.isStandaloneApp();
         boolean isCatalog = hello.isAppCatalog();
         ClientSession current = new ClientSession(
                 sessionId, sinkType, isAdbLocalSocket, permanentTrust, hello.sessionRole, hello.appPackage,
-                clientId, clientName, transport, out, listener);
+                clientId, clientName, transport, frameTransport, listener);
 
         ClientSession replaced = null;
         boolean capacityExceeded = false;
@@ -758,7 +801,7 @@ public final class RemoteStreamServer {
                 notifiedConnect = true;
             }
             while (!stopped && !current.isClosed()) {
-                OpalCastProtocol.Frame frame = OpalCastProtocol.readFrame(in);
+                OpalCastProtocol.Frame frame = frameTransport.readFrame();
                 if (frame == null) {
                     break;
                 }
@@ -969,11 +1012,11 @@ public final class RemoteStreamServer {
         return bestOther;
     }
 
-    private void sendAuthFailureAndClose(OutputStream out, Closeable sock, String msg) {
+    private void sendAuthFailureAndClose(OpalCastFrameTransport frameTransport, Closeable sock, String msg) {
         try {
             OpalCastProtocol.AuthResultMsg fail = new OpalCastProtocol.AuthResultMsg(
                     false, "", msg, deviceName, getCertFingerprint());
-            writeAuthResultImmediate(out, fail);
+            writeAuthResultImmediate(frameTransport, fail);
         } catch (IOException e) {
             System.err.println("OPALDESK_AUTH_FAIL_SEND_WARN: " + e.getMessage());
         } finally {
@@ -981,11 +1024,13 @@ public final class RemoteStreamServer {
         }
     }
 
-    private static void writeAuthResultImmediate(OutputStream out, OpalCastProtocol.AuthResultMsg msg) throws IOException {
+    private static void writeAuthResultImmediate(
+            OpalCastFrameTransport frameTransport,
+            OpalCastProtocol.AuthResultMsg msg) throws IOException {
         byte[] payload = OpalCastProtocol.encodeAuthResult(msg);
-        OpalCastProtocol.writeFrame(out, OpalCastProtocol.TYPE_AUTH_RESULT, 0,
+        frameTransport.writeFrame(OpalCastProtocol.TYPE_AUTH_RESULT, 0,
                 SystemClock.elapsedRealtimeNanos() / 1000L, payload, 0, payload.length);
-        out.flush();
+        frameTransport.flush();
     }
 
     private static void applySecureTlsProtocols(String[] supported, Consumer<String[]> setter) {

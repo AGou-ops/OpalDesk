@@ -114,6 +114,15 @@
                 android:value="Receiver-side standalone remote app floating window overlay" />
         </service>
 
+        <service
+            android:name=".web.WebActivationService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Temporary opt-in LAN Web activation bridge for local wireless ADB bootstrap" />
+        </service>
+
         <receiver
             android:name=".AdbPairingReceiver"
             android:exported="false" />

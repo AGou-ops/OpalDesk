@@ -48,7 +48,7 @@ final class ClientSession {
     final String clientId;
     final String clientName;
     private final Closeable transport;
-    private final OutputStream out;
+    private final OpalCastFrameTransport frameWriter;
     private final RemoteStreamServer.SessionListener listener;
 
     private final Object queueLock = new Object();
@@ -74,6 +74,22 @@ final class ClientSession {
             Closeable transport,
             OutputStream out,
             RemoteStreamServer.SessionListener listener) {
+        this(sessionId, sinkType, isAdbLocalSocket, permanentTrust, sessionRole, appPackage,
+                clientId, clientName, transport, OpalCastFrameTransport.raw(null, out), listener);
+    }
+
+    ClientSession(
+            int sessionId,
+            int sinkType,
+            boolean isAdbLocalSocket,
+            boolean permanentTrust,
+            String sessionRole,
+            String appPackage,
+            String clientId,
+            String clientName,
+            Closeable transport,
+            OpalCastFrameTransport frameWriter,
+            RemoteStreamServer.SessionListener listener) {
         this.sessionId = sessionId;
         this.sinkType = sinkType;
         this.isAdbLocalSocket = isAdbLocalSocket;
@@ -84,7 +100,7 @@ final class ClientSession {
         this.clientId = clientId;
         this.clientName = clientName;
         this.transport = transport;
-        this.out = out;
+        this.frameWriter = frameWriter;
         this.listener = listener;
     }
 
@@ -223,11 +239,11 @@ final class ClientSession {
                             || next.type == OpalCastProtocol.TYPE_IME_REQUEST
                             || next.type == OpalCastProtocol.TYPE_PONG;
                 }
-                OpalCastProtocol.writeFrame(
-                        out, next.type, next.flags, next.timestampUs,
+                frameWriter.writeFrame(
+                        next.type, next.flags, next.timestampUs,
                         next.payload, 0, next.payload.length);
                 if (shouldFlush) {
-                    out.flush();
+                    frameWriter.flush();
                 }
             }
         } catch (InterruptedException ie) {

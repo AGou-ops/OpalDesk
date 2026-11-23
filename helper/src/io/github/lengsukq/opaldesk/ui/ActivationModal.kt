@@ -26,6 +26,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -42,8 +44,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.lengsukq.opaldesk.AdbBootstrap
+import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.adb.ShizukuBootstrap
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
+import io.github.lengsukq.opaldesk.web.WebActivationService
 
 /**
  * Beginner-friendly 4-channel Rootless-First Activation Modal:
@@ -58,10 +62,18 @@ fun ActivationModal(
     onActivated: () -> Unit,
 ) {
     val ctx = LocalContext.current
+    val daemonStatus by BridgeClient.statusFlow.collectAsState()
+    val webActState by WebActivationService.stateFlow.collectAsState()
+    LaunchedEffect(daemonStatus.connected) {
+        if (daemonStatus.connected) {
+            onActivated()
+        }
+    }
     var tabIndex by remember {
         mutableIntStateOf(
             when {
-                ShizukuBootstrap.isBinderAlive() -> 1
+                WebActivationService.isRunning -> 1
+                ShizukuBootstrap.isBinderAlive() -> 2
                 else -> 0
             },
         )
@@ -171,7 +183,7 @@ fun ActivationModal(
 
             Spacer(Modifier.height(14.dp))
             OpalSegmentedRow(
-                options = listOf("无线调试", "Shizuku", "电脑 ADB", "可选 Root"),
+                options = listOf("无线调试", "Web激活", "Shizuku", "电脑ADB", "Root"),
                 selectedIndex = tabIndex,
                 onSelect = { if (!isBusy) tabIndex = it },
             )
@@ -221,7 +233,18 @@ fun ActivationModal(
                         },
                     )
 
-                    1 -> ShizukuActivationPane(
+                    1 -> WebLanActivationPane(
+                        ctx = ctx,
+                        state = webActState,
+                        onCopyUrl = { url ->
+                            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                            cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk Web Activation", url))
+                            feedbackError = false
+                            feedbackText = "已复制 Web 局域网激活链接，在电脑/平板浏览器打开即可。"
+                        },
+                    )
+
+                    2 -> ShizukuActivationPane(
                         ctx = ctx,
                         isBusy = isBusy,
                         summary = shizukuSummary,
@@ -239,7 +262,7 @@ fun ActivationModal(
                         },
                     )
 
-                    2 -> PcAdbActivationPane(
+                    3 -> PcAdbActivationPane(
                         copied = copiedPcCmd,
                         onCopy = { cmd ->
                             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -250,7 +273,7 @@ fun ActivationModal(
                         },
                     )
 
-                    3 -> OptionalRootActivationPane(
+                    4 -> OptionalRootActivationPane(
                         isBusy = isBusy,
                         autoRoot = autoRoot,
                         onAutoRootChange = {
@@ -496,5 +519,127 @@ private fun OptionalRootActivationPane(
         accent = OpalPalette.AccentEmerald,
         onClick = onActivateRoot,
         modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+@Composable
+private fun WebLanActivationPane(
+    ctx: Context,
+    state: WebActivationService.State,
+    onCopyUrl: (String) -> Unit,
+) {
+    OpalText(
+        text = "免数据线 · 免电脑装 ADB：开启下方临时局域网激活服务后，用电脑或平板浏览器扫码打开 GitHub Pages，再把手机停留在系统「无线调试 → 配对码」弹窗即可在电脑上远程输入配对码完成激活并自动进入 Web 投屏。",
+        fontSize = 12.5.sp,
+        color = OpalPalette.TextSecondary,
+        lineHeight = 18.sp,
+    )
+    Spacer(Modifier.height(12.dp))
+
+    if (!state.running) {
+        OpalButton(
+            label = "开启 Web 局域网激活服务（5 分钟自动关闭）",
+            accent = OpalPalette.AccentBlue,
+            modifier = Modifier.fillMaxWidth(),
+            onClick = { WebActivationService.start(ctx) },
+        )
+        if (state.lastMessage.isNotBlank()) {
+            Spacer(Modifier.height(10.dp))
+            OpalText(
+                text = state.lastMessage,
+                fontSize = 12.sp,
+                color = if (state.lastError) OpalPalette.AccentDanger else OpalPalette.TextSecondary,
+            )
+        }
+        return
+    }
+
+    val actUrl = state.activationUrl
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .background(OpalPalette.ChipFill)
+            .border(0.8.dp, OpalPalette.BorderSubtle, RoundedCornerShape(16.dp))
+            .padding(14.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (actUrl.isNotEmpty()) {
+            OpalQrCodeCard(content = actUrl, qrSize = 164.dp)
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                OpalText(
+                    text = "局域网服务 ${state.lanIp}:${state.port}",
+                    fontSize = 12.5.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                val portHint = buildString {
+                    append("配对端口: ")
+                    append(if (state.pairingPort > 0) state.pairingPort.toString() else "等待发现")
+                    append(" · 连接端口: ")
+                    append(if (state.connectPort > 0) state.connectPort.toString() else "等待发现")
+                }
+                OpalText(text = portHint, fontSize = 11.sp, color = OpalPalette.TextSecondary)
+            }
+            Spacer(Modifier.width(8.dp))
+            OpalStatusBadge(
+                label = "访问码 ${state.sessionCode}",
+                color = OpalPalette.AccentEmerald,
+            )
+        }
+        if (state.lastMessage.isNotBlank()) {
+            OpalText(
+                text = state.lastMessage,
+                fontSize = 11.5.sp,
+                color = if (state.lastError) OpalPalette.AccentDanger else OpalPalette.AccentCyan,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            OpalButton(
+                label = "复制 Web 链接",
+                compact = true,
+                filled = false,
+                enabled = actUrl.isNotEmpty(),
+                onClick = { onCopyUrl(actUrl) },
+                modifier = Modifier.weight(1f),
+            )
+            OpalButton(
+                label = "停止服务",
+                compact = true,
+                filled = false,
+                accent = OpalPalette.AccentDanger,
+                onClick = { WebActivationService.stop(ctx) },
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+
+    Spacer(Modifier.height(10.dp))
+    OpalButton(
+        label = "打开系统「开发者选项 → 无线调试」（后台保持服务运行）",
+        accent = OpalPalette.AccentCyan,
+        modifier = Modifier.fillMaxWidth(),
+        onClick = {
+            try {
+                ctx.startActivity(
+                    Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    },
+                )
+            } catch (_: Throwable) {
+                try {
+                    ctx.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                } catch (_: Throwable) {
+                }
+            }
+        },
     )
 }

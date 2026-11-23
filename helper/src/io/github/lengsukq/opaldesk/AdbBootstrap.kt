@@ -50,9 +50,14 @@ object AdbBootstrap {
 
     fun getDiscoveryState(): DiscoveryState = AdbMdnsDiscovery.getState()
     fun startDiscovery(ctx: Context, listener: DiscoveryListener?) = AdbMdnsDiscovery.start(ctx, listener)
+    fun ensureDiscoveryStarted(ctx: Context) = AdbMdnsDiscovery.ensureStarted(ctx.applicationContext)
     fun stopDiscovery() = AdbMdnsDiscovery.stop()
     fun stopDiscoveryIfIdle() {
-        if (AdbPairingNotifier.isShowing) AdbMdnsDiscovery.clearListener() else AdbMdnsDiscovery.stop()
+        if (AdbPairingNotifier.isShowing || io.github.lengsukq.opaldesk.web.WebActivationService.isRunning) {
+            AdbMdnsDiscovery.clearListener()
+        } else {
+            AdbMdnsDiscovery.stop()
+        }
     }
 
     fun showPairingNotification(ctx: Context, statusText: String?) {

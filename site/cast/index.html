@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="pure-frost">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>OpalDesk Web — 浏览器被投屏端 &amp; 局域网免线激活中心</title>
+  <meta name="description" content="OpalDesk Web 接收端与局域网激活中心：零客户端安装，通过 GitHub Pages + WebCodecs 直连手机 60/120fps 无线投屏与免线激活。" />
+  <link rel="icon" type="image/svg+xml" href="../assets/icon.svg" />
+  <script>
+    (function () {
+      try {
+        var saved = window.localStorage.getItem('opaldesk-showcase-theme-v1');
+        var theme = saved === 'pure-frost' || saved === 'prism-pulse'
+          ? saved
+          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'prism-pulse' : 'pure-frost');
+        document.documentElement.setAttribute('data-theme', theme);
+      } catch (_) {}
+    })();
+  </script>
+  <link rel="stylesheet" href="./cast.css" />
+</head>
+<body>
+  <div class="ambient-backdrop" aria-hidden="true">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
+  </div>
+
+  <!-- Floating Toast Island -->
+  <div id="toastIsland" class="toast-island" role="status" aria-live="polite" hidden>
+    <span id="toastText"></span>
+    <button id="toastActionBtn" type="button" class="toast-action-btn" hidden></button>
+  </div>
+
+  <!-- Hidden Offscreen IME / Paste Bridge -->
+  <textarea
+    id="imeBridge"
+    class="ime-bridge"
+    autocomplete="off"
+    autocorrect="off"
+    autocapitalize="off"
+    spellcheck="false"
+    aria-label="OpalDesk 远端输入法桥"
+  ></textarea>
+
+  <!-- ==================== LOBBY VIEW ==================== -->
+  <div id="lobbyView" class="lobby-shell">
+    <header class="top-nav glass-surface">
+      <div class="nav-brand">
+        <a href="../index.html" class="brand-link">
+          <img src="../assets/icon.svg" alt="OpalDesk" width="26" height="26" />
+          <span class="brand-title">OpalDesk</span>
+          <span class="brand-badge mono">Web Cast</span>
+        </a>
+        <span id="codecBadge" class="status-pill mono">检测 WebCodecs…</span>
+      </div>
+      <div class="nav-actions">
+        <a href="../overview.html" class="pill-btn">2D 详解</a>
+        <a href="../index.html" class="pill-btn">3D 舞台</a>
+        <button id="themeToggleBtn" type="button" class="pill-btn">切换主题</button>
+      </div>
+    </header>
+
+    <main class="lobby-main">
+      <section class="hero-copy">
+        <h1>浏览器秒变 OpalDesk 无线显示器</h1>
+        <p>免安装客户端 · WebCodecs 硬件直解 H.264 / HEVC + AAC 音频 · 支持局域网远程无线调试激活</p>
+      </section>
+
+      <!-- Browser compatibility warnings -->
+      <div id="browserWarnBanner" class="alert-banner warn" hidden></div>
+
+      <!-- Primary Glass Card -->
+      <section class="lobby-card glass-surface">
+        <div class="segmented-bar" role="tablist">
+          <button id="tabCastBtn" type="button" class="seg-btn active" role="tab" aria-selected="true">
+            无线 / USB 投屏
+          </button>
+          <button id="tabActivateBtn" type="button" class="seg-btn" role="tab" aria-selected="false">
+            局域网激活引擎
+          </button>
+        </div>
+
+        <!-- ===== TAB 1: WEB CAST RECEIVER ===== -->
+        <div id="paneCast" class="tab-pane">
+          <div class="sub-toggle-row">
+            <button id="modeWifiBtn" type="button" class="chip-btn active">局域网无线 (WSS)</button>
+            <button id="modeUsbBtn" type="button" class="chip-btn">USB 本地转发 (免证书)</button>
+          </div>
+
+          <div id="usbHelperBox" class="info-box" hidden>
+            <div class="info-box-head">
+              <strong>USB 免证书极速通道</strong>
+              <button id="copyAdbForwardBtn" type="button" class="mini-btn">复制转发命令</button>
+            </div>
+            <code class="mono-code">adb forward tcp:19878 localabstract:opaldesk_stream</code>
+            <p class="hint-text">在电脑终端执行上方命令后，点击下方「开始 Web 投屏」即可通过 <code>ws://127.0.0.1:19878/ws</code> 零警告直连。</p>
+          </div>
+
+          <div class="form-grid">
+            <label class="field">
+              <span>手机局域网 IP</span>
+              <input id="castHostInput" type="text" placeholder="例如 192.168.31.88" autocomplete="off" />
+            </label>
+            <label class="field field-sm">
+              <span>投屏端口</span>
+              <input id="castPortInput" type="number" value="19878" min="1" max="65535" />
+            </label>
+          </div>
+
+          <div class="form-grid three-col">
+            <label class="field">
+              <span>视频编码偏好</span>
+              <select id="castCodecSelect">
+                <option value="h264">H.264 (推荐 · 全平台兼容)</option>
+                <option value="hevc">HEVC / H.265 (高画质)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>目标帧率</span>
+              <select id="castFpsSelect">
+                <option value="60">60 Hz (流畅省电)</option>
+                <option value="120">120 Hz (高刷丝滑)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>清晰度 / 码率</span>
+              <select id="castBitrateSelect">
+                <option value="8000">8 Mbps (均衡)</option>
+                <option value="14000" selected>14 Mbps (高清推荐)</option>
+                <option value="22000">22 Mbps (超清 2K)</option>
+              </select>
+            </label>
+          </div>
+
+          <label class="switch-row">
+            <input id="castAudioCheck" type="checkbox" checked />
+            <span>同步播放手机系统音频（48kHz 立体声 AAC-LC）</span>
+          </label>
+
+          <!-- Certificate Trust Guided Helper -->
+          <div id="castTrustBox" class="alert-banner info" hidden>
+            <div class="banner-body">
+              <strong>首次局域网连接需信任手机加密证书</strong>
+              <p id="castTrustMsg">浏览器出于安全策略不会自动弹出局域网自签名证书确认框。点击右侧按钮打开放行页，点一次「高级 → 继续前往」即可自动返回并连接。</p>
+            </div>
+            <button id="openCastTrustBtn" type="button" class="primary-btn compact">步骤 1：信任设备证书</button>
+          </div>
+
+          <div id="castErrorBox" class="alert-banner danger" hidden></div>
+
+          <div class="cta-row">
+            <button id="connectCastBtn" type="button" class="primary-btn full">开始 Web 投屏</button>
+          </div>
+
+          <!-- Saved recent devices -->
+          <div id="recentDevicesWrap" class="recent-wrap" hidden>
+            <div class="recent-head">
+              <span>最近信任的设备</span>
+              <button id="clearRecentBtn" type="button" class="text-btn">清空记录</button>
+            </div>
+            <div id="recentDevicesList" class="recent-list"></div>
+          </div>
+        </div>
+
+        <!-- ===== TAB 2: LAN ACTIVATION HUB ===== -->
+        <div id="paneActivate" class="tab-pane" hidden>
+          <p class="pane-intro">
+            在手机 OpalDesk App 内打开「激活 → Web激活」并开启服务，随后把手机停留在系统「开发者选项 → 无线调试 → 使用配对码配对设备」页面即可在本页免线完成激活。
+          </p>
+
+          <div class="form-grid three-col">
+            <label class="field">
+              <span>手机局域网 IP</span>
+              <input id="actHostInput" type="text" placeholder="例如 192.168.31.88" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span>激活端口</span>
+              <input id="actPortInput" type="number" value="19879" min="1" max="65535" />
+            </label>
+            <label class="field">
+              <span>6 位会话访问码</span>
+              <input id="actCodeInput" type="text" inputmode="numeric" maxlength="6" placeholder="手机端 6 位码" autocomplete="off" />
+            </label>
+          </div>
+
+          <div id="actTrustBox" class="alert-banner info" hidden>
+            <div class="banner-body">
+              <strong>首次局域网激活需放行激活服务证书</strong>
+              <p>点击右侧按钮在弹出页放行手机 <code>:19879</code> 本地自签证书，放行后自动回到本页建立加密通道。</p>
+            </div>
+            <button id="openActTrustBtn" type="button" class="primary-btn compact">信任激活证书</button>
+          </div>
+
+          <div id="actErrorBox" class="alert-banner danger" hidden></div>
+
+          <div class="cta-row">
+            <button id="connectActBtn" type="button" class="primary-btn full">连接手机激活服务</button>
+            <button id="disconnectActBtn" type="button" class="ghost-btn" hidden>断开激活服务</button>
+          </div>
+
+          <!-- Connected Activation Workspace -->
+          <div id="actWorkspace" class="act-workspace" hidden>
+            <div class="device-status-strip">
+              <div>
+                <strong id="actDeviceTitle">已连接手机</strong>
+                <div id="actDiscoverySummary" class="mono small-muted">等待 mDNS 发现无线调试端口…</div>
+              </div>
+              <span id="actDaemonBadge" class="status-pill">未激活</span>
+            </div>
+
+            <div class="act-panel">
+              <h3>① 无线调试配对并激活（首次使用）</h3>
+              <div class="form-grid three-col">
+                <label class="field">
+                  <span>配对端口 (自动发现)</span>
+                  <input id="adbPairPortInput" type="number" placeholder="自动填充" />
+                </label>
+                <label class="field">
+                  <span>手机 6 位配对码</span>
+                  <input id="adbPairCodeInput" type="text" inputmode="numeric" maxlength="6" placeholder="输入系统弹窗配对码" />
+                </label>
+                <label class="field">
+                  <span>连接端口 (可选)</span>
+                  <input id="adbConnPortInput" type="number" placeholder="自动填充" />
+                </label>
+              </div>
+              <label class="switch-row">
+                <input id="actAutoCastCheck" type="checkbox" checked />
+                <span>激活成功后自动开启无线共享并切入 Web 投屏</span>
+              </label>
+              <div class="cta-row">
+                <button id="actPairStartBtn" type="button" class="primary-btn">配对并激活引擎</button>
+                <button id="actDirectConnBtn" type="button" class="ghost-btn">已配对 · 一键直连</button>
+                <button id="actShizukuBtn" type="button" class="ghost-btn" hidden>Shizuku 秒激活</button>
+              </div>
+            </div>
+
+            <div class="log-panel">
+              <div class="log-head">
+                <span>实时激活日志</span>
+                <button id="actRefreshStateBtn" type="button" class="mini-btn">刷新端口</button>
+              </div>
+              <pre id="actLogOutput" class="log-output mono"></pre>
+            </div>
+
+            <details class="fallback-details">
+              <summary>兜底方案：复制电脑终端无线 ADB 激活命令</summary>
+              <div class="fallback-body">
+                <code id="actFallbackCmd" class="mono-code"></code>
+                <button id="copyActFallbackBtn" type="button" class="mini-btn">复制命令</button>
+              </div>
+            </details>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ==================== FULLSCREEN CAST STAGE ==================== -->
+  <div id="stageView" class="stage-shell" hidden>
+    <!-- Floating Top Liquid Glass Pill Bar -->
+    <div id="stageToolbar" class="stage-toolbar glass-surface">
+      <div class="tb-left">
+        <span class="live-dot"></span>
+        <strong id="stagePeerName">Android</strong>
+        <span id="stageTelemetry" class="mono tb-meta">等待画面…</span>
+      </div>
+      <div class="tb-actions">
+        <button id="tbBackBtn" type="button" class="tb-btn" title="返回 (Esc / 右键)">返回</button>
+        <button id="tbHomeBtn" type="button" class="tb-btn" title="显示桌面">桌面</button>
+        <button id="tbAppsBtn" type="button" class="tb-btn" title="打开手机应用或独立小窗">应用</button>
+        <button id="tbAudioBtn" type="button" class="tb-btn" title="静音 / 开启声音">声音</button>
+        <button id="tbQualityBtn" type="button" class="tb-btn" title="分辨率与刷新率">画质</button>
+        <button id="tbFullscreenBtn" type="button" class="tb-btn" title="全屏显示">全屏</button>
+        <button id="tbDisconnectBtn" type="button" class="tb-btn danger" title="断开投屏">断开</button>
+      </div>
+    </div>
+
+    <!-- Video Surface + Drag-Drop Highlight -->
+    <div id="canvasWrap" class="canvas-wrap">
+      <canvas id="castCanvas" class="cast-canvas"></canvas>
+      <div id="dropOverlay" class="drop-overlay" hidden>
+        <div class="drop-card glass-surface">释放鼠标即可将文件发送至手机 Download/OpalDesk 目录</div>
+      </div>
+    </div>
+
+    <!-- Waiting for Phone Consent Modal -->
+    <div id="approvalOverlay" class="stage-overlay" hidden>
+      <div class="overlay-card glass-surface">
+        <div class="spinner"></div>
+        <h2 id="approvalTitle">等待手机端确认连接…</h2>
+        <p id="approvalDesc">请在手机通知栏或 OpalDesk 弹窗中点击「永久允许」或「仅本次允许」。</p>
+        <button id="cancelConnectBtn" type="button" class="ghost-btn">取消连接</button>
+      </div>
+    </div>
+
+    <!-- Quality Popover -->
+    <div id="qualityPopover" class="stage-popover glass-surface" hidden>
+      <div class="pop-head">
+        <strong>画质与分辨率</strong>
+        <button id="closeQualityPopBtn" type="button" class="mini-btn">关闭</button>
+      </div>
+      <div class="pop-grid">
+        <button type="button" class="chip-btn" data-preset="auto">自适应窗口</button>
+        <button type="button" class="chip-btn" data-preset="1920x1080">1080p 16:9</button>
+        <button type="button" class="chip-btn" data-preset="2560x1440">2K 16:9</button>
+        <button type="button" class="chip-btn" data-preset="1280x800">720p 省流</button>
+      </div>
+      <div class="pop-row">
+        <label><span>刷新率</span>
+          <select id="liveFpsSelect">
+            <option value="60">60 Hz</option>
+            <option value="120">120 Hz</option>
+          </select>
+        </label>
+        <label><span>码率</span>
+          <select id="liveBitrateSelect">
+            <option value="8000">8 Mbps</option>
+            <option value="14000">14 Mbps</option>
+            <option value="22000">22 Mbps</option>
+          </select>
+        </label>
+      </div>
+      <button id="applyQualityBtn" type="button" class="primary-btn full compact">立即应用</button>
+    </div>
+
+    <!-- Remote App Launcher Popover -->
+    <div id="appsPopover" class="stage-popover apps-popover glass-surface" hidden>
+      <div class="pop-head">
+        <strong>远程应用启动器</strong>
+        <button id="closeAppsPopBtn" type="button" class="mini-btn">关闭</button>
+      </div>
+      <input id="appSearchInput" type="search" placeholder="搜索手机应用…" autocomplete="off" />
+      <div id="appsList" class="apps-list"></div>
+    </div>
+  </div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>

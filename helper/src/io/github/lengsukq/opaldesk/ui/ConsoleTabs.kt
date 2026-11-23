@@ -51,6 +51,7 @@ import io.github.lengsukq.opaldesk.protocol.DaemonStatus
 import io.github.lengsukq.opaldesk.protocol.RemoteStreamStatus
 import io.github.lengsukq.opaldesk.update.AppUpdateLogic
 import io.github.lengsukq.opaldesk.update.AppUpdateManager
+import io.github.lengsukq.opaldesk.web.WebActivationPolicy
 import java.util.Locale
 import kotlin.math.abs
 
@@ -110,6 +111,7 @@ fun ConsoleDashboardTab(
 
     var castModeTab by remember { mutableIntStateOf(if (remote.wifiEnabled || remote.connected) 1 else 0) }
     var showManualConnect by remember { mutableStateOf(false) }
+    var showWebCastQr by remember { mutableStateOf(false) }
     var wifiBusy by remember { mutableStateOf(false) }
     var peerHostText by remember { mutableStateOf("") }
     var peerLabelText by remember { mutableStateOf("") }
@@ -624,6 +626,11 @@ fun ConsoleDashboardTab(
                 if (status.connected && remote.wifiEnabled && !peerRole.isReceiving) {
                     val port = if (remote.wifiPort > 0) remote.wifiPort else 19878
                     val endpoint = if (remote.lanIp.isNotEmpty()) "${remote.lanIp}:$port" else ":$port"
+                    val webCastUrl = if (remote.lanIp.isNotEmpty()) {
+                        WebActivationPolicy.buildWebCastUrl(remote.lanIp, port)
+                    } else {
+                        WebActivationPolicy.DEFAULT_WEB_CAST_URL
+                    }
                     Spacer(Modifier.height(10.dp))
                     Column(
                         modifier = Modifier
@@ -637,6 +644,34 @@ fun ConsoleDashboardTab(
                         CopyableInfoLine(ctx, "局域网地址", endpoint)
                         if (remote.shortCertFingerprint.isNotEmpty()) {
                             CopyableInfoLine(ctx, "TLS 证书短指纹", remote.shortCertFingerprint)
+                        }
+                        CopyableInfoLine(ctx, "Web 浏览器投屏链接", webCastUrl)
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { showWebCastQr = !showWebCastQr }
+                                .padding(vertical = 3.dp, horizontal = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            OpalText(
+                                text = if (showWebCastQr) "收起 Web 扫码投屏二维码 ▴" else "展开 Web 扫码投屏二维码 ▾",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = OpalPalette.AccentBlue,
+                            )
+                        }
+                        if (showWebCastQr) {
+                            Box(
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                OpalQrCodeCard(content = webCastUrl, qrSize = 168.dp)
+                            }
+                            OpalText(
+                                text = "使用电脑 / 平板 Chrome 或 Edge 扫码打开 GitHub Pages 即可直连投屏（免安装客户端）",
+                                fontSize = 11.sp,
+                                color = OpalPalette.TextMuted,
+                            )
                         }
                     }
                 }
