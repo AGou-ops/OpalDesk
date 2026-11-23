@@ -65,7 +65,10 @@
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.5 3.5 7.25v9.5L12 21.5l8.5-4.75v-9.5L12 2.5Z"/><path d="M3.5 7.25 12 12l8.5-4.75"/><path d="M12 21.5V12"/></svg>
           <span data-i18n="nav_3d">3D 舞台</span>
         </a>
-        <a href="./cast/" class="pill-btn" title="打开 OpalDesk Web 被投屏端与局域网激活中心">Web 投屏端</a>
+        <a href="./cast/" class="pill-btn nav-web-pill" title="打开 OpalDesk Web 被投屏端与局域网激活中心">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="18" x2="12" y2="21"/></svg>
+          <span data-i18n="nav_web">Web 投屏端</span>
+        </a>
         <button type="button" class="pill-btn theme-pill-btn" id="themeToggleBtn" title="切换晴霜浅色 / 曜石暗色主题">
           <span class="theme-icon-wrap" aria-hidden="true">
             <svg class="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5M12 19.5V22M4.93 4.93l1.77 1.77M17.3 17.3l1.77 1.77M2 12h2.5M19.5 12H22M4.93 19.07l1.77-1.77M17.3 6.7l1.77-1.77"/></svg>
@@ -85,8 +88,9 @@
       <a href="#gallery" data-i18n="nav_gallery">真机实拍</a>
       <a href="#compare" data-i18n="nav_compare">路线对比</a>
       <a href="#features" data-i18n="nav_features">核心特性</a>
-      <a href="#architecture" data-i18n="nav_arch">三端架构</a>
+      <a href="#architecture" data-i18n="nav_arch">四端架构</a>
       <a href="#download" data-i18n="nav_dl">下载激活</a>
+      <a href="./cast/" data-i18n="nav_web">Web 投屏端</a>
     </nav>
   </header>
 
@@ -116,8 +120,11 @@
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               <span data-i18n="cta_dl">获取最新 APK / Mac 伴侣端</span>
             </a>
-            <a href="#gallery" class="btn-hero-secondary">
-              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="18" x2="12" y2="21"/></svg>
+            <a href="./cast/" class="btn-hero-secondary">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="18" x2="12" y2="21"/></svg>
+              <span data-i18n="cta_web">打开 Web 投屏端 / 局域网激活</span>
+            </a>
+            <a href="#gallery" class="hero-text-link">
               <span data-i18n="cta_gallery">浏览双机真机实拍</span>
             </a>
             <a href="./index.html" class="hero-text-link">
@@ -433,14 +440,18 @@
               </div>
             </div>
 
-            <div class="arch-bus mono" data-i18n="arch_bus_stream">↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / USB ADB 端口转发 ↕</div>
+            <div class="arch-bus mono" data-i18n="arch_bus_stream">↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / WSS WebSocket / USB ADB 端口转发 ↕</div>
 
             <div class="arch-tier">
-              <span class="tier-label mono">MACOS COMPANION · macos/OpalDeskMac (Swift 6)</span>
-              <div class="tier-nodes">
-                <button type="button" class="arch-node arch-node-wide" data-arch="macos">
-                  <strong>OpalDeskMac (Apple Silicon · macOS 14+)</strong>
-                  <span class="mono">HEVC 硬解 · 剪贴板图文同步 · Command→Ctrl 映射 · 文件互传</span>
+              <span class="tier-label mono">COMPANION RECEIVERS · macOS (Swift 6) &amp; WEB (GitHub Pages)</span>
+              <div class="tier-nodes tier-nodes-2">
+                <button type="button" class="arch-node" data-arch="macos">
+                  <strong>OpalDeskMac (Swift 6)</strong>
+                  <span class="mono">HEVC 硬解 · 剪贴板 · Command→Ctrl</span>
+                </button>
+                <button type="button" class="arch-node" data-arch="web">
+                  <strong>OpalDesk Web Cast &amp; LAN Hub</strong>
+                  <span class="mono">WebCodecs · WSS/USB · 扫码局域网激活</span>
                 </button>
               </div>
             </div>
@@ -485,7 +496,7 @@
           <div class="dl-card elevated-surface">
             <div class="dl-card-head">
               <span class="dl-platform mono">MACOS 14+ · SWIFT 6</span>
-              <span class="dl-size mono">~2.4 MB · Native</span>
+              <span class="dl-size mono">~2.5 MB · Native</span>
             </div>
             <h3 data-i18n="dl_mac_t">OpalDesk macOS 伴侣端 (ZIP)</h3>
             <p data-i18n="dl_mac_d">纯原生 Swift 6 macOS 接收伴侣端，支持 USB / Wi-Fi TLS 低延迟 HEVC 视频与 AAC 音频串流、双向剪贴板与快捷映射。</p>
@@ -493,17 +504,30 @@
               <span data-i18n="dl_mac_btn">前往 Releases 下载 macOS 伴侣端</span>
             </a>
           </div>
+
+          <div class="dl-card elevated-surface">
+            <div class="dl-card-head">
+              <span class="dl-platform mono">WEB · GITHUB PAGES</span>
+              <span class="dl-size mono">Zero Install · WebCodecs</span>
+            </div>
+            <h3 data-i18n="dl_web_t">OpalDesk Web 被投屏端 &amp; 局域网激活</h3>
+            <p data-i18n="dl_web_d">Windows / Linux / macOS / 平板浏览器打开即用：支持 H.264/HEVC 硬件直解、AAC 音频、键鼠触控与中文输入法，以及免数据线扫码远程激活引擎。</p>
+            <a href="./cast/" class="btn-hero-primary dl-btn">
+              <span data-i18n="dl_web_btn">立即打开 Web 投屏端 →</span>
+            </a>
+          </div>
         </div>
 
-        <!-- Adaptive Code Studio: 4-Channel Activation & Local Build -->
+        <!-- Adaptive Code Studio: Multi-Channel Activation & Local Build -->
         <div class="code-studio">
           <div class="studio-header">
             <div class="studio-dots" aria-hidden="true"><span></span><span></span><span></span></div>
             <div class="studio-tabs" role="tablist" aria-label="激活与构建方式">
-              <button type="button" class="studio-tab active" data-code="wireless" data-i18n="tab_wireless">① 内置无线调试（推荐）</button>
-              <button type="button" class="studio-tab" data-code="shizuku" data-i18n="tab_shizuku">② Shizuku / Sui</button>
-              <button type="button" class="studio-tab" data-code="adb" data-i18n="tab_adb">③ 电脑单行 ADB</button>
-              <button type="button" class="studio-tab" data-code="build" data-i18n="tab_build">④ 源码编译测试</button>
+              <button type="button" class="studio-tab active" data-code="wireless" data-i18n="tab_wireless">① 本机无线调试</button>
+              <button type="button" class="studio-tab" data-code="webact" data-i18n="tab_webact">② Web 局域网激活</button>
+              <button type="button" class="studio-tab" data-code="shizuku" data-i18n="tab_shizuku">③ Shizuku / Sui</button>
+              <button type="button" class="studio-tab" data-code="adb" data-i18n="tab_adb">④ 电脑单行 ADB</button>
+              <button type="button" class="studio-tab" data-code="build" data-i18n="tab_build">⑤ 源码编译测试</button>
             </div>
             <button type="button" class="studio-copy-btn mono" id="copyCodeBtn" data-i18n="btn_copy">复制命令</button>
           </div>
@@ -520,6 +544,7 @@
         <span><strong>OpalDesk</strong> · Universal Wayland-Style Compositor</span>
       </div>
       <div class="footer-links">
+        <a href="./cast/" data-i18n="ft_web">Web 被投屏端</a>
         <a href="./index.html" data-i18n="ft_3d">3D 舞台主页</a>
         <a href="https://github.com/lengsukq/OpalDesk" target="_blank" rel="noopener noreferrer">GitHub</a>
         <a href="https://github.com/lengsukq/OpalDesk/releases" target="_blank" rel="noopener noreferrer">Releases</a>

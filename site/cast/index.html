@@ -258,8 +258,13 @@
 
   <!-- ==================== FULLSCREEN CAST STAGE ==================== -->
   <div id="stageView" class="stage-shell" hidden>
+    <!-- Minimal top grab handle to reveal auto-hidden toolbar without blocking app top bars -->
+    <button id="stageRevealHandle" type="button" class="stage-reveal-handle" title="展开控制栏" aria-label="展开控制栏">
+      <span></span>
+    </button>
+
     <!-- Floating Top Liquid Glass Pill Bar -->
-    <div id="stageToolbar" class="stage-toolbar glass-surface">
+    <div id="stageToolbar" class="stage-toolbar">
       <div class="tb-left">
         <span class="live-dot"></span>
         <strong id="stagePeerName">Android</strong>
@@ -269,6 +274,7 @@
         <button id="tbBackBtn" type="button" class="tb-btn" title="返回 (Esc / 右键)">返回</button>
         <button id="tbHomeBtn" type="button" class="tb-btn" title="显示桌面">桌面</button>
         <button id="tbAppsBtn" type="button" class="tb-btn" title="打开手机应用或独立小窗">应用</button>
+        <button id="tbInputModeBtn" type="button" class="tb-btn active" title="切换左键拖拽模式：触控滑动（推荐） / 鼠标指针">触控</button>
         <button id="tbAudioBtn" type="button" class="tb-btn" title="静音 / 开启声音">声音</button>
         <button id="tbQualityBtn" type="button" class="tb-btn" title="分辨率与刷新率">画质</button>
         <button id="tbFullscreenBtn" type="button" class="tb-btn" title="全屏显示">全屏</button>

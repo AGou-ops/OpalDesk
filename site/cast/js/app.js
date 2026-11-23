@@ -425,6 +425,14 @@ class OpalCastWebApp {
     $('tbDisconnectBtn').addEventListener('click', () => this.disconnectCast('已断开投屏'));
     $('tbBackBtn').addEventListener('click', () => this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_BACK)));
     $('tbHomeBtn').addEventListener('click', () => this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_HOME)));
+    $('tbInputModeBtn').addEventListener('click', () => {
+      const nextTouch = !this.input.primaryLeftAsTouch;
+      this.input.setPrimaryLeftAsTouch(nextTouch);
+      const btn = $('tbInputModeBtn');
+      btn.textContent = nextTouch ? '触控' : '鼠标';
+      btn.classList.toggle('active', nextTouch);
+      this.showToast(nextTouch ? '左键拖拽已切换为「触控滑动」模式（支持列表拖拽滚动）' : '左键拖拽已切换为「鼠标指针」模式（支持文本框选）');
+    });
     $('tbAudioBtn').addEventListener('click', async () => {
       await this.audio.resumeFromGesture();
       const nextMuted = !this.audio.muted;
@@ -469,9 +477,12 @@ class OpalCastWebApp {
       $('toastIsland').hidden = true;
     });
 
-    // Stage toolbar auto-dim + reveal on top mouse movement
+    // Stage toolbar auto-hide + reveal via top grab handle or top-edge hover
+    $('stageRevealHandle').addEventListener('pointerenter', () => this.bumpToolbarVisibility());
+    $('stageRevealHandle').addEventListener('click', () => this.bumpToolbarVisibility());
+    $('stageToolbar').addEventListener('pointerleave', () => this.bumpToolbarVisibility());
     $('stageView').addEventListener('pointermove', (e) => {
-      if (e.clientY < 86) this.bumpToolbarVisibility();
+      if (e.clientY <= 18) this.bumpToolbarVisibility();
     });
 
     // Drag-drop visual cue
@@ -798,8 +809,11 @@ class OpalCastWebApp {
     if (this.resizeMode === 'auto') {
       const rect = $('canvasWrap').getBoundingClientRect();
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      w = Math.min(2560, Math.max(640, Math.round(rect.width * dpr)));
-      h = Math.min(1600, Math.max(480, Math.round(rect.height * dpr)));
+      const isStandalone = this.sessionRole === SESSION_ROLE_STANDALONE_APP;
+      const minW = isStandalone ? 480 : 640;
+      const maxH = isStandalone ? 2560 : 1600;
+      w = Math.min(2560, Math.max(minW, Math.round(rect.width * dpr)));
+      h = Math.min(maxH, Math.max(480, Math.round(rect.height * dpr)));
     } else {
       const [pw, ph] = this.resizeMode.split('x').map(Number);
       w = pw || 1920;
@@ -920,10 +934,14 @@ class OpalCastWebApp {
   }
 
   enterStageView(peerLabel, showApprovalWait) {
+    const isStandalone = this.sessionRole === SESSION_ROLE_STANDALONE_APP;
     $('lobbyView').hidden = true;
     $('stageView').hidden = false;
     $('stagePeerName').textContent = peerLabel;
     $('approvalOverlay').hidden = !showApprovalWait;
+    $('tbHomeBtn').hidden = isStandalone;
+    $('tbAppsBtn').hidden = isStandalone;
+    $('tbAudioBtn').hidden = isStandalone;
     $('liveFpsSelect').value = $('castFpsSelect').value;
     $('liveBitrateSelect').value = $('castBitrateSelect').value;
     $('connectCastBtn').disabled = false;
@@ -1016,10 +1034,10 @@ class OpalCastWebApp {
     tb.classList.remove('dimmed');
     clearTimeout(this.toolbarFadeTimer);
     this.toolbarFadeTimer = setTimeout(() => {
-      if ($('qualityPopover').hidden && $('appsPopover').hidden) {
+      if ($('qualityPopover').hidden && $('appsPopover').hidden && !tb.matches(':hover')) {
         tb.classList.add('dimmed');
       }
-    }, 3200);
+    }, 2600);
   }
 
   toggleFullscreen() {

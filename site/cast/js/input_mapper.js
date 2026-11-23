@@ -125,9 +125,20 @@ export class OpalInputController {
 
     this.enabled = false;
     this.composing = false;
+    this.primaryLeftAsTouch = true; // Default: left-click & drag emits Android TOUCH for smooth scroll/swipe
+    this.primaryTouchPointerId = null;
+    this.lastTouchPt = null;
     this.isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
     this.touchMap = new Map();
     this.boundHandlers = [];
+  }
+
+  setPrimaryLeftAsTouch(useTouch) {
+    if (this.primaryTouchPointerId !== null && this.lastTouchPt) {
+      this.onTouch(TOUCH_CANCEL, 0, [{ pointerId: 0, x: this.lastTouchPt.x, y: this.lastTouchPt.y, pressure: 0 }]);
+      this.primaryTouchPointerId = null;
+    }
+    this.primaryLeftAsTouch = Boolean(useTouch);
   }
 
   attach() {
@@ -144,18 +155,25 @@ export class OpalInputController {
       if (!this.enabled || e.pointerType === 'touch') return;
       this.onUserGesture();
       e.preventDefault();
-      this.canvas.setPointerCapture(e.pointerId);
+      try { this.canvas.setPointerCapture(e.pointerId); } catch {}
       const pt = this.mapClientPoint(e.clientX, e.clientY);
       if (!pt) return;
-      this.onMouse(
-        MOUSE_BUTTON_DOWN,
-        pt.x,
-        pt.y,
-        domButtonsToAndroidMask(e.buttons) || domButtonToAndroidMask(e.button),
-        domButtonToAndroidMask(e.button),
-        0,
-        0
-      );
+
+      if (this.primaryLeftAsTouch && e.button === 0) {
+        this.primaryTouchPointerId = e.pointerId;
+        this.lastTouchPt = pt;
+        this.onTouch(TOUCH_DOWN, 0, [{ pointerId: 0, x: pt.x, y: pt.y, pressure: 1.0 }]);
+      } else {
+        this.onMouse(
+          MOUSE_BUTTON_DOWN,
+          pt.x,
+          pt.y,
+          domButtonsToAndroidMask(e.buttons) || domButtonToAndroidMask(e.button),
+          domButtonToAndroidMask(e.button),
+          0,
+          0
+        );
+      }
       if (document.activeElement !== this.imeInput) {
         this.imeInput.focus({ preventScroll: true });
       }
@@ -165,12 +183,35 @@ export class OpalInputController {
       if (!this.enabled || e.pointerType === 'touch') return;
       const pt = this.mapClientPoint(e.clientX, e.clientY);
       if (!pt) return;
+      if (this.primaryTouchPointerId === e.pointerId) {
+        if ((e.buttons & 1) === 0) {
+          this.primaryTouchPointerId = null;
+          this.lastTouchPt = pt;
+          this.onTouch(TOUCH_UP, 0, [{ pointerId: 0, x: pt.x, y: pt.y, pressure: 0 }]);
+          return;
+        }
+        this.lastTouchPt = pt;
+        this.onTouch(TOUCH_MOVE, 0, [{ pointerId: 0, x: pt.x, y: pt.y, pressure: 1.0 }]);
+        return;
+      }
       this.onMouse(MOUSE_MOVE_ABS, pt.x, pt.y, domButtonsToAndroidMask(e.buttons), 0, 0, 0);
     });
+
+    const endPrimaryTouch = (e, cancelled) => {
+      if (this.primaryTouchPointerId !== e.pointerId) return false;
+      this.primaryTouchPointerId = null;
+      const pt = this.mapClientPoint(e.clientX, e.clientY) || this.lastTouchPt;
+      if (pt) {
+        this.lastTouchPt = pt;
+        this.onTouch(cancelled ? TOUCH_CANCEL : TOUCH_UP, 0, [{ pointerId: 0, x: pt.x, y: pt.y, pressure: 0 }]);
+      }
+      return true;
+    };
 
     add(this.canvas, 'pointerup', (e) => {
       if (!this.enabled || e.pointerType === 'touch') return;
       e.preventDefault();
+      if (endPrimaryTouch(e, false)) return;
       const pt = this.mapClientPoint(e.clientX, e.clientY);
       if (!pt) return;
       this.onMouse(
@@ -184,8 +225,18 @@ export class OpalInputController {
       );
     });
 
+    add(this.canvas, 'pointercancel', (e) => {
+      if (e.pointerType === 'touch') return;
+      endPrimaryTouch(e, true);
+    });
+
+    add(this.canvas, 'lostpointercapture', (e) => {
+      if (e.pointerType === 'touch') return;
+      endPrimaryTouch(e, false);
+    });
+
     add(this.canvas, 'pointerleave', (e) => {
-      if (!this.enabled || e.pointerType === 'touch' || e.buttons !== 0) return;
+      if (!this.enabled || e.pointerType === 'touch' || e.buttons !== 0 || this.primaryTouchPointerId !== null) return;
       const pt = this.mapClientPoint(e.clientX, e.clientY);
       if (pt) this.onMouse(MOUSE_HOVER_EXIT, pt.x, pt.y, 0, 0, 0, 0);
     });

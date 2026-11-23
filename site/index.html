@@ -98,8 +98,13 @@
             <polyline points="12 5 19 12 12 19" />
           </svg>
         </a>
-        <a href="./cast/" class="glass-pill-btn back-link" data-fx="pill" title="打开 OpalDesk Web 被投屏端与局域网激活中心">
-          <span>Web 投屏端</span>
+        <a href="./cast/" class="glass-pill-btn back-link nav-web-pill" data-fx="pill" title="打开 OpalDesk Web 被投屏端与局域网激活中心">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2" y="4" width="20" height="14" rx="2" />
+            <line x1="8" y1="21" x2="16" y2="21" />
+            <line x1="12" y1="18" x2="12" y2="21" />
+          </svg>
+          <span data-i18n="nav_web">Web 投屏端</span>
         </a>
       </div>
 
@@ -204,6 +209,10 @@
               <kbd class="kbd-whisper mono" id="heroKeycap">120 Hz</kbd>
               <span data-i18n="s0_trigger">触发 3D 多窗分屏脉冲</span>
             </button>
+            <a href="./cast/" class="dock-secondary-link" data-fx="pill">
+              <span data-i18n="s0_web_cta">打开 Web 投屏端 / 局域网激活</span>
+              <span aria-hidden="true">→</span>
+            </a>
             <a href="./overview.html" class="dock-secondary-link" data-fx="pill">
               <span data-i18n="s0_overview_cta">查看真机实拍与 2D 模拟器</span>
               <span aria-hidden="true">→</span>
@@ -292,10 +301,16 @@
             <div class="topo-detail-quote" id="topoDetailQuote">“平板全屏 2560×1600 @ 120Hz 接收手机桌面，手机端同步切换为液态毛玻璃触控板并支持一键物理息屏省电。”</div>
             <div class="topo-detail-meta mono" id="topoDetailMeta">Wi-Fi TLS 1.3 · TOFU 指纹 · OpalPeerCastMutex 单向防环锁</div>
           </div>
-          <a href="./overview.html#gallery" class="editorial-arrow-link">
-            <span data-i18n="s3_link">查看真机投屏、独立小窗与触控板实拍画廊</span>
-            <span class="arrow-glyph" aria-hidden="true">→</span>
-          </a>
+          <div class="editorial-links-row">
+            <a href="./cast/" class="editorial-arrow-link">
+              <span data-i18n="s3_web_link">立即打开 Web 被投屏端（免安装浏览器直连）</span>
+              <span class="arrow-glyph" aria-hidden="true">→</span>
+            </a>
+            <a href="./overview.html#gallery" class="editorial-arrow-link">
+              <span data-i18n="s3_link">查看真机投屏、独立小窗与触控板实拍画廊</span>
+              <span class="arrow-glyph" aria-hidden="true">→</span>
+            </a>
+          </div>
         </div>
       </div>
     </section>
@@ -345,18 +360,22 @@
             <a href="https://github.com/lengsukq/OpalDesk/releases/latest" target="_blank" rel="noopener noreferrer" class="primary-film-cta" data-fx="primary">
               <span data-i18n="s5_cta_apk">下载最新 APK &amp; Mac 伴侣端</span>
             </a>
+            <a href="./cast/" class="secondary-film-cta" data-fx="pill">
+              <span data-i18n="s5_cta_web">打开 Web 投屏端 &amp; 局域网激活&nbsp;→</span>
+            </a>
             <a href="./overview.html" class="secondary-film-cta" data-fx="pill">
               <span data-i18n="s5_cta_home">进入 2D 实拍画廊与多窗模拟器&nbsp;→</span>
             </a>
           </div>
 
-          <nav class="portal-strip" aria-label="直达 2D 详解页各板块">
+          <nav class="portal-strip" aria-label="直达 2D 详解页与 Web 投屏端">
+            <a href="./cast/" data-fx="pill" data-i18n="p_web">Web 被投屏端 &amp; 局域网激活</a>
             <a href="./overview.html#simulator" data-fx="pill" data-i18n="p_sim">120fps 多窗模拟器</a>
             <a href="./overview.html#gallery" data-fx="pill" data-i18n="p_gallery">双机真机实拍画廊</a>
             <a href="./overview.html#compare" data-fx="pill" data-i18n="p_compare">架构路线对比</a>
             <a href="./overview.html#features" data-fx="pill" data-i18n="p_features">核心特性总览</a>
-            <a href="./overview.html#architecture" data-fx="pill" data-i18n="p_arch">三端架构蓝图</a>
-            <a href="./overview.html#download" data-fx="pill" data-i18n="p_dl">四通道激活指南</a>
+            <a href="./overview.html#architecture" data-fx="pill" data-i18n="p_arch">四端架构蓝图</a>
+            <a href="./overview.html#download" data-fx="pill" data-i18n="p_dl">多通道激活指南</a>
           </nav>
         </div>
       </div>

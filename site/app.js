@@ -206,53 +206,84 @@
       path: 'macos/OpalDeskMac/',
       zhTitle: 'OpalDeskMac · 原生 Swift 6 macOS 伴侣接收端',
       enTitle: 'OpalDeskMac · Native Swift 6 macOS Companion App',
-      zhDesc: '专为 Apple Silicon / macOS 14+ 打造的轻量级纯原生接收端（仅 2.4 MB），无 Electron 套壳。',
-      enDesc: 'Lightweight 2.4 MB native Swift 6 companion app for Apple Silicon / macOS 14+ with zero Electron overhead.',
+      zhDesc: '专为 Apple Silicon / macOS 14+ 打造的轻量级纯原生接收端（仅 2.5 MB），无 Electron 套壳。',
+      enDesc: 'Lightweight 2.5 MB native Swift 6 companion app for Apple Silicon / macOS 14+ with zero Electron overhead.',
       zhBullets: ['支持 USB ADB 端口转发与局域网 Wi-Fi TLS + TOFU 指纹校验', '硬件加速 HEVC / H.264 视频解码 + AAC 低延迟音频串流', '双向剪贴板图文同步、文件互传与 macOS Command→Ctrl 快捷键映射'],
       enBullets: ['Supports USB ADB forwarding and LAN Wi-Fi TLS + TOFU verification', 'Hardware-accelerated HEVC/H.264 decode with low-latency AAC audio', 'Two-way clipboard sync, file transfer, and Command→Ctrl key mapping']
+    },
+    web: {
+      path: 'site/cast/ · bridge/.../WebSocketHttpHandler.java · helper/.../WebActivationService.kt',
+      zhTitle: 'OpalDesk Web · 免安装浏览器被投屏端 & 局域网激活中心',
+      enTitle: 'OpalDesk Web · Zero-Install Browser Receiver & LAN Activation Hub',
+      zhDesc: '直接托管在 GitHub Pages，纯 ES Modules + WebCodecs 零构建产物；守护进程 :19878 同端口首字节嗅探无缝复用原生 TLS 与 WSS，兼容 Windows / Linux / macOS / 平板浏览器。',
+      enDesc: 'Hosted directly on GitHub Pages with zero-build ES Modules & WebCodecs. Daemon port :19878 sniffs OPD1 vs HTTP/WSS on the same TLS socket for instant cross-platform browser casting.',
+      zhBullets: ['WebCodecs VideoDecoder (H.264/HEVC) + AudioDecoder (AAC-LC AudioWorklet) 低延迟直解', '支持键鼠、10 指触控、中文 IME 桥、文本/图片粘贴、拖拽传文件与独立应用小窗', '支持 :19879 临时前台服务扫码 + 6 位会话码局域网免线激活，激活后自动切入投屏'],
+      enBullets: ['WebCodecs VideoDecoder (H.264/HEVC) + AAC-LC AudioWorklet low-latency playback', 'Mouse, 10-finger touch, CJK IME bridge, clipboard paste, file drop & standalone app pop-outs', 'Opt-in :19879 QR + 6-digit code LAN Activation service hands off directly into live Web Cast']
     }
   };
 
-  /* 4-Channel Activation & Build Code Studio Snippets */
+  /* Multi-Channel Activation & Build Code Studio Snippets */
   const CODE_SNIPPETS = {
     wireless: {
-      zh: `# ① 推荐：内置无线调试（无需电脑、免 Root）
+      zh: `# ① 本机内置无线调试（无需电脑、免 Root）
 1. 在手机/平板安装最新版 OpalDesk APK 并打开 App
 2. 进入「系统设置 → 开发者选项 → 开启无线调试 → 使用配对码配对设备」
 3. 无需切出设置：在顶部通知栏直接输入 6 位配对码即可完成本机自激活
 4. APK 内置 libadb.so 自动提取 assets/opaldesk.jar 并以 uid=2000 拉起守护进程`,
-      en: `# 1. Recommended: Built-in Wireless Debugging (No PC, Rootless)
+      en: `# 1. Built-in Wireless Debugging (No PC, Rootless)
 1. Install and launch the latest OpalDesk APK on Android 11–17
 2. Open Developer Options -> Wireless Debugging -> Pair device with pairing code
 3. Enter the 6-digit pairing code directly in OpalDesk's notification prompt
 4. Built-in libadb.so extracts assets/opaldesk.jar and starts uid=2000 daemon`
     },
+    webact: {
+      zh: `# ② Web 局域网免线激活（免数据线 · 免电脑装 ADB · 免切分屏）
+1. 手机打开 OpalDesk → 激活 →「Web激活」→ 开启局域网激活服务（5 分钟自动关闭）
+2. 用电脑 / 平板 Chrome 或 Edge 扫描二维码打开 https://lengsukq.github.io/OpalDesk/cast/
+3. 手机停留在系统「无线调试 → 使用配对码配对设备」弹窗，浏览器自动发现配对端口
+4. 在电脑端输入 6 位配对码一键激活，完成后自动开启无线共享并切入 Web 投屏画布`,
+      en: `# 2. Web LAN Activation (No Cable, No PC ADB CLI, No Split-Screen)
+1. Open OpalDesk on phone -> Activate -> "Web Activate" -> Start LAN Activation Service (5m timeout)
+2. Scan the QR code with Chrome/Edge on PC or tablet (https://lengsukq.github.io/OpalDesk/cast/)
+3. Leave phone on Android "Wireless Debugging -> Pair with pairing code"; browser auto-discovers ports
+4. Type the 6-digit pairing code on PC to activate and seamlessly transition into live Web Cast`
+    },
     shizuku: {
-      zh: `# ② Shizuku / Sui 一键激活（免电脑）
+      zh: `# ③ Shizuku / Sui 一键激活（免电脑）
 1. 确保设备已启动 Shizuku（无线调试模式或 Sui）
 2. 打开 OpalDesk → 点击激活引导卡片中的「Shizuku 一键激活」
 3. 授予 Shizuku 授权后自动校验签名并启动 OpalDeskDaemon（uid=2000）`,
-      en: `# 2. Shizuku / Sui One-Tap Activation (No PC)
+      en: `# 3. Shizuku / Sui One-Tap Activation (No PC)
 1. Ensure Shizuku (Wireless ADB or Sui) is running on the device
 2. Open OpalDesk -> tap "Activate via Shizuku" in the activation modal
 3. Grant Shizuku permission to verify signature and start OpalDeskDaemon (uid=2000)`
     },
     adb: {
-      zh: `adb shell "rm -f /data/local/tmp/opd_src.apk /data/local/tmp/opaldesk.jar.new && pm path io.github.lengsukq.opaldesk | grep '^package:' | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/opd_src.apk && unzip -p /data/local/tmp/opd_src.apk assets/opaldesk.jar > /data/local/tmp/opaldesk.jar.new && rm -f /data/local/tmp/opd_src.apk && chmod 644 /data/local/tmp/opaldesk.jar.new && mv -f /data/local/tmp/opaldesk.jar.new /data/local/tmp/opaldesk.jar && (CLASSPATH=/data/local/tmp/opaldesk.jar nohup app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon >/data/local/tmp/opaldesk.log 2>&1 </dev/null &)"`,
-      en: `adb shell "rm -f /data/local/tmp/opd_src.apk /data/local/tmp/opaldesk.jar.new && pm path io.github.lengsukq.opaldesk | grep '^package:' | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/opd_src.apk && unzip -p /data/local/tmp/opd_src.apk assets/opaldesk.jar > /data/local/tmp/opaldesk.jar.new && rm -f /data/local/tmp/opd_src.apk && chmod 644 /data/local/tmp/opaldesk.jar.new && mv -f /data/local/tmp/opaldesk.jar.new /data/local/tmp/opaldesk.jar && (CLASSPATH=/data/local/tmp/opaldesk.jar nohup app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon >/data/local/tmp/opaldesk.log 2>&1 </dev/null &)"`
+      zh: `# ④ 电脑单行 ADB 激活命令（或搭配 USB 本地转发免证书 Web 投屏）
+adb shell "rm -f /data/local/tmp/opd_src.apk /data/local/tmp/opaldesk.jar.new && pm path io.github.lengsukq.opaldesk | grep '^package:' | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/opd_src.apk && unzip -p /data/local/tmp/opd_src.apk assets/opaldesk.jar > /data/local/tmp/opaldesk.jar.new && rm -f /data/local/tmp/opd_src.apk && chmod 644 /data/local/tmp/opaldesk.jar.new && mv -f /data/local/tmp/opaldesk.jar.new /data/local/tmp/opaldesk.jar && (CLASSPATH=/data/local/tmp/opaldesk.jar nohup app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon >/data/local/tmp/opaldesk.log 2>&1 </dev/null &)"
+
+# 可选：USB 有线免证书直连 GitHub Pages Web 投屏端 (ws://127.0.0.1:19878/ws)
+adb forward tcp:19878 localabstract:opaldesk_stream`,
+      en: `# 4. One-Line PC ADB Activation (plus optional zero-cert USB Web Cast forward)
+adb shell "rm -f /data/local/tmp/opd_src.apk /data/local/tmp/opaldesk.jar.new && pm path io.github.lengsukq.opaldesk | grep '^package:' | cut -d: -f2 | head -n1 | xargs cat > /data/local/tmp/opd_src.apk && unzip -p /data/local/tmp/opd_src.apk assets/opaldesk.jar > /data/local/tmp/opaldesk.jar.new && rm -f /data/local/tmp/opd_src.apk && chmod 644 /data/local/tmp/opaldesk.jar.new && mv -f /data/local/tmp/opaldesk.jar.new /data/local/tmp/opaldesk.jar && (CLASSPATH=/data/local/tmp/opaldesk.jar nohup app_process /data/local/tmp io.github.lengsukq.opaldesk.daemon.OpalDeskDaemon >/data/local/tmp/opaldesk.log 2>&1 </dev/null &)"
+
+# Optional: Zero-cert wired USB loopback for GitHub Pages Web Cast (ws://127.0.0.1:19878/ws)
+adb forward tcp:19878 localabstract:opaldesk_stream`
     },
     build: {
-      zh: `# ④ 本地从源码编译、运行全量单元测试与部署
+      zh: `# ⑤ 本地从源码编译、运行全量单元测试与部署
 ./scripts/init-signing.sh                         # 首次生成本地 PKCS12 签名证书
 ./gradlew :bridge:test :helper:testDebugUnitTest  # 全量纯 JVM 单元测试
+node --test site/cast/test/*.test.mjs             # Web 被投屏端协议 & Annex-B 单测
 ./gradlew :helper:assembleRelease                 # 自动打包 assets/opaldesk.jar 并签名
 ./scripts/dev-deploy.sh --logs                    # 一键安装并拉起守护进程
 
 # 编译原生 Swift 6 macOS 伴侣端
 cd macos/OpalDeskMac && swift test && swift build -c release && ../../scripts/build-macos-app.sh --skip-build`,
-      en: `# 4. Build, Test & Deploy from Source
+      en: `# 5. Build, Test & Deploy from Source
 ./scripts/init-signing.sh                         # Initialize local PKCS12 key once
 ./gradlew :bridge:test :helper:testDebugUnitTest  # Run full JVM unit test suite
+node --test site/cast/test/*.test.mjs             # Run Web Cast protocol & Annex-B tests
 ./gradlew :helper:assembleRelease                 # Auto-embeds assets/opaldesk.jar
 ./scripts/dev-deploy.sh --logs                    # Install APK & launch daemon
 
@@ -264,12 +295,12 @@ cd macos/OpalDeskMac && swift test && swift build -c release && ../../scripts/bu
   /* Bilingual Dictionary */
   const I18N = {
     zh: {
-      nav_sim: '多窗模拟', nav_gallery: '真机实拍', nav_compare: '路线对比', nav_features: '核心特性', nav_arch: '三端架构', nav_dl: '下载激活',
-      nav_3d: '3D 舞台', theme_light: '晴霜浅色', theme_dark: '曜石暗色', nav_get: '下载 APK',
-      hero_badge: 'ANDROID 11–17 · 95%+ 免 ROOT · 120FPS GPU 合成 · MIT 开源',
+      nav_sim: '多窗模拟', nav_gallery: '真机实拍', nav_compare: '路线对比', nav_features: '核心特性', nav_arch: '四端架构', nav_dl: '下载激活',
+      nav_3d: '3D 舞台', nav_web: 'Web 投屏端', theme_light: '晴霜浅色', theme_dark: '曜石暗色', nav_get: '下载 APK',
+      hero_badge: 'ANDROID 11–17 · 95%+ 免 ROOT · 120FPS GPU 合成 · WEB 投屏',
       hero_t1: '一窗一独立虚拟屏，', hero_t2: '全品牌安卓通用桌面工作站。',
-      hero_sub: '彻底告别厂商私有 Freeform 小窗与撕裂悬浮标题栏。120fps 单 RenderNode 皮肉合一液态毛玻璃桌面、LRU 快照休眠、外接 2K/4K 满屏与手机↔平板↔Mac 无线互联。',
-      cta_dl: '获取最新 APK / Mac 伴侣端', cta_gallery: '浏览双机真机实拍', cta_3d: '前往 3D 交互舞台 →',
+      hero_sub: '彻底告别厂商私有 Freeform 小窗与撕裂悬浮标题栏。120fps 单 RenderNode 皮肉合一液态毛玻璃桌面、LRU 快照休眠、外接 2K/4K 满屏、手机↔平板↔Mac↔Web 浏览器无线互联与局域网扫码激活。',
+      cta_dl: '获取最新 APK / Mac 伴侣端', cta_web: '打开 Web 投屏端 / 局域网激活', cta_gallery: '浏览双机真机实拍', cta_3d: '前往 3D 交互舞台 →',
       sim_label: '在线试玩多窗合成器：', lay_split2: '左右二分', lay_master: '主副 2:1', lay_cols3: '三列分屏', lay_grid4: '四宫格', lay_cascade: '阶梯自由层叠', lay_hib: '模拟 LRU 快照休眠 / 唤醒', sim_reset: '重置排布',
       gal_eyebrow: 'REAL HARDWARE CAPTURES · ZERO MOCKUPS', gal_title: '双机真机实拍，所见即所得',
       gal_desc: '以下 9 组画面全部直采自 <strong>Xiaomi Pad 8 Pro（Android 17）</strong> 与 <strong>Xiaomi 14 Pro（Android 16）</strong> 运行 OpalDesk 的真实屏幕，点击任意截图可放大细看像素级液态毛玻璃细节。',
@@ -282,38 +313,40 @@ cd macos/OpalDeskMac && swift test && swift build -c release && ../../scripts/bu
       cmp_r1_d: '窗口运行模式', cmp_r1_o: '<strong>100% 标准 AOSP FULLSCREEN (1)</strong>，一窗一独立 VirtualDisplay', cmp_r1_old: '魔改 Freeform (5) / ITaskOrganizer，升级即易失效', cmp_r1_oem: '深度绑定特定厂商框架，换品牌即不可用',
       cmp_r2_d: '画面与标题栏合成', cmp_r2_o: '<strong>单 RenderNode 皮肉合一</strong>：纯拖拽 0 IPC、0 虚拟屏重绘', cmp_r2_old: '悬浮窗外挂标题栏，拖拽撕裂、掉帧、热区错位', cmp_r2_oem: '系统自带，但外观/阴影/分屏模板难以自由定制',
       cmp_r3_d: '多窗并发上限', cmp_r3_o: '<strong>VirtualDisplayPool LRU 休眠</strong>：突破 Android 14+ 配额，点击 150ms 唤醒', cmp_r3_old: '受系统小窗数硬上限约束，容易互相挤掉', cmp_r3_oem: '多为固定 3–5 窗，不支持自定义快照池容量',
-      cmp_r4_d: '跨设备无线互联', cmp_r4_o: '<strong>手机↔平板桌面/独立小窗 + 原生 Swift 6 Mac 伴侣端</strong> + 远端输入法自动转发', cmp_r4_old: '几乎无原生跨端协议，依赖第三方投屏拼凑', cmp_r4_oem: '仅限同生态全家桶，跨品牌安卓与 Mac 受限',
+      cmp_r4_d: '跨设备无线互联', cmp_r4_o: '<strong>手机↔平板桌面/独立小窗 + Swift 6 Mac + 零安装 Web 浏览器端（WebCodecs）</strong> + 远端输入法自动转发', cmp_r4_old: '几乎无原生跨端协议，依赖第三方投屏拼凑', cmp_r4_oem: '仅限同生态全家桶，跨品牌安卓、Windows/Linux 与 Mac 受限',
       cmp_r5_d: '外接屏与物理键鼠', cmp_r5_o: '<strong>2K/4K 100Hz+ 满屏不中断</strong> + 鼠标一键切本机/投屏端 + <code>/dev/uhid</code> 回退', cmp_r5_old: '切出 App 外接屏即黑屏，跨屏鼠标常被 ROM 拦截', cmp_r5_oem: '部分机型仅支持 60Hz 镜像或缺少硬件鼠标切换',
-      cmp_r6_d: '权限与安全模型', cmp_r6_o: '<strong>零无障碍 · 95%+ 免 Root</strong>，守护进程强制降权 <code>uid=2000</code> + APK SHA-256 校验', cmp_r6_old: '强依赖敏感无障碍服务与常驻悬浮窗权限', cmp_r6_oem: '闭源系统内置，不开放架构与源码审计',
+      cmp_r6_d: '权限与安全模型', cmp_r6_o: '<strong>零无障碍 · 95%+ 免 Root</strong>，支持 Web 扫码局域网激活，守护进程降权 <code>uid=2000</code> + SHA-256 校验', cmp_r6_old: '强依赖敏感无障碍服务与常驻悬浮窗权限', cmp_r6_oem: '闭源系统内置，不开放架构与源码审计',
       feat_eyebrow: 'UNIVERSAL COMPOSITOR ARCHITECTURE', feat_title: '六大核心能力，稳如原生系统',
-      feat_desc: '每一项特性均围绕真实高频痛点迭代，配套纯 JVM 确定性单元测试与多机型实机回归验证。',
+      feat_desc: '每一项特性均围绕真实高频痛点迭代，配套纯 JVM 与 JS 确定性单元测试及多机型实机回归验证。',
       f1_t: '宿主 DPI 超采样 · 小窗清晰零裁切', f1_d: '新增 <code>resolveWindowBufferSpec</code> 与 <code>resolveStandaloneStreamSpec</code>，在保持逻辑 dp 不变的前提下按比例向宿主机密度超采样，彻底解决微信等兼容应用字体 2× 爆炸与拼多多小窗极小字/闪动问题。',
       f2_t: 'VirtualDisplayPool LRU 智能休眠', f2_d: '动态探测严苛 ROM 单 UID 虚拟屏上限，前台窗口持有实时屏幕，后台旧窗自动捕获 <code>HardwareBuffer</code> 高清快照并释放槽位；点击休眠卡片 150ms 原地挂载无缝续跑。',
-      f3_t: '跨设备无线投屏 & 单应用全局悬浮小窗', f3_d: '免 PIN 交互弹窗授权 + TLS 1.3 直连与 <code>OpalPeerCastMutex</code> 单向防环锁；手机↔平板支持完整桌面投屏或任选单个应用以 macOS 液态毛玻璃小窗悬浮运行，自带 <code>TYPE_IME_REQUEST</code> 远端输入法自动转发。',
+      f3_t: '平板 / Mac / Web 全平台无线投屏 & 独立小窗', f3_d: '免 PIN 弹窗授权 + 同端口 TLS/WSS 直连与 <code>OpalPeerCastMutex</code> 防环锁；除手机↔平板桌面/悬浮小窗与 Swift 6 Mac 端外，Windows/Linux/平板还可直接打开 <a href="./cast/" style="color:var(--accent-text);text-decoration:underline">Web 被投屏端</a> 通过 WebCodecs 硬解直连。',
       f4_t: '液态毛玻璃精密触控板 + 一键物理息屏', f4_d: '无线或 USB-C 投屏时本机即刻化为 120Hz 精密触控板，配备 50/50「左键·按住拖拽 | 右键·返回」硬件按键条与「拖拽锁定 | 显示桌面 | 一键息屏」胶囊，支持 <code>SurfaceControl</code> 物理灭屏省电与双击亮屏。',
       f5_t: '全局物理鼠标跨屏路由 & /dev/uhid 内核回退', f5_d: '蓝牙/USB 物理鼠标一键自由切换归属本机或投屏端，0.50×–3.00× 无级变速并自动隐藏虚拟光标；遇 OEM 封锁跨屏触摸注入时自动创建 Linux <code>/dev/uhid</code> 内核虚拟外设穿透限制。',
-      f6_t: '95%+ 免 Root 降权 + GitHub 直连安全更新', f6_d: '内置无线调试（<code>libadb.so</code>）免电脑激活，守护进程 fail-closed 降权至 <code>uid=2000</code> 并严格校验 APK 签名；内置应用更新直连 GitHub Releases，自动执行 SHA-256 摘要与包名双重校验。',
-      arch_eyebrow: 'CLEAN MODULAR ARCHITECTURE', arch_title: '三端分层架构蓝图（点击模块查看详情）',
-      arch_desc: '核心几何、虚拟屏池、排序器与防环锁完全剥离 Android 单例依赖，保证高确定性纯 JVM 单元测试覆盖。',
+      f6_t: '95%+ 免 Root 降权 + Web 局域网激活 & 安全更新', f6_d: '支持本机无线调试、<strong>Web 局域网扫码免线激活</strong>、Shizuku 与电脑 ADB；守护进程强制降权 <code>uid=2000</code> 并严格校验 APK 签名，内置 GitHub Releases SHA-256 校验更新。',
+      arch_eyebrow: 'CLEAN MODULAR ARCHITECTURE', arch_title: '四端分层架构蓝图（点击模块查看详情）',
+      arch_desc: '核心几何、虚拟屏池、排序器、防环锁与 WebCodecs 协议层完全剥离平台单例依赖，保证高确定性纯 JVM / Node 单元测试覆盖。',
       arch_bus_ipc: '↕ 签名 SHA-256 双向鉴权 Binder IPC · GL_TEXTURE_EXTERNAL_OES 零拷贝 ↕',
-      arch_bus_stream: '↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / USB ADB 端口转发 ↕',
-      dl_eyebrow: 'FREE · MIT OPEN SOURCE · ZERO SUBSCRIPTION', dl_title: '下载 OpalDesk 最新版，30 秒免 Root 激活',
-      dl_desc: '支持 Android 11–17 全品牌手机与平板（内置无线调试免电脑激活）以及 Apple Silicon macOS 14+ 原生伴侣端。',
+      arch_bus_stream: '↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / WSS WebSocket / USB ADB 端口转发 ↕',
+      dl_eyebrow: 'FREE · MIT OPEN SOURCE · ZERO SUBSCRIPTION', dl_title: '下载 OpalDesk 最新版，或直接打开 Web 被投屏端',
+      dl_desc: '支持 Android 11–17 全品牌手机与平板、Apple Silicon macOS 14+ 原生伴侣端，以及免安装 GitHub Pages Web 接收端与局域网激活中心。',
       dl_android_t: 'OpalDesk Android 安装包 (APK)',
-      dl_android_d: '已内嵌同签名守护进程 <code>opaldesk.jar</code>，支持手机/平板本机多窗、外接显示器、跨设备互投及应用内 GitHub 直连自动校验更新。',
+      dl_android_d: '已内嵌同签名守护进程 <code>opaldesk.jar</code>，支持本机多窗、外接显示器、跨设备互投、Web 局域网激活服务与应用内自动校验更新。',
       dl_mac_t: 'OpalDesk macOS 伴侣端 (ZIP)',
       dl_mac_d: '纯原生 Swift 6 macOS 接收伴侣端，支持 USB / Wi-Fi TLS 低延迟 HEVC 视频与 AAC 音频串流、双向剪贴板与快捷映射。',
-      dl_android_btn: '前往 Releases 下载最新 APK', dl_mac_btn: '前往 Releases 下载 macOS 伴侣端',
-      tab_wireless: '① 内置无线调试（推荐）', tab_shizuku: '② Shizuku / Sui', tab_adb: '③ 电脑单行 ADB', tab_build: '④ 源码编译测试',
-      btn_copy: '复制命令', ft_3d: '3D 舞台主页'
+      dl_web_t: 'OpalDesk Web 被投屏端 & 局域网激活',
+      dl_web_d: 'Windows / Linux / macOS / 平板浏览器打开即用：支持 H.264/HEVC WebCodecs 硬解、AAC 音频、键鼠触控中文输入与免数据线扫码远程激活引擎。',
+      dl_android_btn: '前往 Releases 下载最新 APK', dl_mac_btn: '前往 Releases 下载 macOS 伴侣端', dl_web_btn: '立即打开 Web 投屏端 →',
+      tab_wireless: '① 本机无线调试', tab_webact: '② Web 局域网激活', tab_shizuku: '③ Shizuku / Sui', tab_adb: '④ 电脑单行 ADB', tab_build: '⑤ 源码编译测试',
+      btn_copy: '复制命令', ft_web: 'Web 被投屏端', ft_3d: '3D 舞台主页'
     },
     en: {
       nav_sim: 'Simulator', nav_gallery: 'Real Shots', nav_compare: 'Compare', nav_features: 'Features', nav_arch: 'Architecture', nav_dl: 'Download',
-      nav_3d: '3D Stage', theme_light: 'Light Frost', theme_dark: 'Obsidian', nav_get: 'Get APK',
-      hero_badge: 'ANDROID 11–17 · 95%+ ROOTLESS · 120FPS GPU COMPOSITOR · MIT',
+      nav_3d: '3D Stage', nav_web: 'Web Cast', theme_light: 'Light Frost', theme_dark: 'Obsidian', nav_get: 'Get APK',
+      hero_badge: 'ANDROID 11–17 · 95%+ ROOTLESS · 120FPS GPU COMPOSITOR · WEB CAST',
       hero_t1: 'One VirtualDisplay per window.', hero_t2: 'Universal Android desktop workstation.',
-      hero_sub: 'Zero OEM Freeform hacks and zero split-brain overlay chrome. Unified 120fps Liquid Glass compositing, LRU snapshot hibernation, 2K/4K external displays, and Phone ↔ Tablet ↔ Mac wireless casting.',
-      cta_dl: 'Download Latest APK / Mac App', cta_gallery: 'Browse Real Hardware Shots', cta_3d: 'Enter 3D WebGL Stage →',
+      hero_sub: 'Zero OEM Freeform hacks and zero split-brain overlay chrome. Unified 120fps Liquid Glass compositing, LRU snapshot hibernation, 2K/4K external displays, Phone ↔ Tablet ↔ Mac ↔ zero-install Web Cast & LAN browser activation.',
+      cta_dl: 'Download Latest APK / Mac App', cta_web: 'Open Web Cast & LAN Activation', cta_gallery: 'Browse Real Hardware Shots', cta_3d: 'Enter 3D WebGL Stage →',
       sim_label: 'Interactive Compositor Demo:', lay_split2: '50/50 Split', lay_master: 'Master 2:1', lay_cols3: '3 Columns', lay_grid4: '2×2 Grid', lay_cascade: 'Free Cascade', lay_hib: 'Toggle LRU Snapshot Wake', sim_reset: 'Reset',
       gal_eyebrow: 'REAL HARDWARE CAPTURES · ZERO MOCKUPS', gal_title: 'Captured live on real devices.',
       gal_desc: 'All 9 screenshots were captured directly from <strong>Xiaomi Pad 8 Pro (Android 17)</strong> and <strong>Xiaomi 14 Pro (Android 16)</strong> running OpalDesk. Click any image to inspect full-resolution Liquid Glass details.',
@@ -326,30 +359,32 @@ cd macos/OpalDeskMac && swift test && swift build -c release && ../../scripts/bu
       cmp_r1_d: 'Windowing Mode', cmp_r1_o: '<strong>100% Standard AOSP FULLSCREEN (1)</strong>, dedicated VirtualDisplay per window', cmp_r1_old: 'Hacked Freeform (5) / ITaskOrganizer, fragile across updates', cmp_r1_oem: 'Locked to one vendor ROM; unavailable on other brands',
       cmp_r2_d: 'Chrome Composition', cmp_r2_o: '<strong>Unified Single RenderNode</strong>: 0 IPC & 0 VirtualDisplay resize on drag', cmp_r2_old: 'Floating overlay headers cause drag tearing & hit-test drift', cmp_r2_oem: 'Native system chrome, limited visual & layout customization',
       cmp_r3_d: 'Multi-Window Limit', cmp_r3_o: '<strong>VirtualDisplayPool LRU Hibernation</strong>: beats Android 14+ quotas, 150ms wake', cmp_r3_old: 'Hard-capped by OEM freeform task limits', cmp_r3_oem: 'Typically capped at 3–5 windows with no snapshot pooling',
-      cmp_r4_d: 'Cross-Device Cast', cmp_r4_o: '<strong>Phone ↔ Tablet Desktop / Floating App + Swift 6 Mac App</strong> + Remote IME', cmp_r4_old: 'No native cross-device protocol; relies on third-party tools', cmp_r4_oem: 'Walled garden limited to same-brand ecosystem devices',
+      cmp_r4_d: 'Cross-Device Cast', cmp_r4_o: '<strong>Phone ↔ Tablet + Swift 6 Mac + Zero-Install Web Receiver (WebCodecs)</strong> + Remote IME', cmp_r4_old: 'No native cross-device protocol; relies on third-party tools', cmp_r4_oem: 'Walled garden limited to same-brand ecosystem devices',
       cmp_r5_d: 'External & Mouse', cmp_r5_o: '<strong>Uninterrupted 2K/4K 100Hz+</strong> + Mouse Local/Cast Toggle + <code>/dev/uhid</code>', cmp_r5_old: 'Blacks out when switching local apps; cross-display input blocked', cmp_r5_oem: 'Often capped at 60Hz mirror or lacks hardware mouse routing',
-      cmp_r6_d: 'Security & Perms', cmp_r6_o: '<strong>Zero Accessibility · 95%+ Rootless</strong>, forced drop to <code>uid=2000</code> + SHA-256 auth', cmp_r6_old: 'Requires intrusive Accessibility & permanent overlay permissions', cmp_r6_oem: 'Closed-source system binary, not auditable',
+      cmp_r6_d: 'Security & Perms', cmp_r6_o: '<strong>Zero Accessibility · 95%+ Rootless</strong>, QR Web LAN Activation, forced drop to <code>uid=2000</code> + SHA-256 auth', cmp_r6_old: 'Requires intrusive Accessibility & permanent overlay permissions', cmp_r6_oem: 'Closed-source system binary, not auditable',
       feat_eyebrow: 'UNIVERSAL COMPOSITOR ARCHITECTURE', feat_title: 'Six core pillars, built to feel native.',
-      feat_desc: 'Every capability ships with deterministic pure-JVM unit tests and real multi-device regression verification.',
+      feat_desc: 'Every capability ships with deterministic pure-JVM / Node unit tests and real multi-device regression verification.',
       f1_t: 'Host-DPI Supersampling · Razor-Sharp Small Windows', f1_d: 'Pure-JVM <code>resolveWindowBufferSpec</code> & <code>resolveStandaloneStreamSpec</code> scale virtual buffers toward host density while preserving logical dp, curing 2× oversized compat fonts & tiny floating-window text.',
       f2_t: 'VirtualDisplayPool LRU Snapshot Hibernation', f2_d: 'Dynamically adapts to strict OEM VirtualDisplay quotas. Foreground apps keep live displays while older windows save <code>HardwareBuffer</code> snapshots and release slots — waking in ~150ms on click.',
-      f3_t: 'Wireless Desktop Cast & Standalone Floating Apps', f3_d: 'PIN-free interactive approval + TLS 1.3 + <code>OpalPeerCastMutex</code> anti-loop guard. Stream full desktop or float any phone app on your tablet with automatic <code>TYPE_IME_REQUEST</code> remote keyboard forwarding.',
+      f3_t: 'Tablet, Mac & Zero-Install Web Cast + Floating Apps', f3_d: 'PIN-free approval + same-port TLS/WSS + <code>OpalPeerCastMutex</code>. Stream full desktop or floating phone apps to Android tablets, Swift 6 Mac, or directly in Chrome/Edge via the <a href="./cast/" style="color:var(--accent-text);text-decoration:underline">Web Cast Receiver</a>.',
       f4_t: 'Liquid Glass Precision Trackpad & One-Tap Screen-Off', f4_d: 'Turns your phone into a 120Hz trackpad with a 50/50 hardware-style L/R click bar and Drag Lock / Show Desktop / Screen-Off pills backed by AOSP <code>SurfaceControl</code> power-off + double-tap wake.',
       f5_t: 'Global Physical Mouse Router & /dev/uhid Fallback', f5_d: 'Route Bluetooth/USB mouse freely between local and cast screens (0.50×–3.00× speed) with automatic virtual-cursor hiding and Linux <code>/dev/uhid</code> kernel fallback when OEMs block injection.',
-      f6_t: '95%+ Rootless uid=2000 & Verified GitHub OTA', f6_d: 'Built-in Wireless Debugging (<code>libadb.so</code>) activates without a PC. Daemon drops privileges fail-closed to <code>uid=2000</code>, with SHA-256 + package-verified GitHub Releases in-app updates.',
-      arch_eyebrow: 'CLEAN MODULAR ARCHITECTURE', arch_title: 'Three-Tier Architecture Blueprint (Click any module)',
-      arch_desc: 'Geometry, display pooling, launcher sorting, and anti-loop locks are decoupled from Android Binder singletons for 100% deterministic JVM testing.',
+      f6_t: '95%+ Rootless uid=2000 + Web LAN Activation & OTA', f6_d: 'Activate via built-in Wireless ADB, <strong>QR Web LAN Activation</strong>, Shizuku, or PC ADB. Daemon drops fail-closed to <code>uid=2000</code>, with SHA-256 verified GitHub Releases in-app updates.',
+      arch_eyebrow: 'CLEAN MODULAR ARCHITECTURE', arch_title: 'Multi-Tier Architecture Blueprint (Click any module)',
+      arch_desc: 'Geometry, display pooling, launcher sorting, anti-loop locks, and WebCodecs wire codecs are decoupled from runtime singletons for deterministic JVM & Node testing.',
       arch_bus_ipc: '↕ SHA-256 Verified Binder IPC · Zero-Copy GL_TEXTURE_EXTERNAL_OES ↕',
-      arch_bus_stream: '↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / USB ADB Forwarding ↕',
-      dl_eyebrow: 'FREE · MIT OPEN SOURCE · ZERO SUBSCRIPTION', dl_title: 'Get Latest OpalDesk — Rootless in 30s',
-      dl_desc: 'Runs on any Android 11–17 phone or tablet (PC-free Wireless Debugging built in) plus native Swift 6 Apple Silicon macOS 14+ companion.',
+      arch_bus_stream: '↕ HEVC/H.264 + AAC · Wi-Fi TLS 1.3 / WSS WebSocket / USB ADB Forwarding ↕',
+      dl_eyebrow: 'FREE · MIT OPEN SOURCE · ZERO SUBSCRIPTION', dl_title: 'Get Latest OpalDesk — or Launch Web Cast',
+      dl_desc: 'Runs on Android 11–17 phones & tablets, Apple Silicon macOS 14+, plus the zero-install GitHub Pages Web Receiver & LAN Activation Hub.',
       dl_android_t: 'OpalDesk Android Package (APK)',
-      dl_android_d: 'Embeds matching signed <code>opaldesk.jar</code> daemon. Supports local multi-window workstation, external monitors, cross-device casting, and verified GitHub in-app updates.',
+      dl_android_d: 'Embeds matching signed <code>opaldesk.jar</code> daemon. Supports local multi-window workstation, external monitors, cross-device casting, Web LAN activation & verified GitHub OTA.',
       dl_mac_t: 'OpalDesk macOS Companion (ZIP)',
       dl_mac_d: 'Pure native Swift 6 macOS companion app featuring USB & Wi-Fi TLS low-latency HEVC video, AAC audio, clipboard sync, and Command→Ctrl mapping.',
-      dl_android_btn: 'Download Latest APK on Releases', dl_mac_btn: 'Download macOS App on Releases',
-      tab_wireless: '① Wireless ADB (No PC)', tab_shizuku: '② Shizuku / Sui', tab_adb: '③ One-Line PC ADB', tab_build: '④ Build from Source',
-      btn_copy: 'Copy', ft_3d: '3D Interactive Stage'
+      dl_web_t: 'OpalDesk Web Receiver & LAN Activation',
+      dl_web_d: 'Open directly in Chrome/Edge on Windows, Linux, macOS, or tablets: WebCodecs H.264/HEVC + AAC audio, mouse/touch/CJK IME, file drop, and cable-free QR LAN engine activation.',
+      dl_android_btn: 'Download Latest APK on Releases', dl_mac_btn: 'Download macOS App on Releases', dl_web_btn: 'Launch Web Cast Receiver →',
+      tab_wireless: '① On-Device Wireless ADB', tab_webact: '② Web LAN Activation', tab_shizuku: '③ Shizuku / Sui', tab_adb: '④ One-Line PC ADB', tab_build: '⑤ Build from Source',
+      btn_copy: 'Copy', ft_web: 'Web Cast Receiver', ft_3d: '3D Interactive Stage'
     }
   };
 

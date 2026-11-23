@@ -634,6 +634,7 @@ section { padding: 92px 0; scroll-margin-top: 86px; }
 .arch-tier { padding: 14px; border-radius: 16px; background: var(--bg-well); border: 1px solid var(--rim-outer); min-width: 0; }
 .tier-label { display: block; font-size: 11px; font-weight: 660; color: var(--text-tertiary); margin-bottom: 10px; overflow-wrap: anywhere; }
 .tier-nodes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.tier-nodes-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .arch-node {
   padding: 12px;
   border-radius: 12px;
@@ -660,7 +661,7 @@ section { padding: 92px 0; scroll-margin-top: 86px; }
 .inspector-bullets { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; color: var(--text-secondary); overflow-wrap: anywhere; }
 
 /* Download & Code Studio */
-.dl-cards-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin-bottom: 24px; }
+.dl-cards-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-bottom: 24px; }
 .dl-card { padding: 24px; display: flex; flex-direction: column; gap: 10px; }
 .dl-card-head { display: flex; justify-content: space-between; align-items: center; font-size: 11.5px; }
 .dl-platform { color: var(--accent-text); font-weight: 700; }
@@ -774,11 +775,14 @@ section { padding: 92px 0; scroll-margin-top: 86px; }
   section { scroll-margin-top: 128px; padding: 72px 0; }
   .hero-section { padding-top: 146px; padding-bottom: 68px; }
   .featured-hardware-grid, .arch-layout { grid-template-columns: minmax(0, 1fr); }
-  .shot-grid, .bento-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .shot-grid, .bento-grid, .dl-cards-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 768px) {
   .brand-tag, #themeToggleLabel { display: none; }
   .theme-pill-btn { width: 32px; height: 32px; padding: 0; justify-content: center; }
+}
+@media (max-width: 520px) {
+  .nav-web-pill { display: none; }
 }
 @media (max-width: 680px) {
   .container { padding: 0 16px; }
