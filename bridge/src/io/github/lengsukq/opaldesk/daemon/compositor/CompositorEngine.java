@@ -317,6 +317,8 @@ public final class CompositorEngine {
                     sessionsById.values(),
                     this::handleWindowEvictedLocked);
             if (lease == null) {
+                System.err.println("OPALDESK_ATTACH_VD_FAIL wid=" + windowId + " pkg=" + ws.pkg
+                        + " size=" + cw + "x" + ch + "@" + dpi + "dpi");
                 runtimeBridge.releaseSurfaceHandle(surface);
                 return -1;
             }

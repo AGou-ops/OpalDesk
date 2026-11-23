@@ -59,6 +59,7 @@ object BridgeProtocol {
         const val GET_PENDING_PAIRING = 35
         const val RESPOND_PAIRING = 36
         const val INJECT_REMOTE_TRACKPAD = 37
+        const val GET_DAEMON_LOGS = 38
         const val SHUTDOWN = 99
     }
 

@@ -1,5 +1,7 @@
 package io.github.lengsukq.opaldesk
 
+import android.app.Activity
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -13,16 +15,25 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.Process
 import android.util.Log
 import android.view.Display
+import io.github.lengsukq.opaldesk.adb.AdbProcessRunner
+import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
+import io.github.lengsukq.opaldesk.cast.PeerFloatingAppService
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.external.ExternalDisplayPolicy
+import io.github.lengsukq.opaldesk.external.ExternalTrackpadBridge
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.PendingPairingRequest
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
+import io.github.lengsukq.opaldesk.web.WebActivationService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.system.exitProcess
 
 /**
  * Lightweight foreground session service and automatic USB-C / HDMI external physical monitor watcher.
@@ -123,13 +134,65 @@ class BridgeService : Service() {
         }
 
         fun stopAllAndExit(ctx: Context) {
+            val appCtx = ctx.applicationContext
             sUserStopping = true
-            BridgeClient.closeAllWindowsAsync(removeTasks = false)
-            BridgeClient.shutdownDaemonAsync()
-            try {
-                ctx.stopService(Intent(ctx, BridgeService::class.java))
-            } catch (_: Throwable) {
+            OpalLogStore.i("Service", "Stopping daemon and helper background services")
+            stopAuxiliaryServicesAndDiscovery(appCtx)
+            BridgeClient.shutdownDaemonAsync(closeWindows = true, removeTasks = false)
+            runCatching { appCtx.stopService(Intent(appCtx, BridgeService::class.java)) }
+        }
+
+        /**
+         * Performs an ordered full teardown of daemon, foreground services, NSD discovery,
+         * notifications, local ADB server, all Activity tasks, and finally terminates the process.
+         */
+        fun completeExitApp(activity: Activity) {
+            val appCtx = activity.applicationContext
+            sUserStopping = true
+            OpalLogStore.i("Service", "Complete exit requested by user")
+            stopAuxiliaryServicesAndDiscovery(appCtx)
+            ExternalTrackpadBridge.requestClosePhoneTrackpad()
+            ExternalTrackpadBridge.getDirectSink()?.closeExternalDesktop()
+            runCatching { appCtx.stopService(Intent(appCtx, BridgeService::class.java)) }
+
+            val finished = AtomicBoolean(false)
+            val mainHandler = Handler(Looper.getMainLooper())
+            val finishAndTerminate = Runnable {
+                if (!finished.compareAndSet(false, true)) return@Runnable
+                runCatching {
+                    val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                    am?.appTasks?.forEach { task -> runCatching { task.finishAndRemoveTask() } }
+                }
+                runCatching { activity.finishAffinity() }
+                runCatching { activity.finishAndRemoveTask() }
+                mainHandler.postDelayed({
+                    Process.killProcess(Process.myPid())
+                    exitProcess(0)
+                }, 120L)
             }
+
+            // Hard safety watchdog so UI exit never stalls if IPC or local ADB hangs
+            mainHandler.postDelayed(finishAndTerminate, 900L)
+            Thread({
+                runCatching { BridgeClient.shutdownDaemonSync(closeWindows = true, removeTasks = false) }
+                runCatching {
+                    if (AdbProcessRunner.getPrivateAdbSocketFile(appCtx).exists()) {
+                        AdbProcessRunner.stopLocalAdbServerSync(appCtx)
+                    }
+                }
+                OpalLogStore.flushBlocking(220L)
+                mainHandler.post(finishAndTerminate)
+            }, "OpalCompleteExit").start()
+        }
+
+        private fun stopAuxiliaryServicesAndDiscovery(appCtx: Context) {
+            runCatching { WebActivationService.stop(appCtx) }
+            runCatching { PeerFloatingAppService.stop(appCtx) }
+            runCatching { OpalPeerDiscovery.stopAdvertise() }
+            runCatching { OpalPeerDiscovery.stopBrowsing() }
+            runCatching { AdbBootstrap.stopDiscovery() }
+            runCatching { AdbBootstrap.cancelPairingNotification(appCtx) }
+            runCatching { updatePairingNotification(appCtx, null) }
         }
     }
 

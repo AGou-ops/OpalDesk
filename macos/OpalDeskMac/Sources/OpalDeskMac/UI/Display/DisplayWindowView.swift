@@ -11,6 +11,7 @@ public struct DisplayWindowView: View {
     @State private var isDragOverCanvas: Bool = false
     @State private var isInjectWarningDismissed: Bool = false
     @State private var isHoveringTopEdge: Bool = false
+    @State private var canvasFocusGeneration: Int = 0
 
     public init(model: AppModel) {
         self.model = model
@@ -41,7 +42,9 @@ public struct DisplayWindowView: View {
                 config: DisplayCanvasConfig(
                     videoWidth: model.currentVideoWidth,
                     videoHeight: model.currentVideoHeight,
-                    mapCommandToCtrl: model.preferences.mapCommandToCtrl
+                    mapCommandToCtrl: model.preferences.mapCommandToCtrl,
+                    isCanvasInteractive: model.isAuthenticated && model.videoMetrics.totalFramesDecoded > 0,
+                    focusGeneration: canvasFocusGeneration
                 ),
                 callbacks: model.streamBridge.makeCanvasCallbacks(
                     isAuthenticated: { model.isAuthenticated },
@@ -55,6 +58,11 @@ public struct DisplayWindowView: View {
             )
             .onChange(of: model.injectStatus) { _, newStatus in
                 if newStatus != .denied { isInjectWarningDismissed = false }
+            }
+            .onChange(of: isHoveringTopEdge) { wasHovering, isHovering in
+                if wasHovering && !isHovering {
+                    canvasFocusGeneration &+= 1
+                }
             }
 
             topHoverControlBar

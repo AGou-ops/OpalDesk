@@ -15,11 +15,21 @@ public struct DisplayCanvasConfig: Equatable, Sendable {
     public let videoWidth: Int
     public let videoHeight: Int
     public let mapCommandToCtrl: Bool
+    public let isCanvasInteractive: Bool
+    public let focusGeneration: Int
 
-    public init(videoWidth: Int, videoHeight: Int, mapCommandToCtrl: Bool) {
+    public init(
+        videoWidth: Int,
+        videoHeight: Int,
+        mapCommandToCtrl: Bool,
+        isCanvasInteractive: Bool = true,
+        focusGeneration: Int = 0
+    ) {
         self.videoWidth = videoWidth
         self.videoHeight = videoHeight
         self.mapCommandToCtrl = mapCommandToCtrl
+        self.isCanvasInteractive = isCanvasInteractive
+        self.focusGeneration = focusGeneration
     }
 }
 
@@ -98,7 +108,14 @@ public struct InteractiveDisplayNSView: NSViewRepresentable {
     }
 
     public func updateNSView(_ nsView: DisplayCanvasNSView, context: Context) {
+        let becameInteractive = !nsView.config.isCanvasInteractive && config.isCanvasInteractive
+        let focusRequested = nsView.config.focusGeneration != config.focusGeneration
         nsView.config = config
         nsView.callbacks = callbacks
+        if becameInteractive || focusRequested {
+            DispatchQueue.main.async { [weak nsView] in
+                nsView?.claimFirstResponderIfNeeded()
+            }
+        }
     }
 }

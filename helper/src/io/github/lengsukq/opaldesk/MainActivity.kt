@@ -14,12 +14,16 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.widthIn
@@ -37,6 +41,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -46,6 +51,7 @@ import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
 import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
 import io.github.lengsukq.opaldesk.cast.PeerCastViewerActivity
 import io.github.lengsukq.opaldesk.cast.RemoteAppPickerModal
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.external.ExternalTrackpadBridge
 import io.github.lengsukq.opaldesk.external.ExternalTrackpadLauncher
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
@@ -56,7 +62,10 @@ import io.github.lengsukq.opaldesk.ui.AppUpdateModal
 import io.github.lengsukq.opaldesk.ui.ConsoleDashboardTab
 import io.github.lengsukq.opaldesk.ui.ConsoleDisplaySettingsTab
 import io.github.lengsukq.opaldesk.ui.ConsoleEngineSettingsTab
+import io.github.lengsukq.opaldesk.ui.ConsoleLogsTab
 import io.github.lengsukq.opaldesk.ui.OpalAmbientBackdrop
+import io.github.lengsukq.opaldesk.ui.OpalButton
+import io.github.lengsukq.opaldesk.ui.OpalGlassCard
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalSegmentedRow
 import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
@@ -107,6 +116,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        OpalLogStore.init(applicationContext)
+        OpalLogStore.i("App", "MainActivity started (API ${Build.VERSION.SDK_INT})")
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         requestNotificationPermissionIfNeeded()
@@ -138,6 +149,9 @@ class MainActivity : ComponentActivity() {
                     onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
                     onStopEngine = {
                         BridgeService.stopAllAndExit(this)
+                    },
+                    onCompleteExitApp = {
+                        BridgeService.completeExitApp(this)
                     },
                 )
             }
@@ -263,6 +277,7 @@ private fun OpalConsoleScreen(
     onConnectPeerCast: (String, Int, String) -> Unit,
     onPickCustomWallpaper: () -> Unit,
     onStopEngine: () -> Unit,
+    onCompleteExitApp: () -> Unit,
 ) {
     val ctx = androidx.compose.ui.platform.LocalContext.current
     val status by BridgeClient.statusFlow.collectAsState()
@@ -274,6 +289,8 @@ private fun OpalConsoleScreen(
     var selectedTab by remember { mutableIntStateOf(0) }
     var showActivationModal by remember { mutableStateOf(false) }
     var showUpdateModal by remember { mutableStateOf(false) }
+    var showExitConfirmModal by remember { mutableStateOf(false) }
+    var exitingApp by remember { mutableStateOf(false) }
     var floatingPickerTarget by remember { mutableStateOf<Triple<String, Int, String>?>(null) }
     val wallpaperPreset by AppPrefs.wallpaperPresetFlow.collectAsState()
     val updateState by AppUpdateManager.stateFlow.collectAsState()
@@ -368,7 +385,7 @@ private fun OpalConsoleScreen(
 
                 // macOS Floating Glass Segmented Tab Switcher
                 OpalSegmentedRow(
-                    options = listOf("工作站", "显示与外设", "设置"),
+                    options = listOf("工作站", "显示外设", "设置", "日志"),
                     selectedIndex = selectedTab,
                     onSelect = { selectedTab = it },
                 )
@@ -399,6 +416,7 @@ private fun OpalConsoleScreen(
                             }
                         },
                         onOpenActivation = { showActivationModal = true },
+                        onRequestCompleteExit = { showExitConfirmModal = true },
                     )
                     1 -> ConsoleDisplaySettingsTab(
                         status = status,
@@ -406,11 +424,16 @@ private fun OpalConsoleScreen(
                         extDisplay = extDisplay,
                         onPickCustomWallpaper = onPickCustomWallpaper,
                     )
-                    else -> ConsoleEngineSettingsTab(
+                    2 -> ConsoleEngineSettingsTab(
                         status = status,
                         onOpenActivation = { showActivationModal = true },
                         onOpenUpdateModal = { showUpdateModal = true },
                         onStopEngine = onStopEngine,
+                    )
+                    else -> ConsoleLogsTab(
+                        status = status,
+                        scene = scene,
+                        remote = remote,
                     )
                 }
             }
@@ -429,6 +452,22 @@ private fun OpalConsoleScreen(
             )
         }
 
+        if (showExitConfirmModal) {
+            ConfirmCompleteExitModal(
+                connected = status.connected,
+                openWindowCount = scene.windows.size,
+                casting = remote.connected,
+                exiting = exitingApp,
+                onDismiss = { if (!exitingApp) showExitConfirmModal = false },
+                onConfirmExit = {
+                    if (!exitingApp) {
+                        exitingApp = true
+                        onCompleteExitApp()
+                    }
+                },
+            )
+        }
+
         floatingPickerTarget?.let { (host, port, label) ->
             RemoteAppPickerModal(
                 host = host,
@@ -441,6 +480,76 @@ private fun OpalConsoleScreen(
 
         pendingPairing?.let { req ->
             PairingConsentModal(request = req)
+        }
+    }
+}
+
+@Composable
+private fun ConfirmCompleteExitModal(
+    connected: Boolean,
+    openWindowCount: Int,
+    casting: Boolean,
+    exiting: Boolean,
+    onDismiss: () -> Unit,
+    onConfirmExit: () -> Unit,
+) {
+    val detailText = buildString {
+        append("将停止多窗引擎守护进程、局域网/悬浮后台服务并彻底结束应用进程。")
+        val activeItems = buildList {
+            if (openWindowCount > 0) add("已打开的 $openWindowCount 个窗口")
+            if (casting) add("进行中的投屏会话")
+        }
+        if (activeItems.isNotEmpty()) {
+            append("\n当前")
+            append(activeItems.joinToString("与"))
+            append("将会一并关闭。")
+        } else if (connected) {
+            append("\n下次打开应用后需重新激活引擎（若已开启 Shizuku / Root 自动重连则会自动拉起）。")
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(OpalPalette.ScrimColor)
+            .clickable(enabled = !exiting, onClick = onDismiss)
+            .padding(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        OpalGlassCard(
+            modifier = Modifier
+                .widthIn(max = 420.dp)
+                .fillMaxWidth()
+                .pointerInput(Unit) { detectTapGestures {} },
+            cornerRadius = 24.dp,
+            fillColor = OpalPalette.GlassPopover,
+            contentPadding = PaddingValues(20.dp),
+        ) {
+            OpalText(text = "完全退出 OpalDesk？", fontSize = 17.5.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(8.dp))
+            OpalText(
+                text = detailText,
+                fontSize = 13.sp,
+                color = OpalPalette.TextSecondary,
+                lineHeight = 19.sp,
+            )
+            Spacer(Modifier.height(18.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                OpalButton(
+                    label = "取消",
+                    filled = false,
+                    enabled = !exiting,
+                    onClick = onDismiss,
+                    modifier = Modifier.weight(1f),
+                )
+                OpalButton(
+                    label = if (exiting) "正在退出…" else "确认退出",
+                    accent = OpalPalette.AccentDanger,
+                    enabled = !exiting,
+                    onClick = onConfirmExit,
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
     }
 }

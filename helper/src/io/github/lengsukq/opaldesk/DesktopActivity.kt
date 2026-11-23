@@ -32,6 +32,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import io.github.lengsukq.opaldesk.compositor.OpalCompositorWorkspace
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.ui.NativeImeBridgeHost
@@ -71,7 +72,9 @@ class DesktopActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        OpalLogStore.init(applicationContext)
         val currentDisplayId = display?.displayId ?: Display.DEFAULT_DISPLAY
+        OpalLogStore.i("Desktop", "DesktopActivity.onCreate displayId=$currentDisplayId")
         if (currentDisplayId > Display.DEFAULT_DISPLAY) {
             val extIntent = Intent(this, ExternalDesktopActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)

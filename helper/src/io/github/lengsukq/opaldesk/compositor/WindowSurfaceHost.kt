@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import io.github.lengsukq.opaldesk.BridgeClient
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.CompositorGeometry
 import io.github.lengsukq.opaldesk.protocol.CompositorWindow
@@ -192,6 +193,7 @@ fun WindowSurfaceHost(
                             }
 
                             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                                OpalLogStore.i("Surface", "TextureView destroyed wid=${currentWin.windowId} hadFrame=$hasRenderedLiveFrame")
                                 hasRenderedLiveFrame = false
                                 holderState.releaseAll(notifyDaemon = false)
                                 return true
@@ -200,6 +202,7 @@ fun WindowSurfaceHost(
                             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
                                 if (!hasRenderedLiveFrame) {
                                     hasRenderedLiveFrame = true
+                                    OpalLogStore.i("Surface", "First live frame rendered wid=${currentWin.windowId} pkg=${currentWin.pkg}")
                                 }
                             }
                         }

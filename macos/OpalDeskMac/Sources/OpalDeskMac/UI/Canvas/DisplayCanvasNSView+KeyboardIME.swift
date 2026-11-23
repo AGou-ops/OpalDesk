@@ -18,22 +18,41 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
         }
 
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        let isShortcut = modifiers.contains(.command) || modifiers.contains(.control)
+        let wasComposing = hasMarkedText()
 
-        // When a shortcut is pressed and we are not actively composing CJK marked text, bypass IME directly.
-        if isShortcut && !hasMarkedText() {
+        // Only Command shortcuts bypass IME when not actively composing; Control/Option combinations
+        // (Ctrl+Space, Ctrl+Option+Space, Ctrl+., Ctrl+`, Option+Y) must reach NSTextInputContext first.
+        if ImeKeyRoutingPolicy.shouldBypassImeOnKeyDown(modifiers: modifiers, hasMarkedText: wasComposing) {
             sendHardwareKey(event: event, action: .down)
             return
         }
 
-        // Let NSTextInputContext handle CJK composition, dead keys, and Unicode characters.
+        // Let NSTextInputContext handle CJK composition, IME mode switches, dead keys, and Unicode characters.
         imeHandledCurrentKeyDown = false
-        let wasComposing = hasMarkedText()
-        interpretKeyEvents([event])
+        didReceiveDoCommandInCurrentKeyDown = false
+        didReceivePlainAsciiInsertInCurrentKeyDown = false
 
-        // If IME did not consume the key (e.g. Escape, arrows, Enter, Backspace, or plain ASCII), forward hardware key.
-        if !imeHandledCurrentKeyDown && !wasComposing && !hasMarkedText() {
+        let handledByInputContext: Bool
+        if let context = inputContext {
+            handledByInputContext = context.handleEvent(event)
+        } else {
+            interpretKeyEvents([event])
+            handledByInputContext = false
+        }
+
+        let shouldForward = ImeKeyRoutingPolicy.shouldForwardHardwareKeyAfterIme(
+            imeConsumedTextOrMarked: imeHandledCurrentKeyDown,
+            handledByInputContext: handledByInputContext,
+            didReceiveDoCommand: didReceiveDoCommandInCurrentKeyDown,
+            didReceivePlainAsciiInsert: didReceivePlainAsciiInsertInCurrentKeyDown,
+            wasComposing: wasComposing,
+            isComposingNow: hasMarkedText()
+        )
+
+        if shouldForward {
             sendHardwareKey(event: event, action: .down)
+        } else {
+            imeConsumedKeyCodes.insert(event.keyCode)
         }
     }
 
@@ -41,18 +60,45 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
         if consumedShortcutKeyCodes.remove(event.keyCode) != nil {
             return
         }
+        if imeConsumedKeyCodes.remove(event.keyCode) != nil {
+            return
+        }
         guard !hasMarkedText() else { return }
         sendHardwareKey(event: event, action: .up)
     }
 
     public override func flagsChanged(with event: NSEvent) {
+        let previousFlags = lastModifierFlags
         let current = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let sourceBefore = currentInputSourceID()
+
+        // Always deliver modifier transitions (Shift-tap Chinese/English toggle, CapsLock switch, etc.)
+        // to NSTextInputContext so macOS Apple Pinyin, Sogou, WeType, Baidu, and Rime can switch modes.
+        let consumedByContext = inputContext?.handleEvent(event) ?? false
+        if !consumedByContext {
+            super.flagsChanged(with: event)
+        }
+
+        let sourceAfter = currentInputSourceID()
+        let inputSourceChanged = (sourceBefore != nil && sourceAfter != nil && sourceBefore != sourceAfter)
+        lastModifierFlags = current
+
+        guard ImeKeyRoutingPolicy.shouldForwardFlagsChanged(
+            macKeyCode: event.keyCode,
+            currentFlags: current,
+            previousFlags: previousFlags,
+            consumedByInputContext: consumedByContext,
+            hasMarkedText: hasMarkedText(),
+            inputSourceChanged: inputSourceChanged
+        ) else {
+            return
+        }
+
         let action = KeyCodeMapper.modifierKeyAction(
             for: event.keyCode,
             currentFlags: current,
-            previousFlags: lastModifierFlags
+            previousFlags: previousFlags
         )
-        lastModifierFlags = current
 
         if let mapped = KeyCodeMapper.map(
             macKeyCode: event.keyCode,
@@ -69,12 +115,22 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
     }
 
     public override func doCommand(by selector: Selector) {
-        // Leave navigation/editing commands (Enter, Tab, Backspace, Escape, arrows) to hardware key forwarding.
+        // Leave navigation/editing commands (Enter, Tab, Backspace, Escape, arrows, Ctrl+A/C/V)
+        // to hardware key forwarding when not composing.
+        didReceiveDoCommandInCurrentKeyDown = true
         imeHandledCurrentKeyDown = false
     }
 
     private func handleLocalShortcutIfNeeded(_ event: NSEvent) -> Bool {
         false
+    }
+
+    private func currentInputSourceID() -> String? {
+        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+              let rawPtr = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else {
+            return nil
+        }
+        return Unmanaged<CFString>.fromOpaque(rawPtr).takeUnretainedValue() as String
     }
 
     private func sendHardwareKey(event: NSEvent, action: OpalCastKeyAction) {
@@ -112,13 +168,13 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
 
         guard !text.isEmpty else { return }
 
-        // Use INPUT_TEXT commit-paste for IME-composed strings, multi-character strings, or non-ASCII text (Chinese/emoji).
-        let isPureSingleASCII = text.count == 1 && (text.unicodeScalars.first?.isASCII == true)
-        if wasMarked || !isPureSingleASCII {
+        // Use INPUT_TEXT commit-paste for IME-composed strings, multi-character strings, or non-ASCII text (Chinese/punctuation/emoji).
+        if ImeKeyRoutingPolicy.shouldCommitViaInputText(text: text, wasMarked: wasMarked) {
             imeHandledCurrentKeyDown = true
             callbacks.onCommitText(text)
         } else {
             // Single uncomposed ASCII character: let hardware keyDown forward native Android KeyEvent.
+            didReceivePlainAsciiInsertInCurrentKeyDown = true
             imeHandledCurrentKeyDown = false
         }
     }
@@ -131,7 +187,10 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
         } else {
             markedString = ""
         }
-        markedSelectedRange = selectedRange
+        markedSelectedRange = ImeKeyRoutingPolicy.selectedRange(
+            markedLength: (markedString as NSString).length,
+            markedSelectedRange: selectedRange
+        )
         imeHandledCurrentKeyDown = true
     }
 
@@ -141,7 +200,10 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
     }
 
     public func selectedRange() -> NSRange {
-        NSRange(location: NSNotFound, length: 0)
+        ImeKeyRoutingPolicy.selectedRange(
+            markedLength: (markedString as NSString).length,
+            markedSelectedRange: markedSelectedRange
+        )
     }
 
     public func markedRange() -> NSRange {
@@ -158,20 +220,29 @@ extension DisplayCanvasNSView: @preconcurrency NSTextInputClient {
         forProposedRange range: NSRange,
         actualRange: NSRangePointer?
     ) -> NSAttributedString? {
-        nil
+        let nsMarked = markedString as NSString
+        guard nsMarked.length > 0 else { return nil }
+        let fullRange = NSRange(location: 0, length: nsMarked.length)
+        let clipped = NSIntersectionRange(range, fullRange)
+        guard clipped.length > 0 else { return nil }
+        actualRange?.pointee = clipped
+        return NSAttributedString(string: nsMarked.substring(with: clipped))
     }
 
     public func validAttributesForMarkedText() -> [NSAttributedString.Key] {
-        []
+        [.underlineStyle, .markedClauseSegment]
     }
 
     public func firstRect(
         forCharacterRange range: NSRange,
         actualRange: NSRangePointer?
     ) -> NSRect {
+        actualRange?.pointee = range
         guard let window else { return .zero }
-        // Anchor macOS IME candidate window near the bottom-center of the canvas.
-        let localAnchor = NSRect(x: bounds.midX - 60, y: bounds.height - 64, width: 120, height: 24)
+        let localAnchor = ImeKeyRoutingPolicy.candidateAnchorRect(
+            lastClickPoint: lastClickLocalPoint,
+            bounds: bounds
+        )
         let windowRect = convert(localAnchor, to: nil)
         return window.convertToScreen(windowRect)
     }

@@ -1,0 +1,453 @@
+package io.github.lengsukq.opaldesk.diagnostics
+
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.util.Log
+import androidx.core.content.FileProvider
+import io.github.lengsukq.opaldesk.protocol.CompositorScene
+import io.github.lengsukq.opaldesk.protocol.DaemonStatus
+import io.github.lengsukq.opaldesk.protocol.RemoteStreamStatus
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.charset.StandardCharsets
+import java.text.SimpleDateFormat
+import java.util.ArrayDeque
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+/**
+ * Pure JVM-testable log level, immutable entry model, ring buffer, filtering, and diagnostic
+ * report formatter shared by [OpalLogStore] and unit tests.
+ */
+enum class OpalLogLevel(val code: String, val label: String) {
+    INFO("I", "信息"),
+    WARN("W", "警告"),
+    ERROR("E", "错误"),
+}
+
+data class OpalLogEntry(
+    val seq: Long,
+    val timestampMs: Long,
+    val timeText: String,
+    val level: OpalLogLevel,
+    val tag: String,
+    val message: String,
+) {
+    fun formatLine(): String = "$timeText ${level.code}/$tag: $message"
+}
+
+/**
+ * Bounded thread-safe ring buffer for structured client diagnostic entries.
+ */
+class LogRingStore(
+    private val maxEntries: Int = DEFAULT_MAX_ENTRIES,
+) {
+    companion object {
+        const val DEFAULT_MAX_ENTRIES = 600
+        private const val MAX_MESSAGE_CHARS = 1200
+    }
+
+    private val lock = Any()
+    private val ring = ArrayDeque<OpalLogEntry>(maxEntries.coerceAtLeast(16))
+    private var nextSeq = 1L
+    private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    fun append(
+        level: OpalLogLevel,
+        tag: String,
+        message: String,
+        timestampMs: Long = System.currentTimeMillis(),
+    ): OpalLogEntry {
+        val cleanTag = tag.trim().ifEmpty { "App" }.take(24)
+        val cleanMsg = sanitizeMessage(message)
+        synchronized(lock) {
+            val timeText = timeFmt.format(Date(timestampMs))
+            val entry = OpalLogEntry(
+                seq = nextSeq++,
+                timestampMs = timestampMs,
+                timeText = timeText,
+                level = level,
+                tag = cleanTag,
+                message = cleanMsg,
+            )
+            while (ring.size >= maxEntries) {
+                ring.removeFirst()
+            }
+            ring.addLast(entry)
+            return entry
+        }
+    }
+
+    fun appendRawPersistedLine(rawLine: String): OpalLogEntry? {
+        val trimmed = rawLine.trim()
+        if (trimmed.isEmpty()) return null
+        // Expected format: "HH:mm:ss.SSS I/Tag: message"
+        val firstSpace = trimmed.indexOf(' ')
+        val slash = if (firstSpace > 0) trimmed.indexOf('/', firstSpace + 1) else -1
+        val colon = if (slash > 0) trimmed.indexOf(": ", slash + 1) else -1
+        if (firstSpace in 5..15 && slash == firstSpace + 2 && colon > slash + 1) {
+            val timeText = trimmed.substring(0, firstSpace)
+            val level = when (trimmed[firstSpace + 1]) {
+                'E' -> OpalLogLevel.ERROR
+                'W' -> OpalLogLevel.WARN
+                else -> OpalLogLevel.INFO
+            }
+            val tag = trimmed.substring(slash + 1, colon).take(24)
+            val msg = sanitizeMessage(trimmed.substring(colon + 2))
+            synchronized(lock) {
+                val entry = OpalLogEntry(
+                    seq = nextSeq++,
+                    timestampMs = 0L,
+                    timeText = timeText,
+                    level = level,
+                    tag = tag,
+                    message = msg,
+                )
+                while (ring.size >= maxEntries) {
+                    ring.removeFirst()
+                }
+                ring.addLast(entry)
+                return entry
+            }
+        }
+        return append(OpalLogLevel.INFO, "Saved", trimmed, timestampMs = 0L)
+    }
+
+    fun snapshot(): List<OpalLogEntry> = synchronized(lock) { ring.toList() }
+
+    fun clear() = synchronized(lock) { ring.clear() }
+
+    fun size(): Int = synchronized(lock) { ring.size }
+
+    private fun sanitizeMessage(raw: String): String {
+        val normalized = raw.replace('\r', ' ').replace('\n', ' ').trim()
+        return if (normalized.length > MAX_MESSAGE_CHARS) {
+            normalized.substring(0, MAX_MESSAGE_CHARS) + "..."
+        } else {
+            normalized
+        }
+    }
+}
+
+object OpalLogFilter {
+    fun filterHelperEntries(
+        entries: List<OpalLogEntry>,
+        warningsAndErrorsOnly: Boolean,
+        query: String,
+    ): List<OpalLogEntry> {
+        val q = query.trim().lowercase(Locale.ROOT)
+        return entries.filter { entry ->
+            if (warningsAndErrorsOnly && entry.level == OpalLogLevel.INFO) return@filter false
+            if (q.isEmpty()) return@filter true
+            entry.tag.lowercase(Locale.ROOT).contains(q) ||
+                entry.message.lowercase(Locale.ROOT).contains(q) ||
+                entry.timeText.contains(q)
+        }
+    }
+
+    fun filterDaemonLines(
+        daemonLogText: String,
+        warningsAndErrorsOnly: Boolean,
+        query: String,
+    ): List<String> {
+        if (daemonLogText.isBlank()) return emptyList()
+        val q = query.trim().lowercase(Locale.ROOT)
+        return daemonLogText.lineSequence()
+            .map { it.trimEnd() }
+            .filter { it.isNotBlank() }
+            .filter { line ->
+                if (warningsAndErrorsOnly && !isDaemonWarningOrError(line)) return@filter false
+                if (q.isEmpty()) return@filter true
+                line.lowercase(Locale.ROOT).contains(q)
+            }
+            .toList()
+    }
+
+    fun isDaemonWarningOrError(line: String): Boolean {
+        if (line.contains(" E/Daemon:")) return true
+        val upper = line.uppercase(Locale.ROOT)
+        return upper.contains("WARN") ||
+            upper.contains("ERR") ||
+            upper.contains("FAIL") ||
+            upper.contains("EXCEPTION") ||
+            upper.contains("FATAL") ||
+            upper.contains("REJECT")
+    }
+
+    fun buildDiagnosticReport(
+        appVersion: String,
+        deviceSummary: String,
+        status: DaemonStatus,
+        scene: CompositorScene,
+        remote: RemoteStreamStatus,
+        helperEntries: List<OpalLogEntry>,
+        daemonLogText: String,
+        generatedAtText: String,
+    ): String = buildString(8192) {
+        appendLine("=== OpalDesk 诊断日志报告 ===")
+        appendLine("生成时间: $generatedAtText")
+        appendLine("应用版本: v$appVersion")
+        appendLine("设备信息: $deviceSummary")
+        appendLine(
+            "引擎状态: ${if (status.connected) "已连接" else "未连接"} | " +
+                "uid=${status.daemonUid} | rootEnhanced=${status.rootEnhanced} | " +
+                "VD=${status.activeVdCount}/${status.maxVdCount} | windows=${scene.windows.size}",
+        )
+        appendLine(
+            "画布与输入: ${status.canvasWidth}x${status.canvasHeight}@${status.canvasDpi}dpi | " +
+                "targetFps=${status.targetFps} | dpiScale=${status.windowDpiScalePct}% | " +
+                "input=${status.injectBackendLabel}",
+        )
+        appendLine(
+            "投屏状态: connected=${remote.connected} | channel=${remote.channelLabel} | " +
+                "wifi=${remote.wifiEnabled}:${remote.wifiPort} | lanIp=${remote.lanIp.ifBlank { "-" }}",
+        )
+        if (scene.windows.isNotEmpty()) {
+            appendLine("--- 当前窗口列表 (${scene.windows.size}) ---")
+            scene.windows.forEach { w ->
+                appendLine(
+                    "wid=${w.windowId} pkg=${w.pkg} state=${w.state} displayId=${w.displayId} " +
+                        "taskId=${w.taskId} content=${w.contentWidth}x${w.contentHeight}@${w.contentDpi}dpi " +
+                        "pres=${w.presentation} focused=${w.focused}",
+                )
+            }
+        }
+        appendLine()
+        appendLine("=== 客户端日志 (${helperEntries.size} 条) ===")
+        if (helperEntries.isEmpty()) {
+            appendLine("(无记录)")
+        } else {
+            helperEntries.forEach { appendLine(it.formatLine()) }
+        }
+        appendLine()
+        val daemonLines = daemonLogText.lineSequence().filter { it.isNotBlank() }.toList()
+        appendLine("=== 守护进程日志 (${daemonLines.size} 条) ===")
+        if (daemonLines.isEmpty()) {
+            appendLine("(守护进程未连接或暂无输出)")
+        } else {
+            daemonLines.forEach { appendLine(it) }
+        }
+    }
+}
+
+/**
+ * Process-wide diagnostic log store combining an in-memory ring buffer, bounded rolling file
+ * persistence (`filesDir/logs/opaldesk_helper.log`), and reactive UI flows for Helper + Daemon logs.
+ */
+object OpalLogStore {
+    private const val LOGCAT_TAG_PREFIX = "OpalDesk"
+    private const val LOG_DIR_NAME = "logs"
+    private const val LOG_FILE_NAME = "opaldesk_helper.log"
+    private const val MAX_FILE_BYTES = 192 * 1024L
+    private const val KEEP_FILE_TAIL_LINES = 350
+
+    private val ring = LogRingStore(LogRingStore.DEFAULT_MAX_ENTRIES)
+    private val fileExec = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "OpalLogDisk").apply { isDaemon = true }
+    }
+
+    private val _entriesFlow = MutableStateFlow<List<OpalLogEntry>>(emptyList())
+    val entriesFlow: StateFlow<List<OpalLogEntry>> = _entriesFlow.asStateFlow()
+
+    private val _daemonLogsFlow = MutableStateFlow("")
+    val daemonLogsFlow: StateFlow<String> = _daemonLogsFlow.asStateFlow()
+
+    @Volatile
+    private var initialized = false
+
+    @Volatile
+    private var logFile: File? = null
+
+    fun init(ctx: Context) {
+        if (initialized) return
+        synchronized(this) {
+            if (initialized) return
+            initialized = true
+            val dir = File(ctx.applicationContext.filesDir, LOG_DIR_NAME).apply {
+                if (!exists()) mkdirs()
+            }
+            val target = File(dir, LOG_FILE_NAME)
+            logFile = target
+            fileExec.execute {
+                loadTailFromDisk(target)
+            }
+        }
+    }
+
+    fun i(tag: String, message: String) {
+        safeLogcat(OpalLogLevel.INFO, tag, message, null)
+        record(OpalLogLevel.INFO, tag, message)
+    }
+
+    fun w(tag: String, message: String, throwable: Throwable? = null) {
+        safeLogcat(OpalLogLevel.WARN, tag, message, throwable)
+        record(OpalLogLevel.WARN, tag, formatWithThrowable(message, throwable))
+    }
+
+    fun e(tag: String, message: String, throwable: Throwable? = null) {
+        safeLogcat(OpalLogLevel.ERROR, tag, message, throwable)
+        record(OpalLogLevel.ERROR, tag, formatWithThrowable(message, throwable))
+    }
+
+    fun updateDaemonLogs(rawText: String) {
+        _daemonLogsFlow.value = rawText.trimEnd()
+    }
+
+    fun clearHelperLogs() {
+        ring.clear()
+        _entriesFlow.value = emptyList()
+        val file = logFile ?: return
+        fileExec.execute {
+            runCatching {
+                if (file.exists()) {
+                    FileOutputStream(file, false).use { }
+                }
+            }
+        }
+    }
+
+    fun flushBlocking(timeoutMs: Long = 250L) {
+        val latch = CountDownLatch(1)
+        try {
+            fileExec.execute { latch.countDown() }
+            latch.await(timeoutMs.coerceAtLeast(10L), TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun buildReport(
+        appVersion: String,
+        status: DaemonStatus,
+        scene: CompositorScene,
+        remote: RemoteStreamStatus,
+        helperEntries: List<OpalLogEntry> = _entriesFlow.value,
+        daemonLogText: String = _daemonLogsFlow.value,
+    ): String {
+        val deviceSummary = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+        val generatedAt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        return OpalLogFilter.buildDiagnosticReport(
+            appVersion = appVersion,
+            deviceSummary = deviceSummary,
+            status = status,
+            scene = scene,
+            remote = remote,
+            helperEntries = helperEntries,
+            daemonLogText = daemonLogText,
+            generatedAtText = generatedAt,
+        )
+    }
+
+    fun shareDiagnosticReport(ctx: Context, reportText: String): Boolean {
+        return try {
+            val outDir = File(ctx.cacheDir, LOG_DIR_NAME).apply {
+                if (!exists()) mkdirs()
+            }
+            // Keep cache tidy by pruning older exported reports
+            outDir.listFiles()?.filter { it.name.startsWith("opaldesk_diag_") }?.forEach { old ->
+                runCatching { old.delete() }
+            }
+            val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val outFile = File(outDir, "opaldesk_diag_$stamp.txt")
+            outFile.writeText(reportText, StandardCharsets.UTF_8)
+
+            val uri = FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", outFile)
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, "OpalDesk 诊断日志 ($stamp)")
+                putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(shareIntent, "导出 OpalDesk 诊断日志").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            ctx.startActivity(chooser)
+            true
+        } catch (t: Throwable) {
+            w("Logs", "Share diagnostic report failed", t)
+            false
+        }
+    }
+
+    private fun record(level: OpalLogLevel, tag: String, message: String) {
+        val entry = ring.append(level, tag, message)
+        _entriesFlow.value = ring.snapshot()
+        val file = logFile ?: return
+        val line = entry.formatLine() + "\n"
+        fileExec.execute {
+            appendLineToDisk(file, line)
+        }
+    }
+
+    private fun loadTailFromDisk(file: File) {
+        if (!file.isFile || file.length() <= 0L) return
+        runCatching {
+            val lines = file.readLines(StandardCharsets.UTF_8)
+            val tail = if (lines.size > KEEP_FILE_TAIL_LINES) {
+                lines.subList(lines.size - KEEP_FILE_TAIL_LINES, lines.size)
+            } else {
+                lines
+            }
+            if (tail.isNotEmpty()) {
+                val restored = LogRingStore(LogRingStore.DEFAULT_MAX_ENTRIES)
+                tail.forEach { restored.appendRawPersistedLine(it) }
+                val live = ring.snapshot()
+                ring.clear()
+                restored.snapshot().forEach { entry ->
+                    ring.appendRawPersistedLine(entry.formatLine())
+                }
+                live.forEach { entry ->
+                    ring.append(entry.level, entry.tag, entry.message, entry.timestampMs)
+                }
+                _entriesFlow.value = ring.snapshot()
+            }
+            if (file.length() > MAX_FILE_BYTES) {
+                file.writeText(tail.joinToString("\n") + "\n", StandardCharsets.UTF_8)
+            }
+        }
+    }
+
+    private fun appendLineToDisk(file: File, line: String) {
+        runCatching {
+            if (file.exists() && file.length() > MAX_FILE_BYTES) {
+                val lines = file.readLines(StandardCharsets.UTF_8)
+                val kept = if (lines.size > KEEP_FILE_TAIL_LINES) {
+                    lines.subList(lines.size - KEEP_FILE_TAIL_LINES, lines.size)
+                } else {
+                    lines
+                }
+                file.writeText(kept.joinToString("\n") + "\n", StandardCharsets.UTF_8)
+            }
+            FileOutputStream(file, true).use { fos ->
+                fos.write(line.toByteArray(StandardCharsets.UTF_8))
+            }
+        }
+    }
+
+    private fun formatWithThrowable(message: String, t: Throwable?): String {
+        if (t == null) return message
+        val detail = t.message?.takeIf { it.isNotBlank() } ?: t.javaClass.simpleName
+        return "$message (${t.javaClass.simpleName}: $detail)"
+    }
+
+    private fun safeLogcat(level: OpalLogLevel, tag: String, message: String, t: Throwable?) {
+        val fullTag = "$LOGCAT_TAG_PREFIX/$tag"
+        try {
+            when (level) {
+                OpalLogLevel.INFO -> Log.i(fullTag, message)
+                OpalLogLevel.WARN -> if (t != null) Log.w(fullTag, message, t) else Log.w(fullTag, message)
+                OpalLogLevel.ERROR -> if (t != null) Log.e(fullTag, message, t) else Log.e(fullTag, message)
+            }
+        } catch (_: Throwable) {
+            // Safe no-op under plain JVM unit tests
+        }
+    }
+}

@@ -25,6 +25,7 @@ import io.github.lengsukq.opaldesk.daemon.platform.RootEnhancer;
 import io.github.lengsukq.opaldesk.daemon.platform.TaskApiAdapter;
 import io.github.lengsukq.opaldesk.daemon.platform.TaskStackObserver;
 import io.github.lengsukq.opaldesk.daemon.stream.OpalCastCompositorBridge;
+import io.github.lengsukq.opaldesk.daemon.util.DaemonLogBuffer;
 
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -162,6 +163,7 @@ public final class OpalDeskDaemon implements Runnable {
                 System.exit(2);
                 return;
             }
+            DaemonLogBuffer.installSystemStreamTee();
             Looper.prepareMainLooper();
             installUncaughtExceptionHandler();
 

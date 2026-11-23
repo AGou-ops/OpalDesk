@@ -65,6 +65,76 @@ const MAC_CMD_TO_CTRL_CODES = new Set([
   'KeyX', 'KeyY', 'KeyZ', 'Equal', 'Minus', 'Digit0',
 ]);
 
+const MODIFIER_DOM_CODES = new Set([
+  'ShiftLeft', 'ShiftRight',
+  'ControlLeft', 'ControlRight',
+  'AltLeft', 'AltRight',
+  'MetaLeft', 'MetaRight',
+  'CapsLock',
+]);
+
+export function isModifierDomCode(code) {
+  return MODIFIER_DOM_CODES.has(code);
+}
+
+/**
+ * Detects OS / CJK IME mode-switching shortcuts that must never be swallowed by preventDefault()
+ * or forwarded to Android (Ctrl+Space, Ctrl+Alt+Space, Win/Cmd+Space, Ctrl+. punctuation toggle).
+ */
+export function isImeToggleShortcut(ev) {
+  if (!ev) return false;
+  if (ev.ctrlKey && !ev.metaKey && ev.code === 'Space') return true;
+  if (ev.metaKey && !ev.ctrlKey && !ev.altKey && ev.code === 'Space') return true;
+  if (ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey && ev.code === 'Period') return true;
+  return false;
+}
+
+/**
+ * Detects events belonging to active IME composition, dead keys, or direct full-width CJK punctuation
+ * (such as `，`, `。`, `？`, `！`, `、`, `￥`) that must flow into `#imeBridge` and commit via INPUT_TEXT.
+ */
+export function isImeCompositionOrNonAsciiKey(ev) {
+  if (!ev) return false;
+  if (ev.isComposing || ev.keyCode === 229) return true;
+  if (ev.key === 'Process' || ev.key === 'Dead' || ev.key === 'Unidentified') return true;
+  if (typeof ev.key === 'string' && ev.key.length === 1 && /[^\x20-\x7e]/.test(ev.key)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Decides whether the browser default action should be prevented for a forwarded key event.
+ * Never calls preventDefault() on standalone modifiers, IME shortcuts, or printable characters
+ * inside the focused IME bridge textarea so Shift/CapsLock/Ctrl+Space switching and CJK composition
+ * work natively across Chrome, Edge, Firefox, and Safari.
+ */
+export function shouldPreventDefaultForKeyEvent(ev, { imeFocused = false, isModifier = false } = {}) {
+  if (!ev) return false;
+  if (isModifier || isImeToggleShortcut(ev) || isImeCompositionOrNonAsciiKey(ev)) {
+    return false;
+  }
+  const isPrintableInIme = imeFocused
+    && !ev.ctrlKey
+    && !ev.metaKey
+    && !ev.altKey
+    && typeof ev.key === 'string'
+    && ev.key.length === 1;
+  if (isPrintableInIme) {
+    return false;
+  }
+  return true;
+}
+
+export function clampImeBridgeCoords(clientX, clientY, viewportWidth, viewportHeight, margin = 16) {
+  const maxX = Math.max(margin, (viewportWidth || 0) - margin);
+  const maxY = Math.max(margin, (viewportHeight || 0) - margin);
+  return {
+    left: Math.round(Math.min(Math.max(margin, clientX), maxX)),
+    top: Math.round(Math.min(Math.max(margin, clientY), maxY)),
+  };
+}
+
 export function mapDomKeyboardEvent(ev, mapMacCommandToCtrl = true) {
   const androidKeyCode = DOM_CODE_TO_ANDROID_KEYCODE[ev.code];
   if (!androidKeyCode) return null;
@@ -125,10 +195,15 @@ export class OpalInputController {
 
     this.enabled = false;
     this.composing = false;
+    this.imeConsumedCodes = new Set();
+    this.lastCompositionEndAt = 0;
+    this.lastCapsLockState = false;
     this.primaryLeftAsTouch = true; // Default: left-click & drag emits Android TOUCH for smooth scroll/swipe
     this.primaryTouchPointerId = null;
     this.lastTouchPt = null;
-    this.isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '');
+    this.isMac = /Mac|iPhone|iPad/.test(
+      (typeof navigator !== 'undefined' && (navigator.platform || navigator.userAgent)) || ''
+    );
     this.touchMap = new Map();
     this.boundHandlers = [];
   }
@@ -174,9 +249,8 @@ export class OpalInputController {
           0
         );
       }
-      if (document.activeElement !== this.imeInput) {
-        this.imeInput.focus({ preventScroll: true });
-      }
+      this.positionImeBridge(e.clientX, e.clientY);
+      this.focusIme();
     });
 
     add(this.canvas, 'pointermove', (e) => {
@@ -270,6 +344,9 @@ export class OpalInputController {
         if (pt) activeList.push({ pointerId: t.identifier, x: pt.x, y: pt.y, pressure: t.force || 1.0 });
       }
       if (type === 'start') {
+        if (ev.changedTouches.length > 0) {
+          this.positionImeBridge(ev.changedTouches[0].clientX, ev.changedTouches[0].clientY);
+        }
         for (let i = 0; i < ev.changedTouches.length; i++) {
           const ct = ev.changedTouches[i];
           const idx = activeList.findIndex((p) => p.pointerId === ct.identifier);
@@ -303,6 +380,7 @@ export class OpalInputController {
     });
     add(this.imeInput, 'compositionend', (e) => {
       this.composing = false;
+      this.lastCompositionEndAt = typeof performance !== 'undefined' ? performance.now() : Date.now();
       const text = e.data || this.imeInput.value;
       this.imeInput.value = '';
       if (this.enabled && text) {
@@ -314,7 +392,7 @@ export class OpalInputController {
       const val = this.imeInput.value;
       if (val) {
         this.imeInput.value = '';
-        // Non-ASCII / IME committed text (e.g. mobile soft keyboard or voice dictation)
+        // Non-ASCII / IME committed text (e.g. direct Chinese punctuation `，。？！`, soft keyboard, voice dictation)
         if (/[^\x20-\x7e]/.test(val)) {
           this.onText(val, true);
         }
@@ -348,18 +426,72 @@ export class OpalInputController {
       if (active && active !== this.imeInput && active !== document.body && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {
         return;
       }
-      if (this.composing || ev.isComposing || ev.keyCode === 229) return;
+
+      if (isImeToggleShortcut(ev)) {
+        if (action === KEY_DOWN && ev.code) {
+          this.imeConsumedCodes.add(ev.code);
+        } else if (action === KEY_UP && ev.code) {
+          this.imeConsumedCodes.delete(ev.code);
+        }
+        return;
+      }
+
+      if (this.composing || isImeCompositionOrNonAsciiKey(ev)) {
+        if (action === KEY_DOWN && ev.code) {
+          this.imeConsumedCodes.add(ev.code);
+        }
+        return;
+      }
+
+      // Guard Safari's duplicate Enter keydown fired right after compositionend commits CJK text
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      if (
+        action === KEY_DOWN
+        && (ev.code === 'Enter' || ev.code === 'NumpadEnter')
+        && (nowMs - this.lastCompositionEndAt) < 50
+      ) {
+        this.imeConsumedCodes.add(ev.code);
+        return;
+      }
+
+      if (action === KEY_UP && ev.code && this.imeConsumedCodes.delete(ev.code)) {
+        return;
+      }
+
       // Let browser handle paste event cleanly when Ctrl/Cmd+V is pressed inside imeInput
       if (action === KEY_DOWN && (ev.ctrlKey || ev.metaKey) && ev.code === 'KeyV' && active === this.imeInput) {
         return;
       }
+
+      // On macOS, short-pressing CapsLock switches ABC <-> Chinese IME without toggling CapsLock state.
+      if (ev.code === 'CapsLock') {
+        const capsNow = Boolean(ev.getModifierState && ev.getModifierState('CapsLock'));
+        const capsUnchanged = capsNow === this.lastCapsLockState;
+        this.lastCapsLockState = capsNow;
+        if (this.isMac && capsUnchanged) {
+          return;
+        }
+      }
+
       const mapped = mapDomKeyboardEvent(ev, this.isMac);
       if (!mapped) return;
-      ev.preventDefault();
+      if (shouldPreventDefaultForKeyEvent(ev, {
+        imeFocused: active === this.imeInput,
+        isModifier: isModifierDomCode(ev.code),
+      })) {
+        ev.preventDefault();
+      }
       this.onKey(action, mapped.androidKeyCode, mapped.metaState, ev.repeat ? 1 : 0);
     };
     add(window, 'keydown', (e) => handleKey(e, KEY_DOWN));
     add(window, 'keyup', (e) => handleKey(e, KEY_UP));
+    add(window, 'focus', () => {
+      if (!this.enabled) return;
+      const active = document.activeElement;
+      if (!active || active === document.body || !['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {
+        this.focusIme();
+      }
+    });
 
     // Drag & Drop File Upload onto Canvas
     add(this.canvas, 'dragover', (e) => {
@@ -379,15 +511,32 @@ export class OpalInputController {
 
   setEnabled(enabled) {
     this.enabled = Boolean(enabled);
-    if (this.enabled) {
+    if (!this.enabled) {
+      this.composing = false;
+      this.imeConsumedCodes.clear();
+      return;
+    }
+    this.focusIme();
+  }
+
+  focusIme() {
+    if (!this.enabled || !this.imeInput) return;
+    if (typeof document !== 'undefined' && document.activeElement !== this.imeInput) {
       this.imeInput.focus({ preventScroll: true });
     }
+  }
+
+  positionImeBridge(clientX, clientY) {
+    if (!this.imeInput || !this.imeInput.style || typeof window === 'undefined') return;
+    const { left, top } = clampImeBridgeCoords(clientX, clientY, window.innerWidth, window.innerHeight);
+    this.imeInput.style.left = `${left}px`;
+    this.imeInput.style.top = `${top}px`;
   }
 
   handleRemoteImeRequest(show) {
     if (!this.enabled) return;
     if (show) {
-      this.imeInput.focus({ preventScroll: true });
+      this.focusIme();
     }
   }
 

@@ -17,6 +17,7 @@ import io.github.lengsukq.opaldesk.daemon.platform.AndroidServices;
 import io.github.lengsukq.opaldesk.daemon.platform.TaskApiAdapter;
 import io.github.lengsukq.opaldesk.daemon.stream.OpalCastCompositorBridge;
 import io.github.lengsukq.opaldesk.daemon.stream.RemoteStreamServer;
+import io.github.lengsukq.opaldesk.daemon.util.DaemonLogBuffer;
 
 /**
  * Binder IPC dispatcher for the OpalDesk Universal Compositor, External Display EDID controls,
@@ -421,6 +422,12 @@ public final class BridgeBinderService extends Binder {
                 boolean ok = remoteBridge != null
                         && remoteBridge.injectHostTrackpadEvent(action, x, y, hScroll, vScroll, buttonState);
                 if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            }
+            case BridgeProtocol.TX_GET_DAEMON_LOGS: {
+                int maxLines = data.readInt();
+                String logs = DaemonLogBuffer.snapshotTail(maxLines);
+                if (reply != null) reply.writeString(logs);
                 return true;
             }
             case BridgeProtocol.TX_SHUTDOWN: {

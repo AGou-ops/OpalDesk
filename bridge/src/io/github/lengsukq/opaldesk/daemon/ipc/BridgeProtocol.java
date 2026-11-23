@@ -67,6 +67,7 @@ public final class BridgeProtocol {
     public static final int TX_GET_PENDING_PAIRING = 35;
     public static final int TX_RESPOND_PAIRING = 36;
     public static final int TX_INJECT_REMOTE_TRACKPAD = 37;
+    public static final int TX_GET_DAEMON_LOGS = 38;
     public static final int TX_SHUTDOWN = 99;
 
     // ---- Interactive Pairing Approval Decisions (TX_RESPOND_PAIRING) ----

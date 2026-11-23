@@ -46,8 +46,13 @@ public final class DisplayCanvasNSView: NSView {
     var markedString: String = ""
     var markedSelectedRange = NSRange(location: 0, length: 0)
     var imeHandledCurrentKeyDown: Bool = false
+    var didReceiveDoCommandInCurrentKeyDown: Bool = false
+    var didReceivePlainAsciiInsertInCurrentKeyDown: Bool = false
     var lastModifierFlags: NSEvent.ModifierFlags = []
     var consumedShortcutKeyCodes: Set<UInt16> = []
+    var imeConsumedKeyCodes: Set<UInt16> = []
+    var lastClickLocalPoint: CGPoint?
+    nonisolated(unsafe) private var windowKeyObserver: NSObjectProtocol?
 
     public init(
         displayLayer: AVSampleBufferDisplayLayer,
@@ -76,13 +81,69 @@ public final class DisplayCanvasNSView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        if let observer = windowKeyObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
     public override var isFlipped: Bool { true }
     public override var acceptsFirstResponder: Bool { true }
 
+    public override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            lastModifierFlags = NSEvent.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            inputContext?.activate()
+        }
+        return accepted
+    }
+
+    public override func resignFirstResponder() -> Bool {
+        if hasMarkedText() {
+            inputContext?.discardMarkedText()
+            unmarkText()
+        }
+        imeConsumedKeyCodes.removeAll()
+        return super.resignFirstResponder()
+    }
+
+    public func claimFirstResponderIfNeeded() {
+        guard let window, window.isKeyWindow || window.isVisible else { return }
+        if window.firstResponder is NSTextView {
+            return
+        }
+        if window.firstResponder !== self {
+            window.makeFirstResponder(self)
+        }
+        inputContext?.activate()
+    }
+
+    public override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if let observer = windowKeyObserver {
+            NotificationCenter.default.removeObserver(observer)
+            windowKeyObserver = nil
+        }
+    }
+
     public override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.acceptsMouseMovedEvents = true
-        window?.makeFirstResponder(self)
+        guard let window else { return }
+        window.acceptsMouseMovedEvents = true
+        windowKeyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.claimFirstResponderIfNeeded()
+            }
+        }
+        claimFirstResponderIfNeeded()
+        DispatchQueue.main.async { [weak self] in
+            self?.claimFirstResponderIfNeeded()
+        }
         reportCurrentSize()
     }
 
@@ -181,7 +242,15 @@ public final class DisplayCanvasNSView: NSView {
     }
 
     public override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
+        lastClickLocalPoint = convert(event.locationInWindow, from: nil)
+        claimFirstResponderIfNeeded()
+        if hasMarkedText() {
+            let handled = inputContext?.handleEvent(event) ?? false
+            if !handled && hasMarkedText() {
+                inputContext?.discardMarkedText()
+                unmarkText()
+            }
+        }
         callbacks.onCanvasInteract?()
         handleButton(event: event, button: .primary, isDown: true)
     }
@@ -191,7 +260,8 @@ public final class DisplayCanvasNSView: NSView {
     }
 
     public override func rightMouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
+        lastClickLocalPoint = convert(event.locationInWindow, from: nil)
+        claimFirstResponderIfNeeded()
         callbacks.onCanvasInteract?()
         handleButton(event: event, button: .secondary, isDown: true)
     }
@@ -201,7 +271,8 @@ public final class DisplayCanvasNSView: NSView {
     }
 
     public override func otherMouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
+        lastClickLocalPoint = convert(event.locationInWindow, from: nil)
+        claimFirstResponderIfNeeded()
         handleButton(event: event, button: mapOtherMouseButton(event.buttonNumber), isDown: true)
     }
 

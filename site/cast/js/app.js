@@ -423,8 +423,14 @@ class OpalCastWebApp {
     // Stage toolbar actions
     $('cancelConnectBtn').addEventListener('click', () => this.disconnectCast('已取消连接'));
     $('tbDisconnectBtn').addEventListener('click', () => this.disconnectCast('已断开投屏'));
-    $('tbBackBtn').addEventListener('click', () => this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_BACK)));
-    $('tbHomeBtn').addEventListener('click', () => this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_HOME)));
+    $('tbBackBtn').addEventListener('click', () => {
+      this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_BACK));
+      this.input.focusIme();
+    });
+    $('tbHomeBtn').addEventListener('click', () => {
+      this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_HOME));
+      this.input.focusIme();
+    });
     $('tbInputModeBtn').addEventListener('click', () => {
       const nextTouch = !this.input.primaryLeftAsTouch;
       this.input.setPrimaryLeftAsTouch(nextTouch);
@@ -432,21 +438,30 @@ class OpalCastWebApp {
       btn.textContent = nextTouch ? '触控' : '鼠标';
       btn.classList.toggle('active', nextTouch);
       this.showToast(nextTouch ? '左键拖拽已切换为「触控滑动」模式（支持列表拖拽滚动）' : '左键拖拽已切换为「鼠标指针」模式（支持文本框选）');
+      this.input.focusIme();
     });
     $('tbAudioBtn').addEventListener('click', async () => {
       await this.audio.resumeFromGesture();
       const nextMuted = !this.audio.muted;
       this.audio.setMuted(nextMuted);
       this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_SET_AUDIO_ENABLED, nextMuted ? 0 : 1));
+      this.input.focusIme();
     });
-    $('tbFullscreenBtn').addEventListener('click', () => this.toggleFullscreen());
+    $('tbFullscreenBtn').addEventListener('click', () => {
+      this.toggleFullscreen();
+      this.input.focusIme();
+    });
 
     // Quality popover
     $('tbQualityBtn').addEventListener('click', () => {
       $('appsPopover').hidden = true;
       $('qualityPopover').hidden = !$('qualityPopover').hidden;
+      if ($('qualityPopover').hidden) this.input.focusIme();
     });
-    $('closeQualityPopBtn').addEventListener('click', () => { $('qualityPopover').hidden = true; });
+    $('closeQualityPopBtn').addEventListener('click', () => {
+      $('qualityPopover').hidden = true;
+      this.input.focusIme();
+    });
     $('qualityPopover').querySelectorAll('[data-preset]').forEach((btn) => {
       btn.addEventListener('click', () => {
         this.resizeMode = btn.dataset.preset;
@@ -456,6 +471,7 @@ class OpalCastWebApp {
     $('applyQualityBtn').addEventListener('click', () => {
       this.applyLiveResizeConfig();
       $('qualityPopover').hidden = true;
+      this.input.focusIme();
     });
 
     // App launcher popover
@@ -466,9 +482,14 @@ class OpalCastWebApp {
       if (opening) {
         this.sendOpalFrame(TYPE_LIST_APPS);
         $('appSearchInput').focus();
+      } else {
+        this.input.focusIme();
       }
     });
-    $('closeAppsPopBtn').addEventListener('click', () => { $('appsPopover').hidden = true; });
+    $('closeAppsPopBtn').addEventListener('click', () => {
+      $('appsPopover').hidden = true;
+      this.input.focusIme();
+    });
     $('appSearchInput').addEventListener('input', () => this.renderAppList());
 
     // Toast action button

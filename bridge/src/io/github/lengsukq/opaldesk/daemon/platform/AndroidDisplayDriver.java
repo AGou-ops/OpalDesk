@@ -87,15 +87,22 @@ public final class AndroidDisplayDriver
                 };
 
         float vdRefreshRate = (fps > 60.5f) ? fps : 0f;
+        int[] chosenFlags = new int[1];
         VirtualDisplay vd = VirtualDisplayFactory.createWithFlagFallback(
-                services.displayManager, name, width, height, dpi, candidates, vdRefreshRate, surface, null);
+                services.displayManager, name, width, height, dpi, candidates, vdRefreshRate, surface, chosenFlags);
         if (vd == null || vd.getDisplay() == null) {
+            System.err.println("OPALDESK_VD_CREATE_FAIL name=" + name
+                    + " size=" + width + "x" + height + "@" + dpi + "dpi allowSecure=" + allowSecure);
             return null;
         }
 
         Display disp = vd.getDisplay();
         int displayId = disp.getDisplayId();
         String uniqueId = VirtualDisplayFactory.getUniqueId(disp);
+        System.out.println("OPALDESK_VD_CREATED name=" + name
+                + " displayId=" + displayId
+                + " size=" + width + "x" + height + "@" + dpi + "dpi"
+                + " flags=0x" + Integer.toHexString(chosenFlags[0]));
         // Combined with VD_FLAGS_TRUSTED_IME (no OWN_FOCUS / STEAL_TOP_FOCUS_DISABLED),
         // DISPLAY_IME_POLICY_FALLBACK_DISPLAY routes the app's real InputConnection directly to
         // Display 0's IME (full width, works even with FLAG_SECURE password keyboards without
@@ -183,20 +190,29 @@ public final class AndroidDisplayDriver
             taskApi.moveRootTaskToDisplay(candidateTid, displayId);
             if (taskApi.startActivityFromRecents(candidateTid, launchOpts)) {
                 services.focusDisplay(displayId);
+                System.out.println("OPALDESK_LAUNCH_RECENTS_OK pkg=" + pkg
+                        + " displayId=" + displayId + " tid=" + candidateTid);
                 return candidateTid;
             }
         }
 
         Intent launchIntent = resolveSafeLaunchIntent(pkg, cls);
-        if (launchIntent == null) return -1;
+        if (launchIntent == null) {
+            System.err.println("OPALDESK_LAUNCH_NO_INTENT pkg=" + pkg + " cls=" + cls + " displayId=" + displayId);
+            return -1;
+        }
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
         if (!services.startActivityAsShell(launchIntent, launchOpts)) {
+            System.err.println("OPALDESK_LAUNCH_START_FAIL pkg=" + pkg + " displayId=" + displayId);
             return -1;
         }
         services.focusDisplay(displayId);
         SystemClock.sleep(45L);
         int topTid = taskApi.findTopTaskIdOnDisplay(displayId, pkg);
-        return (topTid > 0) ? topTid : taskApi.findRunningOrRecentTaskForPackage(pkg);
+        int resolvedTid = (topTid > 0) ? topTid : taskApi.findRunningOrRecentTaskForPackage(pkg);
+        System.out.println("OPALDESK_LAUNCH_START_OK pkg=" + pkg
+                + " displayId=" + displayId + " tid=" + resolvedTid);
+        return resolvedTid;
     }
 
     @Override

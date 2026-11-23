@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.widget.Toast
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
 
 /**
@@ -31,6 +32,8 @@ class AdbPairingReceiver : BroadcastReceiver() {
         }
 
         val appCtx = context.applicationContext
+        OpalLogStore.init(appCtx)
+        OpalLogStore.i("ADB", "Notification pairing reply received (len=${text.length})")
         // Keep app process alive via ForegroundService instead of holding PendingResult >10s (ANR)
         BridgeService.ensureStarted(appCtx)
         AdbBootstrap.showPairingNotification(appCtx, "正在验证配对码并启动 OpalDesk...")

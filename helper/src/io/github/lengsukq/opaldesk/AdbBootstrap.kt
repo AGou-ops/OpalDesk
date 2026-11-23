@@ -9,6 +9,7 @@ import io.github.lengsukq.opaldesk.adb.AdbPairingNotifier
 import io.github.lengsukq.opaldesk.adb.AdbProcessRunner
 import io.github.lengsukq.opaldesk.adb.DaemonBootstrapScripts
 import io.github.lengsukq.opaldesk.adb.ShizukuBootstrap
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import java.io.File
 import java.util.Locale
@@ -205,9 +206,14 @@ object AdbBootstrap {
 
     private fun submitBootstrap(ctx: Context, listener: ProgressListener?, label: String, block: (Context) -> Unit) {
         val appCtx = ctx.applicationContext
+        OpalLogStore.i("ADB", "Bootstrap started: $label")
         exec.execute {
             try { block(appCtx) }
-            catch (t: Throwable) { Log.e(TAG, "$label failed", t); postResult(listener, false, "执行异常: ${t.message}") }
+            catch (t: Throwable) {
+                Log.e(TAG, "$label failed", t)
+                OpalLogStore.e("ADB", "$label threw exception", t)
+                postResult(listener, false, "执行异常: ${t.message}")
+            }
         }
     }
 
@@ -303,39 +309,62 @@ object AdbBootstrap {
         }
 
         val script = DaemonBootstrapScripts.buildWirelessPostPushScript(remoteTmp, pushedOk, expectedSha256 = expectedSha)
+        OpalLogStore.i("ADB", "Running wireless bootstrap script on $target (pushedOk=$pushedOk)")
         val shRes = AdbProcessRunner.runAdb(appCtx, 24000, "-s", target, "shell", script)
         if (shRes.code != 0 || !shRes.output.contains("LAUNCH_DONE")) {
+            OpalLogStore.e("ADB", "Wireless shell launch failed rc=${shRes.code}: ${shRes.output.take(400)}")
             try { AdbProcessRunner.runAdb(appCtx, 2000, "-s", target, "shell", "rm -f '$remoteTmp' 2>/dev/null") }
             catch (_: Throwable) {}
             postResult(listener, false, "远程 Shell 启动失败:\n${shRes.output}"); return
         }
+        OpalLogStore.i("ADB", "Wireless shell returned LAUNCH_DONE (autoCloseWifiAdb=${isAutoCloseWifiAdbEnabled(appCtx)})")
         if (isAutoCloseWifiAdbEnabled(appCtx)) {
             try { AdbProcessRunner.runAdb(appCtx, 2500, "-s", target, "shell", "settings put global adb_wifi_enabled 0") }
             catch (t: Throwable) { Log.w(TAG, "Auto-close wireless ADB failed", t) }
         }
-        awaitDaemonBinderReady(appCtx, DIAG_WIRELESS, listener, "无线调试激活成功，OpalDesk 服务已就绪！")
+        awaitDaemonBinderReady(appCtx, DIAG_WIRELESS, listener, "无线调试激活成功，OpalDesk 服务已就绪！", wirelessTarget = target)
     }
 
-    private fun awaitDaemonBinderReady(appCtx: Context, diagSource: Int, listener: ProgressListener?, successMsg: String) {
+    private fun awaitDaemonBinderReady(
+        appCtx: Context,
+        diagSource: Int,
+        listener: ProgressListener?,
+        successMsg: String,
+        wirelessTarget: String? = null,
+    ) {
         postStep(listener, "守护进程已拉起，正在验证 Binder 连接...")
         val deadline = System.currentTimeMillis() + 12000
         while (System.currentTimeMillis() < deadline) {
             BridgeClient.requestBinder(appCtx)
             if (BridgeClient.getStatus().connected) {
+                OpalLogStore.i("ADB", "Daemon Binder verified ready (source=$diagSource)")
                 cancelPairingNotification(appCtx); postResult(listener, true, successMsg); return
             }
             try { Thread.sleep(250) } catch (_: InterruptedException) { Thread.currentThread().interrupt(); break }
         }
         val tailDiag = when (diagSource) {
-            DIAG_ROOT -> AdbProcessRunner.runSu(3000, "tail -n 8 /data/local/tmp/opaldesk.log 2>/dev/null")
+            DIAG_ROOT -> AdbProcessRunner.runSu(3000, "tail -n 12 /data/local/tmp/opaldesk.log 2>/dev/null")
                 .output.trim().takeIf { it.isNotEmpty() }?.let { "\n日志摘要:\n$it" }.orEmpty()
-            DIAG_SHIZUKU -> ShizukuBootstrap.execShell(3000, null, "tail -n 8 /data/local/tmp/opaldesk.log 2>/dev/null")
+            DIAG_SHIZUKU -> ShizukuBootstrap.execShell(3000, null, "tail -n 12 /data/local/tmp/opaldesk.log 2>/dev/null")
                 .output.trim().takeIf { it.isNotEmpty() }?.let { "\n日志摘要:\n$it" }.orEmpty()
+            DIAG_WIRELESS -> if (!wirelessTarget.isNullOrBlank()) {
+                AdbProcessRunner.runAdb(appCtx, 3000, "-s", wirelessTarget, "shell", "tail -n 12 /data/local/tmp/opaldesk.log 2>/dev/null")
+                    .output.trim().takeIf { it.isNotEmpty() }?.let { "\n日志摘要:\n$it" }.orEmpty()
+            } else ""
             else -> ""
         }
+        OpalLogStore.e("ADB", "Daemon Binder handshake timed out (source=$diagSource)$tailDiag")
         postResult(listener, false, "守护进程命令已下发，但暂未收到 Binder 握手，请稍等几秒或查看 /data/local/tmp/opaldesk.log$tailDiag")
     }
 
-    private fun postStep(l: ProgressListener?, msg: String?) { l?.let { mainHandler.post { it.onStep(msg) } } }
-    private fun postResult(l: ProgressListener?, ok: Boolean, msg: String?) { l?.let { mainHandler.post { it.onResult(ok, msg) } } }
+    private fun postStep(l: ProgressListener?, msg: String?) {
+        if (!msg.isNullOrBlank()) OpalLogStore.i("ADB", msg)
+        l?.let { mainHandler.post { it.onStep(msg) } }
+    }
+    private fun postResult(l: ProgressListener?, ok: Boolean, msg: String?) {
+        if (!msg.isNullOrBlank()) {
+            if (ok) OpalLogStore.i("ADB", "Result OK: $msg") else OpalLogStore.w("ADB", "Result FAIL: $msg")
+        }
+        l?.let { mainHandler.post { it.onResult(ok, msg) } }
+    }
 }

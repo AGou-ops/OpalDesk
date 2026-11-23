@@ -15,6 +15,7 @@ import android.util.LruCache
 import android.view.Surface
 import androidx.compose.ui.geometry.Offset
 import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
+import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.CompositorScene
 import io.github.lengsukq.opaldesk.protocol.CompositorSceneParser
@@ -108,11 +109,13 @@ object BridgeClient {
         val next = candidate ?: return
         if (binder === next) return
         binder = next
+        OpalLogStore.i("IPC", "Daemon Binder connected")
         try {
             next.linkToDeath({
                 if (binder === next) {
                     binder = null
                     _statusFlow.value = DaemonStatus(connected = false)
+                    OpalLogStore.w("IPC", "Daemon Binder died (linkToDeath)")
                 }
             }, 0)
         } catch (_: Throwable) {
@@ -491,8 +494,11 @@ object BridgeClient {
         right: Int = 0,
         bottom: Int = 0,
     ): Int {
-        val svc = getService() ?: return -1
-        return transact(
+        val svc = getService() ?: run {
+            OpalLogStore.w("IPC", "openWindow($pkg) aborted: daemon not connected")
+            return -1
+        }
+        val winId = transact(
             svc,
             BridgeProtocol.Tx.OPEN_WINDOW,
             oneway = false,
@@ -506,6 +512,12 @@ object BridgeClient {
                 d.writeInt(bottom)
             },
         ) { it.readInt() } ?: -1
+        if (winId > 0) {
+            OpalLogStore.i("Window", "openWindow($pkg) -> wid=$winId")
+        } else {
+            OpalLogStore.w("Window", "openWindow($pkg) failed (wid=$winId)")
+        }
+        return winId
     }
 
     fun attachWindowSurface(
@@ -516,8 +528,11 @@ object BridgeClient {
         dpi: Int,
         fps: Float,
     ): Int {
-        val svc = getService() ?: return -1
-        return transact(
+        val svc = getService() ?: run {
+            OpalLogStore.w("Surface", "attachWindowSurface(wid=$windowId) aborted: daemon not connected")
+            return -1
+        }
+        val displayId = transact(
             svc,
             BridgeProtocol.Tx.ATTACH_WINDOW_SURFACE,
             oneway = false,
@@ -531,6 +546,12 @@ object BridgeClient {
                 surface.writeToParcel(d, 0)
             },
         ) { it.readInt() } ?: -1
+        if (displayId > 0) {
+            OpalLogStore.i("Surface", "attachWindowSurface wid=$windowId -> displayId=$displayId (${contentW}x${contentH}@${dpi}dpi)")
+        } else {
+            OpalLogStore.e("Surface", "attachWindowSurface FAILED wid=$windowId (${contentW}x${contentH}@${dpi}dpi)")
+        }
+        return displayId
     }
 
     fun detachWindowSurface(windowId: Int, releaseDisplay: Boolean): Boolean {
@@ -770,15 +791,49 @@ object BridgeClient {
         }
     }
 
-    fun shutdownDaemonAsync() {
+    fun fetchDaemonLogs(maxLines: Int = 300): String {
+        val svc = getService() ?: return ""
+        val logs = transact(
+            svc,
+            BridgeProtocol.Tx.GET_DAEMON_LOGS,
+            oneway = false,
+            writeArgs = { d -> d.writeInt(maxLines.coerceIn(20, 500)) },
+        ) { it.readString().orEmpty() }.orEmpty()
+        OpalLogStore.updateDaemonLogs(logs)
+        return logs
+    }
+
+    fun fetchDaemonLogsAsync(maxLines: Int = 300, onDone: ((String) -> Unit)? = null) {
         ioExec.execute {
-            val svc = getService()
-            if (svc != null) {
-                transact(svc, BridgeProtocol.Tx.SHUTDOWN, oneway = false, writeArgs = {}) { it.readInt() }
+            val text = fetchDaemonLogs(maxLines)
+            if (onDone != null) mainHandler.post { onDone(text) }
+        }
+    }
+
+    fun shutdownDaemonSync(closeWindows: Boolean = true, removeTasks: Boolean = false) {
+        val svc = getService()
+        if (svc != null) {
+            if (closeWindows) {
+                transact(
+                    svc,
+                    BridgeProtocol.Tx.CLOSE_ALL_WINDOWS,
+                    oneway = false,
+                    writeArgs = { d -> d.writeInt(if (removeTasks) 1 else 0) },
+                ) { it.readInt() }
             }
-            binder = null
-            _statusFlow.value = DaemonStatus(connected = false)
-            _sceneFlow.value = CompositorScene()
+            transact(svc, BridgeProtocol.Tx.SHUTDOWN, oneway = false, writeArgs = {}) { it.readInt() }
+        }
+        binder = null
+        _statusFlow.value = DaemonStatus(connected = false)
+        _sceneFlow.value = CompositorScene()
+        _remoteStatusFlow.value = RemoteStreamStatus()
+        _pendingPairingFlow.value = null
+        _trustedPeersFlow.value = emptyList()
+    }
+
+    fun shutdownDaemonAsync(closeWindows: Boolean = false, removeTasks: Boolean = false) {
+        ioExec.execute {
+            shutdownDaemonSync(closeWindows = closeWindows, removeTasks = removeTasks)
         }
     }
 

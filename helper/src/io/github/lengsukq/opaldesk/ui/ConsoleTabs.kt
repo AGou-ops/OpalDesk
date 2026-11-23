@@ -3,6 +3,8 @@ package io.github.lengsukq.opaldesk.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -101,6 +103,7 @@ fun ConsoleDashboardTab(
     onConnectPeerCast: (String, Int, String) -> Unit,
     onOpenFloatingAppPicker: (String, Int, String) -> Unit,
     onOpenActivation: () -> Unit,
+    onRequestCompleteExit: () -> Unit,
 ) {
     val ctx = LocalContext.current
     var autoExtDisplay by remember { mutableStateOf(AppPrefs.isAutoExternalDisplayEnabled(ctx)) }
@@ -371,6 +374,12 @@ fun ConsoleDashboardTab(
                 }
             }
         }
+
+        // Compact Touch Input Troubleshooting Tip (highlighted in amber when input injection is blocked)
+        TouchInputTroubleshootingTipCard(
+            ctx = ctx,
+            inputBlocked = status.connected && status.injectStatus == BridgeProtocol.InputBackend.STATUS_BLOCKED,
+        )
 
         // Card 2: Cross-Device Interconnect — Clean 2-Mode Switcher ("连接设备" / "共享本机")
         MacGlassSectionCard(
@@ -805,6 +814,23 @@ fun ConsoleDashboardTab(
                 onCheckedChange = { enabled ->
                     AppPrefs.setAutoShowPhoneTrackpadEnabled(ctx, enabled)
                 },
+            )
+        }
+
+        // Bottom Footer Action: Complete App & Daemon Exit
+        MacGlassSectionCard(contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
+            OpalButton(
+                label = "完全退出 OpalDesk",
+                filled = false,
+                accent = OpalPalette.AccentDanger,
+                onClick = onRequestCompleteExit,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(Modifier.height(6.dp))
+            OpalText(
+                text = "将关闭多窗引擎守护进程、投屏及后台常驻服务，并彻底退出应用",
+                fontSize = 11.5.sp,
+                color = OpalPalette.TextMuted,
             )
         }
     }
@@ -1506,6 +1532,64 @@ private fun copyTextWithToast(ctx: Context, text: String, toastMsg: String) {
         cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk", text))
         Toast.makeText(ctx, toastMsg, Toast.LENGTH_SHORT).show()
     } catch (_: Throwable) {
+    }
+}
+
+private fun openDeveloperSettings(ctx: Context) {
+    try {
+        ctx.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            },
+        )
+    } catch (_: Throwable) {
+        try {
+            ctx.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Throwable) {
+            Toast.makeText(ctx, "请手动打开系统「设置 → 开发者选项」", Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+@Composable
+private fun TouchInputTroubleshootingTipCard(
+    ctx: Context,
+    inputBlocked: Boolean,
+) {
+    val accent = if (inputBlocked) OpalPalette.AccentAmber else OpalPalette.AccentCyan
+    MacGlassSectionCard(
+        accentBorder = if (inputBlocked) OpalPalette.AccentAmber else null,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                OpalText(
+                    text = if (inputBlocked) "检测到触摸输入受限" else "触摸无反应排查提示",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (inputBlocked) OpalPalette.AccentAmber else OpalPalette.TextPrimary,
+                )
+                Spacer(Modifier.height(3.dp))
+                OpalText(
+                    text = "若进入桌面或投屏后无法触摸点击，请在系统「开发者选项」中开启「USB 调试」与「USB 调试（安全设置）」（部分机型为「禁止权限监控」），或在「设置」页将输入路由切换为 Linux /dev/uhid。",
+                    fontSize = 11.5.sp,
+                    color = OpalPalette.TextSecondary,
+                    lineHeight = 16.5.sp,
+                )
+            }
+            Spacer(Modifier.width(10.dp))
+            OpalButton(
+                label = "开发者选项",
+                compact = true,
+                filled = inputBlocked,
+                accent = accent,
+                onClick = { openDeveloperSettings(ctx) },
+            )
+        }
     }
 }
 
