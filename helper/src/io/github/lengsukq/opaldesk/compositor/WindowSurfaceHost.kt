@@ -172,7 +172,7 @@ fun WindowSurfaceHost(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
-                    TextureView(ctx).apply {
+                    FixedBufferTextureView(ctx).apply {
                         isOpaque = false
                         surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
@@ -180,15 +180,19 @@ fun WindowSurfaceHost(
                                 val h = currentWin.contentHeight.coerceAtLeast(200)
                                 val dpi = currentWin.contentDpi.coerceAtLeast(120)
                                 val activeFps = resolveHostDisplayRefreshRate(this@apply)
-                                st.setDefaultBufferSize(w, h)
+                                syncBufferSize(w, h)
+                                post { syncBufferSize(w, h) }
                                 holderState.attachAsync(st, w, h, dpi, activeFps)
                             }
 
                             override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
                                 // Keep buffer dimensions strictly synced with the daemon's committed VirtualDisplay
-                                // resolution so transient GPU resize drags never fight SurfaceFlinger's BufferQueue.
+                                // resolution so transient GPU resize drags or TextureView relayouts never clobber
+                                // SurfaceFlinger's BufferQueue back to view bounds (which clips/zooms content).
                                 val cw = currentWin.contentWidth.coerceAtLeast(240)
                                 val ch = currentWin.contentHeight.coerceAtLeast(200)
+                                syncBufferSize(cw, ch)
+                                post { syncBufferSize(cw, ch) }
                                 holderState.updateBufferSize(cw, ch)
                             }
 
@@ -201,6 +205,9 @@ fun WindowSurfaceHost(
 
                             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
                                 if (!hasRenderedLiveFrame) {
+                                    val cw = currentWin.contentWidth.coerceAtLeast(240)
+                                    val ch = currentWin.contentHeight.coerceAtLeast(200)
+                                    syncBufferSize(cw, ch)
                                     hasRenderedLiveFrame = true
                                     OpalLogStore.i("Surface", "First live frame rendered wid=${currentWin.windowId} pkg=${currentWin.pkg}")
                                 }
@@ -223,6 +230,9 @@ fun WindowSurfaceHost(
                     }
                 },
                 update = { textureView ->
+                    val cw = window.contentWidth.coerceAtLeast(240)
+                    val ch = window.contentHeight.coerceAtLeast(200)
+                    textureView.syncBufferSize(cw, ch)
                     // Keep native Android View Z-order strictly aligned with Compose zIndex
                     // so AndroidViewsHandler hit-testing never clicks through to lower windows.
                     val zVal = window.zOrder.toFloat()
@@ -295,6 +305,58 @@ fun WindowSurfaceHost(
     }
 }
 
+/**
+ * `TextureView` subclass that preserves the committed VirtualDisplay `SurfaceTexture` buffer size
+ * across Android visibility/layout/resume transitions (preventing Android/OEM `TextureView`
+ * internals from silently resetting `defaultBufferSize` back to view pixel dimensions and zooming
+ * or clipping VirtualDisplay content).
+ */
+private class FixedBufferTextureView(context: android.content.Context) : TextureView(context) {
+    @Volatile
+    private var targetBufferWidth: Int = 0
+
+    @Volatile
+    private var targetBufferHeight: Int = 0
+
+    fun syncBufferSize(w: Int, h: Int) {
+        targetBufferWidth = w
+        targetBufferHeight = h
+        if (w > 0 && h > 0) {
+            surfaceTexture?.setDefaultBufferSize(w, h)
+        }
+    }
+
+    private fun reapplyBufferSize() {
+        val w = targetBufferWidth
+        val h = targetBufferHeight
+        if (w > 0 && h > 0) {
+            surfaceTexture?.setDefaultBufferSize(w, h)
+        }
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        reapplyBufferSize()
+        post { reapplyBufferSize() }
+    }
+
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (visibility == View.VISIBLE) {
+            reapplyBufferSize()
+            post { reapplyBufferSize() }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasWindowFocus: Boolean) {
+        super.onWindowFocusChanged(hasWindowFocus)
+        if (hasWindowFocus) {
+            reapplyBufferSize()
+            post { reapplyBufferSize() }
+        }
+    }
+}
+
 private fun resolveHostDisplayRefreshRate(view: TextureView): Float {
     val disp = view.display ?: return 60f
     val active = disp.mode?.refreshRate ?: disp.refreshRate
@@ -327,6 +389,10 @@ private class SurfaceBindHolder(private val windowId: Int) {
                 } catch (_: Throwable) {
                 }
                 return@Thread
+            }
+            try {
+                st.setDefaultBufferSize(w, h)
+            } catch (_: Throwable) {
             }
             BridgeClient.attachWindowSurface(windowId, surf, w, h, dpi, fps)
         }, "OpalSurfAttach-$windowId").start()

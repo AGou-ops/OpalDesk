@@ -32,15 +32,21 @@ public final class AndroidDisplayDriver
 
     private final AndroidServices services;
     private final TaskApiAdapter taskApi;
+    private final VirtualDisplayStatusBarInset statusBarInset;
     private volatile PerDisplayInputRouter inputRouter;
 
     public AndroidDisplayDriver(AndroidServices services, TaskApiAdapter taskApi) {
         this.services = services;
         this.taskApi = taskApi;
+        this.statusBarInset = new VirtualDisplayStatusBarInset(services.context, null);
     }
 
     public void setInputRouter(PerDisplayInputRouter inputRouter) {
         this.inputRouter = inputRouter;
+    }
+
+    public void shutdown() {
+        statusBarInset.detachAll();
     }
 
     // ---- VirtualDisplayPool.DisplayDriver ----
@@ -108,6 +114,7 @@ public final class AndroidDisplayDriver
         // Display 0's IME (full width, works even with FLAG_SECURE password keyboards without
         // ever blanking the non-secure VirtualDisplay surface!).
         services.configureVirtualDisplayWindowing(displayId, BridgeProtocol.DISPLAY_IME_POLICY_FALLBACK_DISPLAY);
+        statusBarInset.attach(disp, 1);
         return new CreatedDisplay(vd, displayId, uniqueId);
     }
 
@@ -145,6 +152,7 @@ public final class AndroidDisplayDriver
 
     @Override
     public void releaseVirtualDisplay(Object handle, int displayId) {
+        statusBarInset.detach(displayId);
         if (!(handle instanceof VirtualDisplay)) return;
         VirtualDisplay vd = (VirtualDisplay) handle;
         try {

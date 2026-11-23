@@ -347,4 +347,30 @@ public class CompositorEngineTest {
         assertNull("Exited app must close window cleanly instead of leaving a blank white window",
                 engine.getWindowSnapshot(w1));
     }
+
+    @Test
+    public void reloadWindowRefreshesLaunchGracePeriodAndPreservesDisplay() throws Exception {
+        DaemonConfig cfg = new DaemonConfig(new File(tmpDir.getRoot(), "c4.conf"), new File(tmpDir.getRoot(), "p4.conf"));
+        cfg.updateRuntimeConfig(BridgeProtocol.INPUT_BACKEND_AUTO, 4, 2560, 1600, 360);
+        RecordingDriver driver = new RecordingDriver();
+        VirtualDisplayPool pool = new VirtualDisplayPool(driver, 4, false);
+        FakeRuntime runtime = new FakeRuntime(driver.events);
+        CompositorEngine engine = new CompositorEngine(cfg, pool, runtime, null);
+
+        int w1 = engine.openOrFocusWindow("com.tencent.mm", "", BridgeProtocol.PROFILE_PORTRAIT, 0, 0, 0, 0);
+        int d1 = engine.attachWindowSurface(w1, new Object(), 1236, 1738, 480, 60f);
+        WindowSession before = engine.getWindowSnapshot(w1);
+        before.lastLaunchAtMs = 1L;
+        before.emptyDisplayTicks = 2;
+
+        int launchesBefore = runtime.launchCount;
+        assertTrue(engine.performWindowAction(w1, BridgeProtocol.WIN_ACTION_RELOAD_APP, null));
+
+        WindowSession after = engine.getWindowSnapshot(w1);
+        assertNotNull("Reloading an app must never prematurely close the window", after);
+        assertEquals("Reload must keep the same VirtualDisplay alive", d1, after.displayId);
+        assertEquals(0, after.emptyDisplayTicks);
+        assertTrue("Reload must refresh lastLaunchAtMs grace window", after.lastLaunchAtMs > 1L);
+        assertEquals(launchesBefore + 1, runtime.launchCount);
+    }
 }

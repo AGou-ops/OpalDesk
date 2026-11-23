@@ -54,6 +54,7 @@ public final class OpalDeskDaemon implements Runnable {
     private final Handler mainHandler;
     private final ExecutorService bgExec;
     private final HelperClientBridge helperBridge;
+    private final AndroidDisplayDriver displayDriver;
     private final PerDisplayInputRouter inputRouter;
     private final ExternalMouseRouter mouseRouter;
     private final VirtualDisplayPool vdPool;
@@ -82,10 +83,10 @@ public final class OpalDeskDaemon implements Runnable {
         });
 
         TaskApiAdapter taskApi = new TaskApiAdapter(services.iActivityTaskManager);
-        AndroidDisplayDriver displayDriver = new AndroidDisplayDriver(services, taskApi);
+        this.displayDriver = new AndroidDisplayDriver(services, taskApi);
         this.inputRouter = new PerDisplayInputRouter(services, config);
         this.mouseRouter = new ExternalMouseRouter(services, config, mainHandler);
-        displayDriver.setInputRouter(this.inputRouter);
+        this.displayDriver.setInputRouter(this.inputRouter);
 
         this.helperBridge = new HelperClientBridge(services, config);
         this.vdPool = new VirtualDisplayPool(
@@ -321,6 +322,10 @@ public final class OpalDeskDaemon implements Runnable {
         }
         try {
             inputRouter.releaseAllDisplays();
+        } catch (RuntimeException ignored) {
+        }
+        try {
+            displayDriver.shutdown();
         } catch (RuntimeException ignored) {
         }
     }

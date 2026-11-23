@@ -625,6 +625,8 @@ public final class CompositorEngine {
                     reloadCls = ws.activityClass;
                     reloadDisplayId = ws.displayId;
                     ws.taskId = -1;
+                    ws.lastLaunchAtMs = now;
+                    ws.emptyDisplayTicks = 0;
                     focusWindowLocked(ws, now);
                     markDirtyAndNotifyLocked();
                     break;

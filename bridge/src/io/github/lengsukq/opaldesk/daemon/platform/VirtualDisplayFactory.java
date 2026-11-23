@@ -10,13 +10,37 @@ import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
 /**
- * Single source of truth for creating Android {@link VirtualDisplay} instances via hidden
- * {@code VirtualDisplayConfig$Builder} reflection (supporting optional {@code setHomeSupported}
- * and {@code setRequestedRefreshRate} flags across API 30-37+).
+ * Single source of truth for creating Android {@link VirtualDisplay} instances across API 30-37+.
+ *
+ * <p>Dispatches cleanly across Android SDK/hidden-API overload changes:
+ * <ol>
+ *   <li>API 34+ (Android 14+): {@code DisplayManager.createVirtualDisplay(VirtualDisplayConfig)}</li>
+ *   <li>API 33 (Android 13): {@code DisplayManager.createVirtualDisplay(VirtualDisplayConfig, Handler, Callback)}</li>
+ *   <li>API 30-32 (Android 11-12): {@code DisplayManager.createVirtualDisplay(MediaProjection, VirtualDisplayConfig, Callback, Handler)}</li>
+ *   <li>Universal SDK fallback (API 19+): {@code DisplayManager.createVirtualDisplay(String, int, int, int, Surface, int)}</li>
+ * </ol>
  */
 public final class VirtualDisplayFactory {
+    enum CreateMode {
+        CONFIG_1_ARG,
+        CONFIG_3_ARG,
+        CONFIG_4_ARG,
+        LEGACY_6_ARG
+    }
+
+    static final class ResolvedCreateMethod {
+        final CreateMode mode;
+        final Method method;
+
+        ResolvedCreateMethod(CreateMode mode, Method method) {
+            this.mode = mode;
+            this.method = method;
+        }
+    }
+
     private static final Object INIT_LOCK = new Object();
     private static volatile boolean sInitialized;
+    private static volatile boolean sUniqueIdInitialized;
     // Remember the highest-capability flag mask accepted by this ROM so subsequent windows skip rejected masks.
     private static volatile int sLastAcceptedFlags = -1;
 
@@ -26,25 +50,68 @@ public final class VirtualDisplayFactory {
     private static Method sSetRequestedRefreshRate;
     private static Method sSetSurface;
     private static Method sBuild;
-    private static Method sCreateVirtualDisplay;
+    private static ResolvedCreateMethod sResolvedCreate;
     private static Method sGetUniqueId;
 
     private VirtualDisplayFactory() {}
 
-    private static void ensureInitialized() throws ReflectiveOperationException {
+    /**
+     * Resolves the best available {@code createVirtualDisplay} overload on {@code dmClass}.
+     * Package-private for deterministic JVM unit testing across simulated API 30-37 signatures.
+     */
+    static ResolvedCreateMethod resolveCreateMethod(Class<?> dmClass, Class<?> configCls) {
+        if (dmClass != null && configCls != null) {
+            Method oneArg = findOptionalMethod(dmClass, "createVirtualDisplay", configCls);
+            if (oneArg != null) {
+                return new ResolvedCreateMethod(CreateMode.CONFIG_1_ARG, oneArg);
+            }
+            // API 33+: createVirtualDisplay(VirtualDisplayConfig, Handler, VirtualDisplay.Callback)
+            for (Method m : dmClass.getMethods()) {
+                if (!"createVirtualDisplay".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 3 && pt[0] == configCls) {
+                    return new ResolvedCreateMethod(CreateMode.CONFIG_3_ARG, m);
+                }
+            }
+            // API 30-32 @hide: createVirtualDisplay(MediaProjection, VirtualDisplayConfig, Callback, Handler)
+            for (Method m : dmClass.getMethods()) {
+                if (!"createVirtualDisplay".equals(m.getName())) continue;
+                Class<?>[] pt = m.getParameterTypes();
+                if (pt.length == 4 && pt[1] == configCls) {
+                    return new ResolvedCreateMethod(CreateMode.CONFIG_4_ARG, m);
+                }
+            }
+        }
+        return new ResolvedCreateMethod(CreateMode.LEGACY_6_ARG, null);
+    }
+
+    private static void ensureInitialized() {
         if (sInitialized) return;
         synchronized (INIT_LOCK) {
             if (sInitialized) return;
-            Class<?> builderCls = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
-            Class<?> configCls = Class.forName("android.hardware.display.VirtualDisplayConfig");
-            sBuilderCtor = builderCls.getConstructor(String.class, int.class, int.class, int.class);
-            sSetFlags = builderCls.getMethod("setFlags", int.class);
-            sSetHomeSupported = findOptionalMethod(builderCls, "setHomeSupported", boolean.class);
-            sSetRequestedRefreshRate = findOptionalMethod(builderCls, "setRequestedRefreshRate", float.class);
-            sSetSurface = builderCls.getMethod("setSurface", Surface.class);
-            sBuild = builderCls.getMethod("build");
-            sCreateVirtualDisplay = DisplayManager.class.getMethod("createVirtualDisplay", configCls);
-            sGetUniqueId = findOptionalMethod(Display.class, "getUniqueId");
+            ResolvedCreateMethod resolved = new ResolvedCreateMethod(CreateMode.LEGACY_6_ARG, null);
+            try {
+                Class<?> builderCls = Class.forName("android.hardware.display.VirtualDisplayConfig$Builder");
+                Class<?> configCls = Class.forName("android.hardware.display.VirtualDisplayConfig");
+                Constructor<?> ctor = builderCls.getConstructor(String.class, int.class, int.class, int.class);
+                Method setFlags = builderCls.getMethod("setFlags", int.class);
+                Method setSurface = builderCls.getMethod("setSurface", Surface.class);
+                Method build = builderCls.getMethod("build");
+                ResolvedCreateMethod candidate = resolveCreateMethod(DisplayManager.class, configCls);
+                if (candidate.mode != CreateMode.LEGACY_6_ARG && candidate.method != null) {
+                    sBuilderCtor = ctor;
+                    sSetFlags = setFlags;
+                    sSetHomeSupported = findOptionalMethod(builderCls, "setHomeSupported", boolean.class);
+                    sSetRequestedRefreshRate = findOptionalMethod(builderCls, "setRequestedRefreshRate", float.class);
+                    sSetSurface = setSurface;
+                    sBuild = build;
+                    resolved = candidate;
+                }
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                System.err.println("OPALDESK_VD_CONFIG_FALLBACK_6ARG: " + e.getMessage());
+            }
+            sResolvedCreate = resolved;
+            System.out.println("OPALDESK_VD_FACTORY_MODE mode=" + resolved.mode.name());
             sInitialized = true;
         }
     }
@@ -65,6 +132,11 @@ public final class VirtualDisplayFactory {
             throw new IllegalArgumentException("DisplayManager must not be null");
         }
         ensureInitialized();
+        ResolvedCreateMethod resolved = sResolvedCreate;
+        if (resolved == null || resolved.mode == CreateMode.LEGACY_6_ARG || resolved.method == null) {
+            return dm.createVirtualDisplay(name, width, height, dpi, surface, flags);
+        }
+
         Object builder = sBuilderCtor.newInstance(name, width, height, dpi);
         sSetFlags.invoke(builder, flags);
         if (sSetHomeSupported != null) {
@@ -83,7 +155,18 @@ public final class VirtualDisplayFactory {
         }
         sSetSurface.invoke(builder, surface);
         Object config = sBuild.invoke(builder);
-        return (VirtualDisplay) sCreateVirtualDisplay.invoke(dm, config);
+
+        switch (resolved.mode) {
+            case CONFIG_1_ARG:
+                return (VirtualDisplay) resolved.method.invoke(dm, config);
+            case CONFIG_3_ARG:
+                return (VirtualDisplay) resolved.method.invoke(dm, config, null, null);
+            case CONFIG_4_ARG:
+                return (VirtualDisplay) resolved.method.invoke(dm, null, config, null, null);
+            case LEGACY_6_ARG:
+            default:
+                return dm.createVirtualDisplay(name, width, height, dpi, surface, flags);
+        }
     }
 
     /**
@@ -163,15 +246,22 @@ public final class VirtualDisplayFactory {
 
     public static String getUniqueId(Display display) {
         if (display == null) return null;
-        try {
-            ensureInitialized();
-            if (sGetUniqueId != null) {
-                return (String) sGetUniqueId.invoke(display);
+        if (!sUniqueIdInitialized) {
+            synchronized (INIT_LOCK) {
+                if (!sUniqueIdInitialized) {
+                    sGetUniqueId = findOptionalMethod(Display.class, "getUniqueId");
+                    sUniqueIdInitialized = true;
+                }
             }
+        }
+        Method m = sGetUniqueId;
+        if (m == null) return null;
+        try {
+            return (String) m.invoke(display);
         } catch (ReflectiveOperationException | RuntimeException e) {
             System.err.println("OPALDESK_VD_UNIQUE_ID_WARN: " + e.getMessage());
+            return null;
         }
-        return null;
     }
 
     private static Method findOptionalMethod(Class<?> cls, String name, Class<?>... params) {
