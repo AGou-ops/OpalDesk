@@ -586,6 +586,45 @@ public final class AndroidServices {
         return false;
     }
 
+    /**
+     * Resolves physical Display 0 dimensions and density DPI ({@code [widthPx, heightPx, densityDpi]})
+     * for host-adapted DPI scaling of remote standalone floating app displays.
+     */
+    @SuppressWarnings("deprecation")
+    public int[] getPrimaryDisplayMetrics() {
+        int w = 0;
+        int h = 0;
+        int dpi = 0;
+        try {
+            Display d0 = (displayManager != null) ? displayManager.getDisplay(Display.DEFAULT_DISPLAY) : null;
+            if (d0 != null) {
+                android.util.DisplayMetrics dm = new android.util.DisplayMetrics();
+                d0.getRealMetrics(dm);
+                w = dm.widthPixels;
+                h = dm.heightPixels;
+                dpi = dm.densityDpi;
+                if (w <= 0 || h <= 0) {
+                    Display.Mode m = d0.getMode();
+                    if (m != null) {
+                        w = m.getPhysicalWidth();
+                        h = m.getPhysicalHeight();
+                    }
+                }
+            }
+        } catch (RuntimeException ignored) {
+        }
+        if ((w <= 0 || h <= 0 || dpi <= 0) && context != null) {
+            try {
+                android.util.DisplayMetrics rdm = context.getResources().getDisplayMetrics();
+                if (w <= 0) w = rdm.widthPixels;
+                if (h <= 0) h = rdm.heightPixels;
+                if (dpi <= 0) dpi = rdm.densityDpi;
+            } catch (RuntimeException ignored) {
+            }
+        }
+        return new int[]{w, h, dpi};
+    }
+
     /** Resolves AOSP Display uniqueId (e.g. {@code local:4622403537125514005}) across Android 11–17. */
     public String getDisplayUniqueId(int displayId) {
         if (displayId < 0 || displayManager == null) return null;

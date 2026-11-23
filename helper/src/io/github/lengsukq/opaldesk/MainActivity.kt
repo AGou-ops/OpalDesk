@@ -41,6 +41,7 @@ import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
 import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
 import io.github.lengsukq.opaldesk.cast.PeerCastViewerActivity
 import io.github.lengsukq.opaldesk.cast.RemoteAppPickerModal
+import io.github.lengsukq.opaldesk.external.RemoteTrackpadActivity
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
@@ -105,6 +106,7 @@ class MainActivity : ComponentActivity() {
                 }
                 OpalConsoleScreen(
                     onEnterDesktop = ::launchDesktopWorkstation,
+                    onOpenRemoteTrackpad = ::launchRemoteTrackpad,
                     onProjectExternalOrTrackpad = ::launchExternalOrTrackpad,
                     onConnectPeerCast = ::launchPeerCastViewer,
                     onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
@@ -160,11 +162,35 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun launchDesktopWorkstation() {
+        if (BridgeClient.remoteStatusFlow.value.connected) {
+            Toast.makeText(
+                this,
+                "投屏进行中，无法进入本机桌面，请使用本机触控板或先断开投屏",
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
         startActivity(
             Intent(this, DesktopActivity::class.java).apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             },
         )
+    }
+
+    private fun launchRemoteTrackpad() {
+        val remote = BridgeClient.remoteStatusFlow.value
+        if (!remote.hasActiveDesktopCast) {
+            Toast.makeText(this, "当前未处于桌面投屏状态", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(this, RemoteTrackpadActivity::class.java).apply {
+            addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                    Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+            )
+        }
+        DisplayLaunchHelper.launchOnDisplay0(this, intent)
     }
 
     private fun launchExternalOrTrackpad(displayId: Int) {
@@ -208,6 +234,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun OpalConsoleScreen(
     onEnterDesktop: () -> Unit,
+    onOpenRemoteTrackpad: () -> Unit,
     onProjectExternalOrTrackpad: (Int) -> Unit,
     onConnectPeerCast: (String, Int, String) -> Unit,
     onPickCustomWallpaper: () -> Unit,
@@ -238,28 +265,32 @@ private fun OpalConsoleScreen(
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
                     .padding(horizontal = 20.dp, vertical = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                // Top Header Bar
+                // Clean Apple-style Top Header Bar
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    Column {
-                        OpalText(text = "OpalDesk", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                    Row(
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OpalText(text = "OpalDesk", fontSize = 26.sp, fontWeight = FontWeight.Bold)
                         OpalText(
-                            text = "macOS 液态毛玻璃 × DeX 多窗合成工作站 · v1.0.1",
+                            text = "v1.0.2",
                             fontSize = 12.sp,
-                            color = OpalPalette.TextSecondary,
+                            color = OpalPalette.TextMuted,
+                            modifier = Modifier.padding(bottom = 3.dp),
                         )
                     }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         if (status.connected && status.rootEnhanced) {
                             OpalStatusBadge(label = "Root 增强", color = OpalPalette.AccentEmerald)
                         }
                         OpalStatusBadge(
-                            label = status.privilegeSummary,
+                            label = if (status.connected) "引擎就绪" else "未激活",
                             color = if (status.connected) OpalPalette.AccentEmerald else OpalPalette.AccentAmber,
                         )
                     }
@@ -267,7 +298,7 @@ private fun OpalConsoleScreen(
 
                 // macOS Floating Glass Segmented Tab Switcher
                 OpalSegmentedRow(
-                    options = listOf("工作站总览", "显示与画质", "高级与引擎"),
+                    options = listOf("工作站", "显示与外设", "设置"),
                     selectedIndex = selectedTab,
                     onSelect = { selectedTab = it },
                 )
@@ -279,6 +310,7 @@ private fun OpalConsoleScreen(
                         remote = remote,
                         extDisplay = extDisplay,
                         onEnterLocalDesktop = onEnterDesktop,
+                        onOpenRemoteTrackpad = onOpenRemoteTrackpad,
                         onOpenExternalOrTrackpad = onProjectExternalOrTrackpad,
                         onConnectPeerCast = onConnectPeerCast,
                         onOpenFloatingAppPicker = { host, port, label ->
@@ -304,6 +336,7 @@ private fun OpalConsoleScreen(
                     )
                     else -> ConsoleEngineSettingsTab(
                         status = status,
+                        onOpenActivation = { showActivationModal = true },
                         onStopEngine = onStopEngine,
                     )
                 }

@@ -64,6 +64,7 @@ class OpalCastPeerClient(
         val pkg: String,
         val cls: String,
         val label: String,
+        val openCount: Int = 0,
     )
 
     interface Listener {
@@ -491,6 +492,7 @@ class OpalCastPeerClient(
                             pkg = pkg,
                             cls = o.optString("cls", ""),
                             label = o.optString("label", pkg).ifBlank { pkg },
+                            openCount = o.optInt("openCount", 0).coerceAtLeast(0),
                         ),
                     )
                 }

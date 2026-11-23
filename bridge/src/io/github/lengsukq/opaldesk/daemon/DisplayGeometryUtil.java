@@ -96,6 +96,54 @@ public final class DisplayGeometryUtil {
         return dpi;
     }
 
+    /**
+     * Computes a crisp, host-adapted DPI for a remote standalone floating app VirtualDisplay
+     * ({@code streamW x streamH}) derived from the host (被投屏端) physical Display 0 logical
+     * short-edge dp and the host's configured {@code windowDpiScalePct}.
+     */
+    public static int computeStandaloneAppDpi(
+            int streamW,
+            int streamH,
+            int hostDisplayW,
+            int hostDisplayH,
+            int hostDisplayDpi,
+            int dpiScalePct) {
+        int safeStreamW = Math.max(240, streamW);
+        int safeStreamH = Math.max(240, streamH);
+        int streamShort = Math.min(safeStreamW, safeStreamH);
+        boolean isPortrait = safeStreamH >= safeStreamW;
+
+        float hostShortDp = 412f;
+        if (hostDisplayW > 0 && hostDisplayH > 0 && hostDisplayDpi >= 120 && hostDisplayDpi <= 800) {
+            int hostShortPx = Math.min(hostDisplayW, hostDisplayH);
+            hostShortDp = Math.max(360f, Math.min(960f, hostShortPx * 160f / hostDisplayDpi));
+        }
+
+        float targetShortDp;
+        if (isPortrait) {
+            if (hostShortDp <= 520f) {
+                // Host is a phone: preserve its native logical width (e.g. ~393-412dp) 1:1
+                targetShortDp = Math.max(380f, Math.min(450f, hostShortDp));
+            } else {
+                // Host is a tablet: adapt cleanly to narrow phone-shaped vs wide tablet-shaped floating windows
+                float aspect = (float) safeStreamW / (float) safeStreamH;
+                if (aspect < 0.72f) {
+                    targetShortDp = Math.max(412f, Math.min(520f, hostShortDp * 0.62f));
+                } else {
+                    targetShortDp = Math.max(520f, Math.min(680f, hostShortDp * 0.85f));
+                }
+            }
+        } else {
+            // Landscape floating window: preserve host short-edge dp (phone ~411dp, tablet ~692dp)
+            targetShortDp = Math.max(390f, Math.min(720f, hostShortDp));
+        }
+
+        int baseDpi = Math.round(streamShort * 160f / targetShortDp);
+        int clampedPct = Math.max(70, Math.min(140, dpiScalePct <= 0 ? 100 : dpiScalePct));
+        int scaled = Math.round(baseDpi * (clampedPct / 100f));
+        return Math.max(MIN_DPI, Math.min(480, scaled));
+    }
+
     public static int normalizeRotation(int rot) {
         return ((rot % 4) + 4) % 4;
     }

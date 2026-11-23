@@ -254,6 +254,7 @@ public final class CompositorEngine {
             sessionsById.put(winId, created);
             focusWindowLocked(created, now);
             config.rememberProfile(pkg, profile);
+            config.recordAppLaunch(pkg);
             markDirtyAndNotifyLocked();
             return winId;
         }

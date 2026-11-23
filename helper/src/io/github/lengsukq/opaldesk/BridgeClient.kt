@@ -13,6 +13,8 @@ import android.os.Parcel
 import android.util.Log
 import android.util.LruCache
 import android.view.Surface
+import androidx.compose.ui.geometry.Offset
+import io.github.lengsukq.opaldesk.cast.OpalPeerCastMutex
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.CompositorScene
 import io.github.lengsukq.opaldesk.protocol.CompositorSceneParser
@@ -77,6 +79,13 @@ object BridgeClient {
     private val _imeBridgeRequestFlow = MutableStateFlow<ImeBridgeRequest?>(null)
     val imeBridgeRequestFlow: StateFlow<ImeBridgeRequest?> = _imeBridgeRequestFlow.asStateFlow()
 
+    private val _remoteTrackpadCursorFlow = MutableStateFlow<Offset?>(null)
+    val remoteTrackpadCursorFlow: StateFlow<Offset?> = _remoteTrackpadCursorFlow.asStateFlow()
+
+    fun updateRemoteTrackpadCursor(pos: Offset?) {
+        _remoteTrackpadCursorFlow.value = pos
+    }
+
     private val binderReadyListeners = CopyOnWriteArraySet<Runnable>()
     private val snapshotCache = object : LruCache<String, Bitmap>(24) {}
 
@@ -131,6 +140,14 @@ object BridgeClient {
             inputType = inputType,
             seq = imeReqSeq.incrementAndGet(),
         )
+    }
+
+    fun onPushedRemoteStateChanged() {
+        ioExec.execute {
+            val r = refreshRemoteStatus()
+            refreshStatus()
+            OpalPeerCastMutex.syncDaemonSendingState(r.connected, r.peerName)
+        }
     }
 
     fun onPushedSceneJson(sceneJson: String, pushedSeq: Long) {
@@ -236,6 +253,7 @@ object BridgeClient {
                 activeSessionPermanent = r.readInt() != 0,
                 trustedCount = r.readInt(),
                 lanIp = r.readString().orEmpty(),
+                desktopDisplayId = if (r.dataAvail() >= 4) r.readInt() else -1,
             )
         }?.also { _remoteStatusFlow.value = it } ?: _remoteStatusFlow.value
     }
@@ -647,6 +665,33 @@ object BridgeClient {
                     d.writeInt(action)
                     d.writeInt(keyCode)
                     d.writeInt(metaState)
+                },
+                readReply = { Unit },
+            )
+        }
+    }
+
+    fun injectRemoteTrackpadOneway(
+        action: Int,
+        x: Float,
+        y: Float,
+        hScroll: Float = 0f,
+        vScroll: Float = 0f,
+        buttonState: Int = 0,
+    ) {
+        inputExec.execute {
+            val svc = getService() ?: return@execute
+            transact(
+                svc,
+                BridgeProtocol.Tx.INJECT_REMOTE_TRACKPAD,
+                oneway = true,
+                writeArgs = { d ->
+                    d.writeInt(action)
+                    d.writeFloat(x)
+                    d.writeFloat(y)
+                    d.writeFloat(hScroll)
+                    d.writeFloat(vScroll)
+                    d.writeInt(buttonState)
                 },
                 readReply = { Unit },
             )

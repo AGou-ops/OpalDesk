@@ -263,7 +263,7 @@ public final class BridgeBinderService extends Binder {
             case BridgeProtocol.TX_GET_REMOTE_STREAM_STATUS: {
                 OpalCastCompositorBridge.RemoteStatusSnapshot st = (remoteBridge != null)
                         ? remoteBridge.getStatusSnapshot()
-                        : new OpalCastCompositorBridge.RemoteStatusSnapshot(false, 0, "", 0, 0, 0, 0, false, 0, "", false, 0, "");
+                        : new OpalCastCompositorBridge.RemoteStatusSnapshot(false, 0, "", 0, 0, 0, 0, false, 0, "", false, 0, "", -1);
                 if (reply != null) {
                     reply.writeInt(st.connected ? 1 : 0);
                     reply.writeInt(st.sinkType);
@@ -278,6 +278,7 @@ public final class BridgeBinderService extends Binder {
                     reply.writeInt(st.activeSessionPermanent ? 1 : 0);
                     reply.writeInt(st.trustedCount);
                     reply.writeString(st.lanIp);
+                    reply.writeInt(st.desktopDisplayId);
                 }
                 return true;
             }
@@ -407,6 +408,18 @@ public final class BridgeBinderService extends Binder {
                 String requestId = data.readString();
                 int decision = data.readInt();
                 boolean ok = remoteBridge != null && remoteBridge.respondToPairing(requestId, decision);
+                if (reply != null) reply.writeInt(ok ? 1 : 0);
+                return true;
+            }
+            case BridgeProtocol.TX_INJECT_REMOTE_TRACKPAD: {
+                int action = data.readInt();
+                float x = data.readFloat();
+                float y = data.readFloat();
+                float hScroll = data.readFloat();
+                float vScroll = data.readFloat();
+                int buttonState = data.readInt();
+                boolean ok = remoteBridge != null
+                        && remoteBridge.injectHostTrackpadEvent(action, x, y, hScroll, vScroll, buttonState);
                 if (reply != null) reply.writeInt(ok ? 1 : 0);
                 return true;
             }

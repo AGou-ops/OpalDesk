@@ -69,6 +69,11 @@ class DesktopActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (BridgeClient.remoteStatusFlow.value.connected) {
+            Toast.makeText(this, "投屏进行中，无法进入本机桌面，请使用本机触控板或先断开投屏", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
@@ -95,8 +100,16 @@ class DesktopActivity : ComponentActivity() {
                 val imeController = rememberNativeImeHostController()
                 val imeRequest by BridgeClient.imeBridgeRequestFlow.collectAsState()
                 val scene by BridgeClient.sceneFlow.collectAsState()
+                val remote by BridgeClient.remoteStatusFlow.collectAsState()
                 var lastHandledImeSeq by remember {
                     mutableLongStateOf(BridgeClient.imeBridgeRequestFlow.value?.seq ?: 0L)
+                }
+
+                // Never allow Local DeX to stay active concurrently with an outgoing remote cast
+                LaunchedEffect(remote.connected) {
+                    if (remote.connected) {
+                        finish()
+                    }
                 }
 
                 LaunchedEffect(imeRequest?.seq) {
@@ -183,11 +196,20 @@ class DesktopActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (BridgeClient.remoteStatusFlow.value.connected) {
+            Toast.makeText(this, "投屏进行中，已锁定本机桌面", Toast.LENGTH_SHORT).show()
+            finish()
+            return
+        }
         applyImmersiveFullscreen()
         BridgeClient.requestBinder(this)
         Thread({
             BridgeClient.refreshStatus()
             BridgeClient.refreshSceneSnapshot()
+            val r = BridgeClient.refreshRemoteStatus()
+            if (r.connected) {
+                runOnUiThread { finish() }
+            }
         }, "OpalDesktopSync").start()
     }
 

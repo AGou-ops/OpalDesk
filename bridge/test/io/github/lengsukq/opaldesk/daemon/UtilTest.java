@@ -125,4 +125,42 @@ public class UtilTest {
         assertTrue("Portrait initial frame must fit inside phone width", frame.left >= 0 && frame.right <= canvasW);
         assertTrue("Portrait initial frame must fit inside work height", frame.top >= work.top && frame.bottom <= work.bottom);
     }
+
+    @Test
+    public void testStandaloneAppDpiAdaptsToHostDeviceDpi() {
+        // Phone host: Xiaomi 14 Pro 1440x3200 @ 560dpi -> logical short edge = 411.4dp
+        // Floating portrait stream 744x1280 should keep ~411dp width (~289dpi)
+        int phonePortraitDpi = DisplayGeometryUtil.computeStandaloneAppDpi(744, 1280, 1440, 3200, 560, 100);
+        assertTrue("Expected ~289dpi for 744px wide on 411dp phone, got " + phonePortraitDpi,
+                phonePortraitDpi >= 280 && phonePortraitDpi <= 298);
+
+        // Resizing narrower to 560x1280 on same phone host scales DPI proportionally down (~218dpi)
+        int phoneNarrowDpi = DisplayGeometryUtil.computeStandaloneAppDpi(560, 1280, 1440, 3200, 560, 100);
+        assertTrue("Narrower stream must reduce DPI proportionally, got " + phoneNarrowDpi,
+                phoneNarrowDpi >= 210 && phoneNarrowDpi <= 226);
+
+        // Tablet host: Xiaomi Pad 8 Pro 3040x1904 @ 440dpi -> logical short edge = 692.4dp
+        // Landscape floating window 1280x792 should produce ~183dpi (much lower than phone landscape!)
+        int tabletLandDpi = DisplayGeometryUtil.computeStandaloneAppDpi(1280, 792, 3040, 1904, 440, 100);
+        int phoneLandDpi = DisplayGeometryUtil.computeStandaloneAppDpi(1280, 792, 1440, 3200, 560, 100);
+        assertTrue("Tablet host landscape DPI (" + tabletLandDpi + ") must be lower than phone host (" + phoneLandDpi + ")",
+                tabletLandDpi < phoneLandDpi - 80);
+    }
+
+    @Test
+    public void testDaemonConfigPersistsAppLaunchCounts() throws Exception {
+        File dir = tmpDir.newFolder("cfg_counts");
+        File conf = new File(dir, "main.conf");
+        File prof = new File(dir, "profiles.conf");
+        DaemonConfig cfg1 = new DaemonConfig(conf, prof);
+        assertEquals(0, cfg1.getAppLaunchCount("com.tencent.mm"));
+        assertEquals(1, cfg1.recordAppLaunch("com.tencent.mm"));
+        assertEquals(2, cfg1.recordAppLaunch("com.tencent.mm"));
+        assertEquals(1, cfg1.recordAppLaunch("tv.danmaku.bili"));
+
+        DaemonConfig cfg2 = new DaemonConfig(conf, prof);
+        cfg2.loadAll();
+        assertEquals(2, cfg2.getAppLaunchCount("com.tencent.mm"));
+        assertEquals(1, cfg2.getAppLaunchCount("tv.danmaku.bili"));
+    }
 }

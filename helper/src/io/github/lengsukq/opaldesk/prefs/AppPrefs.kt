@@ -38,6 +38,8 @@ object AppPrefs {
     private const val KEY_TRACKPAD_SENSITIVITY = "trackpad_sensitivity"
     private const val KEY_THEME_MODE = "appearance_theme_mode"
     private const val KEY_MOUSE_TARGET = "physical_mouse_target"
+    private const val KEY_SORT_APPS_BY_USAGE = "sort_apps_by_usage"
+    private const val KEY_APP_LAUNCH_COUNTS = "app_launch_counts_v1"
 
     private val DEFAULT_PINNED = listOf(
         "com.android.chrome",
@@ -75,6 +77,12 @@ object AppPrefs {
     private val _customWallpaperPathFlow = MutableStateFlow("")
     val customWallpaperPathFlow: StateFlow<String> = _customWallpaperPathFlow.asStateFlow()
 
+    private val _sortAppsByUsageFlow = MutableStateFlow(true)
+    val sortAppsByUsageFlow: StateFlow<Boolean> = _sortAppsByUsageFlow.asStateFlow()
+
+    private val _appLaunchCountsFlow = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val appLaunchCountsFlow: StateFlow<Map<String, Int>> = _appLaunchCountsFlow.asStateFlow()
+
     private fun prefs(ctx: Context?) =
         ctx?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -92,6 +100,8 @@ object AppPrefs {
             .coerceIn(MOUSE_TARGET_LOCAL, MOUSE_TARGET_EXTERNAL)
         _desktopShortcutsFlow.value = loadPkgList(p, KEY_DESKTOP_SHORTCUTS, fallbackKey = KEY_PINNED_PKGS)
         _dockPinnedFlow.value = loadPkgList(p, KEY_DOCK_PINNED, fallbackKey = KEY_PINNED_PKGS).take(MAX_DOCK_PINNED)
+        _sortAppsByUsageFlow.value = p.getBoolean(KEY_SORT_APPS_BY_USAGE, true)
+        _appLaunchCountsFlow.value = parseLaunchCounts(p.getString(KEY_APP_LAUNCH_COUNTS, null))
     }
 
     private fun loadPkgList(p: android.content.SharedPreferences, key: String, fallbackKey: String): List<String> {
@@ -273,4 +283,49 @@ object AppPrefs {
         if (host.isBlank()) return
         prefs(ctx)?.edit()?.remove("peer_tok_${host.trim()}")?.apply()
     }
+
+    fun isSortAppsByUsageEnabled(ctx: Context?): Boolean {
+        hydrateFlows(ctx)
+        return _sortAppsByUsageFlow.value
+    }
+
+    fun setSortAppsByUsage(ctx: Context?, enabled: Boolean) {
+        prefs(ctx)?.edit()?.putBoolean(KEY_SORT_APPS_BY_USAGE, enabled)?.apply()
+        _sortAppsByUsageFlow.value = enabled
+    }
+
+    fun getAppLaunchCounts(ctx: Context?): Map<String, Int> {
+        hydrateFlows(ctx)
+        return _appLaunchCountsFlow.value
+    }
+
+    fun recordAppLaunch(ctx: Context?, pkg: String): Int {
+        val clean = pkg.trim()
+        if (clean.isEmpty()) return 0
+        hydrateFlows(ctx)
+        val next = LinkedHashMap(_appLaunchCountsFlow.value)
+        val updated = (next[clean] ?: 0) + 1
+        next[clean] = updated
+        _appLaunchCountsFlow.value = next
+        prefs(ctx)?.edit()?.putString(KEY_APP_LAUNCH_COUNTS, serializeLaunchCounts(next))?.apply()
+        return updated
+    }
+
+    fun parseLaunchCounts(raw: String?): Map<String, Int> {
+        if (raw.isNullOrBlank()) return emptyMap()
+        val out = LinkedHashMap<String, Int>()
+        raw.lineSequence().forEach { line ->
+            val eq = line.indexOf('=')
+            if (eq <= 0) return@forEach
+            val k = line.substring(0, eq).trim()
+            val v = line.substring(eq + 1).trim().toIntOrNull() ?: return@forEach
+            if (k.isNotEmpty() && v > 0) out[k] = v
+        }
+        return out
+    }
+
+    fun serializeLaunchCounts(counts: Map<String, Int>): String =
+        counts.entries
+            .filter { it.key.isNotBlank() && it.value > 0 }
+            .joinToString("\n") { "${it.key.trim()}=${it.value}" }
 }

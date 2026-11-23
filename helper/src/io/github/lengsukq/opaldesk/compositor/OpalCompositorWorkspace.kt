@@ -259,6 +259,7 @@ fun OpalCompositorWorkspace(
                     rowsPerColumn = shortcutRowsPerCol,
                     onLaunch = { entry ->
                         dismissAllPopovers()
+                        AppPrefs.recordAppLaunch(ctx, entry.pkg)
                         scope.launch(Dispatchers.IO) {
                             BridgeClient.openWindow(entry.pkg, entry.activityClass, BridgeProtocol.Profile.AUTO)
                         }
@@ -430,6 +431,7 @@ fun OpalCompositorWorkspace(
                         } else if (existing != null) {
                             BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.FOCUS)
                         } else {
+                            AppPrefs.recordAppLaunch(ctx, pkg)
                             scope.launch(Dispatchers.IO) {
                                 BridgeClient.openWindow(pkg, cls, BridgeProtocol.Profile.AUTO)
                             }
@@ -455,6 +457,7 @@ fun OpalCompositorWorkspace(
                     maxHeight = drawerMaxH,
                     onLaunch = { entry, profileCode ->
                         showAppDrawer = false
+                        AppPrefs.recordAppLaunch(ctx, entry.pkg)
                         scope.launch(Dispatchers.IO) {
                             BridgeClient.openWindow(entry.pkg, entry.activityClass, profileCode)
                         }
@@ -619,6 +622,7 @@ fun OpalCompositorWorkspace(
                         if (win != null) {
                             BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.FOCUS)
                         } else {
+                            AppPrefs.recordAppLaunch(ctx, pkg)
                             scope.launch(Dispatchers.IO) {
                                 BridgeClient.openWindow(pkg, appEntry?.activityClass.orEmpty(), BridgeProtocol.Profile.AUTO)
                             }

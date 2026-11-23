@@ -109,6 +109,7 @@ public final class OpalDeskDaemon implements Runnable {
                 inputRouter,
                 mouseRouter);
         this.remoteBridge.setPairingEventConsumer(helperBridge::pushPairingEvent);
+        this.remoteBridge.setRemoteStateChangeListener(helperBridge::pushRemoteStateChanged);
         this.taskStackObserver = new TaskStackObserver(
                 services.iActivityTaskManager,
                 mainHandler,

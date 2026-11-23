@@ -60,7 +60,10 @@ data class RemoteStreamStatus(
     val activeSessionPermanent: Boolean = false,
     val trustedCount: Int = 0,
     val lanIp: String = "",
+    val desktopDisplayId: Int = -1,
 ) {
+    val hasActiveDesktopCast: Boolean
+        get() = connected && desktopDisplayId > 0
     val shortCertFingerprint: String
         get() {
             val clean = certFingerprint.replace(":", "").trim().uppercase()

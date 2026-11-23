@@ -71,12 +71,14 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         public final boolean activeSessionPermanent;
         public final int trustedCount;
         public final String lanIp;
+        public final int desktopDisplayId;
 
         public RemoteStatusSnapshot(
                 boolean connected, int sinkType, String peerName,
                 int width, int height, int fpsX100, int bitrateKbps,
                 boolean wifiEnabled, int wifiPort, String certFingerprint,
-                boolean activeSessionPermanent, int trustedCount, String lanIp) {
+                boolean activeSessionPermanent, int trustedCount, String lanIp,
+                int desktopDisplayId) {
             this.connected = connected;
             this.sinkType = sinkType;
             this.peerName = peerName != null ? peerName : "";
@@ -90,6 +92,7 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
             this.activeSessionPermanent = activeSessionPermanent;
             this.trustedCount = Math.max(0, trustedCount);
             this.lanIp = lanIp != null ? lanIp : "";
+            this.desktopDisplayId = desktopDisplayId;
         }
     }
 
@@ -146,6 +149,7 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
     private volatile int desktopSessionId = -1;
     private volatile boolean localHostTextFieldFocused = false;
     private volatile AudioStreamCapturer audioCapturer;
+    private volatile Runnable remoteStateChangeListener;
 
     public OpalCastCompositorBridge(
             AndroidServices services,
@@ -177,6 +181,17 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         }
         server.setPairingChangeListener((PairingApprovalCoordinator.PendingRequest req) ->
                 consumer.accept(req != null ? req.toJson() : ""));
+    }
+
+    public void setRemoteStateChangeListener(Runnable listener) {
+        this.remoteStateChangeListener = listener;
+    }
+
+    private void notifyRemoteStateChanged() {
+        Runnable r = remoteStateChangeListener;
+        if (r != null) {
+            try { r.run(); } catch (RuntimeException ignored) {}
+        }
     }
 
     public String getTrustedPeersJson() {
@@ -230,7 +245,8 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                 server.getCertFingerprint(),
                 active && server.isActiveSessionPermanent(),
                 server.getTrustedCount(),
-                lanIp != null ? lanIp : "");
+                lanIp != null ? lanIp : "",
+                getActiveDesktopDisplayId());
     }
 
     public RemoteStreamServer.WifiConfigStatus configureWifi(boolean enable, int port) {
@@ -286,6 +302,70 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         reconfigureActiveDesktop(0, 0, nextFps);
     }
 
+    /**
+     * Injects Display 0 host trackpad pointer/click/drag/scroll events directly onto the active
+     * remote OpalCast desktop VirtualDisplay so the host phone works as a live DeX touchpad
+     * while casting wirelessly or over USB.
+     */
+    public boolean injectHostTrackpadEvent(
+            int action, float x, float y, float hScroll, float vScroll, int buttonState) {
+        int sid = desktopSessionId;
+        ActiveRemoteSession s = (sid > 0) ? sessions.get(sid) : null;
+        if (s == null || s.closed || s.displayId <= 0) return false;
+
+        float cx = Math.max(0f, Math.min(s.width - 1f, x));
+        float cy = Math.max(0f, Math.min(s.height - 1f, y));
+        long now = SystemClock.uptimeMillis();
+        if (action == MotionEvent.ACTION_DOWN) {
+            s.mouseDownTimeMs = now;
+        }
+        int masked = action & MotionEvent.ACTION_MASK;
+        boolean isScroll = (masked == MotionEvent.ACTION_SCROLL);
+        boolean isHover = (masked == MotionEvent.ACTION_HOVER_MOVE || masked == MotionEvent.ACTION_HOVER_EXIT);
+
+        MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[]{new MotionEvent.PointerProperties()};
+        props[0].id = 0;
+        props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+
+        if (isScroll) {
+            MotionEvent.PointerCoords hoverCoord = new MotionEvent.PointerCoords();
+            hoverCoord.x = cx;
+            hoverCoord.y = cy;
+            hoverCoord.pressure = 0f;
+            hoverCoord.size = 1f;
+            MotionEvent hoverPrime = MotionEvent.obtain(
+                    now, now, MotionEvent.ACTION_HOVER_MOVE,
+                    1, props, new MotionEvent.PointerCoords[]{hoverCoord},
+                    0, 0, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+            try {
+                inputRouter.injectRawEventToDisplay(hoverPrime, s.displayId, s.vdUniqueId, s.width, s.height);
+            } finally {
+                hoverPrime.recycle();
+            }
+        }
+
+        MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[]{new MotionEvent.PointerCoords()};
+        coords[0].x = cx;
+        coords[0].y = cy;
+        coords[0].pressure = (isHover || isScroll || masked == MotionEvent.ACTION_UP) ? 0f : 1f;
+        coords[0].size = 1f;
+        if (isScroll) {
+            coords[0].setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll);
+            coords[0].setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
+        }
+
+        long downTime = (isHover || isScroll || s.mouseDownTimeMs <= 0L) ? now : s.mouseDownTimeMs;
+        int effButtons = (isHover || isScroll) ? 0 : buttonState;
+        MotionEvent ev = MotionEvent.obtain(
+                downTime, now, action, 1, props, coords,
+                0, effButtons, 1f, 1f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
+        try {
+            return inputRouter.injectRawEventToDisplay(ev, s.displayId, s.vdUniqueId, s.width, s.height);
+        } finally {
+            ev.recycle();
+        }
+    }
+
     // ---- RemoteStreamServer.SessionListener ----
 
     @Override
@@ -311,6 +391,7 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         if (s != null) {
             closeSessionResources(s);
         }
+        notifyRemoteStateChanged();
     }
 
     @Override
@@ -580,7 +661,9 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
             int[] aligned = DisplayGeometryUtil.alignForEncoder(hello.width, hello.height, 8);
             s.width = aligned[0];
             s.height = aligned[1];
-            s.dpi = DisplayGeometryUtil.clampDpi(hello.dpi, s.width, s.height);
+            s.dpi = standalone
+                    ? resolveHostAdaptedStandaloneDpi(s.width, s.height, hello.dpi)
+                    : DisplayGeometryUtil.clampDpi(hello.dpi, s.width, s.height);
             float nativeFps = DisplayGeometryUtil.clampFps(hello.fps > 0 ? hello.fps : 60f, 60f);
             s.requestedNativeFps = nativeFps;
             int cfgFps = config.getTargetFps();
@@ -691,11 +774,13 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                     startAudioForDesktop(sessionId);
                 }
             } else if (!s.appPackage.isEmpty()) {
+                config.recordAppLaunch(s.appPackage);
                 displayDriver.launchOrMoveFullscreenApp(s.appPackage, s.appActivity, s.displayId, -1);
             }
 
             s.clipboard.onSessionStarted();
             pushDeviceState(s);
+            notifyRemoteStateChanged();
             System.out.println("OPALDESK_REMOTE_SESSION_READY sid=" + sessionId
                     + " role=" + (standalone ? "standalone" : "desktop")
                     + " displayId=" + s.displayId + " " + s.width + "x" + s.height + "@" + s.fps);
@@ -711,7 +796,12 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                     8);
             int nextW = aligned[0];
             int nextH = aligned[1];
-            int nextDpi = (cfg.dpi > 0) ? DisplayGeometryUtil.clampDpi(cfg.dpi, nextW, nextH) : s.dpi;
+            int nextDpi;
+            if (s.standalone) {
+                nextDpi = resolveHostAdaptedStandaloneDpi(nextW, nextH, cfg.dpi);
+            } else {
+                nextDpi = (cfg.dpi > 0) ? DisplayGeometryUtil.clampDpi(cfg.dpi, nextW, nextH) : s.dpi;
+            }
             float nextFps = (cfg.fpsX100 > 0) ? DisplayGeometryUtil.clampFps(cfg.fpsX100 / 100f, s.fps) : s.fps;
             int nextBitrate = (cfg.bitrateKbps > 0)
                     ? DisplayGeometryUtil.clampBitrateKbps(
@@ -737,7 +827,25 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                     });
             if (!ok) return;
             pushDeviceState(s);
+            notifyRemoteStateChanged();
         }
+    }
+
+    private int resolveHostAdaptedStandaloneDpi(int streamW, int streamH, int requestedDpi) {
+        if (requestedDpi >= 120 && requestedDpi <= 480) {
+            // Respect explicit manual override when a client requests a non-zero custom DPI;
+            // default 0 delegates to host physical Display 0 adaptation.
+            return requestedDpi;
+        }
+        int[] hostMetrics = services.getPrimaryDisplayMetrics();
+        int hostW = (hostMetrics != null && hostMetrics.length >= 3 && hostMetrics[0] > 0)
+                ? hostMetrics[0] : config.getCanvasWidth();
+        int hostH = (hostMetrics != null && hostMetrics.length >= 3 && hostMetrics[1] > 0)
+                ? hostMetrics[1] : config.getCanvasHeight();
+        int hostDpi = (hostMetrics != null && hostMetrics.length >= 3 && hostMetrics[2] > 0)
+                ? hostMetrics[2] : config.getCanvasDpi();
+        return DisplayGeometryUtil.computeStandaloneAppDpi(
+                streamW, streamH, hostW, hostH, hostDpi, config.getWindowDpiScalePct());
     }
 
     private static int computeRecommendedBitrateKbps(int w, int h, float fps) {
@@ -867,7 +975,8 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                 if (!seenPkgs.add(pkg)) continue;
                 CharSequence lbl = ri.loadLabel(pm);
                 String label = (lbl != null && lbl.length() > 0) ? lbl.toString().trim() : pkg;
-                out.add(new OpalCastProtocol.AppEntry(pkg, ri.activityInfo.name, label, false, -1));
+                int openCount = config.getAppLaunchCount(pkg);
+                out.add(new OpalCastProtocol.AppEntry(pkg, ri.activityInfo.name, label, false, -1, "", openCount));
             }
             out.sort(Comparator.comparing(a -> a.label.toLowerCase(Locale.ROOT)));
         } catch (RuntimeException ignored) {

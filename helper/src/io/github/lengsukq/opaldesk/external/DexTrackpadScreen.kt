@@ -94,6 +94,9 @@ fun DexTrackpadScreen(
     externalDisplayId: Int,
     cursorX: Int,
     cursorY: Int,
+    badgePrefix: String = "独立满屏",
+    allowSwitchToLocalDesktop: Boolean = true,
+    exitButtonLabel: String = "退出投射",
     onMoveCursor: (Float, Float) -> Unit,
     onSetPrimaryButton: (Boolean) -> Unit,
     onTapPrimary: () -> Unit,
@@ -171,7 +174,7 @@ fun DexTrackpadScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 OpalStatusBadge(
-                    label = "独立满屏 · $monitorSummary",
+                    label = "$badgePrefix · $monitorSummary",
                     color = OpalPalette.AccentEmerald,
                 )
                 OpalText(
@@ -206,15 +209,17 @@ fun DexTrackpadScreen(
                     filled = false,
                     onClick = onOpenConsole,
                 )
+                if (allowSwitchToLocalDesktop) {
+                    OpalButton(
+                        label = "切回本机",
+                        compact = true,
+                        filled = false,
+                        accent = OpalPalette.AccentCyan,
+                        onClick = onSwitchToLocalDesktop,
+                    )
+                }
                 OpalButton(
-                    label = "切回本机",
-                    compact = true,
-                    filled = false,
-                    accent = OpalPalette.AccentCyan,
-                    onClick = onSwitchToLocalDesktop,
-                )
-                OpalButton(
-                    label = "退出投射",
+                    label = exitButtonLabel,
                     compact = true,
                     filled = false,
                     accent = OpalPalette.AccentDanger,

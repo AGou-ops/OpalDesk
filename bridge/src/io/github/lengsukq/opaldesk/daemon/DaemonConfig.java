@@ -24,6 +24,7 @@ import java.util.regex.Pattern;
 public final class DaemonConfig {
     public static final String DEFAULT_CONF_PATH = "/data/local/tmp/opaldesk_v2.conf";
     public static final String DEFAULT_PROFILE_CONF_PATH = "/data/local/tmp/opaldesk_profiles.conf";
+    public static final String DEFAULT_LAUNCH_COUNTS_PATH = "/data/local/tmp/opaldesk_app_counts.conf";
     public static final int DEFAULT_ROOTLESS_MAX_VD = 6;
     public static final int DEFAULT_ROOT_ENHANCED_MAX_VD = 10;
     public static final int MIN_MAX_VD = 2;
@@ -63,7 +64,9 @@ public final class DaemonConfig {
     private final Object lock = new Object();
     private final File confFile;
     private final File profileFile;
+    private final File launchCountsFile;
     private final Map<String, WindowProfile> appProfiles = new HashMap<>();
+    private final Map<String, Integer> appLaunchCounts = new HashMap<>();
 
     public volatile boolean shuttingDown = false;
     private int canvasWidth = 1920;
@@ -78,17 +81,30 @@ public final class DaemonConfig {
     private boolean secureCaptureEnabled = false;
 
     public DaemonConfig() {
-        this(new File(DEFAULT_CONF_PATH), new File(DEFAULT_PROFILE_CONF_PATH));
+        this(new File(DEFAULT_CONF_PATH), new File(DEFAULT_PROFILE_CONF_PATH), new File(DEFAULT_LAUNCH_COUNTS_PATH));
     }
 
     public DaemonConfig(File confFile, File profileFile) {
+        this(confFile, profileFile, deriveLaunchCountsFile(confFile));
+    }
+
+    public DaemonConfig(File confFile, File profileFile, File launchCountsFile) {
         this.confFile = (confFile != null) ? confFile : new File(DEFAULT_CONF_PATH);
         this.profileFile = (profileFile != null) ? profileFile : new File(DEFAULT_PROFILE_CONF_PATH);
+        this.launchCountsFile = (launchCountsFile != null) ? launchCountsFile : new File(DEFAULT_LAUNCH_COUNTS_PATH);
+    }
+
+    private static File deriveLaunchCountsFile(File confFile) {
+        if (confFile != null && confFile.getParentFile() != null) {
+            return new File(confFile.getParentFile(), "opaldesk_app_counts.conf");
+        }
+        return new File(DEFAULT_LAUNCH_COUNTS_PATH);
     }
 
     public void loadAll() {
         loadMainConf();
         loadAppProfiles();
+        loadAppLaunchCounts();
     }
 
     public int getCanvasWidth() {
@@ -198,6 +214,29 @@ public final class DaemonConfig {
         saveAppProfiles();
     }
 
+    public int getAppLaunchCount(String pkg) {
+        if (!PackagePolicy.isValidPackageName(pkg)) return 0;
+        synchronized (lock) {
+            Integer c = appLaunchCounts.get(pkg);
+            return c != null ? c : 0;
+        }
+    }
+
+    public int recordAppLaunch(String pkg) {
+        if (!PackagePolicy.isValidPackageName(pkg)) return 0;
+        int next;
+        synchronized (lock) {
+            if (appLaunchCounts.size() >= 1024 && !appLaunchCounts.containsKey(pkg)) {
+                return 0;
+            }
+            Integer prev = appLaunchCounts.get(pkg);
+            next = (prev != null ? prev : 0) + 1;
+            appLaunchCounts.put(pkg, next);
+        }
+        saveAppLaunchCounts();
+        return next;
+    }
+
     private void loadMainConf() {
         if (!confFile.isFile()) return;
         try (BufferedReader br = new BufferedReader(
@@ -288,6 +327,46 @@ public final class DaemonConfig {
             AtomicFiles.writeAtomicUtf8(profileFile, sb.toString(), AtomicFiles.MODE_OWNER_RW);
         } catch (IOException e) {
             System.err.println("OPALDESK_PROFILES_SAVE_WARN: " + e.getMessage());
+        }
+    }
+
+    private void loadAppLaunchCounts() {
+        if (!launchCountsFile.isFile()) return;
+        synchronized (lock) {
+            appLaunchCounts.clear();
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(launchCountsFile), StandardCharsets.UTF_8))) {
+                String ln;
+                while ((ln = br.readLine()) != null) {
+                    int eq = ln.indexOf('=');
+                    if (eq <= 0) continue;
+                    String pkg = ln.substring(0, eq).trim();
+                    if (!PackagePolicy.isValidPackageName(pkg)) continue;
+                    try {
+                        int c = Integer.parseInt(ln.substring(eq + 1).trim());
+                        if (c > 0) appLaunchCounts.put(pkg, c);
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+            } catch (IOException e) {
+                System.err.println("OPALDESK_COUNTS_LOAD_WARN: " + e.getMessage());
+            }
+        }
+    }
+
+    private void saveAppLaunchCounts() {
+        StringBuilder sb = new StringBuilder();
+        synchronized (lock) {
+            for (Map.Entry<String, Integer> e : appLaunchCounts.entrySet()) {
+                if (e.getValue() != null && e.getValue() > 0) {
+                    sb.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+                }
+            }
+        }
+        try {
+            AtomicFiles.writeAtomicUtf8(launchCountsFile, sb.toString(), AtomicFiles.MODE_OWNER_RW);
+        } catch (IOException e) {
+            System.err.println("OPALDESK_COUNTS_SAVE_WARN: " + e.getMessage());
         }
     }
 }

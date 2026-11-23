@@ -278,6 +278,18 @@ public final class HelperClientBridge {
         });
     }
 
+    /**
+     * Signals the Helper UI immediately when an outgoing OpalCast session connects, resizes, or
+     * disconnects so Display 0 console, Local DeX guards, and Remote Trackpad update without polling.
+     */
+    public void pushRemoteStateChanged() {
+        if (config.shuttingDown || !isHelperAlive()) return;
+        scenePushExec.execute(() -> {
+            if (config.shuttingDown || !isHelperAlive()) return;
+            callHelperProvider(BridgeProtocol.PROVIDER_METHOD_REMOTE_STATE_CHANGED, new Bundle());
+        });
+    }
+
     public void grantHelperPrivileges() {
         if (getVerifiedHelperUid() <= 0) return;
         // Standard AOSP background & notification grants (zero SYSTEM_ALERT_WINDOW or MIUI ops needed!)

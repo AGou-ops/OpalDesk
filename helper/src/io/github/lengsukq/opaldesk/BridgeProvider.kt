@@ -32,6 +32,7 @@ class BridgeProvider : ContentProvider() {
             BridgeProtocol.PROVIDER_METHOD_SYNC_SCENE -> handleSyncScene(extras)
             BridgeProtocol.PROVIDER_METHOD_PAIRING_EVENT -> handlePairingEvent(extras)
             BridgeProtocol.PROVIDER_METHOD_IME_REQUEST -> handleImeRequest(extras)
+            BridgeProtocol.PROVIDER_METHOD_REMOTE_STATE_CHANGED -> handleRemoteStateChanged()
             else -> Bundle()
         }
     }
@@ -78,6 +79,13 @@ class BridgeProvider : ContentProvider() {
             val show = extras.getBoolean(BridgeProtocol.EXTRA_IME_SHOW, true)
             val inputType = extras.getInt(BridgeProtocol.EXTRA_IME_INPUT_TYPE, 0)
             BridgeClient.onPushedImeRequest(windowId, show, inputType)
+        }
+        return Bundle().apply { putBoolean("ok", true) }
+    }
+
+    private fun handleRemoteStateChanged(): Bundle {
+        if (!BridgeService.sUserStopping) {
+            BridgeClient.onPushedRemoteStateChanged()
         }
         return Bundle().apply { putBoolean("ok", true) }
     }

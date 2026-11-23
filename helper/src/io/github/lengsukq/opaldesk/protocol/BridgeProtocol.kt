@@ -19,6 +19,7 @@ object BridgeProtocol {
     const val PROVIDER_METHOD_SYNC_SCENE = "syncScene"
     const val PROVIDER_METHOD_PAIRING_EVENT = "pairingEvent"
     const val PROVIDER_METHOD_IME_REQUEST = "imeRequest"
+    const val PROVIDER_METHOD_REMOTE_STATE_CHANGED = "remoteStateChanged"
 
     const val EXTRA_CALLBACK_BINDER = "cb"
     const val EXTRA_PROC_TOKEN = "proc"
@@ -57,6 +58,7 @@ object BridgeProtocol {
         const val REVOKE_TRUSTED_PEER = 34
         const val GET_PENDING_PAIRING = 35
         const val RESPOND_PAIRING = 36
+        const val INJECT_REMOTE_TRACKPAD = 37
         const val SHUTDOWN = 99
     }
 

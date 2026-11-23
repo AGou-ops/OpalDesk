@@ -194,6 +194,7 @@ class ExternalDesktopActivity : ComponentActivity() {
                     )
                 } else {
                     val uiScale by AppPrefs.externalUiScaleFlow.collectAsState()
+                    val remoteCursor by BridgeClient.remoteTrackpadCursorFlow.collectAsState()
                     val baseDensity = LocalDensity.current
                     val effDensity = Density(
                         density = (baseDensity.density * uiScale).coerceIn(0.85f, 3.5f),
@@ -209,6 +210,7 @@ class ExternalDesktopActivity : ComponentActivity() {
                         OpalCompositorWorkspace(
                             isExternalMonitor = true,
                             externalMonitorSummary = summary,
+                            virtualCursorPx = remoteCursor,
                             onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
                             onOpenConsole = ::openConsoleOnPrimaryDisplay,
                             onExitDesktop = { finish() },

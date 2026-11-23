@@ -220,6 +220,7 @@ class PeerFloatingAppService : Service() {
 
         startForegroundNotification(nextAppLabel, nextPeerLabel)
         _activeFlow.value = ActiveFloatingInfo(host, port, peerLabel, appPackage, appLabel)
+        AppPrefs.recordAppLaunch(this, nextPkg)
 
         tearDownSessionOnly()
         ensureFloatingWindowAttached()
@@ -242,9 +243,10 @@ class PeerFloatingAppService : Service() {
 
     private fun connectRemoteStandaloneApp() {
         updateOverlayStatus("正在连接 $peerLabel…", dotColor = 0xFFF59E0B.toInt(), showRetry = false)
-        val dm = resources.displayMetrics
         val (streamW, streamH) = computeStreamSizeForView(expandedW, expandedH)
-        val reqDpi = if (isLandscape) 220 else 280
+        // Pass reqDpi=0 so the host (被投屏端) adapts DPI dynamically to its real physical screen DPI
+        // and the floating window's stream resolution/aspect ratio.
+        val reqDpi = 0
         val savedTok = AppPrefs.getPeerAuthToken(this, host)
         val tokenToUse = savedTok.ifBlank { handoverToken }
         handoverToken = "" // single-use in memory only
@@ -682,24 +684,24 @@ class PeerFloatingAppService : Service() {
 
     private fun commitRemoteResize() {
         val (streamW, streamH) = computeStreamSizeForView(expandedW, expandedH)
-        val dpi = if (streamW > streamH) 220 else 280
-        client?.sendResizeConfig(streamW, streamH, dpi, 60, 9_000)
+        // Pass dpi=0 so host recalculates host-adapted DPI for the new window dimensions
+        client?.sendResizeConfig(streamW, streamH, 0, 60, 10_000)
     }
 
     private fun computeStreamSizeForView(viewW: Int, viewH: Int): Pair<Int, Int> {
         val contentH = max(dp(180), viewH - dp(36))
         val ratio = viewW.toFloat() / contentH.toFloat()
-        val targetLong = 1080
+        val targetLong = 1280
         val w: Int
         val h: Int
         if (ratio >= 1f) {
             w = targetLong
-            h = (targetLong / ratio).roundToInt().coerceIn(540, 1080)
+            h = (targetLong / ratio).roundToInt().coerceIn(540, 1280)
         } else {
             h = targetLong
-            w = (targetLong * ratio).roundToInt().coerceIn(540, 1080)
+            w = (targetLong * ratio).roundToInt().coerceIn(540, 1280)
         }
-        return (w and 7.inv()).coerceAtLeast(360) to (h and 7.inv()).coerceAtLeast(360)
+        return (w and 7.inv()).coerceAtLeast(480) to (h and 7.inv()).coerceAtLeast(480)
     }
 
     @Suppress("DEPRECATION")

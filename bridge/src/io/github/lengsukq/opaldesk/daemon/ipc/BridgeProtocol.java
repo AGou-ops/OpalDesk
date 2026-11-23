@@ -24,6 +24,7 @@ public final class BridgeProtocol {
     public static final String PROVIDER_METHOD_SYNC_SCENE = "syncScene";
     public static final String PROVIDER_METHOD_PAIRING_EVENT = "pairingEvent";
     public static final String PROVIDER_METHOD_IME_REQUEST = "imeRequest";
+    public static final String PROVIDER_METHOD_REMOTE_STATE_CHANGED = "remoteStateChanged";
 
     public static final String EXTRA_SYNC_SCENE_JSON = "sceneJson";
     public static final String EXTRA_SYNC_STATE_SEQ = "stateSeq";
@@ -65,6 +66,7 @@ public final class BridgeProtocol {
     public static final int TX_REVOKE_TRUSTED_PEER = 34;
     public static final int TX_GET_PENDING_PAIRING = 35;
     public static final int TX_RESPOND_PAIRING = 36;
+    public static final int TX_INJECT_REMOTE_TRACKPAD = 37;
     public static final int TX_SHUTDOWN = 99;
 
     // ---- Interactive Pairing Approval Decisions (TX_RESPOND_PAIRING) ----

@@ -36,6 +36,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -536,6 +537,8 @@ private fun GlassDockDivider() {
 
 /**
  * Floating Rounded Liquid Glass App Launcher (macOS Launchpad × Samsung DeX Search & Profile Picker).
+ * Delegates directly to [io.github.lengsukq.opaldesk.ui.UnifiedAppLauncherPanel] so Local DeX
+ * and Remote Standalone Floating Window Picker share one identical search, usage-sorting, and grid component.
  */
 @Composable
 fun DexAppDrawerPopover(
@@ -547,8 +550,7 @@ fun DexAppDrawerPopover(
     maxHeight: Dp = 460.dp,
     modifier: Modifier = Modifier,
 ) {
-    val ctx = LocalContext.current
-    var query by remember { mutableStateOf("") }
+    val launchCounts by AppPrefs.appLaunchCountsFlow.collectAsState()
     var selectedProfileIdx by remember { mutableIntStateOf(0) }
 
     val profileCode = when (selectedProfileIdx) {
@@ -558,103 +560,44 @@ fun DexAppDrawerPopover(
         else -> BridgeProtocol.Profile.AUTO
     }
 
-    val filtered = remember(apps, query) {
-        if (query.isBlank()) {
-            apps
-        } else {
-            val q = query.trim().lowercase(Locale.getDefault())
-            apps.filter {
-                it.label.lowercase(Locale.getDefault()).contains(q) ||
-                    it.pkg.lowercase(Locale.ROOT).contains(q)
-            }
+    val byPkg = remember(apps) { apps.associateBy { it.pkg } }
+    val unifiedItems = remember(apps, desktopPkgs, dockPinnedPkgs, launchCounts) {
+        val desktopSet = desktopPkgs.toHashSet()
+        val dockSet = dockPinnedPkgs.toHashSet()
+        apps.map { app ->
+            io.github.lengsukq.opaldesk.ui.UnifiedAppItem(
+                pkg = app.pkg,
+                activityClass = app.activityClass,
+                label = app.label,
+                openCount = launchCounts[app.pkg] ?: 0,
+                isPinnedDesktop = desktopSet.contains(app.pkg),
+                isPinnedDock = dockSet.contains(app.pkg),
+            )
         }
     }
 
-    val shape = RoundedCornerShape(24.dp)
-    Column(
-        modifier = modifier
-            .widthIn(max = 580.dp)
-            .fillMaxWidth()
-            .heightIn(max = maxHeight)
-            .liquidGlassSurface(
-                shape = shape,
-                fill = OpalPalette.LiquidPopoverFill,
-                rim = OpalPalette.LiquidGlassRim,
-                elevation = 28.dp,
+    io.github.lengsukq.opaldesk.ui.UnifiedAppLauncherPanel(
+        items = unifiedItems,
+        searchPlaceholder = "搜索应用（点击启动 · 右键 / 长按固定）",
+        maxWidth = 580.dp,
+        maxHeight = maxHeight,
+        onSelectApp = { item ->
+            val entry = byPkg[item.pkg] ?: InstalledAppEntry(item.pkg, item.activityClass, item.label)
+            onLaunch(entry, profileCode)
+        },
+        onContextApp = { item, rootPos ->
+            val entry = byPkg[item.pkg] ?: InstalledAppEntry(item.pkg, item.activityClass, item.label)
+            onContextApp(entry, rootPos)
+        },
+        topControlsContent = {
+            OpalSegmentedRow(
+                options = listOf("自动记忆", "桌面横屏", "手机竖屏", "平板 4:3"),
+                selectedIndex = selectedProfileIdx,
+                onSelect = { selectedProfileIdx = it },
             )
-            .pointerInput(Unit) { detectTapGestures {} }
-            .padding(16.dp),
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            OpalTextInput(
-                value = query,
-                onValueChange = { query = it },
-                placeholder = "搜索应用（点击启动 · 右键 / 长按添加到桌面或程序坞）",
-                modifier = Modifier.weight(1f),
-            )
-            Spacer(Modifier.width(10.dp))
-            OpalText(text = "${filtered.size}", fontSize = 12.sp, color = OpalPalette.TextSecondary)
-        }
-        Spacer(Modifier.height(10.dp))
-        OpalSegmentedRow(
-            options = listOf("自动记忆", "桌面横屏", "手机竖屏", "平板 4:3"),
-            selectedIndex = selectedProfileIdx,
-            onSelect = { selectedProfileIdx = it },
-        )
-        Spacer(Modifier.height(12.dp))
-
-        LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = 90.dp),
-            modifier = Modifier.fillMaxSize(),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            items(filtered, key = { it.pkg }) { app ->
-                val icon = remember(app.pkg) { AppCatalogRepository.getAppIcon(ctx, app.pkg) }
-                val onDesktop = desktopPkgs.contains(app.pkg)
-                val onDock = dockPinnedPkgs.contains(app.pkg)
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(if (onDesktop || onDock) OpalPalette.ChipFill else Color.Transparent)
-                        .onTapOrContextAction(
-                            app.pkg, profileCode,
-                            onPrimaryTap = { onLaunch(app, profileCode) },
-                            onContextAction = { rootPos -> onContextApp(app, rootPos) },
-                        )
-                        .padding(vertical = 8.dp, horizontal = 5.dp),
-                ) {
-                    if (icon != null) {
-                        Image(
-                            bitmap = icon,
-                            contentDescription = app.label,
-                            modifier = Modifier
-                                .size(46.dp)
-                                .clip(RoundedCornerShape(12.dp)),
-                        )
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .size(46.dp)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(OpalPalette.BgElevated),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            OpalText(text = app.label.take(1), fontWeight = FontWeight.Bold)
-                        }
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    OpalText(
-                        text = if (onDock || onDesktop) "★ ${app.label}" else app.label,
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        color = OpalPalette.TextPrimary,
-                    )
-                }
-            }
-        }
-    }
+        },
+        modifier = modifier,
+    )
 }
 
 /**

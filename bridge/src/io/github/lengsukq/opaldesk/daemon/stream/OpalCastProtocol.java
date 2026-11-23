@@ -582,19 +582,27 @@ public final class OpalCastProtocol {
         public final boolean runningOnExt;
         public final int taskId;
         public final String iconPngBase64;
+        public final int openCount;
 
         public AppEntry(String pkg, String cls, String label, boolean runningOnExt, int taskId) {
-            this(pkg, cls, label, runningOnExt, taskId, "");
+            this(pkg, cls, label, runningOnExt, taskId, "", 0);
         }
 
         public AppEntry(
                 String pkg, String cls, String label, boolean runningOnExt, int taskId, String iconPngBase64) {
+            this(pkg, cls, label, runningOnExt, taskId, iconPngBase64, 0);
+        }
+
+        public AppEntry(
+                String pkg, String cls, String label, boolean runningOnExt, int taskId,
+                String iconPngBase64, int openCount) {
             this.pkg = (pkg != null) ? pkg : "";
             this.cls = (cls != null) ? cls : "";
             this.label = (label != null) ? label : "";
             this.runningOnExt = runningOnExt;
             this.taskId = taskId;
             this.iconPngBase64 = (iconPngBase64 != null) ? iconPngBase64 : "";
+            this.openCount = Math.max(0, openCount);
         }
     }
 
@@ -618,7 +626,8 @@ public final class OpalCastProtocol {
                         .put("cls", e.cls)
                         .put("label", e.label)
                         .put("runningOnExt", e.runningOnExt)
-                        .put("taskId", e.taskId);
+                        .put("taskId", e.taskId)
+                        .put("openCount", e.openCount);
                 if (e.iconPngBase64 != null && !e.iconPngBase64.isEmpty()) {
                     item.put("icon", e.iconPngBase64);
                 }

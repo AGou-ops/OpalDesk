@@ -74,6 +74,17 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
 
         <activity
+            android:name=".external.RemoteTrackpadActivity"
+            android:exported="false"
+            android:label="OpalDesk 投屏触控板"
+            android:launchMode="singleTask"
+            android:taskAffinity="io.github.lengsukq.opaldesk.trackpad"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize|stateHidden"
+            android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|touchscreen|colorMode|density|uiMode" />
+
+        <activity
             android:name=".cast.PeerCastViewerActivity"
             android:exported="false"
             android:label="OpalDesk 设备互投接收端"
