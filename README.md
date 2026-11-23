@@ -1,14 +1,28 @@
-# OpalDesk (`v1.0.2` · Universal Compositor Edition)
+# OpalDesk (`v1.0.3` · Universal Compositor Edition)
 
 > **全品牌安卓通用 · 免 Root 优先 · Wayland 式「一窗一独立虚拟屏」120fps 液态毛玻璃多窗合成工作站**
 
-**OpalDesk** 是一套面向 **Android 11–17** 的 **Wayland 式独立虚拟屏池 + 客户端 GPU 统一合成工作站**，彻底摒弃厂商私有 Freeform 小窗与分体悬浮标题栏路线，集 **macOS 液态毛玻璃多窗桌面**、**外接 2K/4K 高刷显示器工作站**、**物理键鼠全局跨屏路由**、**跨设备单应用悬浮窗** 与 **Android ↔ Mac / Android ↔ Android 局域网单向互投** 于一体。历经 `v1.0.0` → `v1.0.2` 连续三轮核心演进与多机型真机打磨，所有关键链路均配套全量 JVM 单元测试与实机回归验证，力求做到**界面清爽、功能完备、少 Bug、稳如原生**。
+**OpalDesk** 是一套面向 **Android 11–17** 的 **Wayland 式独立虚拟屏池 + 客户端 GPU 统一合成工作站**，彻底摒弃厂商私有 Freeform 小窗与分体悬浮标题栏路线，集 **macOS 液态毛玻璃多窗桌面**、**外接 2K/4K 高刷显示器工作站**、**物理键鼠全局跨屏路由**、**跨设备单应用悬浮窗** 与 **Android ↔ Mac / Android ↔ Android 局域网单向互投** 于一体。历经 `v1.0.0` → `v1.0.3` 连续四轮核心演进与多机型真机打磨，所有关键链路均配套全量 JVM 单元测试与实机回归验证，力求做到**界面清爽、功能完备、少 Bug、稳如原生**。
 
 ---
 
-## 🚀 版本演进与核心优化总览（v1.0.0 ~ v1.0.2）
+## 🚀 版本演进与核心优化总览（v1.0.0 ~ v1.0.3）
 
-### 🆕 `v1.0.2` — 投屏触控板、小窗宿主 DPI 适配、极简主页重构与统一常用排序
+### 🆕 `v1.0.3` — 宿主 DPI 超采样、跨端输入法自动转发、独立小窗与触控板焕新及应用内更新
+- **内置应用内更新（GitHub Releases 直连 + 安全校验）**：
+  - 新增 `AppUpdateLogic` / `AppUpdateManager` / `AppUpdateModal` 全链路更新模块：支持启动静默检查（每 6 小时节流、可开关、支持忽略指定版本）与「设置 → 应用更新」手动检查，发现新版本时在主控台顶栏轻提醒。
+  - 下载链路严格限制官方 GitHub HTTPS 域名白名单，流式下载实时展示进度与取消控制，自动完成 **SHA-256 摘要校验** 与 **APK 包名校验** 后通过 `FileProvider` 安全调起系统安装器（并兼容 API 403 限流回退与浏览器直达）。
+- **宿主 DPI 超采样（彻底解决微信等 `always-compat` 应用小窗字体爆炸与裁切）**：
+  - 新增纯 JVM `DisplayGeometryUtil.resolveWindowBufferSpec` / `resolveStandaloneStreamSpec`，在保持逻辑 `dp` 布局完全不变的前提下，按比例同步超采样虚拟屏分辨率与 DPI 向宿主机原生密度靠拢；缩小微信窗口不再触发 2× 放大裁切，独立应用小窗（拼多多等）实现 1:1 原生清晰排版与零 3 列闪动。
+- **跨设备投屏输入法自动转发至接收端（`TYPE_IME_REQUEST = 0x16`）**：
+  - 修复投屏时点击输入框只在发送端手机弹出键盘的问题：无论是 **投屏桌面模式** 还是 **独立应用小窗模式**，发送端检测到输入框聚焦后立即通过 TLS 通道即时下发 `TYPE_IME_REQUEST`，接收端平板自动弹出本机输入法（小窗同步自动展开顶部毛玻璃输入栏）。
+- **独立小窗与触控板 Apple 液态毛玻璃重构 + 滚动阴影防闪**：
+  - 重绘独立应用悬浮窗为浅/深双主题 macOS 液态毛玻璃顶栏（三色红黄绿交通灯 + 精致返回/键盘胶囊 + 对角缩放柄），并将悬浮根容器 `elevation` 归零改用静态 `1.25dp` 细边框彻底根治 Adreno HWUI 滚动时左右边缘阴影疯狂闪烁；修复统一应用选择器浅色模式下深灰底块缺陷。
+  - 重做手机端投屏触控板底部操作区（`TrackpadControlDeck`）：改为 50/50 一体化「左键 · 按住拖拽 | 右键 · 返回」硬件按键条 + 三等分「拖拽锁定 | 显示桌面 | **一键息屏**」快捷胶囊（横屏自适应单行），息屏按钮一键直达并实时同步唤醒状态。
+- **Android 17（SDK 37）本地网络权限弹窗死循环根治**：
+  - 在 `OpalPeerDiscovery` 与 `AdbMdnsDiscovery` 中对 API 37 `ACCESS_LOCAL_NETWORK` 进行显式权限守卫并将停止扫描移至 `onStop()`，彻底杜绝未授权时反复弹出无法取消的 `NsdPickerActivity` 系统框，改为首页内联温和引导授权。
+
+### 🔧 `v1.0.2` — 投屏触控板、小窗宿主 DPI 适配、极简主页重构与统一常用排序
 - **投屏期间本机触控板与本机 DeX 强锁定**：
   - 新增独立 Display 0 投屏触控板（`RemoteTrackpadActivity`）与 120Hz `FLAG_ONEWAY` 指针/滚轮直通通道（`TX_INJECT_REMOTE_TRACKPAD`），无线 / USB 投屏开启后可随时在本机打开触控板精准操控远端桌面，并在投屏画面实时渲染零延迟光标。
   - 新增 `remoteStateChanged` 实时状态推送；投屏期间主控台立即切换为「打开本机触控板 / 物理息屏 / 断开投屏」，并在入口、生命周期与响应式状态三层严格锁定本机 DeX 桌面，避免双端画面与窗口状态冲突，断开投屏后触控板自动退出恢复。
@@ -160,7 +174,8 @@ flowchart LR
 │   │   ├── cast/                              # OpalPeerCastMutex / OpalPeerDiscovery / PeerCastViewerActivity / PeerFloatingAppService / RemoteAppPickerModal
 │   │   ├── prefs/                             # AppPrefs & WallpaperStorage (自定义相册壁纸 & 应用使用次数持久化)
 │   │   ├── protocol/                          # BridgeProtocol & CompositorModels (多列分屏 & 光标锚点算法)
-│   │   ├── ui/                                # OpalPrimitives / UnifiedAppLauncherPanel / NativeImeBridge / PairingConsentModal / ConsoleTabs / ActivationModal
+│   │   ├── ui/                                # OpalPrimitives / UnifiedAppLauncherPanel / NativeImeBridge / PairingConsentModal / AppUpdateModal / ConsoleTabs / ActivationModal
+│   │   ├── update/                            # AppUpdateLogic / AppUpdateManager (GitHub Releases 应用内安全更新与 SHA-256 校验)
 │   │   └── adb/                               # 内置无线 ADB 三级投递、mDNS 自动发现与 Shizuku 引导
 │   └── test/                                  # 几何算法、防互投互斥锁、应用排序器与引导安全单元测试
 ├── macos/OpalDeskMac/                         # 原生 Swift 6 macOS 伴侣接收端与单元测试
@@ -172,9 +187,9 @@ flowchart LR
 
 ## 📦 下载与安装
 
-前往 **[GitHub Releases](https://github.com/lengsukq/OpalDesk/releases)** 获取 `v1.0.2` 官方构建产物：
-- **Android 端**：`OpalDesk_v1.0.2.apk`（已内嵌对应签名的守护进程 `opaldesk.jar`）
-- **macOS 伴侣端**：`OpalDesk_v1.0.2-macos.zip`（Apple Silicon / macOS 14+ 原生 Swift 6 应用）
+前往 **[GitHub Releases](https://github.com/lengsukq/OpalDesk/releases)** 获取 `v1.0.3` 官方构建产物（也支持在 App 内「设置 → 应用更新」一键检测并安装更新）：
+- **Android 端**：`OpalDesk_v1.0.3.apk`（已内嵌对应签名的守护进程 `opaldesk.jar`）
+- **macOS 伴侣端**：`OpalDesk_v1.0.3-macos.zip`（Apple Silicon / macOS 14+ 原生 Swift 6 应用）
 
 安装 APK 后，打开 App 可直接通过 **内置无线调试（免电脑）** 或 **Shizuku** 一键激活；也可以连接电脑执行下方跨平台单行 ADB 命令：
 

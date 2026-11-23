@@ -38,9 +38,12 @@ public enum WindowProfile {
                 break;
             case DESKTOP:
             default:
-                // Crisp desktop density: ~840dp short edge on large/2K+ monitors, scaling smoothly when shrunk
+                // Crisp desktop density: ~840dp short edge on large/2K+ monitors, scaling smoothly when shrunk.
+                // If user drags a window into narrow portrait phone proportions, adopt a readable ~440dp width.
                 int targetDp;
-                if (contentW >= 1600 && contentH >= 900) {
+                if (contentH > contentW && contentW < 720) {
+                    targetDp = 440;
+                } else if (contentW >= 1600 && contentH >= 900) {
                     targetDp = 840;
                 } else if (contentW >= 1080) {
                     targetDp = 720;
@@ -55,7 +58,7 @@ public enum WindowProfile {
     }
 
     private static int clampDpi(int dpi) {
-        return Math.max(120, Math.min(480, dpi));
+        return Math.max(120, Math.min(560, dpi));
     }
 
     public static WindowProfile fromCode(int code, WindowProfile fallback) {

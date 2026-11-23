@@ -101,6 +101,10 @@ public final class ImmsDumpInspectorTest {
         assertNotNull(snap);
         assertTrue(snap.inputShown);
         assertFalse(ImmsDumpInspector.shouldTriggerHostImeBridge(snap, 119, 3200, 468521000L, 468521150L));
+        // However during remote casting (Phone -> Tablet), MUST forward IME open to the remote receiver!
+        assertTrue(ImmsDumpInspector.shouldTriggerRemoteCastIme(snap, 119, 3200, 468521000L, 468521150L));
+        // Never double-fire on already-handled sequence
+        assertFalse(ImmsDumpInspector.shouldTriggerRemoteCastIme(snap, 119, snap.latestShowSeq, 468521000L, 468521150L));
     }
 
     @Test

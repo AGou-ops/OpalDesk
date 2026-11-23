@@ -79,6 +79,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
@@ -479,6 +480,7 @@ fun OpalText(
     fontFamily: FontFamily? = null,
     maxLines: Int = Int.MAX_VALUE,
     lineHeight: TextUnit = TextUnit.Unspecified,
+    textAlign: TextAlign = TextAlign.Unspecified,
 ) {
     BasicText(
         text = text,
@@ -491,6 +493,7 @@ fun OpalText(
             fontWeight = fontWeight,
             fontFamily = fontFamily,
             lineHeight = lineHeight,
+            textAlign = textAlign,
         ),
     )
 }
@@ -856,6 +859,8 @@ enum class ChromeGlyph {
     WIFI,
     KEYBOARD,
     EXTERNAL_MONITOR,
+    LOCK,
+    SCREEN_OFF,
 }
 
 @Composable
@@ -979,6 +984,41 @@ fun OpalGlyphIcon(
                 drawRoundRect(tint, Offset(w * 0.10f, h * 0.14f), Size(w * 0.80f, h * 0.56f), CornerRadius(2.dp.toPx()), Stroke(sw))
                 drawLine(tint, Offset(w * 0.34f, h * 0.84f), Offset(w * 0.66f, h * 0.84f), sw, StrokeCap.Round)
                 drawLine(tint, Offset(w * 0.50f, h * 0.70f), Offset(w * 0.50f, h * 0.84f), sw, StrokeCap.Round)
+            }
+            ChromeGlyph.LOCK -> {
+                // Padlock body
+                drawRoundRect(
+                    tint,
+                    Offset(w * 0.20f, h * 0.46f),
+                    Size(w * 0.60f, h * 0.42f),
+                    CornerRadius(2.2.dp.toPx()),
+                    Stroke(sw * 0.95f),
+                )
+                // Shackle arch
+                drawArc(
+                    color = tint,
+                    startAngle = 180f,
+                    sweepAngle = 180f,
+                    useCenter = false,
+                    topLeft = Offset(w * 0.31f, h * 0.14f),
+                    size = Size(w * 0.38f, h * 0.38f),
+                    style = Stroke(width = sw * 0.95f, cap = StrokeCap.Round),
+                )
+                drawLine(tint, Offset(w * 0.31f, h * 0.33f), Offset(w * 0.31f, h * 0.46f), sw * 0.95f, StrokeCap.Round)
+                drawLine(tint, Offset(w * 0.69f, h * 0.33f), Offset(w * 0.69f, h * 0.46f), sw * 0.95f, StrokeCap.Round)
+            }
+            ChromeGlyph.SCREEN_OFF -> {
+                // Universal power/sleep icon (open top arc + vertical stem)
+                drawArc(
+                    color = tint,
+                    startAngle = -52f,
+                    sweepAngle = 284f,
+                    useCenter = false,
+                    topLeft = Offset(w * 0.16f, h * 0.18f),
+                    size = Size(w * 0.68f, h * 0.68f),
+                    style = Stroke(width = sw, cap = StrokeCap.Round),
+                )
+                drawLine(tint, Offset(w * 0.50f, h * 0.10f), Offset(w * 0.50f, h * 0.46f), sw, StrokeCap.Round)
             }
         }
     }

@@ -71,6 +71,7 @@ class OpalCastPeerClient(
         fun onWaitingForApproval() {}
         fun onAuthenticated(peerName: String, authToken: String, permanent: Boolean, certFingerprint: String)
         fun onAppListReceived(apps: List<RemoteAppEntry>) {}
+        fun onRemoteImeRequest(show: Boolean, inputType: Int) {}
         fun onVideoSizeChanged(width: Int, height: Int, fps: Int)
         fun onError(message: String)
         fun onDisconnected(reason: String)
@@ -91,6 +92,7 @@ class OpalCastPeerClient(
         private const val TYPE_AUDIO_FRAME = 0x04
         private const val TYPE_AUTH_RESULT = 0x12
         private const val TYPE_APP_LIST = 0x15
+        private const val TYPE_IME_REQUEST = 0x16
 
         private const val TYPE_HELLO = 0x20
         private const val TYPE_RESIZE_CONFIG = 0x21
@@ -146,6 +148,8 @@ class OpalCastPeerClient(
     private var videoCodec: MediaCodec? = null
     private var videoMime: String = MediaFormat.MIMETYPE_VIDEO_HEVC
     private var pendingCsd: ByteArray? = null
+    private var configuredVideoW: Int = 0
+    private var configuredVideoH: Int = 0
     private var videoConfigured = false
     @Volatile
     private var videoDrainThread: Thread? = null
@@ -207,10 +211,11 @@ class OpalCastPeerClient(
     fun sendResizeConfig(width: Int, height: Int, dpi: Int, fps: Int = reqFps, bitrateKbps: Int = 9_000) {
         val alignedW = (width.coerceIn(320, 2560) and 7.inv()).coerceAtLeast(320)
         val alignedH = (height.coerceIn(320, 2560) and 7.inv()).coerceAtLeast(320)
+        val wireDpi = if (dpi <= 0) 0 else dpi.coerceIn(120, 560)
         val bb = ByteBuffer.allocate(14).order(ByteOrder.BIG_ENDIAN)
         bb.putShort(alignedW.toShort())
         bb.putShort(alignedH.toShort())
-        bb.putShort(dpi.coerceIn(120, 480).toShort())
+        bb.putShort(wireDpi.toShort())
         bb.putShort((fps.coerceIn(30, 120) * 100).toShort())
         bb.putInt(bitrateKbps.coerceIn(2500, 24_000))
         bb.put(0xFF.toByte()) // DISPLAY_MODE_UNCHANGED
@@ -469,6 +474,7 @@ class OpalCastPeerClient(
                 }
             }
             TYPE_APP_LIST -> handleAppList(frame.payload)
+            TYPE_IME_REQUEST -> handleImeRequest(frame.payload)
             TYPE_VIDEO_CONFIG -> handleVideoConfig(frame.payload)
             TYPE_VIDEO_FRAME -> handleVideoFrame(frame.payload, frame.flags, frame.timestampUs)
             TYPE_AUDIO_CONFIG -> handleAudioConfig(frame.payload)
@@ -500,6 +506,19 @@ class OpalCastPeerClient(
             listener.onAppListReceived(out)
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to parse APP_LIST: ${t.message}")
+        }
+    }
+
+    private fun handleImeRequest(payload: ByteArray) {
+        if (payload.isEmpty()) return
+        try {
+            val obj = JSONObject(String(payload, StandardCharsets.UTF_8))
+            val show = obj.optBoolean("show", true)
+            val inputType = obj.optInt("inputType", 0)
+            Log.i(TAG, "RX IME_REQUEST show=$show inputType=0x${inputType.toString(16)}")
+            listener.onRemoteImeRequest(show, inputType)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to parse IME_REQUEST: ${t.message}")
         }
     }
 
@@ -543,6 +562,14 @@ class OpalCastPeerClient(
         listener.onVideoSizeChanged(remoteWidth, remoteHeight, fps)
 
         synchronized(videoLock) {
+            if (videoConfigured
+                && videoMime == mime
+                && configuredVideoW == remoteWidth
+                && configuredVideoH == remoteHeight
+                && pendingCsd?.contentEquals(csd) == true
+            ) {
+                return
+            }
             videoMime = mime
             pendingCsd = csd
             configureVideoDecoderLocked(mime, remoteWidth, remoteHeight, csd)
@@ -591,6 +618,8 @@ class OpalCastPeerClient(
                     codec.configure(fmt, surf, null, 0)
                     codec.start()
                     videoCodec = codec
+                    configuredVideoW = width
+                    configuredVideoH = height
                     videoConfigured = true
                     startVideoDrainThreadLocked(codec)
                     return

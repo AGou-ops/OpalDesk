@@ -256,6 +256,12 @@ public final class AndroidDisplayDriver
         }
     }
 
+    @Override
+    public int getHostDisplayDpi() {
+        int[] metrics = services.getPrimaryDisplayMetrics();
+        return (metrics != null && metrics.length >= 3 && metrics[2] > 0) ? metrics[2] : 0;
+    }
+
     private Intent resolveSafeLaunchIntent(String pkg, String cls) {
         if (services.context == null || !PackagePolicy.isValidPackageName(pkg)) return null;
         PackageManager pm = services.context.getPackageManager();

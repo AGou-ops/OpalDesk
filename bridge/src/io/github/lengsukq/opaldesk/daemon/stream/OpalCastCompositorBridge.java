@@ -21,6 +21,7 @@ import io.github.lengsukq.opaldesk.daemon.audio.AudioStreamCapturer;
 import io.github.lengsukq.opaldesk.daemon.compositor.CompositorEngine;
 import io.github.lengsukq.opaldesk.daemon.compositor.WindowSession;
 import io.github.lengsukq.opaldesk.daemon.input.ExternalMouseRouter;
+import io.github.lengsukq.opaldesk.daemon.input.ImmsDumpInspector;
 import io.github.lengsukq.opaldesk.daemon.input.PerDisplayInputRouter;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
 import io.github.lengsukq.opaldesk.daemon.platform.AndroidDisplayDriver;
@@ -120,6 +121,8 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         volatile long mouseDownTimeMs = 0L;
         volatile long touchDownTimeMs = 0L;
         volatile int mouseButtons = 0;
+        volatile int lastImeShowSeq = -1;
+        volatile long imeProbeGen = 0L;
         volatile boolean closed = false;
 
         ActiveRemoteSession(int sessionId, int sinkType, boolean standalone, String pkg, String cls) {
@@ -285,6 +288,43 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         int sid = desktopSessionId;
         ActiveRemoteSession s = (sid > 0) ? sessions.get(sid) : null;
         return (s != null && !s.closed) ? s.displayId : -1;
+    }
+
+    /** Forwards a soft-keyboard show/hide request to the active remote desktop receiver (e.g. Tablet). */
+    public void sendDesktopImeRequest(boolean show, int inputType) {
+        int sid = desktopSessionId;
+        ActiveRemoteSession s = (sid > 0) ? sessions.get(sid) : null;
+        if (s != null && !s.closed) {
+            server.sendImeRequest(sid, show, inputType);
+        }
+    }
+
+    private void scheduleStandaloneImeProbe(ActiveRemoteSession s, long tapDownMs) {
+        if (s == null || !s.standalone || s.closed || s.displayId <= 0) return;
+        final long gen = ++s.imeProbeGen;
+        final int targetDisplayId = s.displayId;
+        worker.execute(() -> {
+            for (long waitMs : new long[]{140L, 200L, 260L}) {
+                SystemClock.sleep(waitMs);
+                if (s.closed || s.imeProbeGen != gen || s.displayId != targetDisplayId) return;
+                ImmsDumpInspector.Snapshot snap = AndroidServices.inspectInputMethodService(targetDisplayId);
+                if (snap == null || s.closed || s.imeProbeGen != gen) return;
+                long nowMs = SystemClock.uptimeMillis();
+                if (ImmsDumpInspector.shouldTriggerRemoteCastIme(
+                        snap, targetDisplayId, s.lastImeShowSeq, tapDownMs, nowMs)) {
+                    s.lastImeShowSeq = snap.latestShowSeq;
+                    s.imeProbeGen = gen + 1L;
+                    int rawType = snap.effectiveInputType(targetDisplayId);
+                    int hostType = ImmsDumpInspector.sanitizeHostInputType(rawType);
+                    System.out.println("OPALDESK_STANDALONE_IME_FORWARD sid=" + s.sessionId
+                            + " display=" + targetDisplayId
+                            + " seq=" + snap.latestShowSeq
+                            + " hostType=0x" + Integer.toHexString(hostType));
+                    server.sendImeRequest(s.sessionId, true, hostType);
+                    return;
+                }
+            }
+        });
     }
 
     public float getActiveNativeFps() {
@@ -467,6 +507,9 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         } finally {
             ev.recycle();
         }
+        if (s.standalone && msg.action == OpalCastProtocol.MOUSE_BUTTON_UP) {
+            scheduleStandaloneImeProbe(s, s.mouseDownTimeMs > 0L ? s.mouseDownTimeMs : now);
+        }
     }
 
     @Override
@@ -502,6 +545,9 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
             inputRouter.injectRawEventToDisplay(ev, s.displayId, s.vdUniqueId, s.width, s.height);
         } finally {
             ev.recycle();
+        }
+        if (s.standalone && msg.action == OpalCastProtocol.TOUCH_UP) {
+            scheduleStandaloneImeProbe(s, s.touchDownTimeMs > 0L ? s.touchDownTimeMs : now);
         }
     }
 
@@ -658,12 +704,17 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         ActiveRemoteSession s = new ActiveRemoteSession(
                 sessionId, sinkType, standalone, hello.appPackage, hello.appActivity);
         synchronized (s.lock) {
-            int[] aligned = DisplayGeometryUtil.alignForEncoder(hello.width, hello.height, 8);
-            s.width = aligned[0];
-            s.height = aligned[1];
-            s.dpi = standalone
-                    ? resolveHostAdaptedStandaloneDpi(s.width, s.height, hello.dpi)
-                    : DisplayGeometryUtil.clampDpi(hello.dpi, s.width, s.height);
+            if (standalone) {
+                int[] spec = resolveStandaloneStreamSpec(hello.width, hello.height, hello.dpi);
+                s.width = spec[0];
+                s.height = spec[1];
+                s.dpi = spec[2];
+            } else {
+                int[] aligned = DisplayGeometryUtil.alignForEncoder(hello.width, hello.height, 8);
+                s.width = aligned[0];
+                s.height = aligned[1];
+                s.dpi = DisplayGeometryUtil.clampDpi(hello.dpi, s.width, s.height);
+            }
             float nativeFps = DisplayGeometryUtil.clampFps(hello.fps > 0 ? hello.fps : 60f, 60f);
             s.requestedNativeFps = nativeFps;
             int cfgFps = config.getTargetFps();
@@ -790,16 +841,20 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
     private void reconfigureSession(ActiveRemoteSession s, OpalCastProtocol.ResizeConfig cfg) {
         synchronized (s.lock) {
             if (s.closed || s.sink == null || s.vd == null) return;
-            int[] aligned = DisplayGeometryUtil.alignForEncoder(
-                    cfg.width > 0 ? cfg.width : s.width,
-                    cfg.height > 0 ? cfg.height : s.height,
-                    8);
-            int nextW = aligned[0];
-            int nextH = aligned[1];
+            int reqW = cfg.width > 0 ? cfg.width : s.width;
+            int reqH = cfg.height > 0 ? cfg.height : s.height;
+            int nextW;
+            int nextH;
             int nextDpi;
             if (s.standalone) {
-                nextDpi = resolveHostAdaptedStandaloneDpi(nextW, nextH, cfg.dpi);
+                int[] spec = resolveStandaloneStreamSpec(reqW, reqH, cfg.dpi);
+                nextW = spec[0];
+                nextH = spec[1];
+                nextDpi = spec[2];
             } else {
+                int[] aligned = DisplayGeometryUtil.alignForEncoder(reqW, reqH, 8);
+                nextW = aligned[0];
+                nextH = aligned[1];
                 nextDpi = (cfg.dpi > 0) ? DisplayGeometryUtil.clampDpi(cfg.dpi, nextW, nextH) : s.dpi;
             }
             float nextFps = (cfg.fpsX100 > 0) ? DisplayGeometryUtil.clampFps(cfg.fpsX100 / 100f, s.fps) : s.fps;
@@ -831,12 +886,7 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         }
     }
 
-    private int resolveHostAdaptedStandaloneDpi(int streamW, int streamH, int requestedDpi) {
-        if (requestedDpi >= 120 && requestedDpi <= 480) {
-            // Respect explicit manual override when a client requests a non-zero custom DPI;
-            // default 0 delegates to host physical Display 0 adaptation.
-            return requestedDpi;
-        }
+    private int[] resolveStandaloneStreamSpec(int reqW, int reqH, int requestedDpi) {
         int[] hostMetrics = services.getPrimaryDisplayMetrics();
         int hostW = (hostMetrics != null && hostMetrics.length >= 3 && hostMetrics[0] > 0)
                 ? hostMetrics[0] : config.getCanvasWidth();
@@ -844,8 +894,8 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                 ? hostMetrics[1] : config.getCanvasHeight();
         int hostDpi = (hostMetrics != null && hostMetrics.length >= 3 && hostMetrics[2] > 0)
                 ? hostMetrics[2] : config.getCanvasDpi();
-        return DisplayGeometryUtil.computeStandaloneAppDpi(
-                streamW, streamH, hostW, hostH, hostDpi, config.getWindowDpiScalePct());
+        return DisplayGeometryUtil.resolveStandaloneStreamSpec(
+                reqW, reqH, requestedDpi, hostW, hostH, hostDpi, config.getWindowDpiScalePct());
     }
 
     private static int computeRecommendedBitrateKbps(int w, int h, float fps) {

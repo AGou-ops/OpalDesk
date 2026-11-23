@@ -33,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -92,6 +93,9 @@ class PeerCastViewerActivity : ComponentActivity() {
     private var toolbarExpanded by mutableStateOf(true)
     private var imeVisible by mutableStateOf(false)
     private var composingText by mutableStateOf("")
+    private var remoteImeReqSeq by mutableLongStateOf(0L)
+    private var remoteImeShow by mutableStateOf(false)
+    private var remoteImeInputType by mutableIntStateOf(0)
     private var errorText by mutableStateOf("")
     private var showAppPicker by mutableStateOf(false)
     private var remoteApps by mutableStateOf<List<OpalCastPeerClient.RemoteAppEntry>>(emptyList())
@@ -171,6 +175,14 @@ class PeerCastViewerActivity : ComponentActivity() {
                     if (connected && toolbarExpanded) {
                         kotlinx.coroutines.delay(2_200L)
                         toolbarExpanded = false
+                    }
+                }
+                LaunchedEffect(remoteImeReqSeq) {
+                    if (remoteImeReqSeq <= 0L || showAppPicker) return@LaunchedEffect
+                    if (remoteImeShow) {
+                        imeController.showKeyboard(remoteImeInputType)
+                    } else if (imeVisible) {
+                        imeController.hideKeyboard()
                     }
                 }
                 Box(modifier = Modifier.fillMaxSize()) {
@@ -290,6 +302,14 @@ class PeerCastViewerActivity : ComponentActivity() {
                 override fun onAppListReceived(apps: List<OpalCastPeerClient.RemoteAppEntry>) {
                     runOnUiThread {
                         remoteApps = apps
+                    }
+                }
+
+                override fun onRemoteImeRequest(show: Boolean, inputType: Int) {
+                    runOnUiThread {
+                        remoteImeShow = show
+                        remoteImeInputType = inputType
+                        remoteImeReqSeq += 1L
                     }
                 }
 

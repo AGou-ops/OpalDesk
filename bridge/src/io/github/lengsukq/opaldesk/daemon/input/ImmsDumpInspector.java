@@ -223,6 +223,33 @@ public final class ImmsDumpInspector {
         if (snap == null || targetDisplayId <= 0 || snap.inputShown) {
             return false;
         }
+        return matchesFreshShowRequest(snap, targetDisplayId, lastHandledShowSeq, tapDownUptimeMs, nowUptimeMs);
+    }
+
+    /**
+     * Decides whether to forward an IME open request to an active OpalCast remote receiver
+     * (e.g. Tablet viewing Phone's desktop or standalone floating app). Unlike Display 0 local bridge,
+     * this ALSO fires when {@code snap.inputShown == true} (Android 16 popped the keyboard on the
+     * sender phone's screen while the user is actually typing on the remote tablet!).
+     */
+    public static boolean shouldTriggerRemoteCastIme(
+            Snapshot snap,
+            int targetDisplayId,
+            int lastHandledShowSeq,
+            long tapDownUptimeMs,
+            long nowUptimeMs) {
+        if (snap == null || targetDisplayId <= 0) {
+            return false;
+        }
+        return matchesFreshShowRequest(snap, targetDisplayId, lastHandledShowSeq, tapDownUptimeMs, nowUptimeMs);
+    }
+
+    private static boolean matchesFreshShowRequest(
+            Snapshot snap,
+            int targetDisplayId,
+            int lastHandledShowSeq,
+            long tapDownUptimeMs,
+            long nowUptimeMs) {
         if (snap.latestShowSeq <= 0 || snap.latestShowSeq <= lastHandledShowSeq) {
             return false;
         }

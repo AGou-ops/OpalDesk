@@ -42,6 +42,7 @@ public final class OpalCastProtocol {
     public static final int TYPE_FILE_TRANSFER_ACK = 0x13;
     public static final int TYPE_WIFI_UPGRADE_READY = 0x14;
     public static final int TYPE_APP_LIST = 0x15;
+    public static final int TYPE_IME_REQUEST = 0x16;
     public static final int TYPE_PONG = 0x1F;
 
     // Uplink frame types (Mac -> Android)
@@ -636,6 +637,14 @@ public final class OpalCastProtocol {
         }
         String json = new SimpleJson.ObjectBuilder()
                 .putRaw("apps", arr.build())
+                .build();
+        return json.getBytes(StandardCharsets.UTF_8);
+    }
+
+    public static byte[] encodeImeRequest(boolean show, int inputType) {
+        String json = new SimpleJson.ObjectBuilder()
+                .put("show", show)
+                .put("inputType", inputType)
                 .build();
         return json.getBytes(StandardCharsets.UTF_8);
     }

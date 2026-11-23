@@ -247,33 +247,33 @@ fun UnifiedAppLauncherPanel(
             }
             else -> {
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 88.dp),
+                    columns = GridCells.Adaptive(minSize = 84.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f, fill = false),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(sortedItems, key = { it.pkg }) { app ->
                         val icon = remember(app.pkg) { AppCatalogRepository.getAppIcon(ctx, app.pkg) }
                         val highlighted = app.isPinnedDesktop || app.isPinnedDock
+                        val tileBg = if (highlighted) OpalPalette.ChipFill else Color.Transparent
                         val tileModifier = if (onContextApp != null) {
                             Modifier
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(if (highlighted) OpalPalette.ChipFill else Color.Transparent)
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(tileBg)
                                 .onTapOrContextAction(
                                     app.pkg,
                                     onPrimaryTap = { onSelectApp(app) },
                                     onContextAction = { rootPos -> onContextApp(app, rootPos) },
                                 )
-                                .padding(vertical = 8.dp, horizontal = 5.dp)
+                                .padding(vertical = 8.dp, horizontal = 4.dp)
                         } else {
                             Modifier
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(OpalPalette.ChipFill.copy(alpha = 0.65f))
-                                .border(0.6.dp, OpalPalette.BorderHairline, RoundedCornerShape(14.dp))
+                                .clip(RoundedCornerShape(16.dp))
+                                .background(tileBg)
                                 .clickable { onSelectApp(app) }
-                                .padding(vertical = 8.dp, horizontal = 5.dp)
+                                .padding(vertical = 8.dp, horizontal = 4.dp)
                         }
 
                         Column(
@@ -286,22 +286,27 @@ fun UnifiedAppLauncherPanel(
                                         bitmap = icon,
                                         contentDescription = app.label,
                                         modifier = Modifier
-                                            .size(46.dp)
-                                            .clip(RoundedCornerShape(12.dp)),
+                                            .size(50.dp)
+                                            .clip(RoundedCornerShape(14.dp)),
                                     )
                                 } else {
                                     val tint = seedAvatarColor(app.pkg)
+                                    val isDark = OpalPalette.isDark
                                     Box(
                                         modifier = Modifier
-                                            .size(46.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(tint.copy(alpha = 0.18f))
-                                            .border(0.75.dp, tint.copy(alpha = 0.35f), RoundedCornerShape(12.dp)),
+                                            .size(50.dp)
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(tint.copy(alpha = if (isDark) 0.24f else 0.14f))
+                                            .border(
+                                                0.85.dp,
+                                                tint.copy(alpha = if (isDark) 0.45f else 0.28f),
+                                                RoundedCornerShape(14.dp),
+                                            ),
                                         contentAlignment = Alignment.Center,
                                     ) {
                                         OpalText(
                                             text = app.label.trim().take(1).ifEmpty { "A" },
-                                            fontSize = 18.sp,
+                                            fontSize = 19.sp,
                                             fontWeight = FontWeight.Bold,
                                             color = tint,
                                         )
@@ -312,7 +317,8 @@ fun UnifiedAppLauncherPanel(
                                         modifier = Modifier
                                             .align(Alignment.TopEnd)
                                             .clip(CircleShape)
-                                            .background(OpalPalette.AccentBlue.copy(alpha = 0.88f))
+                                            .background(OpalPalette.AccentBlue)
+                                            .border(1.dp, OpalPalette.GlassPopover, CircleShape)
                                             .padding(horizontal = 5.dp, vertical = 1.dp),
                                     ) {
                                         OpalText(
@@ -328,7 +334,8 @@ fun UnifiedAppLauncherPanel(
                             Spacer(Modifier.height(6.dp))
                             OpalText(
                                 text = if (highlighted) "★ ${app.label}" else app.label,
-                                fontSize = 11.sp,
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.Medium,
                                 maxLines = 1,
                                 color = OpalPalette.TextPrimary,
                             )

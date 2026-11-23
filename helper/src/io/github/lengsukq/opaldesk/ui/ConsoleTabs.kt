@@ -49,6 +49,8 @@ import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.CompositorScene
 import io.github.lengsukq.opaldesk.protocol.DaemonStatus
 import io.github.lengsukq.opaldesk.protocol.RemoteStreamStatus
+import io.github.lengsukq.opaldesk.update.AppUpdateLogic
+import io.github.lengsukq.opaldesk.update.AppUpdateManager
 import java.util.Locale
 import kotlin.math.abs
 
@@ -90,6 +92,8 @@ fun ConsoleDashboardTab(
     scene: CompositorScene,
     remote: RemoteStreamStatus,
     extDisplay: BridgeService.ExternalDisplayInfo?,
+    needsLocalNetworkPerm: Boolean = false,
+    onRequestLocalNetworkPerm: () -> Unit = {},
     onEnterLocalDesktop: () -> Unit,
     onOpenRemoteTrackpad: () -> Unit,
     onOpenExternalOrTrackpad: (Int) -> Unit,
@@ -488,6 +492,29 @@ fun ConsoleDashboardTab(
                                 }
                             }
                         }
+                    }
+                } else if (needsLocalNetworkPerm) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(OpalPalette.ChipFill)
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        OpalText(
+                            text = "授权本地网络权限后可自动发现同局域网设备",
+                            fontSize = 12.sp,
+                            color = OpalPalette.TextSecondary,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        OpalButton(
+                            label = "开启发现",
+                            compact = true,
+                            onClick = onRequestLocalNetworkPerm,
+                        )
                     }
                 } else {
                     Box(
@@ -1182,10 +1209,14 @@ fun ConsoleDisplaySettingsTab(
 fun ConsoleEngineSettingsTab(
     status: DaemonStatus,
     onOpenActivation: () -> Unit,
+    onOpenUpdateModal: () -> Unit,
     onStopEngine: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val sortByUsage by AppPrefs.sortAppsByUsageFlow.collectAsState()
+    val autoCheckUpdate by AppPrefs.autoCheckUpdateFlow.collectAsState()
+    val updateState by AppUpdateManager.stateFlow.collectAsState()
+    val currentVersion = remember(ctx) { AppUpdateManager.getCurrentVersionName(ctx) }
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         MacGlassSectionCard {
@@ -1199,6 +1230,106 @@ fun ConsoleEngineSettingsTab(
                     AppPrefs.setSortAppsByUsage(ctx, enabled)
                 },
             )
+        }
+
+        MacGlassSectionCard {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    OpalText(text = "应用更新", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    OpalText(
+                        text = "当前版本 v$currentVersion · GitHub Releases 直连校验",
+                        fontSize = 12.sp,
+                        color = OpalPalette.TextSecondary,
+                    )
+                }
+                when (val st = updateState) {
+                    is AppUpdateManager.UpdateState.UpdateAvailable ->
+                        OpalStatusBadge(label = "新版本 ${st.release.tagName}", color = OpalPalette.AccentBlue)
+                    is AppUpdateManager.UpdateState.ReadyToInstall ->
+                        OpalStatusBadge(label = "待安装 ${st.release.tagName}", color = OpalPalette.AccentEmerald)
+                    is AppUpdateManager.UpdateState.Downloading -> {
+                        val pct = if (st.totalBytes > 0L) ((st.downloadedBytes * 100L) / st.totalBytes).toInt() else 0
+                        OpalStatusBadge(label = "下载中 $pct%", color = OpalPalette.AccentBlue)
+                    }
+                    is AppUpdateManager.UpdateState.UpToDate ->
+                        OpalStatusBadge(label = "已是最新", color = OpalPalette.AccentEmerald)
+                    is AppUpdateManager.UpdateState.Checking ->
+                        OpalStatusBadge(label = "检查中…", color = OpalPalette.AccentCyan)
+                    else -> {}
+                }
+            }
+
+            if (updateState is AppUpdateManager.UpdateState.Error) {
+                Spacer(Modifier.height(8.dp))
+                OpalText(
+                    text = (updateState as AppUpdateManager.UpdateState.Error).message,
+                    fontSize = 12.sp,
+                    color = OpalPalette.AccentDanger,
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+            OpalSwitchRow(
+                title = "启动时自动检查新版本",
+                subtitle = "每 6 小时静默检查一次 GitHub Releases，发现正式版更新后在顶栏轻提醒",
+                checked = autoCheckUpdate,
+                onCheckedChange = { enabled ->
+                    AppPrefs.setAutoCheckUpdate(ctx, enabled)
+                },
+            )
+
+            Spacer(Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                val primaryLabel = when (val st = updateState) {
+                    is AppUpdateManager.UpdateState.Checking -> "正在检查更新…"
+                    is AppUpdateManager.UpdateState.UpdateAvailable -> "更新至 ${st.release.tagName}"
+                    is AppUpdateManager.UpdateState.Downloading -> "查看下载进度"
+                    is AppUpdateManager.UpdateState.ReadyToInstall -> "立即安装 ${st.release.tagName}"
+                    else -> "检查更新"
+                }
+                val primaryAccent = when (updateState) {
+                    is AppUpdateManager.UpdateState.ReadyToInstall -> OpalPalette.AccentEmerald
+                    else -> OpalPalette.AccentBlue
+                }
+                OpalButton(
+                    label = primaryLabel,
+                    compact = true,
+                    filled = updateState is AppUpdateManager.UpdateState.UpdateAvailable ||
+                        updateState is AppUpdateManager.UpdateState.ReadyToInstall,
+                    enabled = updateState !is AppUpdateManager.UpdateState.Checking,
+                    accent = primaryAccent,
+                    onClick = {
+                        when (updateState) {
+                            is AppUpdateManager.UpdateState.UpdateAvailable,
+                            is AppUpdateManager.UpdateState.Downloading,
+                            is AppUpdateManager.UpdateState.ReadyToInstall,
+                            -> onOpenUpdateModal()
+                            else -> {
+                                AppUpdateManager.checkForUpdates(ctx, userInitiated = true)
+                                onOpenUpdateModal()
+                            }
+                        }
+                    },
+                    modifier = Modifier.weight(1.35f),
+                )
+                OpalButton(
+                    label = "GitHub Releases ↗",
+                    compact = true,
+                    filled = false,
+                    accent = OpalPalette.AccentCyan,
+                    onClick = {
+                        AppUpdateManager.openReleaseInBrowser(ctx, AppUpdateLogic.ALL_RELEASES_WEB_URL)
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
 
         MacGlassSectionCard {

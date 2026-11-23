@@ -9,8 +9,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.content.res.Configuration
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Outline
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
@@ -243,10 +246,7 @@ class PeerFloatingAppService : Service() {
 
     private fun connectRemoteStandaloneApp() {
         updateOverlayStatus("正在连接 $peerLabel…", dotColor = 0xFFF59E0B.toInt(), showRetry = false)
-        val (streamW, streamH) = computeStreamSizeForView(expandedW, expandedH)
-        // Pass reqDpi=0 so the host (被投屏端) adapts DPI dynamically to its real physical screen DPI
-        // and the floating window's stream resolution/aspect ratio.
-        val reqDpi = 0
+        val (streamW, streamH, reqDpi) = computeStreamSpecForView(expandedW, expandedH)
         val savedTok = AppPrefs.getPeerAuthToken(this, host)
         val tokenToUse = savedTok.ifBlank { handoverToken }
         handoverToken = "" // single-use in memory only
@@ -290,8 +290,25 @@ class PeerFloatingAppService : Service() {
 
                 override fun onVideoSizeChanged(width: Int, height: Int, fps: Int) {
                     mainHandler.post {
-                        statusDotView?.background = circleDrawable(0xFF10B981.toInt())
+                        try {
+                            textureView?.surfaceTexture?.setDefaultBufferSize(
+                                width.coerceAtLeast(2),
+                                height.coerceAtLeast(2),
+                            )
+                        } catch (_: Throwable) {
+                        }
+                        statusDotView?.background = circleDrawable(0xFF28C840.toInt())
                         overlayBanner?.visibility = View.GONE
+                    }
+                }
+
+                override fun onRemoteImeRequest(show: Boolean, inputType: Int) {
+                    mainHandler.post {
+                        if (show && !isCollapsed) {
+                            showImeBar()
+                        } else if (!show && isImeBarVisible) {
+                            hideImeBar()
+                        }
                     }
                 }
 
@@ -331,83 +348,135 @@ class PeerFloatingAppService : Service() {
         val windowManager = wm ?: return
         val dm = resources.displayMetrics
         val minScreen = min(dm.widthPixels, dm.heightPixels)
-        expandedW = (minScreen * 0.48f).roundToInt().coerceIn(dp(230), dp(360))
-        expandedH = (expandedW * 1.72f).roundToInt().coerceIn(dp(340), (dm.heightPixels * 0.78f).roundToInt())
+        val minScreenDp = minScreen / dm.density
+        if (minScreenDp >= 580f) {
+            // Tablet receiver: size floating window to a crisp, comfortable phone width (~390dp)
+            expandedW = dp(390).coerceAtMost((dm.widthPixels * 0.44f).roundToInt())
+            expandedH = (expandedW * 1.72f).roundToInt().coerceIn(dp(440), (dm.heightPixels * 0.82f).roundToInt())
+        } else {
+            expandedW = (minScreen * 0.56f).roundToInt().coerceIn(dp(230), dp(330))
+            expandedH = (expandedW * 1.70f).roundToInt().coerceIn(dp(340), (dm.heightPixels * 0.74f).roundToInt())
+        }
         savedX = dp(18)
         savedY = dp(90)
 
+        AppPrefs.hydrateFlows(this)
+        val isDark = resolveFloatingDarkTheme()
+        val containerBg = if (isDark) 0xF2191E2A.toInt() else 0xF5F6F9FE.toInt()
+        val containerStroke = if (isDark) 0x3AFFFFFF else 0xC8D2DEEE.toInt()
+        val headerBg = if (isDark) 0xEB222838.toInt() else 0xF0FFFFFF.toInt()
+        val dividerColor = if (isDark) 0x24FFFFFF else 0x1A0F172A
+        val titleInk = if (isDark) 0xFFF5F7FB.toInt() else 0xFF0F172A.toInt()
+        val pillBg = if (isDark) 0x1CFFFFFF else 0x100F172A
+        val pillBorder = if (isDark) 0x2EFFFFFF else 0x1E0F172A
+        val pillInk = if (isDark) 0xFFD8E1F0.toInt() else 0xFF334155.toInt()
+        val imeBarBg = if (isDark) 0xF5151A25.toInt() else 0xF5EEF3FA.toInt()
+        val canvasBg = if (isDark) 0xFF0B0E15.toInt() else 0xFFF4F7FC.toInt()
+        val bannerBg = if (isDark) 0xE6101520.toInt() else 0xEBF4F8FE.toInt()
+        val cornerRadiusPx = dp(20).toFloat()
+
+        val strokePx = max(2, (1.25f * resources.displayMetrics.density).roundToInt())
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                setColor(0xEE141822.toInt())
-                cornerRadius = dp(18).toFloat()
-                setStroke(dp(1), 0x44FFFFFF)
+                setColor(containerBg)
+                cornerRadius = cornerRadiusPx
+                setStroke(strokePx, containerStroke)
             }
-            elevation = dp(16).toFloat()
+            setPadding(strokePx, strokePx, strokePx, strokePx)
+            // Keep elevation = 0f on root TYPE_APPLICATION_OVERLAY view: dynamic 3D HWUI shadow on a
+            // tight-bounded overlay window gets clipped along left/right edges and flashes on every
+            // 60fps TextureView scroll frame on Adreno GPUs. Clean static frosted bezel = zero flicker.
+            elevation = 0f
             outlineProvider = object : ViewOutlineProvider() {
                 override fun getOutline(view: View, outline: Outline) {
-                    outline.setRoundRect(0, 0, view.width, view.height, dp(18).toFloat())
+                    outline.setRoundRect(0, 0, view.width, view.height, cornerRadiusPx)
                 }
             }
             clipToOutline = true
         }
 
-        // ---- Integrated macOS-style Header Bar (Drag to move + quick controls) ----
+        // ---- Authentic macOS Liquid Frosted Glass Title Bar (40dp) ----
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0xE01A202E.toInt())
-            setPadding(dp(10), dp(4), dp(6), dp(4))
+            setBackgroundColor(headerBg)
+            setPadding(dp(12), dp(6), dp(10), dp(6))
         }
+
+        // macOS Traffic Lights: Red = Close, Yellow = Collapse to Bubble, Green = Rotate Orientation
+        val lightsRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        lightsRow.addView(
+            buildTrafficLightDot(0xFFFF5F57.toInt(), 0xFFE0443E.toInt()) { stopSelf() },
+            LinearLayout.LayoutParams(dp(13), dp(13)).apply { rightMargin = dp(7) },
+        )
+        lightsRow.addView(
+            buildTrafficLightDot(0xFFFEBC2E.toInt(), 0xFFD89E24.toInt()) { collapseToBubble() },
+            LinearLayout.LayoutParams(dp(13), dp(13)).apply { rightMargin = dp(7) },
+        )
+        lightsRow.addView(
+            buildTrafficLightDot(0xFF28C840.toInt(), 0xFF1AAB29.toInt()) { toggleOrientation() },
+            LinearLayout.LayoutParams(dp(13), dp(13)).apply { rightMargin = dp(10) },
+        )
+        header.addView(lightsRow)
 
         val dot = View(this).apply {
             background = circleDrawable(0xFFF59E0B.toInt())
         }
         statusDotView = dot
-        header.addView(dot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { rightMargin = dp(7) })
+        header.addView(dot, LinearLayout.LayoutParams(dp(6), dp(6)).apply { rightMargin = dp(6) })
 
         val titleTv = TextView(this).apply {
             text = appLabel
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(titleInk)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
             maxLines = 1
             ellipsize = TextUtils.TruncateAt.END
         }
         titleTextView = titleTv
-        header.addView(titleTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        header.addView(titleTv, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+            rightMargin = dp(8)
+        })
 
-        header.addView(buildHeaderBtn("←", 0xFFE2E8F0.toInt()) {
-            client?.sendSystemAction(OpalCastPeerClient.SYS_BACK)
-        })
-        header.addView(buildHeaderBtn("⌨", 0xFFE2E8F0.toInt()) {
-            toggleImeBar()
-        })
-        header.addView(buildHeaderBtn("↻", 0xFFE2E8F0.toInt()) {
-            toggleOrientation()
-        })
-        header.addView(buildHeaderBtn("—", 0xFFE2E8F0.toInt()) {
-            collapseToBubble()
-        })
-        header.addView(buildHeaderBtn("×", 0xFFF87171.toInt()) {
-            stopSelf()
-        })
+        header.addView(
+            buildHeaderPill("返回", pillBg, pillBorder, pillInk) {
+                client?.sendSystemAction(OpalCastPeerClient.SYS_BACK)
+            },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                rightMargin = dp(5)
+            },
+        )
+        header.addView(
+            buildHeaderPill("键盘", pillBg, pillBorder, pillInk) {
+                toggleImeBar()
+            },
+        )
 
         installDragMoveListener(header)
-        container.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(36)))
+        container.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+
+        // Hairline macOS titlebar separator
+        container.addView(
+            View(this).apply { setBackgroundColor(dividerColor) },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, max(1, dp(1))),
+        )
 
         // ---- Optional Inline IME Input Bar (hidden by default so touches outside go to local apps) ----
         val imeBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(0xF0111622.toInt())
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setBackgroundColor(imeBarBg)
+            setPadding(dp(10), dp(6), dp(10), dp(6))
             visibility = View.GONE
         }
         val edit = EditText(this).apply {
             hint = "输入文字发送到 $appLabel…"
-            setHintTextColor(0x88CBD5E1.toInt())
-            setTextColor(Color.WHITE)
+            setHintTextColor(if (isDark) 0x88CBD5E1.toInt() else 0x8864748B.toInt())
+            setTextColor(titleInk)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setBackgroundColor(Color.TRANSPARENT)
             isSingleLine = true
@@ -431,28 +500,37 @@ class PeerFloatingAppService : Service() {
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
-                setColor(0xFF2563EB.toInt())
-                cornerRadius = dp(10).toFloat()
+                setColor(0xFF007AFF.toInt())
+                cornerRadius = dp(12).toFloat()
             }
-            setPadding(dp(10), dp(5), dp(10), dp(5))
+            setPadding(dp(12), dp(5), dp(12), dp(5))
             setOnClickListener { sendImeBarText() }
         }
         imeBar.addView(edit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         imeBar.addView(sendBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-            leftMargin = dp(6)
+            leftMargin = dp(8)
         })
         imeInputBar = imeBar
         container.addView(imeBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // ---- Live TextureView Content Area + Status Overlay + Corner Resize Handle ----
+        // ---- Live Zero-Flicker Opaque TextureView Content Area + Status Overlay + Corner Resize Handle ----
         val body = FrameLayout(this).apply {
-            setBackgroundColor(0xFF0A0D14.toInt())
+            setBackgroundColor(canvasBg)
         }
 
         val tv = TextureView(this).apply {
-            isOpaque = false
+            // Strictly opaque video surface prevents HWUI alpha-blend flickering on Qualcomm Adreno overlays
+            isOpaque = true
             surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                 override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                    val rw = client?.remoteWidth ?: width
+                    val rh = client?.remoteHeight ?: height
+                    if (rw >= 2 && rh >= 2) {
+                        try {
+                            st.setDefaultBufferSize(rw, rh)
+                        } catch (_: Throwable) {
+                        }
+                    }
                     activeSurface?.release()
                     val surf = Surface(st)
                     activeSurface = surf
@@ -460,7 +538,14 @@ class PeerFloatingAppService : Service() {
                 }
 
                 override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
-                    client?.requestKeyFrame()
+                    val rw = client?.remoteWidth ?: return
+                    val rh = client?.remoteHeight ?: return
+                    if (rw >= 2 && rh >= 2) {
+                        try {
+                            st.setDefaultBufferSize(rw, rh)
+                        } catch (_: Throwable) {
+                        }
+                    }
                 }
 
                 override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
@@ -499,12 +584,12 @@ class PeerFloatingAppService : Service() {
         val banner = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
-            setBackgroundColor(0xCC0D111A.toInt())
+            setBackgroundColor(bannerBg)
             setPadding(dp(18), dp(18), dp(18), dp(18))
         }
         val bannerTv = TextView(this).apply {
             text = "正在连接…"
-            setTextColor(Color.WHITE)
+            setTextColor(titleInk)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             gravity = Gravity.CENTER
         }
@@ -515,7 +600,7 @@ class PeerFloatingAppService : Service() {
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
             background = GradientDrawable().apply {
-                setColor(0xFF2563EB.toInt())
+                setColor(0xFF007AFF.toInt())
                 cornerRadius = dp(14).toFloat()
             }
             setPadding(dp(16), dp(7), dp(16), dp(7))
@@ -534,18 +619,28 @@ class PeerFloatingAppService : Service() {
         })
         body.addView(banner, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
-        // Bottom-right corner resize grip
-        val resizeGrip = TextView(this).apply {
-            text = "◢"
-            setTextColor(0xAAFFFFFF.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            gravity = Gravity.BOTTOM or Gravity.END
-            setPadding(dp(4), dp(4), dp(4), dp(2))
+        // Sleek macOS 2-line diagonal bottom-right resize grip matching CompositorWindowNode
+        val gripTint = if (isDark) 0x99CBD5E1.toInt() else 0x88475569.toInt()
+        val resizeGrip = object : View(this) {
+            private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = gripTint
+                strokeWidth = dp(2).toFloat().coerceAtLeast(2.2f)
+                strokeCap = Paint.Cap.ROUND
+            }
+            override fun onDraw(canvas: Canvas) {
+                super.onDraw(canvas)
+                val pad = dp(6).toFloat()
+                val w = width.toFloat() - pad
+                val h = height.toFloat() - pad
+                val span = dp(10).toFloat()
+                canvas.drawLine(w - span, h, w, h - span, paint)
+                canvas.drawLine(w - span * 0.52f, h, w, h - span * 0.52f, paint)
+            }
         }
         installResizeListener(resizeGrip)
         body.addView(
             resizeGrip,
-            FrameLayout.LayoutParams(dp(28), dp(28), Gravity.BOTTOM or Gravity.END),
+            FrameLayout.LayoutParams(dp(34), dp(34), Gravity.BOTTOM or Gravity.END),
         )
 
         container.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
@@ -576,18 +671,43 @@ class PeerFloatingAppService : Service() {
         }
     }
 
-    private fun buildHeaderBtn(label: String, textColor: Int, onClick: () -> Unit): TextView =
-        TextView(this).apply {
-            text = label
-            setTextColor(textColor)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-            minWidth = dp(28)
-            minHeight = dp(28)
-            setPadding(dp(4), dp(2), dp(4), dp(2))
+    private fun resolveFloatingDarkTheme(): Boolean = when (AppPrefs.themeModeFlow.value) {
+        AppPrefs.THEME_DARK -> true
+        AppPrefs.THEME_SYSTEM ->
+            (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        else -> false
+    }
+
+    private fun buildTrafficLightDot(fillColor: Int, borderColor: Int, onClick: () -> Unit): View =
+        View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(fillColor)
+                setStroke(max(1, (0.8f * resources.displayMetrics.density).roundToInt()), borderColor)
+            }
             setOnClickListener { onClick() }
         }
+
+    private fun buildHeaderPill(
+        label: String,
+        bgColor: Int,
+        borderColor: Int,
+        textColor: Int,
+        onClick: () -> Unit,
+    ): TextView = TextView(this).apply {
+        text = label
+        setTextColor(textColor)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        gravity = Gravity.CENTER
+        background = GradientDrawable().apply {
+            setColor(bgColor)
+            cornerRadius = dp(10).toFloat()
+            setStroke(max(1, (0.7f * resources.displayMetrics.density).roundToInt()), borderColor)
+        }
+        setPadding(dp(9), dp(4), dp(9), dp(4))
+        setOnClickListener { onClick() }
+    }
 
     @SuppressLint("ClickableViewAccessibility")
     private fun installDragMoveListener(handle: View) {
@@ -665,12 +785,23 @@ class PeerFloatingAppService : Service() {
         val dm = resources.displayMetrics
         isLandscape = !isLandscape
         if (isLandscape) {
-            expandedW = (dm.widthPixels * 0.84f).roundToInt().coerceIn(dp(320), dp(580))
-            expandedH = (expandedW * 0.62f).roundToInt().coerceIn(dp(230), (dm.heightPixels * 0.60f).roundToInt())
+            val minScreenDp = min(dm.widthPixels, dm.heightPixels) / dm.density
+            expandedW = if (minScreenDp >= 580f) {
+                dp(620).coerceAtMost((dm.widthPixels * 0.72f).roundToInt())
+            } else {
+                (dm.widthPixels * 0.84f).roundToInt().coerceIn(dp(320), dp(580))
+            }
+            expandedH = (expandedW * 0.62f).roundToInt().coerceIn(dp(240), (dm.heightPixels * 0.64f).roundToInt())
         } else {
             val minScreen = min(dm.widthPixels, dm.heightPixels)
-            expandedW = (minScreen * 0.48f).roundToInt().coerceIn(dp(230), dp(360))
-            expandedH = (expandedW * 1.72f).roundToInt().coerceIn(dp(340), (dm.heightPixels * 0.78f).roundToInt())
+            val minScreenDp = minScreen / dm.density
+            if (minScreenDp >= 580f) {
+                expandedW = dp(390).coerceAtMost((dm.widthPixels * 0.44f).roundToInt())
+                expandedH = (expandedW * 1.72f).roundToInt().coerceIn(dp(440), (dm.heightPixels * 0.82f).roundToInt())
+            } else {
+                expandedW = (minScreen * 0.56f).roundToInt().coerceIn(dp(230), dp(330))
+                expandedH = (expandedW * 1.70f).roundToInt().coerceIn(dp(340), (dm.heightPixels * 0.74f).roundToInt())
+            }
         }
         lp.width = expandedW
         lp.height = expandedH
@@ -683,46 +814,70 @@ class PeerFloatingAppService : Service() {
     }
 
     private fun commitRemoteResize() {
-        val (streamW, streamH) = computeStreamSizeForView(expandedW, expandedH)
-        // Pass dpi=0 so host recalculates host-adapted DPI for the new window dimensions
-        client?.sendResizeConfig(streamW, streamH, 0, 60, 10_000)
+        val (streamW, streamH, reqDpi) = computeStreamSpecForView(expandedW, expandedH)
+        client?.sendResizeConfig(streamW, streamH, reqDpi, 60, 12_000)
     }
 
-    private fun computeStreamSizeForView(viewW: Int, viewH: Int): Pair<Int, Int> {
-        val contentH = max(dp(180), viewH - dp(36))
+    /**
+     * Computes encoder-aligned `(streamW, streamH, reqDpi)` matched 1:1 to this floating window's
+     * physical dp dimensions on the receiver screen so text renders at native readable scale
+     * (never microscopic on high-DPI tablets) and remains safe even on narrow windows.
+     */
+    private fun computeStreamSpecForView(viewW: Int, viewH: Int): Triple<Int, Int, Int> {
+        val dm = resources.displayMetrics
+        val density = dm.density.coerceAtLeast(1f)
+        val contentH = max(dp(180), viewH - dp(41))
         val ratio = viewW.toFloat() / contentH.toFloat()
-        val targetLong = 1280
-        val w: Int
-        val h: Int
+        val targetLong = 1440
+        val rawW: Int
+        val rawH: Int
         if (ratio >= 1f) {
-            w = targetLong
-            h = (targetLong / ratio).roundToInt().coerceIn(540, 1280)
+            rawW = targetLong
+            rawH = (targetLong / ratio).roundToInt().coerceIn(544, targetLong)
         } else {
-            h = targetLong
-            w = (targetLong * ratio).roundToInt().coerceIn(540, 1280)
+            rawH = targetLong
+            rawW = (targetLong * ratio).roundToInt().coerceIn(544, targetLong)
         }
-        return (w and 7.inv()).coerceAtLeast(480) to (h and 7.inv()).coerceAtLeast(480)
+        val streamW = (rawW and 7.inv()).coerceAtLeast(544)
+        val streamH = (rawH and 7.inv()).coerceAtLeast(544)
+
+        val viewWdp = viewW / density
+        val viewHdp = contentH / density
+        val reqDpi = if (streamH >= streamW) {
+            val targetLogicalWdp = viewWdp.coerceIn(330f, 430f)
+            (streamW * 160f / targetLogicalWdp).roundToInt().coerceIn(240, 480)
+        } else {
+            val targetLogicalHdp = viewHdp.coerceIn(340f, 520f)
+            (streamH * 160f / targetLogicalHdp).roundToInt().coerceIn(240, 480)
+        }
+        return Triple(streamW, streamH, reqDpi)
     }
 
     @Suppress("DEPRECATION")
-    private fun toggleImeBar() {
+    private fun showImeBar() {
         val lp = layoutParams ?: return
         val rv = rootView ?: return
         val bar = imeInputBar ?: return
         val edit = imeEditText ?: return
-        isImeBarVisible = !isImeBarVisible
-        if (isImeBarVisible) {
-            bar.visibility = View.VISIBLE
-            lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-            safeUpdateViewLayout(rv, lp)
+        Log.i(TAG, "Opening floating IME bar on receiver")
+        isImeBarVisible = true
+        bar.visibility = View.VISIBLE
+        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        safeUpdateViewLayout(rv, lp)
+        rv.requestLayout()
+        edit.requestFocus()
+        mainHandler.postDelayed({
+            if (!isImeBarVisible) return@postDelayed
             edit.requestFocus()
-            mainHandler.postDelayed({
-                val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                imm?.showSoftInput(edit, InputMethodManager.SHOW_IMPLICIT)
-            }, 60L)
-        } else {
-            hideImeBar()
-        }
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            if (imm != null && !imm.showSoftInput(edit, InputMethodManager.SHOW_IMPLICIT)) {
+                imm.showSoftInput(edit, InputMethodManager.SHOW_FORCED)
+            }
+        }, 120L)
+    }
+
+    private fun toggleImeBar() {
+        if (!isImeBarVisible) showImeBar() else hideImeBar()
     }
 
     private fun hideImeBar() {

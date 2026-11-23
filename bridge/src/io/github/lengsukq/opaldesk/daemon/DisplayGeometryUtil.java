@@ -84,9 +84,15 @@ public final class DisplayGeometryUtil {
         return Math.max(MIN_DPI, Math.min(MAX_DPI, dpi));
     }
 
+    public static final int MAX_SUPERSAMPLED_LONG_EDGE = 2400;
+    public static final long MAX_SUPERSAMPLED_PIXELS = 3_800_000L;
+    public static final int MAX_STANDALONE_LONG_EDGE = 2160;
+    public static final long MAX_STANDALONE_PIXELS = 2_800_000L;
+
     public static int computeAutoDpi(int w, int h) {
         int minEdge = Math.min(Math.max(1, w), Math.max(1, h));
-        return Math.max(120, Math.min(280, Math.round(minEdge * 160f / 1440f)));
+        float targetDp = (minEdge <= 960) ? 412f : 720f;
+        return Math.max(160, Math.min(440, Math.round(minEdge * 160f / targetDp)));
     }
 
     public static int clampDpi(int dpi, int fallbackW, int fallbackH) {
@@ -97,9 +103,8 @@ public final class DisplayGeometryUtil {
     }
 
     /**
-     * Computes a crisp, host-adapted DPI for a remote standalone floating app VirtualDisplay
-     * ({@code streamW x streamH}) derived from the host (被投屏端) physical Display 0 logical
-     * short-edge dp and the host's configured {@code windowDpiScalePct}.
+     * Computes a crisp, readable DPI for a remote standalone floating app VirtualDisplay
+     * ({@code streamW x streamH}) when the receiver did not specify an explicit DPI.
      */
     public static int computeStandaloneAppDpi(
             int streamW,
@@ -113,7 +118,7 @@ public final class DisplayGeometryUtil {
         int streamShort = Math.min(safeStreamW, safeStreamH);
         boolean isPortrait = safeStreamH >= safeStreamW;
 
-        float hostShortDp = 412f;
+        float hostShortDp = 400f;
         if (hostDisplayW > 0 && hostDisplayH > 0 && hostDisplayDpi >= 120 && hostDisplayDpi <= 800) {
             int hostShortPx = Math.min(hostDisplayW, hostDisplayH);
             hostShortDp = Math.max(360f, Math.min(960f, hostShortPx * 160f / hostDisplayDpi));
@@ -122,26 +127,111 @@ public final class DisplayGeometryUtil {
         float targetShortDp;
         if (isPortrait) {
             if (hostShortDp <= 520f) {
-                // Host is a phone: preserve its native logical width (e.g. ~393-412dp) 1:1
-                targetShortDp = Math.max(380f, Math.min(450f, hostShortDp));
+                // Phone host: keep readable ~385-412dp logical width so text is never tiny inside floating windows
+                targetShortDp = Math.max(360f, Math.min(412f, hostShortDp));
             } else {
-                // Host is a tablet: adapt cleanly to narrow phone-shaped vs wide tablet-shaped floating windows
                 float aspect = (float) safeStreamW / (float) safeStreamH;
-                if (aspect < 0.72f) {
-                    targetShortDp = Math.max(412f, Math.min(520f, hostShortDp * 0.62f));
-                } else {
-                    targetShortDp = Math.max(520f, Math.min(680f, hostShortDp * 0.85f));
-                }
+                targetShortDp = (aspect < 0.72f)
+                        ? Math.max(380f, Math.min(440f, hostShortDp * 0.58f))
+                        : Math.max(460f, Math.min(600f, hostShortDp * 0.78f));
             }
         } else {
-            // Landscape floating window: preserve host short-edge dp (phone ~411dp, tablet ~692dp)
-            targetShortDp = Math.max(390f, Math.min(720f, hostShortDp));
+            targetShortDp = Math.max(360f, Math.min(540f, hostShortDp));
         }
 
         int baseDpi = Math.round(streamShort * 160f / targetShortDp);
         int clampedPct = Math.max(70, Math.min(140, dpiScalePct <= 0 ? 100 : dpiScalePct));
         int scaled = Math.round(baseDpi * (clampedPct / 100f));
-        return Math.max(MIN_DPI, Math.min(480, scaled));
+        return Math.max(MIN_DPI, Math.min(MAX_DPI, scaled));
+    }
+
+    /**
+     * Resolves encoder-aligned {@code [streamW, streamH, streamDpi]} for a standalone floating app
+     * session. Respects receiver-computed 1:1 readable DPI and proportionally supersamples up toward
+     * {@code hostDisplayDpi} so density-pinned apps (e.g. WeChat {@code always-compat} on 560dpi phones)
+     * render at the exact same logical layout & crispness as standard Android apps.
+     */
+    public static int[] resolveStandaloneStreamSpec(
+            int reqW,
+            int reqH,
+            int reqDpi,
+            int hostDisplayW,
+            int hostDisplayH,
+            int hostDisplayDpi,
+            int dpiScalePct) {
+        int[] aligned = alignForEncoder(reqW, reqH, 8);
+        int baseW = aligned[0];
+        int baseH = aligned[1];
+        int clampedPct = Math.max(70, Math.min(140, dpiScalePct <= 0 ? 100 : dpiScalePct));
+        int baseDpi;
+        if (reqDpi >= 120 && reqDpi <= MAX_DPI) {
+            baseDpi = Math.max(MIN_DPI, Math.min(MAX_DPI, Math.round(reqDpi * (clampedPct / 100f))));
+        } else {
+            baseDpi = computeStandaloneAppDpi(baseW, baseH, hostDisplayW, hostDisplayH, hostDisplayDpi, clampedPct);
+        }
+
+        int targetHostDpi = (hostDisplayDpi >= 240 && hostDisplayDpi <= MAX_DPI) ? hostDisplayDpi : 0;
+        if (targetHostDpi > baseDpi) {
+            float scale = computeSupersampleScale(
+                    baseW, baseH, baseDpi, targetHostDpi, MAX_STANDALONE_LONG_EDGE, MAX_STANDALONE_PIXELS);
+            if (scale > 1.05f) {
+                int[] up = alignForEncoder(
+                        Math.round(baseW * scale),
+                        Math.round(baseH * scale),
+                        8);
+                // Compute effective actual ratio so logical dp (width / (dpi/160)) stays exact
+                float actualScale = (float) up[0] / (float) baseW;
+                int upDpi = Math.max(MIN_DPI, Math.min(MAX_DPI, Math.round(baseDpi * actualScale)));
+                return new int[]{up[0], up[1], upDpi};
+            }
+        }
+        return new int[]{baseW, baseH, baseDpi};
+    }
+
+    /**
+     * Resolves {@code [bufW, bufH, vdDpi]} for a compositor window's isolated VirtualDisplay.
+     * When a window is shrunk small on screen, scales buffer pixels and VirtualDisplay DPI together
+     * toward {@code hostDisplayDpi} (keeping exact logical dp invariant!) so apps that pin Display 0
+     * compat density (e.g. WeChat {@code compat={440/560dpi}}) never explode or clip when shrunk.
+     */
+    public static int[] resolveWindowBufferSpec(
+            IntRect windowFrame,
+            int canvasDpi,
+            boolean fullscreen,
+            WindowProfile profile,
+            int dpiScalePct,
+            int hostDisplayDpi) {
+        int[] raw = computeContentBufferSize(windowFrame, canvasDpi, fullscreen);
+        int rawW = raw[0];
+        int rawH = raw[1];
+        WindowProfile effProfile = (profile != null) ? profile : WindowProfile.DESKTOP;
+        int baseDpi = effProfile.resolveContentDpi(rawW, rawH, dpiScalePct);
+        int targetHostDpi = (hostDisplayDpi >= 240 && hostDisplayDpi <= MAX_DPI) ? hostDisplayDpi : 0;
+        if (targetHostDpi > baseDpi) {
+            float scale = computeSupersampleScale(
+                    rawW, rawH, baseDpi, targetHostDpi, MAX_SUPERSAMPLED_LONG_EDGE, MAX_SUPERSAMPLED_PIXELS);
+            if (scale > 1.05f) {
+                int upW = alignEven(Math.round(rawW * scale), 240, MAX_WINDOW_EDGE_PX);
+                int upH = alignEven(Math.round(rawH * scale), 200, MAX_WINDOW_EDGE_PX);
+                float actualScale = (float) upW / (float) rawW;
+                int upDpi = Math.max(MIN_DPI, Math.min(MAX_DPI, Math.round(baseDpi * actualScale)));
+                return new int[]{upW, upH, upDpi};
+            }
+        }
+        return new int[]{rawW, rawH, baseDpi};
+    }
+
+    private static float computeSupersampleScale(
+            int w, int h, int baseDpi, int targetHostDpi, int maxLongEdge, long maxPixels) {
+        if (w <= 0 || h <= 0 || baseDpi <= 0 || targetHostDpi <= baseDpi) return 1.0f;
+        int longEdge = Math.max(w, h);
+        if (longEdge >= maxLongEdge) return 1.0f;
+        double pixels = (double) w * (double) h;
+        if (pixels >= (double) maxPixels) return 1.0f;
+        float dpiScale = (float) targetHostDpi / (float) baseDpi;
+        float longCap = (float) maxLongEdge / (float) longEdge;
+        float pixelCap = (float) Math.sqrt((double) maxPixels / pixels);
+        return Math.max(1.0f, Math.min(dpiScale, Math.min(longCap, pixelCap)));
     }
 
     public static int normalizeRotation(int rot) {

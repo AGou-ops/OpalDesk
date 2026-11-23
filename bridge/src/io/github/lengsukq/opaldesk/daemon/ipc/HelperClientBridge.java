@@ -310,7 +310,11 @@ public final class HelperClientBridge {
             Bundle res = isVerifiedHelperProviderOwner()
                     ? callHelperProvider(BridgeProtocol.PROVIDER_METHOD_SET_BINDER, b) : null;
             if (res != null && res.getBoolean("ok", false)) {
+                boolean newProc = (res.getBinder("proc") != null && res.getBinder("proc") != helperProcToken);
                 linkHelperProcessToken(res.getBinder("proc"));
+                if (newProc) {
+                    grantHelperPrivileges();
+                }
                 Runnable boundCb = onHelperBound;
                 if (boundCb != null) boundCb.run();
             }

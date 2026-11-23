@@ -1,6 +1,7 @@
 package io.github.lengsukq.opaldesk.cast
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
@@ -27,6 +28,20 @@ data class DiscoveredOpalPeer(
 object OpalPeerDiscovery {
     private const val TAG = "OpalPeerNsd"
     const val SERVICE_TYPE = "_opaldesk._tcp."
+    const val PERMISSION_ACCESS_LOCAL_NETWORK = "android.permission.ACCESS_LOCAL_NETWORK"
+
+    /**
+     * On Android 17 (API 37+), calling NsdManager.discoverServices without ACCESS_LOCAL_NETWORK
+     * launches the system NsdPickerActivity modal on every call. Guard all NSD calls behind this check.
+     */
+    fun hasLocalNetworkPermission(ctx: Context): Boolean {
+        if (Build.VERSION.SDK_INT < 37) return true
+        return try {
+            ctx.checkSelfPermission(PERMISSION_ACCESS_LOCAL_NETWORK) == PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) {
+            false
+        }
+    }
 
     private val peersByKey = ConcurrentHashMap<String, DiscoveredOpalPeer>()
     private val _discoveredPeersFlow = MutableStateFlow<List<DiscoveredOpalPeer>>(emptyList())
@@ -46,7 +61,7 @@ object OpalPeerDiscovery {
     private var localLanIp: String = ""
 
     fun syncAdvertise(ctx: Context, enabled: Boolean, port: Int, shortFingerprint: String) {
-        val shouldAdvertise = enabled && port > 0 && !OpalPeerCastMutex.isReceivingActive
+        val shouldAdvertise = enabled && port > 0 && !OpalPeerCastMutex.isReceivingActive && hasLocalNetworkPermission(ctx)
         if (!shouldAdvertise) {
             stopAdvertise()
             return
@@ -101,6 +116,10 @@ object OpalPeerDiscovery {
 
     fun startBrowsing(ctx: Context, selfLanIp: String) {
         localLanIp = selfLanIp.trim()
+        if (!hasLocalNetworkPermission(ctx)) {
+            stopBrowsing()
+            return
+        }
         if (discListener != null) return
         val mgr = (ctx.applicationContext.getSystemService(Context.NSD_SERVICE) as? NsdManager) ?: return
         nsdManager = mgr

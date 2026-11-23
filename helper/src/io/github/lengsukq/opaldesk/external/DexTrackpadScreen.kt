@@ -7,6 +7,7 @@ import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -16,9 +17,11 @@ import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,6 +33,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +49,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -61,6 +66,9 @@ import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTextInput
 import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -116,9 +124,21 @@ fun DexTrackpadScreen(
     val mouseTarget by AppPrefs.mouseTargetFlow.collectAsState()
     var oledDimMode by remember { mutableStateOf(false) }
     var leftButtonHeld by remember { mutableStateOf(false) }
+    var rightButtonHeld by remember { mutableStateOf(false) }
     var dragLockToggled by remember { mutableStateOf(false) }
     var imeBarVisible by remember { mutableStateOf(false) }
     var imeDraft by remember { mutableStateOf("") }
+
+    LaunchedEffect(status.connected, status.hostScreenOff) {
+        if (status.connected && status.hostScreenOff) {
+            while (true) {
+                delay(2_000L)
+                withContext(Dispatchers.IO) {
+                    BridgeClient.refreshStatus()
+                }
+            }
+        }
+    }
 
     val scaleOptions = listOf(1.0f to "100%", 1.25f to "125%", 1.5f to "150%")
 
@@ -195,13 +215,6 @@ fun DexTrackpadScreen(
                     compact = true,
                     filled = false,
                     onClick = { oledDimMode = true },
-                )
-                OpalButton(
-                    label = if (status.hostScreenOff) "点亮本机屏" else "物理息屏",
-                    compact = true,
-                    filled = false,
-                    accent = OpalPalette.AccentEmerald,
-                    onClick = { BridgeClient.setHostScreenPowerAsync(status.hostScreenOff) },
                 )
                 OpalButton(
                     label = "主控制台",
@@ -417,7 +430,7 @@ fun DexTrackpadScreen(
                 Column(
                     modifier = Modifier
                         .align(Alignment.Center)
-                        .padding(20.dp),
+                        .padding(horizontal = 24.dp, vertical = 20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     OpalGlyphIcon(
@@ -425,153 +438,356 @@ fun DexTrackpadScreen(
                         tint = OpalPalette.TextMuted.copy(alpha = 0.36f),
                         size = 36.dp,
                     )
-                    Spacer(Modifier.height(8.dp))
+                    Spacer(Modifier.height(10.dp))
                     OpalText(
-                        text = "DeX 精密触控板（同步支持蓝牙/USB 键鼠直连）",
+                        text = "DeX 精密触控板 · 支持蓝牙/USB 键鼠直连",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium,
                         color = OpalPalette.TextSecondary,
+                        textAlign = TextAlign.Center,
                     )
-                    Spacer(Modifier.height(4.dp))
+                    Spacer(Modifier.height(5.dp))
                     OpalText(
-                        text = "单指滑动移光标 · 轻点左键 · 双击按住拖拽 · 双指上下滚动 · 双指轻点返回",
-                        fontSize = 11.sp,
+                        text = "单指滑动移光标 · 轻点左键 · 双击按住拖拽\n双指上下滚动 · 双指轻点返回",
+                        fontSize = 11.5.sp,
+                        lineHeight = 17.sp,
                         color = OpalPalette.TextMuted,
+                        textAlign = TextAlign.Center,
                     )
                 }
             }
 
-            // Bottom Ergonomic Left-Drag / Drag-Lock / Right-Back / Desktop Bar (artifact-free Liquid Glass)
-            val btnShape = RoundedCornerShape(16.dp)
+            // Apple-inspired Unified Liquid Glass Trackpad Control Deck (adaptive portrait / landscape)
+            TrackpadControlDeck(
+                leftButtonHeld = leftButtonHeld,
+                rightButtonHeld = rightButtonHeld,
+                dragLockToggled = dragLockToggled,
+                hostScreenOff = status.hostScreenOff,
+                onLeftPressChange = { pressed ->
+                    leftButtonHeld = pressed
+                    if (pressed) {
+                        onSetPrimaryButton(true)
+                    } else if (!dragLockToggled) {
+                        onSetPrimaryButton(false)
+                    }
+                },
+                onRightPressChange = { pressed -> rightButtonHeld = pressed },
+                onRightClick = onSecondaryAction,
+                onToggleDragLock = {
+                    val next = !dragLockToggled
+                    dragLockToggled = next
+                    onSetPrimaryButton(next)
+                },
+                onShowDesktop = {
+                    BridgeClient.sceneFlow.value.visibleWindows.forEach { win ->
+                        BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.MINIMIZE)
+                    }
+                },
+                onToggleHostScreenPower = {
+                    toggleTrackpadHostScreenPower(ctx, screenOn = status.hostScreenOff)
+                },
+            )
+        }
+    }
+}
+
+@Composable
+private fun TrackpadControlDeck(
+    leftButtonHeld: Boolean,
+    rightButtonHeld: Boolean,
+    dragLockToggled: Boolean,
+    hostScreenOff: Boolean,
+    onLeftPressChange: (Boolean) -> Unit,
+    onRightPressChange: (Boolean) -> Unit,
+    onRightClick: () -> Unit,
+    onToggleDragLock: () -> Unit,
+    onShowDesktop: () -> Unit,
+    onToggleHostScreenPower: () -> Unit,
+) {
+    val isDark = OpalPalette.isDark
+    val curOnLeftPress by rememberUpdatedState(onLeftPressChange)
+    val curOnRightPress by rememberUpdatedState(onRightPressChange)
+    val curOnRightClick by rememberUpdatedState(onRightClick)
+
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val compact = maxWidth < 560.dp
+        if (compact) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                // Row 1: Unified Hardware-Style Split Mouse Click Bar (50% Left / 50% Right)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .liquidGlassSurface(
+                            shape = RoundedCornerShape(16.dp),
+                            fill = OpalPalette.LiquidDockFill,
+                            rim = OpalPalette.LiquidGlassRim,
+                            elevation = 8.dp,
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TrackpadPrimaryHalf(
+                        held = leftButtonHeld,
+                        label = if (leftButtonHeld) "左键按下 · 拖动中" else "左键 · 按住拖拽",
+                        onPressChange = { curOnLeftPress(it) },
+                        modifier = Modifier.weight(1f),
+                    )
+                    TrackpadDockDivider()
+                    TrackpadSecondaryHalf(
+                        held = rightButtonHeld,
+                        label = "右键 · 返回",
+                        onPressChange = { curOnRightPress(it) },
+                        onTrigger = { curOnRightClick() },
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+
+                // Row 2: Unified 3-Way Quick Utility Capsule (Drag Lock | Show Desktop | Quick Screen Off)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
+                        .liquidGlassSurface(
+                            shape = RoundedCornerShape(14.dp),
+                            fill = OpalPalette.LiquidDockFill,
+                            rim = OpalPalette.LiquidGlassRim,
+                            elevation = 6.dp,
+                        ),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TrackpadUtilitySegment(
+                        glyph = ChromeGlyph.LOCK,
+                        label = if (dragLockToggled) "拖拽已锁" else "拖拽锁定",
+                        active = dragLockToggled,
+                        activeAccent = OpalPalette.AccentAmber,
+                        idleIconTint = OpalPalette.TextSecondary,
+                        isDark = isDark,
+                        onClick = onToggleDragLock,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TrackpadDockDivider()
+                    TrackpadUtilitySegment(
+                        glyph = ChromeGlyph.EXPOSE,
+                        label = "显示桌面",
+                        active = false,
+                        activeAccent = OpalPalette.AccentBlue,
+                        idleIconTint = OpalPalette.TextSecondary,
+                        isDark = isDark,
+                        onClick = onShowDesktop,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TrackpadDockDivider()
+                    TrackpadUtilitySegment(
+                        glyph = ChromeGlyph.SCREEN_OFF,
+                        label = if (hostScreenOff) "点亮屏幕" else "一键息屏",
+                        active = hostScreenOff,
+                        activeAccent = OpalPalette.AccentEmerald,
+                        idleIconTint = OpalPalette.AccentEmerald,
+                        isDark = isDark,
+                        onClick = onToggleHostScreenPower,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        } else {
+            // Landscape / Wide: Single sleek unified 5-segment Liquid Glass trackpad dock
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(50.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    .height(48.dp)
+                    .liquidGlassSurface(
+                        shape = RoundedCornerShape(16.dp),
+                        fill = OpalPalette.LiquidDockFill,
+                        rim = OpalPalette.LiquidGlassRim,
+                        elevation = 8.dp,
+                    ),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1.3f)
-                        .fillMaxSize()
-                        .liquidGlassSurface(
-                            shape = btnShape,
-                            fill = if (leftButtonHeld) {
-                                Brush.verticalGradient(listOf(OpalPalette.AccentBlue, OpalPalette.AccentBlue.copy(alpha = 0.88f)))
-                            } else {
-                                OpalPalette.LiquidDockFill
-                            },
-                            rim = if (leftButtonHeld) {
-                                Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.55f), OpalPalette.AccentBlue))
-                            } else {
-                                OpalPalette.LiquidGlassRim
-                            },
-                            elevation = 10.dp,
-                        )
-                        .pointerInput(Unit) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false)
-                                leftButtonHeld = true
-                                onSetPrimaryButton(true)
-                                waitForUpOrCancellation()
-                                leftButtonHeld = false
-                                if (!dragLockToggled) onSetPrimaryButton(false)
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    OpalText(
-                        text = if (leftButtonHeld) "左键按下中（滑动拖拽）" else "左键 / 按住拖拽",
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (leftButtonHeld) Color.White else OpalPalette.TextPrimary,
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .width(106.dp)
-                        .fillMaxSize()
-                        .liquidGlassSurface(
-                            shape = btnShape,
-                            fill = if (dragLockToggled) {
-                                Brush.verticalGradient(
-                                    listOf(
-                                        OpalPalette.AccentAmber.copy(alpha = 0.28f),
-                                        OpalPalette.AccentAmber.copy(alpha = 0.16f),
-                                    ),
-                                )
-                            } else {
-                                OpalPalette.LiquidDockFill
-                            },
-                            rim = if (dragLockToggled) {
-                                Brush.verticalGradient(listOf(OpalPalette.AccentAmber, OpalPalette.AccentAmber.copy(alpha = 0.45f)))
-                            } else {
-                                OpalPalette.LiquidGlassRim
-                            },
-                            elevation = 10.dp,
-                        )
-                        .clickable {
-                            val next = !dragLockToggled
-                            dragLockToggled = next
-                            onSetPrimaryButton(next)
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    OpalText(
-                        text = if (dragLockToggled) "拖拽已锁" else "拖拽锁定",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (dragLockToggled) OpalPalette.AccentAmber else OpalPalette.TextSecondary,
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxSize()
-                        .liquidGlassSurface(
-                            shape = btnShape,
-                            fill = OpalPalette.LiquidDockFill,
-                            rim = OpalPalette.LiquidGlassRim,
-                            elevation = 10.dp,
-                        )
-                        .clickable(onClick = onSecondaryAction),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    OpalText(
-                        text = "右键 / 返回",
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = OpalPalette.TextPrimary,
-                    )
-                }
-
-                Box(
-                    modifier = Modifier
-                        .width(104.dp)
-                        .fillMaxSize()
-                        .liquidGlassSurface(
-                            shape = btnShape,
-                            fill = OpalPalette.LiquidDockFill,
-                            rim = OpalPalette.LiquidGlassRim,
-                            elevation = 10.dp,
-                        )
-                        .clickable {
-                            BridgeClient.sceneFlow.value.visibleWindows.forEach { win ->
-                                BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.MINIMIZE)
-                            }
-                        },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    OpalText(
-                        text = "显示桌面",
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Medium,
-                        color = OpalPalette.TextSecondary,
-                    )
-                }
+                TrackpadPrimaryHalf(
+                    held = leftButtonHeld,
+                    label = if (leftButtonHeld) "左键按下中" else "左键 · 拖拽",
+                    onPressChange = { curOnLeftPress(it) },
+                    modifier = Modifier.weight(1.2f),
+                )
+                TrackpadDockDivider()
+                TrackpadSecondaryHalf(
+                    held = rightButtonHeld,
+                    label = "右键 · 返回",
+                    onPressChange = { curOnRightPress(it) },
+                    onTrigger = { curOnRightClick() },
+                    modifier = Modifier.weight(1.0f),
+                )
+                TrackpadDockDivider()
+                TrackpadUtilitySegment(
+                    glyph = ChromeGlyph.LOCK,
+                    label = if (dragLockToggled) "拖拽已锁" else "拖拽锁定",
+                    active = dragLockToggled,
+                    activeAccent = OpalPalette.AccentAmber,
+                    idleIconTint = OpalPalette.TextSecondary,
+                    isDark = isDark,
+                    onClick = onToggleDragLock,
+                    modifier = Modifier.weight(0.95f),
+                )
+                TrackpadDockDivider()
+                TrackpadUtilitySegment(
+                    glyph = ChromeGlyph.EXPOSE,
+                    label = "显示桌面",
+                    active = false,
+                    activeAccent = OpalPalette.AccentBlue,
+                    idleIconTint = OpalPalette.TextSecondary,
+                    isDark = isDark,
+                    onClick = onShowDesktop,
+                    modifier = Modifier.weight(0.9f),
+                )
+                TrackpadDockDivider()
+                TrackpadUtilitySegment(
+                    glyph = ChromeGlyph.SCREEN_OFF,
+                    label = if (hostScreenOff) "点亮屏幕" else "一键息屏",
+                    active = hostScreenOff,
+                    activeAccent = OpalPalette.AccentEmerald,
+                    idleIconTint = OpalPalette.AccentEmerald,
+                    isDark = isDark,
+                    onClick = onToggleHostScreenPower,
+                    modifier = Modifier.weight(0.95f),
+                )
             }
         }
+    }
+}
+
+@Composable
+private fun TrackpadPrimaryHalf(
+    held: Boolean,
+    label: String,
+    onPressChange: (Boolean) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val curPress by rememberUpdatedState(onPressChange)
+    val bgBrush = if (held) {
+        Brush.verticalGradient(listOf(OpalPalette.AccentBlue, OpalPalette.AccentBlue.copy(alpha = 0.88f)))
+    } else {
+        Brush.verticalGradient(listOf(Color.Transparent, Color.Transparent))
+    }
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .background(bgBrush)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    curPress(true)
+                    waitForUpOrCancellation()
+                    curPress(false)
+                }
+            }
+            .padding(horizontal = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        OpalText(
+            text = label,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = if (held) Color.White else OpalPalette.TextPrimary,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun TrackpadSecondaryHalf(
+    held: Boolean,
+    label: String,
+    onPressChange: (Boolean) -> Unit,
+    onTrigger: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val curPress by rememberUpdatedState(onPressChange)
+    val curTrigger by rememberUpdatedState(onTrigger)
+    Box(
+        modifier = modifier
+            .fillMaxHeight()
+            .background(if (held) OpalPalette.ChipActiveFill else Color.Transparent)
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    curPress(true)
+                    val up = waitForUpOrCancellation()
+                    curPress(false)
+                    if (up != null) {
+                        curTrigger()
+                    }
+                }
+            }
+            .padding(horizontal = 12.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        OpalText(
+            text = label,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = OpalPalette.TextPrimary,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun TrackpadUtilitySegment(
+    glyph: ChromeGlyph,
+    label: String,
+    active: Boolean,
+    activeAccent: Color,
+    idleIconTint: Color,
+    isDark: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val bg = if (active) activeAccent.copy(alpha = if (isDark) 0.22f else 0.14f) else Color.Transparent
+    val textColor = if (active) activeAccent else OpalPalette.TextPrimary
+    val iconTint = if (active) activeAccent else idleIconTint
+    Row(
+        modifier = modifier
+            .fillMaxHeight()
+            .background(bg)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        OpalGlyphIcon(glyph = glyph, tint = iconTint, size = 14.dp)
+        Spacer(Modifier.width(5.5.dp))
+        OpalText(
+            text = label,
+            fontSize = 12.sp,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+            color = textColor,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+private fun TrackpadDockDivider() {
+    Box(
+        modifier = Modifier
+            .width(0.8.dp)
+            .fillMaxHeight()
+            .padding(vertical = 10.dp)
+            .background(OpalPalette.DividerColor),
+    )
+}
+
+private fun toggleTrackpadHostScreenPower(ctx: Context, screenOn: Boolean) {
+    BridgeClient.setHostScreenPowerAsync(screenOn) { ok ->
+        val msg = when {
+            !ok -> "当前设备暂不支持物理息屏控制"
+            screenOn -> "已点亮本机屏幕"
+            else -> "已物理息屏（双击屏幕随时亮屏，断开投屏自动亮屏）"
+        }
+        Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
     }
 }
 

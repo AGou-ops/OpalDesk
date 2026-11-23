@@ -75,6 +75,11 @@ public final class CompositorEngine {
 
         /** Releases an Android Surface handle when no longer referenced. */
         void releaseSurfaceHandle(Object surface);
+
+        /** Returns the host device's physical Display 0 densityDpi (or 0 if unavailable in unit tests). */
+        default int getHostDisplayDpi() {
+            return 0;
+        }
     }
 
     private final Object lock = new Object();
@@ -129,18 +134,21 @@ public final class CompositorEngine {
         vdPool.setConfiguredMaxDisplays(maxDisplays);
     }
 
-    /** Recomputes DPI for all open windows after the user changes global DPI scale preference. */
+    /** Recomputes buffer resolution & DPI for all open windows after global DPI scale changes. */
     public void reapplyWindowDpiScale() {
         synchronized (lock) {
             int dpiPct = config.getWindowDpiScalePct();
             boolean changed = false;
             for (WindowSession ws : sessionsById.values()) {
-                int nextDpi = ws.profile.resolveContentDpi(ws.contentWidth, ws.contentHeight, dpiPct);
-                if (nextDpi != ws.contentDpi) {
-                    ws.contentDpi = nextDpi;
-                    vdPool.resizeIfActive(ws.windowId, ws.contentWidth, ws.contentHeight, nextDpi);
+                boolean isFs = BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation);
+                int[] spec = computeWindowSpecLocked(ws.frame, isFs, ws.profile);
+                if (spec[0] != ws.contentWidth || spec[1] != ws.contentHeight || spec[2] != ws.contentDpi) {
+                    ws.contentWidth = spec[0];
+                    ws.contentHeight = spec[1];
+                    ws.contentDpi = spec[2];
+                    vdPool.resizeIfActive(ws.windowId, spec[0], spec[1], spec[2]);
                     System.out.println("OPALDESK_WINDOW_DPI_REAPPLIED wid=" + ws.windowId
-                            + " dpiPct=" + dpiPct + " nextDpi=" + nextDpi);
+                            + " dpiPct=" + dpiPct + " buf=" + spec[0] + "x" + spec[1] + "@" + spec[2] + "dpi");
                     changed = true;
                 }
             }
@@ -243,14 +251,13 @@ public final class CompositorEngine {
                         profile, sessionsById.size(), canvasW, canvasH, canvasDpi);
             }
 
-            int[] contentDims = DisplayGeometryUtil.computeContentBufferSize(initialFrame, canvasDpi);
-            int contentDpi = profile.resolveContentDpi(contentDims[0], contentDims[1], config.getWindowDpiScalePct());
+            int[] spec = computeWindowSpecLocked(initialFrame, false, profile);
             int winId = nextWindowId.getAndIncrement();
             String label = runtimeBridge.resolveAppLabel(pkg);
 
             WindowSession created = new WindowSession(
                     winId, pkg, safeCls, label, profile, initialFrame,
-                    contentDims[0], contentDims[1], contentDpi, now);
+                    spec[0], spec[1], spec[2], now);
             sessionsById.put(winId, created);
             focusWindowLocked(created, now);
             config.rememberProfile(pkg, profile);
@@ -435,12 +442,11 @@ public final class CompositorEngine {
             focusWindowLocked(ws, System.currentTimeMillis());
 
             if (sizeChanged) {
-                int[] dims = DisplayGeometryUtil.computeContentBufferSize(nextFrame, canvasDpi, nextFullscreen);
-                int dpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
-                ws.contentWidth = dims[0];
-                ws.contentHeight = dims[1];
-                ws.contentDpi = dpi;
-                vdPool.resizeIfActive(windowId, dims[0], dims[1], dpi);
+                int[] spec = computeWindowSpecLocked(nextFrame, nextFullscreen, ws.profile);
+                ws.contentWidth = spec[0];
+                ws.contentHeight = spec[1];
+                ws.contentDpi = spec[2];
+                vdPool.resizeIfActive(windowId, spec[0], spec[1], spec[2]);
             }
             markDirtyAndNotifyLocked();
             return true;
@@ -518,10 +524,10 @@ public final class CompositorEngine {
                         ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
                                 ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
                                 : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
-                        int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, false);
-                        ws.contentWidth = dims[0];
-                        ws.contentHeight = dims[1];
-                        ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
+                        int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile);
+                        ws.contentWidth = spec[0];
+                        ws.contentHeight = spec[1];
+                        ws.contentDpi = spec[2];
                     }
                     ws.state = BridgeProtocol.STATE_MINIMIZED;
                     ws.focused = false;
@@ -547,11 +553,11 @@ public final class CompositorEngine {
                         ws.frame = DisplayGeometryUtil.computeSnapFrame(
                                 BridgeProtocol.PRES_MAXIMIZED, canvasW, canvasH, canvasDpi);
                     }
-                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, false);
-                    ws.contentWidth = dims[0];
-                    ws.contentHeight = dims[1];
-                    ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
-                    vdPool.resizeIfActive(windowId, dims[0], dims[1], ws.contentDpi);
+                    int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile);
+                    ws.contentWidth = spec[0];
+                    ws.contentHeight = spec[1];
+                    ws.contentDpi = spec[2];
+                    vdPool.resizeIfActive(windowId, spec[0], spec[1], spec[2]);
                     focusWindowLocked(ws, now);
                     markDirtyAndNotifyLocked();
                     return true;
@@ -574,11 +580,11 @@ public final class CompositorEngine {
                                 ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
                                 : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
                     }
-                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, enterFs);
-                    ws.contentWidth = dims[0];
-                    ws.contentHeight = dims[1];
-                    ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
-                    vdPool.resizeIfActive(windowId, dims[0], dims[1], ws.contentDpi);
+                    int[] spec = computeWindowSpecLocked(ws.frame, enterFs, ws.profile);
+                    ws.contentWidth = spec[0];
+                    ws.contentHeight = spec[1];
+                    ws.contentDpi = spec[2];
+                    vdPool.resizeIfActive(windowId, spec[0], spec[1], spec[2]);
                     focusWindowLocked(ws, now);
                     markDirtyAndNotifyLocked();
                     return true;
@@ -821,10 +827,10 @@ public final class CompositorEngine {
                     ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
                             ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
                             : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
-                    int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi, false);
-                    ws.contentWidth = dims[0];
-                    ws.contentHeight = dims[1];
-                    ws.contentDpi = ws.profile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
+                    int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile);
+                    ws.contentWidth = spec[0];
+                    ws.contentHeight = spec[1];
+                    ws.contentDpi = spec[2];
                 }
                 ws.state = BridgeProtocol.STATE_MINIMIZED;
                 ws.focused = false;
@@ -884,6 +890,16 @@ public final class CompositorEngine {
         }
     }
 
+    private int[] computeWindowSpecLocked(IntRect frame, boolean fullscreen, WindowProfile profile) {
+        return DisplayGeometryUtil.resolveWindowBufferSpec(
+                frame,
+                config.getCanvasDpi(),
+                fullscreen,
+                profile,
+                config.getWindowDpiScalePct(),
+                runtimeBridge.getHostDisplayDpi());
+    }
+
     private void applyProfileChangeLocked(WindowSession ws, WindowProfile nextProfile) {
         ws.profile = nextProfile;
         config.rememberProfile(ws.pkg, nextProfile);
@@ -893,11 +909,11 @@ public final class CompositorEngine {
         ws.presentation = BridgeProtocol.PRES_FLOATING;
         ws.frame = DisplayGeometryUtil.computeInitialWindowFrame(nextProfile, 0, canvasW, canvasH, canvasDpi);
         ws.restoreFrame = ws.frame;
-        int[] dims = DisplayGeometryUtil.computeContentBufferSize(ws.frame, canvasDpi);
-        ws.contentWidth = dims[0];
-        ws.contentHeight = dims[1];
-        ws.contentDpi = nextProfile.resolveContentDpi(dims[0], dims[1], config.getWindowDpiScalePct());
-        vdPool.resizeIfActive(ws.windowId, dims[0], dims[1], ws.contentDpi);
+        int[] spec = computeWindowSpecLocked(ws.frame, false, nextProfile);
+        ws.contentWidth = spec[0];
+        ws.contentHeight = spec[1];
+        ws.contentDpi = spec[2];
+        vdPool.resizeIfActive(ws.windowId, spec[0], spec[1], spec[2]);
     }
 
     private void handleWindowEvictedLocked(WindowSession victim, byte[] snapshotBytes) {

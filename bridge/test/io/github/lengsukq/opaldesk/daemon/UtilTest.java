@@ -140,11 +140,47 @@ public class UtilTest {
                 phoneNarrowDpi >= 210 && phoneNarrowDpi <= 226);
 
         // Tablet host: Xiaomi Pad 8 Pro 3040x1904 @ 440dpi -> logical short edge = 692.4dp
-        // Landscape floating window 1280x792 should produce ~183dpi (much lower than phone landscape!)
+        // Landscape floating window 1280x792 should be lower than phone landscape while staying readable
         int tabletLandDpi = DisplayGeometryUtil.computeStandaloneAppDpi(1280, 792, 3040, 1904, 440, 100);
         int phoneLandDpi = DisplayGeometryUtil.computeStandaloneAppDpi(1280, 792, 1440, 3200, 560, 100);
         assertTrue("Tablet host landscape DPI (" + tabletLandDpi + ") must be lower than phone host (" + phoneLandDpi + ")",
-                tabletLandDpi < phoneLandDpi - 80);
+                tabletLandDpi < phoneLandDpi - 50);
+
+        // Receiver-computed 1:1 readable spec (Phone 560dpi -> Tablet 390dp floating window, 904x1440 @ 371dpi)
+        // must supersample proportionally toward 560dpi while preserving exact ~390dp logical width!
+        int[] spec = DisplayGeometryUtil.resolveStandaloneStreamSpec(904, 1440, 371, 1440, 3200, 560, 100);
+        assertTrue("Supersampled DPI should approach host 560dpi for compat apps, got " + spec[2], spec[2] >= 520);
+        float logicalW = spec[0] * 160f / spec[2];
+        assertTrue("Logical width must stay ~390dp for 1:1 readable text, got " + logicalW,
+                logicalW >= 382f && logicalW <= 398f);
+        // Compat app pinned at 560dpi sees spec[0] / 3.5 >= 370dp (never zoomed/clipped!)
+        float compatW = spec[0] * 160f / 560f;
+        assertTrue("Compat 560dpi app must see >= 370dp logical width, got " + compatW, compatW >= 370f);
+    }
+
+    @Test
+    public void testShrunkCompositorWindowSupersamplesToHostDpiForWeChatCompat() {
+        // Shrunk portrait window (480x700px) on a 1920x1080 cast canvas hosted by a 560dpi phone
+        DisplayGeometryUtil.IntRect shrunk = new DisplayGeometryUtil.IntRect(100, 100, 580, 800);
+        int[] spec = DisplayGeometryUtil.resolveWindowBufferSpec(
+                shrunk, 240, false, WindowProfile.PORTRAIT, 100, 560);
+        assertTrue("Shrunk window VD DPI must supersample near host 560dpi, got " + spec[2], spec[2] >= 520);
+        float normalLogicalW = spec[0] * 160f / spec[2];
+        float wechatCompatW = spec[0] * 160f / 560f;
+        assertTrue("Normal app logical width must remain ~412dp, got " + normalLogicalW,
+                normalLogicalW >= 400f && normalLogicalW <= 425f);
+        assertTrue("WeChat compat=560dpi logical width must stay >= 385dp (never giant!), got " + wechatCompatW,
+                wechatCompatW >= 385f);
+
+        // Tablet host (440dpi) shrunk window must match 440dpi compat 1:1
+        int[] tabSpec = DisplayGeometryUtil.resolveWindowBufferSpec(
+                shrunk, 240, false, WindowProfile.PORTRAIT, 100, 440);
+        assertTrue("Tablet shrunk window VD DPI must match 440dpi, got " + tabSpec[2],
+                tabSpec[2] >= 432 && tabSpec[2] <= 448);
+
+        // Auto DPI fallback must never collapse to tiny 120dpi for 792x1280 stream
+        int autoDpi = DisplayGeometryUtil.computeAutoDpi(792, 1280);
+        assertTrue("computeAutoDpi(792, 1280) must be readable (~308dpi), got " + autoDpi, autoDpi >= 280);
     }
 
     @Test

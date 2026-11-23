@@ -220,6 +220,7 @@ final class ClientSession {
                             || next.type == OpalCastProtocol.TYPE_VIDEO_CONFIG
                             || next.type == OpalCastProtocol.TYPE_WIFI_UPGRADE_READY
                             || next.type == OpalCastProtocol.TYPE_APP_LIST
+                            || next.type == OpalCastProtocol.TYPE_IME_REQUEST
                             || next.type == OpalCastProtocol.TYPE_PONG;
                 }
                 OpalCastProtocol.writeFrame(

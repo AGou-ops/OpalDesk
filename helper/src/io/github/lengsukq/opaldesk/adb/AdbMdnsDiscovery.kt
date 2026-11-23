@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import io.github.lengsukq.opaldesk.AdbBootstrap
+import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
 import java.util.ArrayDeque
 
 /**
@@ -57,6 +58,10 @@ internal object AdbMdnsDiscovery {
     fun start(ctx: Context, nextListener: AdbBootstrap.DiscoveryListener?) {
         listener = nextListener
         val appCtx = ctx.applicationContext
+        if (!OpalPeerDiscovery.hasLocalNetworkPermission(appCtx)) {
+            Log.i(TAG, "Skipping NSD wireless-ADB scan until ACCESS_LOCAL_NETWORK is granted")
+            return
+        }
         if (nsdManager != null) {
             notifyListenerLocked()
             return

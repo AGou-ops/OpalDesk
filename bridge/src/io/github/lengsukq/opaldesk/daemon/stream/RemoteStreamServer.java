@@ -431,6 +431,14 @@ public final class RemoteStreamServer {
         }
     }
 
+    public void sendImeRequest(int sessionId, boolean show, int inputType) {
+        ClientSession s = allSessions.get(sessionId);
+        if (s != null && !s.isClosed()) {
+            long ts = SystemClock.elapsedRealtimeNanos() / 1000L;
+            s.enqueue(OpalCastProtocol.TYPE_IME_REQUEST, 0, ts, OpalCastProtocol.encodeImeRequest(show, inputType));
+        }
+    }
+
     // ---- Desktop-session convenience senders ----
 
     public void sendAudioConfig(OpalCastProtocol.AudioConfig config, long timestampUs) {

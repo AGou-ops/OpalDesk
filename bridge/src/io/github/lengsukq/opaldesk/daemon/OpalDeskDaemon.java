@@ -233,6 +233,9 @@ public final class OpalDeskDaemon implements Runnable {
         mainHandler.postDelayed(
                 () -> bgExec.execute(() -> runImeFallbackProbe(gen, windowId, displayId, tapDownUptimeMs)),
                 260L);
+        mainHandler.postDelayed(
+                () -> bgExec.execute(() -> runImeFallbackProbe(gen, windowId, displayId, tapDownUptimeMs)),
+                460L);
     }
 
     private void runImeFallbackProbe(long gen, int windowId, int displayId, long tapDownUptimeMs) {
@@ -243,8 +246,29 @@ public final class OpalDeskDaemon implements Runnable {
         ImmsDumpInspector.Snapshot snap = AndroidServices.inspectInputMethodService(displayId);
         if (snap == null || imeProbeGen.get() != gen) return;
 
+        long nowUptime = SystemClock.uptimeMillis();
+        boolean remoteDesktopActive = remoteBridge != null && remoteBridge.hasActiveDesktopSession();
+        if (remoteDesktopActive) {
+            // While casting desktop to a remote receiver (e.g. Phone -> Tablet), always summon the
+            // receiver's soft keyboard — even if Android 16 opened a fallback IME on the sender phone!
+            if (ImmsDumpInspector.shouldTriggerRemoteCastIme(
+                    snap, displayId, lastHandledImmsShowSeq.get(), tapDownUptimeMs, nowUptime)) {
+                lastHandledImmsShowSeq.set(snap.latestShowSeq);
+                imeProbeGen.compareAndSet(gen, gen + 1L);
+                int rawType = snap.effectiveInputType(displayId);
+                int hostType = ImmsDumpInspector.sanitizeHostInputType(rawType);
+                System.out.println("OPALDESK_REMOTE_IME_FORWARD win=" + windowId
+                        + " display=" + displayId
+                        + " seq=" + snap.latestShowSeq
+                        + " inputShown=" + snap.inputShown
+                        + " hostType=0x" + Integer.toHexString(hostType));
+                remoteBridge.sendDesktopImeRequest(true, hostType);
+            }
+            return;
+        }
+
         if (snap.inputShown) {
-            // Native cross-display fallback IME opened cleanly (e.g. Android 16) — do not interfere.
+            // Native cross-display fallback IME opened cleanly on Display 0 (e.g. Android 16 local DeX) — do not interfere.
             if (snap.latestShowSeq > lastHandledImmsShowSeq.get()) {
                 lastHandledImmsShowSeq.set(snap.latestShowSeq);
             }
@@ -252,7 +276,6 @@ public final class OpalDeskDaemon implements Runnable {
             return;
         }
 
-        long nowUptime = SystemClock.uptimeMillis();
         if (ImmsDumpInspector.shouldTriggerHostImeBridge(
                 snap, displayId, lastHandledImmsShowSeq.get(), tapDownUptimeMs, nowUptime)) {
             lastHandledImmsShowSeq.set(snap.latestShowSeq);

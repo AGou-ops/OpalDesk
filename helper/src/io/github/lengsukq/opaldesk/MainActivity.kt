@@ -11,6 +11,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -32,6 +36,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -46,6 +51,7 @@ import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.service.DisplayLaunchHelper
 import io.github.lengsukq.opaldesk.ui.ActivationModal
+import io.github.lengsukq.opaldesk.ui.AppUpdateModal
 import io.github.lengsukq.opaldesk.ui.ConsoleDashboardTab
 import io.github.lengsukq.opaldesk.ui.ConsoleDisplaySettingsTab
 import io.github.lengsukq.opaldesk.ui.ConsoleEngineSettingsTab
@@ -56,6 +62,7 @@ import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTheme
 import io.github.lengsukq.opaldesk.ui.PairingConsentModal
+import io.github.lengsukq.opaldesk.update.AppUpdateManager
 
 /**
  * OpalDesk v1.0.0 macOS Liquid Glass Control Console.
@@ -69,9 +76,20 @@ import io.github.lengsukq.opaldesk.ui.PairingConsentModal
 class MainActivity : ComponentActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var localNetworkPermGranted by mutableStateOf(true)
     private val notifPermLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { _ -> }
+    private val localNetPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        localNetworkPermGranted = granted || OpalPeerDiscovery.hasLocalNetworkPermission(this)
+        if (localNetworkPermGranted) {
+            val r = BridgeClient.remoteStatusFlow.value
+            OpalPeerDiscovery.syncAdvertise(this, r.wifiEnabled, r.wifiPort, r.shortCertFingerprint)
+            OpalPeerDiscovery.startBrowsing(this, r.lanIp)
+        }
+    }
     private val wallpaperPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         if (uri == null) return@registerForActivityResult
         Thread({
@@ -91,6 +109,7 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
         requestNotificationPermissionIfNeeded()
+        localNetworkPermGranted = OpalPeerDiscovery.hasLocalNetworkPermission(this)
         BridgeService.sUserStopping = false
         BridgeService.ensureStarted(this)
         BridgeClient.requestBinder(this)
@@ -105,6 +124,12 @@ class MainActivity : ComponentActivity() {
                     ctrl.isAppearanceLightNavigationBars = !isDark
                 }
                 OpalConsoleScreen(
+                    needsLocalNetworkPerm = !localNetworkPermGranted,
+                    onRequestLocalNetworkPerm = {
+                        if (Build.VERSION.SDK_INT >= 37) {
+                            localNetPermLauncher.launch(OpalPeerDiscovery.PERMISSION_ACCESS_LOCAL_NETWORK)
+                        }
+                    },
                     onEnterDesktop = ::launchDesktopWorkstation,
                     onOpenRemoteTrackpad = ::launchRemoteTrackpad,
                     onProjectExternalOrTrackpad = ::launchExternalOrTrackpad,
@@ -121,7 +146,10 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         BridgeClient.requestBinder(this)
-        OpalPeerDiscovery.startBrowsing(this, BridgeClient.remoteStatusFlow.value.lanIp)
+        localNetworkPermGranted = OpalPeerDiscovery.hasLocalNetworkPermission(this)
+        if (localNetworkPermGranted) {
+            OpalPeerDiscovery.startBrowsing(this, BridgeClient.remoteStatusFlow.value.lanIp)
+        }
         Thread({
             BridgeClient.refreshStatus()
             BridgeClient.refreshSceneSnapshot()
@@ -130,14 +158,18 @@ class MainActivity : ComponentActivity() {
             val pending = BridgeClient.refreshPendingPairing()
             BridgeService.updatePairingNotification(this, pending)
             OpalPeerCastMutex.syncDaemonSendingState(r.connected, r.peerName)
-            OpalPeerDiscovery.syncAdvertise(this, r.wifiEnabled, r.wifiPort, r.shortCertFingerprint)
-            OpalPeerDiscovery.startBrowsing(this, r.lanIp)
+            val hasLocalNet = OpalPeerDiscovery.hasLocalNetworkPermission(this)
+            runOnUiThread { localNetworkPermGranted = hasLocalNet }
+            if (hasLocalNet) {
+                OpalPeerDiscovery.syncAdvertise(this, r.wifiEnabled, r.wifiPort, r.shortCertFingerprint)
+                OpalPeerDiscovery.startBrowsing(this, r.lanIp)
+            }
         }, "OpalConsoleRefresh").start()
     }
 
-    override fun onPause() {
+    override fun onStop() {
         OpalPeerDiscovery.stopBrowsing()
-        super.onPause()
+        super.onStop()
     }
 
     private fun launchPeerCastViewer(host: String, port: Int, label: String) {
@@ -233,6 +265,8 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun OpalConsoleScreen(
+    needsLocalNetworkPerm: Boolean,
+    onRequestLocalNetworkPerm: () -> Unit,
     onEnterDesktop: () -> Unit,
     onOpenRemoteTrackpad: () -> Unit,
     onProjectExternalOrTrackpad: (Int) -> Unit,
@@ -249,8 +283,22 @@ private fun OpalConsoleScreen(
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var showActivationModal by remember { mutableStateOf(false) }
+    var showUpdateModal by remember { mutableStateOf(false) }
     var floatingPickerTarget by remember { mutableStateOf<Triple<String, Int, String>?>(null) }
     val wallpaperPreset by AppPrefs.wallpaperPresetFlow.collectAsState()
+    val updateState by AppUpdateManager.stateFlow.collectAsState()
+    val currentVersion = remember(ctx) { AppUpdateManager.getCurrentVersionName(ctx) }
+
+    LaunchedEffect(Unit) {
+        AppUpdateManager.maybeSilentCheckOnStartup(ctx)
+    }
+
+    val availableReleaseTag = when (val st = updateState) {
+        is AppUpdateManager.UpdateState.UpdateAvailable -> st.release.tagName
+        is AppUpdateManager.UpdateState.Downloading -> st.release.tagName
+        is AppUpdateManager.UpdateState.ReadyToInstall -> st.release.tagName
+        else -> null
+    }
 
     OpalAmbientBackdrop(modifier = Modifier.fillMaxSize(), wallpaperPreset = wallpaperPreset) {
         Box(
@@ -274,16 +322,48 @@ private fun OpalConsoleScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Row(
-                        verticalAlignment = Alignment.Bottom,
+                        verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        OpalText(text = "OpalDesk", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                        OpalText(
-                            text = "v1.0.2",
-                            fontSize = 12.sp,
-                            color = OpalPalette.TextMuted,
-                            modifier = Modifier.padding(bottom = 3.dp),
-                        )
+                        Row(
+                            verticalAlignment = Alignment.Bottom,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OpalText(text = "OpalDesk", fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                            OpalText(
+                                text = "v$currentVersion",
+                                fontSize = 12.sp,
+                                color = OpalPalette.TextMuted,
+                                modifier = Modifier.padding(bottom = 3.dp),
+                            )
+                        }
+                        if (availableReleaseTag != null) {
+                            val badgeColor = if (updateState is AppUpdateManager.UpdateState.ReadyToInstall) {
+                                OpalPalette.AccentEmerald
+                            } else {
+                                OpalPalette.AccentBlue
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(badgeColor.copy(alpha = if (OpalPalette.isDark) 0.22f else 0.14f))
+                                    .border(0.8.dp, badgeColor.copy(alpha = 0.42f), CircleShape)
+                                    .clickable { showUpdateModal = true }
+                                    .padding(horizontal = 9.dp, vertical = 3.5.dp),
+                            ) {
+                                OpalText(
+                                    text = if (updateState is AppUpdateManager.UpdateState.ReadyToInstall) {
+                                        "安装 $availableReleaseTag"
+                                    } else {
+                                        "新版本 $availableReleaseTag"
+                                    },
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = badgeColor,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
                     }
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         if (status.connected && status.rootEnhanced) {
@@ -309,6 +389,8 @@ private fun OpalConsoleScreen(
                         scene = scene,
                         remote = remote,
                         extDisplay = extDisplay,
+                        needsLocalNetworkPerm = needsLocalNetworkPerm,
+                        onRequestLocalNetworkPerm = onRequestLocalNetworkPerm,
                         onEnterLocalDesktop = onEnterDesktop,
                         onOpenRemoteTrackpad = onOpenRemoteTrackpad,
                         onOpenExternalOrTrackpad = onProjectExternalOrTrackpad,
@@ -337,6 +419,7 @@ private fun OpalConsoleScreen(
                     else -> ConsoleEngineSettingsTab(
                         status = status,
                         onOpenActivation = { showActivationModal = true },
+                        onOpenUpdateModal = { showUpdateModal = true },
                         onStopEngine = onStopEngine,
                     )
                 }
@@ -347,6 +430,12 @@ private fun OpalConsoleScreen(
             ActivationModal(
                 onDismiss = { showActivationModal = false },
                 onActivated = { showActivationModal = false },
+            )
+        }
+
+        if (showUpdateModal) {
+            AppUpdateModal(
+                onDismiss = { showUpdateModal = false },
             )
         }
 

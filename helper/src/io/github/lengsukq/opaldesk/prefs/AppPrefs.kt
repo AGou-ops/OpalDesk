@@ -40,6 +40,9 @@ object AppPrefs {
     private const val KEY_MOUSE_TARGET = "physical_mouse_target"
     private const val KEY_SORT_APPS_BY_USAGE = "sort_apps_by_usage"
     private const val KEY_APP_LAUNCH_COUNTS = "app_launch_counts_v1"
+    private const val KEY_AUTO_CHECK_UPDATE = "auto_check_app_update"
+    private const val KEY_LAST_UPDATE_CHECK_MS = "last_update_check_ms"
+    private const val KEY_IGNORED_UPDATE_TAG = "ignored_update_tag"
 
     private val DEFAULT_PINNED = listOf(
         "com.android.chrome",
@@ -83,6 +86,9 @@ object AppPrefs {
     private val _appLaunchCountsFlow = MutableStateFlow<Map<String, Int>>(emptyMap())
     val appLaunchCountsFlow: StateFlow<Map<String, Int>> = _appLaunchCountsFlow.asStateFlow()
 
+    private val _autoCheckUpdateFlow = MutableStateFlow(true)
+    val autoCheckUpdateFlow: StateFlow<Boolean> = _autoCheckUpdateFlow.asStateFlow()
+
     private fun prefs(ctx: Context?) =
         ctx?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -102,6 +108,7 @@ object AppPrefs {
         _dockPinnedFlow.value = loadPkgList(p, KEY_DOCK_PINNED, fallbackKey = KEY_PINNED_PKGS).take(MAX_DOCK_PINNED)
         _sortAppsByUsageFlow.value = p.getBoolean(KEY_SORT_APPS_BY_USAGE, true)
         _appLaunchCountsFlow.value = parseLaunchCounts(p.getString(KEY_APP_LAUNCH_COUNTS, null))
+        _autoCheckUpdateFlow.value = p.getBoolean(KEY_AUTO_CHECK_UPDATE, true)
     }
 
     private fun loadPkgList(p: android.content.SharedPreferences, key: String, fallbackKey: String): List<String> {
@@ -328,4 +335,28 @@ object AppPrefs {
         counts.entries
             .filter { it.key.isNotBlank() && it.value > 0 }
             .joinToString("\n") { "${it.key.trim()}=${it.value}" }
+
+    fun isAutoCheckUpdateEnabled(ctx: Context?): Boolean {
+        hydrateFlows(ctx)
+        return _autoCheckUpdateFlow.value
+    }
+
+    fun setAutoCheckUpdate(ctx: Context?, enabled: Boolean) {
+        prefs(ctx)?.edit()?.putBoolean(KEY_AUTO_CHECK_UPDATE, enabled)?.apply()
+        _autoCheckUpdateFlow.value = enabled
+    }
+
+    fun getLastUpdateCheckMs(ctx: Context?): Long =
+        prefs(ctx)?.getLong(KEY_LAST_UPDATE_CHECK_MS, 0L) ?: 0L
+
+    fun setLastUpdateCheckMs(ctx: Context?, timestampMs: Long) {
+        prefs(ctx)?.edit()?.putLong(KEY_LAST_UPDATE_CHECK_MS, timestampMs)?.apply()
+    }
+
+    fun getIgnoredUpdateTag(ctx: Context?): String =
+        prefs(ctx)?.getString(KEY_IGNORED_UPDATE_TAG, "").orEmpty()
+
+    fun setIgnoredUpdateTag(ctx: Context?, tagName: String) {
+        prefs(ctx)?.edit()?.putString(KEY_IGNORED_UPDATE_TAG, tagName.trim())?.apply()
+    }
 }
