@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
@@ -37,7 +38,12 @@ public final class DaemonLogBuffer {
 
     /** Creates a UTF-8 {@link PrintStream} that mirrors completed lines into the ring buffer. */
     public static PrintStream createTeePrintStream(PrintStream delegate, boolean isError) {
-        return new PrintStream(new TeeOutputStream(delegate, isError), true, StandardCharsets.UTF_8);
+        try {
+            // Use String charset overload (API 1+) instead of Charset overload (API 33+ / Android 13+)
+            return new PrintStream(new TeeOutputStream(delegate, isError), true, "UTF-8");
+        } catch (UnsupportedEncodingException e) {
+            return new PrintStream(new TeeOutputStream(delegate, isError), true);
+        }
     }
 
     /** Records a single log line with wall-clock timestamp and severity marker. */
