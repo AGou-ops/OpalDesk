@@ -108,4 +108,42 @@ public class ExternalMouseRouterTest {
         assertFalse(det.onEvent(DoubleTapWakeDetector.EV_KEY, DoubleTapWakeDetector.BTN_TOUCH, 1, 6300L, true));
         assertFalse(det.onEvent(DoubleTapWakeDetector.EV_KEY, DoubleTapWakeDetector.BTN_TOUCH, 0, 6350L, true));
     }
+
+    @Test
+    public void genericMotionFilterRejectsButtonPressReleaseAndNormalizesUsbMouseButtonState() {
+        assertTrue(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_HOVER_ENTER));
+        assertTrue(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_HOVER_MOVE));
+        assertTrue(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_HOVER_EXIT));
+        assertTrue(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_SCROLL));
+
+        // ACTION_BUTTON_PRESS (11) & ACTION_BUTTON_RELEASE (12) must NEVER be injected via injectInputEvent
+        assertFalse(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_BUTTON_PRESS));
+        assertFalse(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_BUTTON_RELEASE));
+        assertFalse(MouseRoutingPolicy.isInjectableGenericMotionAction(MouseRoutingPolicy.ACTION_DOWN));
+
+        // Composite USB / OTG mice that report buttonState=0 on ACTION_DOWN/MOVE normalize to BUTTON_PRIMARY
+        assertEquals(MouseRoutingPolicy.BUTTON_PRIMARY,
+                MouseRoutingPolicy.normalizeMouseButtonState(MouseRoutingPolicy.ACTION_DOWN, true, 0));
+        assertEquals(MouseRoutingPolicy.BUTTON_PRIMARY,
+                MouseRoutingPolicy.normalizeMouseButtonState(MouseRoutingPolicy.ACTION_MOVE, true, 0));
+        assertEquals(2 /* BUTTON_SECONDARY */,
+                MouseRoutingPolicy.normalizeMouseButtonState(MouseRoutingPolicy.ACTION_DOWN, true, 2));
+        assertEquals(0,
+                MouseRoutingPolicy.normalizeMouseButtonState(MouseRoutingPolicy.ACTION_UP, true, 0));
+        assertEquals(0,
+                MouseRoutingPolicy.normalizeMouseButtonState(MouseRoutingPolicy.ACTION_DOWN, false, 0));
+
+        // UHID pre-press positioning report prevents single-click-from-old-coord drag swallow
+        assertTrue(MouseRoutingPolicy.needsPrePressPositionReport(0, 1, 100, 100, 420, 360));
+        assertFalse(MouseRoutingPolicy.needsPrePressPositionReport(0, 1, 420, 360, 420, 360));
+        assertFalse(MouseRoutingPolicy.needsPrePressPositionReport(1, 1, 100, 100, 420, 360));
+        assertFalse(MouseRoutingPolicy.needsPrePressPositionReport(1, 0, 100, 100, 420, 360));
+
+        // Exiting local desktop / detaching surfaces restores Display 0 focus so mice never vanish
+        // into an invisible OWN_FOCUS VirtualDisplay, while leaving active external/cast displays intact
+        assertTrue(MouseRoutingPolicy.shouldRestoreDefaultDisplayFocusOnLocalExit(false, -1, false));
+        assertFalse(MouseRoutingPolicy.shouldRestoreDefaultDisplayFocusOnLocalExit(true, -1, false));
+        assertFalse(MouseRoutingPolicy.shouldRestoreDefaultDisplayFocusOnLocalExit(false, 2, false));
+        assertFalse(MouseRoutingPolicy.shouldRestoreDefaultDisplayFocusOnLocalExit(false, -1, true));
+    }
 }

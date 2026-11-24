@@ -219,6 +219,9 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
 
     public void shutdown() {
         stopAudio();
+        if (mouseRouter != null) {
+            mouseRouter.releaseToLocal();
+        }
         for (ActiveRemoteSession s : new ArrayList<>(sessions.values())) {
             closeSessionResources(s);
         }
@@ -705,7 +708,7 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                 sessionId, sinkType, standalone, hello.appPackage, hello.appActivity);
         synchronized (s.lock) {
             if (standalone) {
-                int[] spec = resolveStandaloneStreamSpec(hello.width, hello.height, hello.dpi);
+                int[] spec = resolveStandaloneStreamSpec(s.appPackage, hello.width, hello.height, hello.dpi);
                 s.width = spec[0];
                 s.height = spec[1];
                 s.dpi = spec[2];
@@ -847,7 +850,7 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
             int nextH;
             int nextDpi;
             if (s.standalone) {
-                int[] spec = resolveStandaloneStreamSpec(reqW, reqH, cfg.dpi);
+                int[] spec = resolveStandaloneStreamSpec(s.appPackage, reqW, reqH, cfg.dpi);
                 nextW = spec[0];
                 nextH = spec[1];
                 nextDpi = spec[2];
@@ -886,7 +889,12 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
         }
     }
 
-    private int[] resolveStandaloneStreamSpec(int reqW, int reqH, int requestedDpi) {
+    private int[] resolveStandaloneStreamSpec(String appPkg, int reqW, int reqH, int requestedDpi) {
+        int customDpi = config.resolveEffectiveCustomDpi(appPkg);
+        if (customDpi > 0) {
+            int[] aligned = DisplayGeometryUtil.alignForEncoder(reqW, reqH, 8);
+            return new int[]{aligned[0], aligned[1], customDpi};
+        }
         int[] hostMetrics = services.getPrimaryDisplayMetrics();
         int hostW = (hostMetrics != null && hostMetrics.length >= 3 && hostMetrics[0] > 0)
                 ? hostMetrics[0] : config.getCanvasWidth();

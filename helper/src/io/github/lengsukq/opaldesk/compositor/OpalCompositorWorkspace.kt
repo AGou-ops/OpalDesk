@@ -187,18 +187,30 @@ fun OpalCompositorWorkspace(
     val mouseTargetMode by AppPrefs.mouseTargetFlow.collectAsState()
     val externalUiScale by AppPrefs.externalUiScaleFlow.collectAsState()
 
+    val profileState by io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.stateFlow.collectAsState()
     var showAppDrawer by remember { mutableStateOf(false) }
     var showExposeOverview by remember { mutableStateOf(false) }
     var showControlCenter by remember { mutableStateOf(false) }
+    var showDpiPopover by remember { mutableStateOf(false) }
+    var showExitSlotModal by remember { mutableStateOf(false) }
+    var savingOnExit by remember { mutableStateOf(false) }
+    var editingAppDpiTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+    var autoRestoredOnce by remember { mutableStateOf(false) }
     var contextMenuTarget by remember { mutableStateOf<Triple<String, CompositorWindow?, Offset>?>(null) }
     var wallpaperMenuPos by remember { mutableStateOf<Offset?>(null) }
     var snapPreviewRect by remember { mutableStateOf<WindowRect?>(null) }
     var trayInfo by remember { mutableStateOf(SystemTrayInfo()) }
 
+    LaunchedEffect(Unit) {
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.hydrate(ctx)
+        BridgeClient.bindAppContext(ctx)
+    }
+
     fun dismissAllPopovers() {
         showAppDrawer = false
         showExposeOverview = false
         showControlCenter = false
+        showDpiPopover = false
         contextMenuTarget = null
         wallpaperMenuPos = null
     }
@@ -226,7 +238,12 @@ fun OpalCompositorWorkspace(
         }
     }
 
-    OpalAmbientBackdrop(modifier = Modifier.fillMaxSize(), wallpaperPreset = wallpaperPreset) {
+    val hasFullscreenWindow = scene.visibleWindows.any { it.isFullscreen }
+    OpalAmbientBackdrop(
+        modifier = Modifier.fillMaxSize(),
+        wallpaperPreset = wallpaperPreset,
+        suspendBackdrop = hasFullscreenWindow,
+    ) {
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val canvasW = constraints.maxWidth
             val canvasH = constraints.maxHeight
@@ -243,6 +260,29 @@ fun OpalCompositorWorkspace(
                 else -> "桌面画布 · ${canvasW}×${canvasH}"
             }
 
+            val currentTarget = remember(isExternalMonitor, remote.connected, remote.peerName, externalMonitorSummary, canvasW, canvasH) {
+                io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.resolveDisplayTarget(
+                    isExternalMonitor = isExternalMonitor,
+                    remoteConnected = remote.connected,
+                    remotePeerName = remote.peerName,
+                    externalDisplayName = if (isExternalMonitor && !remote.connected) externalMonitorSummary.substringBefore("·").trim() else "",
+                    externalWidth = if (isExternalMonitor && !remote.connected) canvasW else 0,
+                    externalHeight = if (isExternalMonitor && !remote.connected) canvasH else 0,
+                )
+            }
+
+            // Automatically select & sync the matching profile slot for the active display / cast receiver
+            LaunchedEffect(status.connected, currentTarget.key, profileState.autoMatchTargetSlot) {
+                if (status.connected && profileState.autoMatchTargetSlot) {
+                    val (matched, changed) = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.autoSelectSlotForTarget(ctx, currentTarget)
+                    if (changed) {
+                        BridgeClient.syncProfileToDaemonAsync(matched) {
+                            Toast.makeText(ctx, "已自动载入槽位 ${matched.id + 1}「${matched.name}」", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+
             // Sync physical canvas dimensions & effective DPI with daemon compositor
             LaunchedEffect(status.connected, canvasW, canvasH, dpiInt) {
                 if (status.connected && canvasW >= 360 && canvasH >= 360) {
@@ -251,6 +291,11 @@ fun OpalCompositorWorkspace(
                         canvasH = canvasH,
                         canvasDpi = dpiInt,
                     )
+                    val activeSlot = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.stateFlow.value.activeSavedSlot
+                    if (!autoRestoredOnce && activeSlot.autoRestoreLayout && scene.windows.isEmpty() && activeSlot.savedLayout.isNotEmpty()) {
+                        autoRestoredOnce = true
+                        BridgeClient.restoreSavedLayoutAsync(activeSlot, canvasW, canvasH)
+                    }
                 }
             }
 
@@ -270,7 +315,7 @@ fun OpalCompositorWorkspace(
                 modifier = Modifier
                     .fillMaxSize()
                     .onTapOrContextAction(
-                        showAppDrawer, showExposeOverview, showControlCenter,
+                        showAppDrawer, showExposeOverview, showControlCenter, showDpiPopover,
                         contextMenuTarget, wallpaperMenuPos,
                         onPrimaryTap = { dismissAllPopovers() },
                         onContextAction = { pos ->
@@ -365,11 +410,17 @@ fun OpalCompositorWorkspace(
                     hostScreenOff = status.hostScreenOff,
                     isCompactWidth = isCompactWidth,
                     showControlCenter = showControlCenter,
+                    showDpiPopover = showDpiPopover,
                     showPhoneTrackpadButton = canControlPhoneTrackpad,
                     phoneTrackpadVisible = phoneTrackpadVisible,
                     onTogglePhoneTrackpad = {
                         dismissAllPopovers()
                         togglePhoneTrackpadFromExternal()
+                    },
+                    onToggleDpiPopover = {
+                        val next = !showDpiPopover
+                        dismissAllPopovers()
+                        showDpiPopover = next
                     },
                     onToggleFullscreen = {
                         val focused = scene.focusedWindow ?: return@MacDesktopMenuBar
@@ -514,6 +565,8 @@ fun OpalCompositorWorkspace(
                 MacControlCenterPopover(
                     tray = trayInfo,
                     totalWindows = scene.windows.size,
+                    canvasW = canvasW,
+                    canvasH = canvasH,
                     displaySummary = displaySummary,
                     inputBackendLabel = status.injectBackendLabel,
                     targetFps = status.targetFps,
@@ -583,6 +636,10 @@ fun OpalCompositorWorkspace(
                         val extId = ExternalTrackpadBridge.sessionFlow.value.displayId
                         BridgeClient.setMouseTargetAsync(mode, if (extId > 0) extId else -1)
                     },
+                    onOpenDpiSettings = {
+                        showControlCenter = false
+                        showDpiPopover = true
+                    },
                     onApplyTilingLayout = ::applyTiling,
                     onMinimizeAll = {
                         showControlCenter = false
@@ -598,12 +655,27 @@ fun OpalCompositorWorkspace(
                     },
                     onExitDesktop = {
                         showControlCenter = false
-                        onExitDesktop()
+                        showExitSlotModal = true
                     },
                     modifier = Modifier
                         .align(Alignment.TopEnd)
                         .padding(top = (CompositorGeometry.TOP_BAR_DP + 8f).dp, start = 12.dp, end = 12.dp)
                         .zIndex(10_020f),
+                )
+            }
+
+            // In-DeX Live DPI Settings Floating Panel (global + per-app DPI with real-time preview)
+            if (showDpiPopover) {
+                val dpiMaxH = (maxHeight - (CompositorGeometry.TOP_BAR_DP + 24f).dp).coerceAtLeast(240.dp)
+                io.github.lengsukq.opaldesk.ui.DexDpiSettingsPopover(
+                    openWindows = scene.windows,
+                    allApps = allApps,
+                    maxHeight = dpiMaxH,
+                    onDismiss = { showDpiPopover = false },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = (CompositorGeometry.TOP_BAR_DP + 8f).dp, start = 12.dp, end = 12.dp)
+                        .zIndex(10_022f),
                 )
             }
 
@@ -711,6 +783,9 @@ fun OpalCompositorWorkspace(
                             BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.TOGGLE_MAXIMIZE)
                         }
                     },
+                    onEditAppDpi = {
+                        editingAppDpiTarget = pkg to (win?.title ?: appEntry?.label ?: pkg)
+                    },
                     onToggleDesktopShortcut = {
                         val added = AppPrefs.toggleDesktopShortcut(ctx, pkg)
                         Toast.makeText(
@@ -788,6 +863,64 @@ fun OpalCompositorWorkspace(
                 Box(modifier = Modifier.fillMaxSize().zIndex(10_050f)) {
                     MacVirtualPointerCursor(positionPx = pos)
                 }
+            }
+
+            // Per-app custom DPI editor modal (live preview; saved when user commits to a slot on exit)
+            editingAppDpiTarget?.let { (pkg, appLabel) ->
+                val working = profileState.workingConfig
+                io.github.lengsukq.opaldesk.ui.PerAppDpiEditorModal(
+                    pkg = pkg,
+                    appLabel = appLabel,
+                    currentCustomDpi = working.appCustomDpis[pkg] ?: 0,
+                    globalCustomDpi = working.globalCustomDpi,
+                    onApplyDpi = { nextDpi ->
+                        BridgeClient.setAppCustomDpiAsync(ctx, pkg, nextDpi)
+                        val tip = if (nextDpi > 0) "已为「$appLabel」应用 $nextDpi DPI（退出时可选择槽位保存）" else "已恢复「$appLabel」跟随全局 DPI"
+                        Toast.makeText(ctx, tip, Toast.LENGTH_SHORT).show()
+                    },
+                    onDismiss = { editingAppDpiTarget = null },
+                    modifier = Modifier.zIndex(10_055f),
+                )
+            }
+
+            // Exit DeX modal: lets user pick which of the 5 slots to save current config & layout into
+            if (showExitSlotModal) {
+                io.github.lengsukq.opaldesk.ui.ExitSaveSlotModal(
+                    title = "退出 DeX 桌面",
+                    subtitle = "可选择将本次调整的 DPI、应用窗口大小/位置与当前桌面布局保存到 1–5 号任意槽位，或直接退出。",
+                    confirmLabel = "保存并退出",
+                    openWindowCount = scene.windows.size,
+                    busy = savingOnExit,
+                    onDismiss = { if (!savingOnExit) showExitSlotModal = false },
+                    onExitWithoutSaving = {
+                        if (!savingOnExit) {
+                            showExitSlotModal = false
+                            onExitDesktop()
+                        }
+                    },
+                    onSaveToSlotAndExit = { slotId, saveLayout ->
+                        if (!savingOnExit) {
+                            savingOnExit = true
+                            scope.launch(Dispatchers.IO) {
+                                BridgeClient.pullDaemonWindowBoundsSync()
+                                val saved = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.saveWorkingToSlot(
+                                    ctx = ctx,
+                                    targetSlotId = slotId,
+                                    scene = scene,
+                                    saveCurrentLayout = saveLayout,
+                                    bindTargetKey = currentTarget.key,
+                                )
+                                withContext(Dispatchers.Main) {
+                                    savingOnExit = false
+                                    showExitSlotModal = false
+                                    Toast.makeText(ctx, "已保存到槽位 ${slotId + 1}「${saved.name}」", Toast.LENGTH_SHORT).show()
+                                    onExitDesktop()
+                                }
+                            }
+                        }
+                    },
+                    modifier = Modifier.zIndex(10_058f),
+                )
             }
 
             // Host-side interactive wireless pairing consent prompt (also active in Desktop mode)

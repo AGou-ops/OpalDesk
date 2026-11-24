@@ -117,6 +117,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         OpalLogStore.init(applicationContext)
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.hydrate(applicationContext)
+        BridgeClient.bindAppContext(applicationContext)
         OpalLogStore.i("App", "MainActivity started (API ${Build.VERSION.SDK_INT})")
         WindowCompat.setDecorFitsSystemWindows(window, false)
 
@@ -426,6 +428,7 @@ private fun OpalConsoleScreen(
                     )
                     2 -> ConsoleEngineSettingsTab(
                         status = status,
+                        scene = scene,
                         onOpenActivation = { showActivationModal = true },
                         onOpenUpdateModal = { showUpdateModal = true },
                         onStopEngine = onStopEngine,
@@ -453,16 +456,49 @@ private fun OpalConsoleScreen(
         }
 
         if (showExitConfirmModal) {
-            ConfirmCompleteExitModal(
-                connected = status.connected,
+            val detailText = buildString {
+                append("将停止多窗引擎守护进程、投屏及后台服务并彻底退出应用。")
+                if (scene.windows.isNotEmpty()) {
+                    append("当前共有 ${scene.windows.size} 个窗口，可选择保存到下方槽位后再退出。")
+                }
+            }
+            io.github.lengsukq.opaldesk.ui.ExitSaveSlotModal(
+                title = "完全退出 OpalDesk",
+                subtitle = detailText,
+                confirmLabel = "保存并退出",
                 openWindowCount = scene.windows.size,
-                casting = remote.connected,
-                exiting = exitingApp,
+                busy = exitingApp,
                 onDismiss = { if (!exitingApp) showExitConfirmModal = false },
-                onConfirmExit = {
+                onExitWithoutSaving = {
                     if (!exitingApp) {
                         exitingApp = true
                         onCompleteExitApp()
+                    }
+                },
+                onSaveToSlotAndExit = { slotId, saveLayout ->
+                    if (!exitingApp) {
+                        exitingApp = true
+                        Thread({
+                            BridgeClient.pullDaemonWindowBoundsSync()
+                            val curTarget = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.resolveDisplayTarget(
+                                isExternalMonitor = extDisplay != null,
+                                remoteConnected = remote.connected,
+                                remotePeerName = remote.peerName,
+                                externalDisplayName = extDisplay?.name.orEmpty(),
+                                externalWidth = extDisplay?.width ?: 0,
+                                externalHeight = extDisplay?.height ?: 0,
+                            )
+                            io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.saveWorkingToSlot(
+                                ctx = ctx,
+                                targetSlotId = slotId,
+                                scene = scene,
+                                saveCurrentLayout = saveLayout,
+                                bindTargetKey = curTarget.key,
+                            )
+                            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                                onCompleteExitApp()
+                            }
+                        }, "OpalSaveAndExit").start()
                     }
                 },
             )

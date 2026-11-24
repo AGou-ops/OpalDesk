@@ -270,6 +270,28 @@ class OpalCastPeerClient(
         enqueue(TYPE_INPUT_TOUCH, 0, bb.array())
     }
 
+    fun handleGenericMouseMotion(ev: MotionEvent?, viewW: Int, viewH: Int): Boolean {
+        if (ev == null || !isMouseMotion(ev)) return false
+        return when (ev.actionMasked) {
+            MotionEvent.ACTION_BUTTON_PRESS -> {
+                if (ev.actionButton == MotionEvent.BUTTON_BACK) {
+                    sendSystemAction(SYS_BACK)
+                }
+                true
+            }
+            MotionEvent.ACTION_BUTTON_RELEASE -> true
+            MotionEvent.ACTION_HOVER_ENTER,
+            MotionEvent.ACTION_HOVER_MOVE,
+            MotionEvent.ACTION_HOVER_EXIT,
+            MotionEvent.ACTION_SCROLL,
+            -> {
+                sendMouseEvent(ev, viewW, viewH)
+                true
+            }
+            else -> false
+        }
+    }
+
     fun sendMouseEvent(ev: MotionEvent, viewW: Int, viewH: Int) {
         if (viewW <= 0 || viewH <= 0) return
         val rw = remoteWidth.coerceAtLeast(2).toFloat()
@@ -283,6 +305,14 @@ class OpalCastPeerClient(
             MotionEvent.ACTION_SCROLL -> 3 // MOUSE_SCROLL
             MotionEvent.ACTION_HOVER_EXIT -> 4 // MOUSE_HOVER_EXIT
             else -> 0 // MOUSE_MOVE_ABS
+        }
+        val normButtons = if (
+            (masked == MotionEvent.ACTION_DOWN || masked == MotionEvent.ACTION_MOVE) &&
+            ev.buttonState == 0
+        ) {
+            MotionEvent.BUTTON_PRIMARY
+        } else {
+            ev.buttonState
         }
         val actBtn = if (masked == MotionEvent.ACTION_BUTTON_PRESS || masked == MotionEvent.ACTION_BUTTON_RELEASE) {
             ev.actionButton
@@ -298,7 +328,7 @@ class OpalCastPeerClient(
         bb.put((mouseAction and 0xFF).toByte())
         bb.putFloat(rx)
         bb.putFloat(ry)
-        bb.putInt(ev.buttonState)
+        bb.putInt(normButtons)
         bb.putInt(actBtn)
         bb.putFloat(hScroll)
         bb.putFloat(vScroll)

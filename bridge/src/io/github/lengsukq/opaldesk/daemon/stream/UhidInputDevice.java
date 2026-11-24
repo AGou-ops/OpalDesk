@@ -10,6 +10,8 @@ import android.view.InputEvent;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 
+import io.github.lengsukq.opaldesk.daemon.input.MouseRoutingPolicy;
+
 import java.io.Closeable;
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -187,7 +189,16 @@ public final class UhidInputDevice implements Closeable {
             byte hWheel = UhidProtocol.clampWheelDelta(me.getAxisValue(MotionEvent.AXIS_HSCROLL));
             return sendPointer(absX, absY, buttons, vWheel, hWheel, true);
         }
-        return sendPointer(absX, absY, buttons, 0, 0, false);
+        synchronized (ioLock) {
+            if (MouseRoutingPolicy.needsPrePressPositionReport(
+                    lastButtons, buttons & 0x1F, lastAbsX, lastAbsY, absX, absY)) {
+                // Move virtual pointer cleanly to (absX, absY) with 0 buttons BEFORE pressing
+                // so InputReader never treats a first click at a new spot as a drag from lastAbsX/Y!
+                sendPointer(absX, absY, 0, 0, 0, false);
+                return sendPointer(absX, absY, buttons, 0, 0, true);
+            }
+            return sendPointer(absX, absY, buttons, 0, 0, false);
+        }
     }
 
     public boolean sendPointer(int absX, int absY, int buttonsMask, int vWheel, int hWheel, boolean force) {

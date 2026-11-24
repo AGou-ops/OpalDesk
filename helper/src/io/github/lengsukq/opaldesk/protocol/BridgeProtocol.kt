@@ -60,6 +60,10 @@ object BridgeProtocol {
         const val RESPOND_PAIRING = 36
         const val INJECT_REMOTE_TRACKPAD = 37
         const val GET_DAEMON_LOGS = 38
+        const val SET_ADVANCED_DPI_CONFIG = 39
+        const val SET_APP_CUSTOM_DPI = 40
+        const val SYNC_APP_WINDOW_BOUNDS = 41
+        const val GET_ADVANCED_CONFIG_STATE = 42
         const val SHUTDOWN = 99
     }
 
@@ -72,6 +76,9 @@ object BridgeProtocol {
     object MouseTarget {
         const val LOCAL = 0
         const val EXTERNAL = 1
+        const val PIN_LOCAL_DISPLAY0 = 2
+        const val UNPIN_LOCAL_DISPLAY0 = 3
+        const val RELEASE_EXTERNAL = 4
     }
 
     object Profile {

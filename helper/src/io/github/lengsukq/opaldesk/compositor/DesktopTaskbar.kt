@@ -130,9 +130,11 @@ fun MacDesktopMenuBar(
     hostScreenOff: Boolean,
     isCompactWidth: Boolean,
     showControlCenter: Boolean,
+    showDpiPopover: Boolean = false,
     showPhoneTrackpadButton: Boolean = false,
     phoneTrackpadVisible: Boolean = false,
     onTogglePhoneTrackpad: () -> Unit = {},
+    onToggleDpiPopover: () -> Unit = {},
     onToggleFullscreen: () -> Unit,
     onToggleControlCenter: () -> Unit,
     onOpenConsole: () -> Unit,
@@ -207,12 +209,19 @@ fun MacDesktopMenuBar(
                         maxLines = 1,
                     )
                 }
-                if (!isCompactWidth) {
-                    Spacer(Modifier.width(9.dp))
+                Spacer(Modifier.width(if (isCompactWidth) 5.dp else 8.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(if (showDpiPopover) OpalPalette.AccentBlue.copy(alpha = 0.20f) else OpalPalette.ChipFill)
+                        .clickable(onClick = onToggleDpiPopover)
+                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                ) {
                     OpalText(
-                        text = "${focusedWindow.contentWidth}×${focusedWindow.contentHeight} · ${focusedWindow.contentDpi}dpi",
+                        text = if (isCompactWidth) "${focusedWindow.contentDpi}dpi" else "${focusedWindow.contentWidth}×${focusedWindow.contentHeight} · ${focusedWindow.contentDpi}dpi",
                         fontSize = 10.5.sp,
-                        color = OpalPalette.TextMuted,
+                        fontWeight = FontWeight.Medium,
+                        color = if (showDpiPopover) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
                         maxLines = 1,
                     )
                 }
@@ -648,6 +657,9 @@ fun WindowTilingPopover(
         WindowTilingLayout.SPLIT_3_MAIN_STACK,
         WindowTilingLayout.SPLIT_4_COLS,
         WindowTilingLayout.SPLIT_4_GRID,
+        WindowTilingLayout.SPLIT_5_COLS,
+        WindowTilingLayout.SPLIT_6_GRID,
+        WindowTilingLayout.SPLIT_8_GRID,
         WindowTilingLayout.CASCADE,
     )
     Column(
@@ -740,6 +752,8 @@ private fun TilingPresetTile(
 fun MacControlCenterPopover(
     tray: SystemTrayInfo,
     totalWindows: Int,
+    canvasW: Int = 1920,
+    canvasH: Int = 1200,
     displaySummary: String,
     inputBackendLabel: String,
     targetFps: Int,
@@ -766,6 +780,7 @@ fun MacControlCenterPopover(
     onSelectWallpaper: (Int) -> Unit,
     onPickCustomWallpaper: () -> Unit,
     onSelectMouseTarget: (Int) -> Unit,
+    onOpenDpiSettings: () -> Unit = {},
     onApplyTilingLayout: (WindowTilingLayout) -> Unit,
     onMinimizeAll: () -> Unit,
     onCloseAll: () -> Unit,
@@ -984,6 +999,15 @@ fun MacControlCenterPopover(
             }
         }
 
+        // Quick 1–5 Configuration Slot Switcher & Layout Restore
+        Spacer(Modifier.height(12.dp))
+        io.github.lengsukq.opaldesk.ui.QuickSlotSwitcherStrip(
+            compact = true,
+            showRestoreButton = true,
+            canvasW = canvasW,
+            canvasH = canvasH,
+        )
+
         // Unified Live Display & Quality Quick Controls (FPS, Window DPI, UI Scale)
         Spacer(Modifier.height(12.dp))
         OpalText(text = "帧率设置（实时生效）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
@@ -997,7 +1021,23 @@ fun MacControlCenterPopover(
         )
 
         Spacer(Modifier.height(10.dp))
-        OpalText(text = "应用窗口密度 DPI（实时热刷新）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            OpalText(text = "应用窗口密度 DPI（实时热刷新）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+            OpalText(
+                text = "自定义 / 单应用 DPI…",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = OpalPalette.AccentBlue,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onOpenDpiSettings)
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+            )
+        }
         Spacer(Modifier.height(6.dp))
         val dpiOpts = listOf(80, 100, 125)
         val dpiIdx = dpiOpts.indexOfFirst { abs(it - windowDpiScalePct) <= 8 }.let { if (it >= 0) it else 1 }
@@ -1071,6 +1111,9 @@ fun MacControlCenterPopover(
             WindowTilingLayout.SPLIT_3_MAIN_STACK,
             WindowTilingLayout.SPLIT_4_COLS,
             WindowTilingLayout.SPLIT_4_GRID,
+            WindowTilingLayout.SPLIT_5_COLS,
+            WindowTilingLayout.SPLIT_6_GRID,
+            WindowTilingLayout.SPLIT_8_GRID,
             WindowTilingLayout.CASCADE,
         )
         Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1191,6 +1234,7 @@ fun TaskbarContextMenuPopover(
     onSnapLeft: () -> Unit,
     onSnapRight: () -> Unit,
     onMaximize: () -> Unit,
+    onEditAppDpi: () -> Unit = {},
     onToggleDesktopShortcut: () -> Unit,
     onToggleDockPin: () -> Unit,
     onCloseWindow: () -> Unit,
@@ -1222,6 +1266,10 @@ fun TaskbarContextMenuPopover(
         ContextMenuRow(if (window != null) "聚焦 / 恢复窗口" else "启动应用") {
             onFocusOrLaunch()
             onDismiss()
+        }
+        ContextMenuRow("自定义此应用 DPI…", textColor = OpalPalette.AccentBlue) {
+            onDismiss()
+            onEditAppDpi()
         }
         if (window != null) {
             ContextMenuRow("贴靠左半屏") {

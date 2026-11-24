@@ -77,6 +77,9 @@ object WorkstationKeyDispatcher {
                 KeyEvent.KEYCODE_2 -> WindowTilingLayout.SPLIT_2_COLS
                 KeyEvent.KEYCODE_3 -> WindowTilingLayout.SPLIT_3_COLS
                 KeyEvent.KEYCODE_4 -> WindowTilingLayout.SPLIT_4_COLS
+                KeyEvent.KEYCODE_5 -> WindowTilingLayout.SPLIT_5_COLS
+                KeyEvent.KEYCODE_6 -> WindowTilingLayout.SPLIT_6_GRID
+                KeyEvent.KEYCODE_8 -> WindowTilingLayout.SPLIT_8_GRID
                 KeyEvent.KEYCODE_G -> WindowTilingLayout.SPLIT_4_GRID
                 else -> null
             }

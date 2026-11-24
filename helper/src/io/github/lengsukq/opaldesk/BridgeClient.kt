@@ -1,5 +1,6 @@
 package io.github.lengsukq.opaldesk
 
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -54,6 +55,15 @@ object BridgeClient {
     @Volatile
     private var binder: IBinder? = null
 
+    @Volatile
+    private var appContext: Context? = null
+
+    fun bindAppContext(ctx: Context?) {
+        val app = ctx?.applicationContext ?: return
+        appContext = app
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.hydrate(app)
+    }
+
     private val _statusFlow = MutableStateFlow(DaemonStatus())
     val statusFlow: StateFlow<DaemonStatus> = _statusFlow.asStateFlow()
 
@@ -87,8 +97,28 @@ object BridgeClient {
         _remoteTrackpadCursorFlow.value = pos
     }
 
+    private const val MAX_SNAPSHOT_CACHE_KB = 16 * 1024 // 16 MiB cap by actual Bitmap byte allocation
     private val binderReadyListeners = CopyOnWriteArraySet<Runnable>()
-    private val snapshotCache = object : LruCache<String, Bitmap>(24) {}
+    private val snapshotCache = object : LruCache<String, Bitmap>(MAX_SNAPSHOT_CACHE_KB) {
+        override fun sizeOf(key: String, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
+
+    @Volatile
+    private var localDesktopMousePinned: Boolean = false
+
+    @Suppress("DEPRECATION")
+    fun onTrimMemory(level: Int) {
+        when {
+            level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
+                snapshotCache.evictAll()
+            }
+            level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
+                level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+                snapshotCache.trimToSize(MAX_SNAPSHOT_CACHE_KB / 2)
+            }
+        }
+    }
 
     fun getService(): IBinder? {
         val b = binder
@@ -121,6 +151,18 @@ object BridgeClient {
         } catch (_: Throwable) {
         }
         ioExec.execute {
+            val ctx = appContext
+            if (ctx != null) {
+                io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.hydrate(ctx)
+                syncProfileToDaemonSync(next, io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.workingConfig)
+            }
+            if (localDesktopMousePinned) {
+                val mode = BridgeProtocol.MouseTarget.PIN_LOCAL_DISPLAY0
+                transact(next, BridgeProtocol.Tx.SET_MOUSE_TARGET, oneway = false, writeArgs = { d ->
+                    d.writeInt(mode)
+                    d.writeInt(-1)
+                }) { it.readInt() }
+            }
             refreshStatus()
             refreshSceneSnapshot()
             refreshRemoteStatus()
@@ -230,6 +272,7 @@ object BridgeClient {
                 connectedMouseCount = if (reply.dataAvail() >= 4) reply.readInt() else 0,
                 mouseRoutedDisplayId = if (reply.dataAvail() >= 4) reply.readInt() else -1,
                 hostScreenOff = if (reply.dataAvail() >= 4) reply.readInt() != 0 else false,
+                globalCustomDpi = if (reply.dataAvail() >= 4) reply.readInt() else 0,
             )
         }?.also { _statusFlow.value = it } ?: DaemonStatus(connected = false).also { _statusFlow.value = it }
     }
@@ -415,6 +458,8 @@ object BridgeClient {
     }
 
     fun updateDisplayPrefsAsync(targetFps: Int, windowDpiScalePct: Int) {
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingTargetFps(targetFps)
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingWindowDpiScalePct(windowDpiScalePct)
         ioExec.execute {
             val svc = getService() ?: return@execute
             transact(
@@ -428,6 +473,153 @@ object BridgeClient {
             ) { it.readInt() }
             refreshStatus()
             refreshSceneSnapshot()
+        }
+    }
+
+    fun setGlobalCustomDpiAsync(ctx: Context?, globalCustomDpi: Int) {
+        bindAppContext(ctx)
+        val updated = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingGlobalCustomDpi(globalCustomDpi)
+        ioExec.execute {
+            val svc = getService() ?: return@execute
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_ADVANCED_DPI_CONFIG,
+                oneway = false,
+                writeArgs = { d ->
+                    d.writeInt(updated.globalCustomDpi)
+                    d.writeInt(0)
+                    d.writeString("")
+                },
+            ) { it.readInt() }
+            refreshStatus()
+            refreshSceneSnapshot()
+        }
+    }
+
+    fun setAppCustomDpiAsync(ctx: Context?, pkg: String, customDpi: Int) {
+        bindAppContext(ctx)
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingAppCustomDpi(pkg, customDpi)
+        ioExec.execute {
+            val svc = getService() ?: return@execute
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_APP_CUSTOM_DPI,
+                oneway = false,
+                writeArgs = { d ->
+                    d.writeString(pkg)
+                    d.writeInt(io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.clampDpiOrAuto(customDpi))
+                },
+            ) { it.readInt() }
+            refreshSceneSnapshot()
+        }
+    }
+
+    fun syncProfileToDaemonAsync(
+        profile: io.github.lengsukq.opaldesk.prefs.WorkspaceProfileConfig,
+        onDone: (() -> Unit)? = null,
+    ) {
+        ioExec.execute {
+            val svc = getService()
+            if (svc != null) {
+                syncProfileToDaemonSync(svc, profile)
+                refreshStatus()
+                refreshSceneSnapshot()
+            }
+            if (onDone != null) mainHandler.post(onDone)
+        }
+    }
+
+    private fun syncProfileToDaemonSync(
+        svc: IBinder,
+        profile: io.github.lengsukq.opaldesk.prefs.WorkspaceProfileConfig,
+    ) {
+        transact(
+            svc,
+            BridgeProtocol.Tx.UPDATE_COMPOSITOR_CONFIG,
+            oneway = false,
+            writeArgs = { d ->
+                d.writeInt(profile.inputBackendMode)
+                d.writeInt(profile.maxVdCount)
+                d.writeInt(-1)
+                d.writeInt(-1)
+                d.writeInt(-1)
+            },
+        ) { it.readInt() }
+        transact(
+            svc,
+            BridgeProtocol.Tx.UPDATE_DISPLAY_PREFS,
+            oneway = false,
+            writeArgs = { d ->
+                d.writeInt(profile.targetFps)
+                d.writeInt(profile.windowDpiScalePct)
+            },
+        ) { it.readInt() }
+        transact(
+            svc,
+            BridgeProtocol.Tx.SYNC_APP_WINDOW_BOUNDS,
+            oneway = false,
+            writeArgs = { d -> d.writeString(profile.formatAppBoundsForDaemon()) },
+        ) { it.readInt() }
+        transact(
+            svc,
+            BridgeProtocol.Tx.SET_ADVANCED_DPI_CONFIG,
+            oneway = false,
+            writeArgs = { d ->
+                d.writeInt(profile.globalCustomDpi)
+                d.writeInt(1)
+                d.writeString(profile.formatAppDpisForDaemon())
+            },
+        ) { it.readInt() }
+    }
+
+    fun pullDaemonWindowBoundsSync() {
+        val svc = getService() ?: return
+        val json = transact(svc, BridgeProtocol.Tx.GET_ADVANCED_CONFIG_STATE, oneway = false, writeArgs = {}) {
+            it.readString().orEmpty()
+        }
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.mergeDaemonBoundsIntoWorking(json)
+    }
+
+    fun pullDaemonWindowBoundsAsync(onDone: (() -> Unit)? = null) {
+        ioExec.execute {
+            pullDaemonWindowBoundsSync()
+            if (onDone != null) mainHandler.post(onDone)
+        }
+    }
+
+    fun restoreSavedLayoutAsync(
+        profile: io.github.lengsukq.opaldesk.prefs.WorkspaceProfileConfig,
+        canvasW: Int,
+        canvasH: Int,
+        onDone: ((Int) -> Unit)? = null,
+    ) {
+        val layout = profile.savedLayout
+        if (layout.isEmpty()) {
+            if (onDone != null) mainHandler.post { onDone(0) }
+            return
+        }
+        ioExec.execute {
+            val w = canvasW.coerceAtLeast(360).toFloat()
+            val h = canvasH.coerceAtLeast(360).toFloat()
+            var restored = 0
+            for (entry in layout.sortedBy { it.zOrder }) {
+                val l = (entry.leftRatio * w).toInt()
+                val t = (entry.topRatio * h).toInt()
+                val r = (entry.rightRatio * w).toInt()
+                val b = (entry.bottomRatio * h).toInt()
+                val winId = openWindow(entry.pkg, entry.activityClass, entry.profileCode, l, t, r, b)
+                if (winId > 0) {
+                    restored++
+                    if (entry.presentation != BridgeProtocol.Presentation.FLOATING) {
+                        updateWindowFrameAsync(winId, l, t, r, b, entry.presentation)
+                    }
+                    if (entry.minimized) {
+                        sendWindowActionAsync(winId, BridgeProtocol.WinAction.MINIMIZE)
+                    }
+                }
+            }
+            refreshSceneSnapshot()
+            if (onDone != null) mainHandler.post { onDone(restored) }
         }
     }
 
@@ -456,6 +648,81 @@ object BridgeClient {
             }
             refreshStatus()
             if (onDone != null) mainHandler.post { onDone(bound) }
+        }
+    }
+
+    fun setLocalDesktopMousePinAsync(pinned: Boolean) {
+        localDesktopMousePinned = pinned
+        val mode = if (pinned) {
+            BridgeProtocol.MouseTarget.PIN_LOCAL_DISPLAY0
+        } else {
+            BridgeProtocol.MouseTarget.UNPIN_LOCAL_DISPLAY0
+        }
+        ioExec.execute {
+            val svc = getService() ?: return@execute
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_MOUSE_TARGET,
+                oneway = false,
+                writeArgs = { d ->
+                    d.writeInt(mode)
+                    d.writeInt(-1)
+                },
+            ) { it.readInt() }
+        }
+    }
+
+    /**
+     * Releases active external monitor mouse routing back to Display 0 without overwriting the
+     * user's saved `MouseTarget.EXTERNAL` preference.
+     */
+    fun releaseExternalMouseRoutingAsync() {
+        ioExec.execute {
+            val svc = getService() ?: return@execute
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_MOUSE_TARGET,
+                oneway = false,
+                writeArgs = { d ->
+                    d.writeInt(BridgeProtocol.MouseTarget.RELEASE_EXTERNAL)
+                    d.writeInt(-1)
+                },
+            ) { it.readInt() }
+            refreshStatus()
+        }
+    }
+
+    /**
+     * Restores Display 0 mouse cursor & host screen power when the user swipes OpalDesk away from
+     * Android Recents while keeping background sessions recoverable.
+     */
+    fun onHostTaskRemoved(hasPhysicalExternal: Boolean) {
+        localDesktopMousePinned = false
+        ioExec.execute {
+            val svc = getService() ?: return@execute
+            if (_statusFlow.value.hostScreenOff && !_remoteStatusFlow.value.connected && !hasPhysicalExternal) {
+                transact(
+                    svc,
+                    BridgeProtocol.Tx.SET_HOST_SCREEN_POWER,
+                    oneway = false,
+                    writeArgs = { d -> d.writeInt(1) },
+                ) { it.readInt() }
+            }
+            val releaseMode = if (!hasPhysicalExternal && !_remoteStatusFlow.value.connected) {
+                BridgeProtocol.MouseTarget.RELEASE_EXTERNAL
+            } else {
+                BridgeProtocol.MouseTarget.UNPIN_LOCAL_DISPLAY0
+            }
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_MOUSE_TARGET,
+                oneway = false,
+                writeArgs = { d ->
+                    d.writeInt(releaseMode)
+                    d.writeInt(-1)
+                },
+            ) { it.readInt() }
+            refreshStatus()
         }
     }
 
@@ -811,8 +1078,19 @@ object BridgeClient {
     }
 
     fun shutdownDaemonSync(closeWindows: Boolean = true, removeTasks: Boolean = false) {
+        localDesktopMousePinned = false
         val svc = getService()
+        var sentShutdownViaBinder = false
         if (svc != null) {
+            transact(
+                svc,
+                BridgeProtocol.Tx.SET_MOUSE_TARGET,
+                oneway = false,
+                writeArgs = { d ->
+                    d.writeInt(BridgeProtocol.MouseTarget.RELEASE_EXTERNAL)
+                    d.writeInt(-1)
+                },
+            ) { it.readInt() }
             if (closeWindows) {
                 transact(
                     svc,
@@ -821,7 +1099,28 @@ object BridgeClient {
                     writeArgs = { d -> d.writeInt(if (removeTasks) 1 else 0) },
                 ) { it.readInt() }
             }
-            transact(svc, BridgeProtocol.Tx.SHUTDOWN, oneway = false, writeArgs = {}) { it.readInt() }
+            sentShutdownViaBinder = (
+                transact(svc, BridgeProtocol.Tx.SHUTDOWN, oneway = false, writeArgs = {}) { it.readInt() } != null
+                )
+        }
+        if (!sentShutdownViaBinder) {
+            // Fallback to abstract control socket so daemon shutdown & mouse/focus cleanup never
+            // get skipped if the Activity exited before Binder finished connecting!
+            try {
+                LocalSocket().use { sock ->
+                    sock.connect(
+                        LocalSocketAddress(
+                            BridgeProtocol.CTL_SOCKET_NAME,
+                            LocalSocketAddress.Namespace.ABSTRACT,
+                        ),
+                    )
+                    sock.soTimeout = 1500
+                    sock.outputStream.write("SHUTDOWN\n".toByteArray(StandardCharsets.UTF_8))
+                    sock.outputStream.flush()
+                    sock.inputStream.read()
+                }
+            } catch (_: Throwable) {
+            }
         }
         binder = null
         _statusFlow.value = DaemonStatus(connected = false)

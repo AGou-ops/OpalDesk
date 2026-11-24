@@ -35,12 +35,14 @@ public final class ExternalMouseRouter {
         final String descriptor;
         final String location;
         final int bindKind; // 1=descriptor, 2=uniquePort, 3=legacyUniquePort, 4=physicalPort
+        final int targetDisplayId;
         final String displayUniqueId;
 
-        BoundMouse(String descriptor, String location, int bindKind, String displayUniqueId) {
+        BoundMouse(String descriptor, String location, int bindKind, int targetDisplayId, String displayUniqueId) {
             this.descriptor = descriptor;
             this.location = location;
             this.bindKind = bindKind;
+            this.targetDisplayId = targetDisplayId;
             this.displayUniqueId = displayUniqueId;
         }
     }
@@ -54,6 +56,7 @@ public final class ExternalMouseRouter {
     private volatile int activeExternalDisplayId = -1;
     private volatile String activeDisplayUniqueId = null;
     private volatile int activeDisplayPort = -1;
+    private volatile boolean localDesktopPinned = false;
     private volatile boolean listenersRegistered = false;
 
     private InputManager.InputDeviceListener inputListener;
@@ -68,6 +71,13 @@ public final class ExternalMouseRouter {
     public void start() {
         if (listenersRegistered || services == null) return;
         listenersRegistered = true;
+        // Defensive startup sweep: clear any stale InputManager UniqueId/Port associations left in
+        // system_server by a prior crashed or force-stopped daemon session so mice are never hidden.
+        synchronized (lock) {
+            if (activeExternalDisplayId <= 0 && !localDesktopPinned) {
+                sweepClearConnectedDeviceAssociationsLocked();
+            }
+        }
         if (services.inputManager != null) {
             inputListener = new InputManager.InputDeviceListener() {
                 @Override
@@ -103,7 +113,15 @@ public final class ExternalMouseRouter {
                 public void onDisplayRemoved(int displayId) {
                     if (displayId > 0 && displayId == activeExternalDisplayId) {
                         System.out.println("OPALDESK_MOUSE_EXT_DISPLAY_REMOVED id=" + displayId + " -> returning mouse to Display 0");
-                        unbindAllInternal(true);
+                        synchronized (lock) {
+                            activeExternalDisplayId = -1;
+                            activeDisplayUniqueId = null;
+                            activeDisplayPort = -1;
+                        }
+                        resyncBindings();
+                        if (!localDesktopPinned) {
+                            services.restoreDefaultDisplayTopFocus();
+                        }
                     }
                 }
             };
@@ -116,7 +134,11 @@ public final class ExternalMouseRouter {
     }
 
     public void shutdown() {
-        unbindAllInternal(true);
+        localDesktopPinned = false;
+        unbindAllInternal(true, true);
+        if (services != null) {
+            services.restoreDefaultDisplayTopFocus();
+        }
         if (!listenersRegistered || services == null) return;
         listenersRegistered = false;
         if (services.inputManager != null && inputListener != null) {
@@ -134,30 +156,57 @@ public final class ExternalMouseRouter {
     }
 
     /**
-     * Applies mouse target routing mode ({@link BridgeProtocol#MOUSE_TARGET_LOCAL} or
-     * {@link BridgeProtocol#MOUSE_TARGET_EXTERNAL}) for {@code externalDisplayId}.
+     * Applies mouse target routing mode ({@link BridgeProtocol#MOUSE_TARGET_LOCAL},
+     * {@link BridgeProtocol#MOUSE_TARGET_EXTERNAL}, {@link BridgeProtocol#MOUSE_TARGET_PIN_LOCAL_DISPLAY0},
+     * {@link BridgeProtocol#MOUSE_TARGET_UNPIN_LOCAL_DISPLAY0}, or
+     * {@link BridgeProtocol#MOUSE_TARGET_RELEASE_EXTERNAL}).
      *
-     * @return number of physical external mice currently bound to the external monitor (0 in LOCAL mode).
+     * @return number of physical external mice currently bound to an external monitor (0 in LOCAL mode).
      */
     public int setMouseTarget(int targetMode, int externalDisplayId) {
+        if (targetMode == BridgeProtocol.MOUSE_TARGET_PIN_LOCAL_DISPLAY0) {
+            localDesktopPinned = true;
+            return resyncBindings();
+        }
+        if (targetMode == BridgeProtocol.MOUSE_TARGET_UNPIN_LOCAL_DISPLAY0) {
+            localDesktopPinned = false;
+            int bound = resyncBindings();
+            if (services != null && MouseRoutingPolicy.shouldRestoreDefaultDisplayFocusOnLocalExit(
+                    false, getBoundDisplayId(), false)) {
+                services.restoreDefaultDisplayTopFocus();
+            }
+            return bound;
+        }
+        if (targetMode == BridgeProtocol.MOUSE_TARGET_RELEASE_EXTERNAL) {
+            releaseToLocal();
+            return 0;
+        }
+
         config.setMouseTargetMode(targetMode);
         if (targetMode != BridgeProtocol.MOUSE_TARGET_EXTERNAL || externalDisplayId <= 0) {
-            unbindAllInternal(true);
-            return 0;
+            synchronized (lock) {
+                activeExternalDisplayId = -1;
+                activeDisplayUniqueId = null;
+                activeDisplayPort = -1;
+            }
+            int bound = resyncBindings();
+            if (services != null && !localDesktopPinned) {
+                services.restoreDefaultDisplayTopFocus();
+            }
+            return bound;
         }
         String uniqueId = (services != null) ? services.getDisplayUniqueId(externalDisplayId) : null;
         int physPort = (services != null) ? services.getDisplayPhysicalPort(externalDisplayId) : -1;
         if ((uniqueId == null || uniqueId.isEmpty()) && physPort < 0) {
             System.err.println("OPALDESK_MOUSE_ROUTE_SKIP no uniqueId/port for displayId=" + externalDisplayId);
-            unbindAllInternal(true);
-            return 0;
+            synchronized (lock) {
+                activeExternalDisplayId = -1;
+                activeDisplayUniqueId = null;
+                activeDisplayPort = -1;
+            }
+            return resyncBindings();
         }
         synchronized (lock) {
-            boolean displayChanged = (activeExternalDisplayId != externalDisplayId)
-                    || (uniqueId != null && !uniqueId.equals(activeDisplayUniqueId));
-            if (displayChanged && !boundByKey.isEmpty()) {
-                unbindLocked();
-            }
             activeExternalDisplayId = externalDisplayId;
             activeDisplayUniqueId = uniqueId;
             activeDisplayPort = physPort;
@@ -166,18 +215,38 @@ public final class ExternalMouseRouter {
     }
 
     public void releaseToLocal() {
-        unbindAllInternal(true);
+        localDesktopPinned = false;
+        synchronized (lock) {
+            activeExternalDisplayId = -1;
+            activeDisplayUniqueId = null;
+            activeDisplayPort = -1;
+        }
+        resyncBindings();
+        if (services != null) {
+            services.restoreDefaultDisplayTopFocus();
+        }
+    }
+
+    public boolean isLocalDesktopPinned() {
+        return localDesktopPinned;
     }
 
     public int getBoundMouseCount() {
         synchronized (lock) {
-            return boundByKey.size();
+            int extCount = 0;
+            for (BoundMouse bm : boundByKey.values()) {
+                if (bm.targetDisplayId > 0) extCount++;
+            }
+            return extCount;
         }
     }
 
     public int getBoundDisplayId() {
         synchronized (lock) {
-            return boundByKey.isEmpty() ? -1 : activeExternalDisplayId;
+            for (BoundMouse bm : boundByKey.values()) {
+                if (bm.targetDisplayId > 0) return bm.targetDisplayId;
+            }
+            return -1;
         }
     }
 
@@ -224,9 +293,28 @@ public final class ExternalMouseRouter {
     private int resyncBindings() {
         if (services == null || services.inputManager == null) return 0;
         synchronized (lock) {
-            if (config.getMouseTargetMode() != BridgeProtocol.MOUSE_TARGET_EXTERNAL
-                    || activeExternalDisplayId <= 0
-                    || ((activeDisplayUniqueId == null || activeDisplayUniqueId.isEmpty()) && activeDisplayPort < 0)) {
+            int desiredDisplayId = -1;
+            String desiredUniqueId = null;
+            int desiredPort = -1;
+
+            boolean routeExternal = config.getMouseTargetMode() == BridgeProtocol.MOUSE_TARGET_EXTERNAL
+                    && activeExternalDisplayId > 0
+                    && ((activeDisplayUniqueId != null && !activeDisplayUniqueId.isEmpty()) || activeDisplayPort >= 0);
+            if (routeExternal) {
+                desiredDisplayId = activeExternalDisplayId;
+                desiredUniqueId = activeDisplayUniqueId;
+                desiredPort = activeDisplayPort;
+            } else if (localDesktopPinned) {
+                String d0Uid = services.getDisplayUniqueId(android.view.Display.DEFAULT_DISPLAY);
+                int d0Port = services.getDisplayPhysicalPort(android.view.Display.DEFAULT_DISPLAY);
+                if ((d0Uid != null && !d0Uid.isEmpty()) || d0Port >= 0) {
+                    desiredDisplayId = android.view.Display.DEFAULT_DISPLAY;
+                    desiredUniqueId = d0Uid;
+                    desiredPort = d0Port;
+                }
+            }
+
+            if (desiredDisplayId < 0) {
                 unbindLocked();
                 return 0;
             }
@@ -235,7 +323,7 @@ public final class ExternalMouseRouter {
             try {
                 ids = services.inputManager.getInputDeviceIds();
             } catch (RuntimeException e) {
-                return boundByKey.size();
+                return getBoundMouseCount();
             }
             if (ids != null) {
                 for (int id : ids) {
@@ -252,20 +340,23 @@ public final class ExternalMouseRouter {
                     stillPresentKeys.add(key);
 
                     BoundMouse existing = boundByKey.get(key);
-                    if (existing != null && activeDisplayUniqueId != null
-                            && activeDisplayUniqueId.equals(existing.displayUniqueId)) {
+                    boolean sameTarget = existing != null
+                            && existing.targetDisplayId == desiredDisplayId
+                            && ((desiredUniqueId == null && existing.displayUniqueId == null)
+                                    || (desiredUniqueId != null && desiredUniqueId.equals(existing.displayUniqueId)));
+                    if (sameTarget) {
                         continue;
                     }
                     if (existing != null) {
                         unbindSingle(existing);
                         boundByKey.remove(key);
                     }
-                    int kind = bindSingle(descriptor, location, activeDisplayUniqueId, activeDisplayPort);
+                    int kind = bindSingle(descriptor, location, desiredUniqueId, desiredPort);
                     if (kind > 0) {
-                        boundByKey.put(key, new BoundMouse(descriptor, location, kind, activeDisplayUniqueId));
-                        System.out.println("OPALDESK_MOUSE_ROUTED_EXTERNAL name=" + dev.getName()
-                                + " displayId=" + activeExternalDisplayId
-                                + " uniqueId=" + activeDisplayUniqueId + " kind=" + kind);
+                        boundByKey.put(key, new BoundMouse(descriptor, location, kind, desiredDisplayId, desiredUniqueId));
+                        System.out.println("OPALDESK_MOUSE_ROUTED name=" + dev.getName()
+                                + " displayId=" + desiredDisplayId
+                                + " uniqueId=" + desiredUniqueId + " kind=" + kind);
                     }
                 }
             }
@@ -278,13 +369,16 @@ public final class ExternalMouseRouter {
                 BoundMouse bm = boundByKey.remove(stale);
                 if (bm != null) unbindSingle(bm);
             }
-            return boundByKey.size();
+            return getBoundMouseCount();
         }
     }
 
-    private void unbindAllInternal(boolean clearDisplay) {
+    private void unbindAllInternal(boolean clearDisplay, boolean sweepSystemDevices) {
         synchronized (lock) {
             unbindLocked();
+            if (sweepSystemDevices) {
+                sweepClearConnectedDeviceAssociationsLocked();
+            }
             if (clearDisplay) {
                 activeExternalDisplayId = -1;
                 activeDisplayUniqueId = null;
@@ -300,6 +394,44 @@ public final class ExternalMouseRouter {
         }
         boundByKey.clear();
         System.out.println("OPALDESK_MOUSE_RETURNED_LOCAL");
+    }
+
+    private void sweepClearConnectedDeviceAssociationsLocked() {
+        if (services == null || services.inputManager == null) return;
+        int[] ids;
+        try {
+            ids = services.inputManager.getInputDeviceIds();
+        } catch (RuntimeException ignored) {
+            return;
+        }
+        if (ids == null) return;
+        for (int id : ids) {
+            InputDevice dev;
+            try {
+                dev = services.inputManager.getInputDevice(id);
+            } catch (RuntimeException ignored) {
+                continue;
+            }
+            if (dev == null) continue;
+            if (!shouldRouteDevice(
+                    dev.getName(), dev.getSources(), dev.getKeyboardType(), dev.isVirtual(), dev.isExternal())) {
+                continue;
+            }
+            String descriptor = dev.getDescriptor();
+            String location = extractInputLocation(dev);
+            if (descriptor != null && !descriptor.isEmpty()) {
+                invokeInputMethod("removeUniqueIdAssociationByDescriptor",
+                        new Class<?>[]{String.class}, descriptor);
+            }
+            if (location != null && !location.isEmpty()) {
+                invokeInputMethod("removeUniqueIdAssociationByPort",
+                        new Class<?>[]{String.class}, location);
+                invokeInputMethod("removeUniqueIdAssociation",
+                        new Class<?>[]{String.class}, location);
+                invokeInputMethod("removePortAssociation",
+                        new Class<?>[]{String.class}, location);
+            }
+        }
     }
 
     private int bindSingle(String descriptor, String location, String displayUniqueId, int displayPort) {

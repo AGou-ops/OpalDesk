@@ -70,6 +70,9 @@ public final class CompositorEngine {
         /** Moves Android display focus onto {@code displayId} when resuming an existing lease. */
         default void focusDisplay(int displayId) {}
 
+        /** Invoked when all client TextureView surfaces have detached so Display 0 top focus can be restored. */
+        default void onAllClientSurfacesDetached() {}
+
         /** Releases any per-display UHID or input resources when a VirtualDisplay is torn down. */
         void onDisplayReleased(int displayId);
 
@@ -81,6 +84,9 @@ public final class CompositorEngine {
             return 0;
         }
     }
+
+    /** Sustained empty-display settle window so fullscreen/streaming Activity transitions never trigger false close/minimize. */
+    public static final long EMPTY_DISPLAY_SETTLE_MS = 900L;
 
     private final Object lock = new Object();
     private final DaemonConfig config;
@@ -134,21 +140,49 @@ public final class CompositorEngine {
         vdPool.setConfiguredMaxDisplays(maxDisplays);
     }
 
-    /** Recomputes buffer resolution & DPI for all open windows after global DPI scale changes. */
+    /** Recomputes buffer resolution & DPI for all open windows after global/per-app DPI changes. */
     public void reapplyWindowDpiScale() {
         synchronized (lock) {
             int dpiPct = config.getWindowDpiScalePct();
             boolean changed = false;
             for (WindowSession ws : sessionsById.values()) {
                 boolean isFs = BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation);
-                int[] spec = computeWindowSpecLocked(ws.frame, isFs, ws.profile);
+                int[] spec = computeWindowSpecLocked(ws.frame, isFs, ws.profile, ws.pkg);
                 if (spec[0] != ws.contentWidth || spec[1] != ws.contentHeight || spec[2] != ws.contentDpi) {
                     ws.contentWidth = spec[0];
                     ws.contentHeight = spec[1];
                     ws.contentDpi = spec[2];
                     vdPool.resizeIfActive(ws.windowId, spec[0], spec[1], spec[2]);
                     System.out.println("OPALDESK_WINDOW_DPI_REAPPLIED wid=" + ws.windowId
-                            + " dpiPct=" + dpiPct + " buf=" + spec[0] + "x" + spec[1] + "@" + spec[2] + "dpi");
+                            + " pkg=" + ws.pkg + " dpiPct=" + dpiPct
+                            + " customDpi=" + config.resolveEffectiveCustomDpi(ws.pkg)
+                            + " buf=" + spec[0] + "x" + spec[1] + "@" + spec[2] + "dpi");
+                    changed = true;
+                }
+            }
+            if (changed) {
+                markDirtyAndNotifyLocked();
+            }
+        }
+    }
+
+    /** Recomputes buffer resolution & DPI for any open window matching {@code pkg}. */
+    public void reapplyAppDpi(String pkg) {
+        if (pkg == null || pkg.isEmpty()) return;
+        synchronized (lock) {
+            boolean changed = false;
+            for (WindowSession ws : sessionsById.values()) {
+                if (!pkg.equals(ws.pkg)) continue;
+                boolean isFs = BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation);
+                int[] spec = computeWindowSpecLocked(ws.frame, isFs, ws.profile, ws.pkg);
+                if (spec[0] != ws.contentWidth || spec[1] != ws.contentHeight || spec[2] != ws.contentDpi) {
+                    ws.contentWidth = spec[0];
+                    ws.contentHeight = spec[1];
+                    ws.contentDpi = spec[2];
+                    vdPool.resizeIfActive(ws.windowId, spec[0], spec[1], spec[2]);
+                    System.out.println("OPALDESK_APP_DPI_REAPPLIED wid=" + ws.windowId
+                            + " pkg=" + ws.pkg + " customDpi=" + config.resolveEffectiveCustomDpi(ws.pkg)
+                            + " buf=" + spec[0] + "x" + spec[1] + "@" + spec[2] + "dpi");
                     changed = true;
                 }
             }
@@ -242,22 +276,42 @@ public final class CompositorEngine {
                     : WindowProfile.fromCode(requestedProfileCode, WindowProfile.DESKTOP);
 
             IntRect initialFrame;
+            String initialPres = BridgeProtocol.PRES_FLOATING;
             if (reqRight - reqLeft >= DisplayGeometryUtil.MIN_WINDOW_EDGE_PX
                     && reqBottom - reqTop >= DisplayGeometryUtil.MIN_WINDOW_EDGE_PX) {
                 initialFrame = DisplayGeometryUtil.clampWindowFrame(
                         new IntRect(reqLeft, reqTop, reqRight, reqBottom), canvasW, canvasH, canvasDpi);
             } else {
-                initialFrame = DisplayGeometryUtil.computeInitialWindowFrame(
-                        profile, sessionsById.size(), canvasW, canvasH, canvasDpi);
+                DaemonConfig.SavedWindowBounds remembered = config.getSavedWindowBounds(pkg);
+                if (remembered != null) {
+                    initialPres = remembered.presentation;
+                    if (!BridgeProtocol.PRES_FLOATING.equals(initialPres)
+                            && !BridgeProtocol.PRES_FULLSCREEN.equals(initialPres)) {
+                        initialFrame = DisplayGeometryUtil.computeSnapFrame(initialPres, canvasW, canvasH, canvasDpi);
+                    } else {
+                        initialPres = BridgeProtocol.PRES_FLOATING;
+                        initialFrame = remembered.toCanvasRect(canvasW, canvasH, canvasDpi);
+                    }
+                } else {
+                    initialFrame = DisplayGeometryUtil.computeInitialWindowFrame(
+                            profile, sessionsById.size(), canvasW, canvasH, canvasDpi);
+                }
             }
 
-            int[] spec = computeWindowSpecLocked(initialFrame, false, profile);
+            int[] spec = computeWindowSpecLocked(initialFrame, false, profile, pkg);
             int winId = nextWindowId.getAndIncrement();
             String label = runtimeBridge.resolveAppLabel(pkg);
 
             WindowSession created = new WindowSession(
                     winId, pkg, safeCls, label, profile, initialFrame,
                     spec[0], spec[1], spec[2], now);
+            created.presentation = initialPres;
+            if (!BridgeProtocol.PRES_FLOATING.equals(initialPres)) {
+                DaemonConfig.SavedWindowBounds remembered = config.getSavedWindowBounds(pkg);
+                if (remembered != null) {
+                    created.restoreFrame = remembered.toCanvasRect(canvasW, canvasH, canvasDpi);
+                }
+            }
             sessionsById.put(winId, created);
             focusWindowLocked(created, now);
             config.rememberProfile(pkg, profile);
@@ -300,9 +354,12 @@ public final class CompositorEngine {
                     reqContentW > 0 ? reqContentW : ws.contentWidth, 240, DisplayGeometryUtil.MAX_WINDOW_EDGE_PX);
             int ch = DisplayGeometryUtil.alignEven(
                     reqContentH > 0 ? reqContentH : ws.contentHeight, 200, DisplayGeometryUtil.MAX_WINDOW_EDGE_PX);
+            int customDpi = config.resolveEffectiveCustomDpi(ws.pkg);
             int dpi = (reqDpi > 0)
                     ? DisplayGeometryUtil.clampDpi(reqDpi)
-                    : ws.profile.resolveContentDpi(cw, ch, config.getWindowDpiScalePct());
+                    : (customDpi > 0
+                            ? customDpi
+                            : ws.profile.resolveContentDpi(cw, ch, config.getWindowDpiScalePct()));
             int cfgFps = config.getTargetFps();
             float effFps = DisplayGeometryUtil.clampFps(cfgFps > 0 ? cfgFps : fps, 60f);
 
@@ -338,6 +395,7 @@ public final class CompositorEngine {
             ws.lastActiveAtMs = nowMs;
             ws.lastLaunchAtMs = nowMs;
             ws.emptyDisplayTicks = 0;
+            ws.emptySinceMs = 0L;
 
             pkgToLaunch = ws.pkg;
             clsToLaunch = ws.activityClass;
@@ -378,10 +436,12 @@ public final class CompositorEngine {
      */
     public boolean detachWindowSurface(int windowId, boolean releaseDisplay) {
         int releasedDisplayId = -1;
+        boolean becameZeroAttachedSurfaces;
         synchronized (lock) {
             WindowSession ws = sessionsById.get(windowId);
             if (ws == null) return false;
 
+            boolean hadSurfaces = !attachedSurfaces.isEmpty();
             Object surf = attachedSurfaces.remove(windowId);
             if (releaseDisplay && ws.displayId > 0) {
                 releasedDisplayId = ws.displayId;
@@ -397,12 +457,41 @@ public final class CompositorEngine {
             if (surf != null) {
                 runtimeBridge.releaseSurfaceHandle(surf);
             }
+            becameZeroAttachedSurfaces = hadSurfaces && attachedSurfaces.isEmpty();
             markDirtyAndNotifyLocked();
         }
         if (releasedDisplayId > 0) {
             runtimeBridge.onDisplayReleased(releasedDisplayId);
         }
+        if (becameZeroAttachedSurfaces) {
+            runtimeBridge.onAllClientSurfacesDetached();
+        }
         return true;
+    }
+
+    /**
+     * Detaches all currently bound client Surfaces (e.g. when the Helper UI process dies or is
+     * swiped away from Recents) while keeping window sessions recoverable in the background.
+     */
+    public void detachAllClientSurfaces() {
+        List<Object> surfacesToRelease = new ArrayList<>();
+        boolean hadAny;
+        synchronized (lock) {
+            hadAny = !attachedSurfaces.isEmpty() || !sessionsById.isEmpty();
+            for (WindowSession ws : sessionsById.values()) {
+                if (ws.displayId > 0) {
+                    vdPool.detachSurfaceOnly(ws.windowId);
+                }
+            }
+            surfacesToRelease.addAll(attachedSurfaces.values());
+            attachedSurfaces.clear();
+        }
+        for (Object s : surfacesToRelease) {
+            runtimeBridge.releaseSurfaceHandle(s);
+        }
+        if (hadAny) {
+            runtimeBridge.onAllClientSurfacesDetached();
+        }
     }
 
     /**
@@ -444,12 +533,13 @@ public final class CompositorEngine {
             focusWindowLocked(ws, System.currentTimeMillis());
 
             if (sizeChanged) {
-                int[] spec = computeWindowSpecLocked(nextFrame, nextFullscreen, ws.profile);
+                int[] spec = computeWindowSpecLocked(nextFrame, nextFullscreen, ws.profile, ws.pkg);
                 ws.contentWidth = spec[0];
                 ws.contentHeight = spec[1];
                 ws.contentDpi = spec[2];
                 vdPool.resizeIfActive(windowId, spec[0], spec[1], spec[2]);
             }
+            rememberWindowBoundsLocked(ws);
             markDirtyAndNotifyLocked();
             return true;
         }
@@ -464,9 +554,12 @@ public final class CompositorEngine {
             if (ws == null) return false;
             int cw = DisplayGeometryUtil.alignEven(contentW, 240, DisplayGeometryUtil.MAX_WINDOW_EDGE_PX);
             int ch = DisplayGeometryUtil.alignEven(contentH, 200, DisplayGeometryUtil.MAX_WINDOW_EDGE_PX);
+            int customDpi = config.resolveEffectiveCustomDpi(ws.pkg);
             int dpi = (reqDpi > 0)
                     ? DisplayGeometryUtil.clampDpi(reqDpi)
-                    : ws.profile.resolveContentDpi(cw, ch, config.getWindowDpiScalePct());
+                    : (customDpi > 0
+                            ? customDpi
+                            : ws.profile.resolveContentDpi(cw, ch, config.getWindowDpiScalePct()));
             if (cw == ws.contentWidth && ch == ws.contentHeight && dpi == ws.contentDpi) {
                 return true;
             }
@@ -488,6 +581,7 @@ public final class CompositorEngine {
         String pkgToReload = null;
         int reloadDisplayId = -1;
         String reloadCls = "";
+        boolean allSurfacesNowDetached = false;
 
         synchronized (lock) {
             WindowSession ws = sessionsById.get(windowId);
@@ -526,7 +620,7 @@ public final class CompositorEngine {
                         ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
                                 ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
                                 : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
-                        int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile);
+                        int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile, ws.pkg);
                         ws.contentWidth = spec[0];
                         ws.contentHeight = spec[1];
                         ws.contentDpi = spec[2];
@@ -534,6 +628,7 @@ public final class CompositorEngine {
                     ws.state = BridgeProtocol.STATE_MINIMIZED;
                     ws.focused = false;
                     promoteTopVisibleFocusLocked(now);
+                    allSurfacesNowDetached = attachedSurfaces.isEmpty();
                     markDirtyAndNotifyLocked();
                     break;
                 }
@@ -555,11 +650,12 @@ public final class CompositorEngine {
                         ws.frame = DisplayGeometryUtil.computeSnapFrame(
                                 BridgeProtocol.PRES_MAXIMIZED, canvasW, canvasH, canvasDpi);
                     }
-                    int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile);
+                    int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile, ws.pkg);
                     ws.contentWidth = spec[0];
                     ws.contentHeight = spec[1];
                     ws.contentDpi = spec[2];
                     vdPool.resizeIfActive(windowId, spec[0], spec[1], spec[2]);
+                    rememberWindowBoundsLocked(ws);
                     focusWindowLocked(ws, now);
                     markDirtyAndNotifyLocked();
                     return true;
@@ -582,7 +678,7 @@ public final class CompositorEngine {
                                 ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
                                 : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
                     }
-                    int[] spec = computeWindowSpecLocked(ws.frame, enterFs, ws.profile);
+                    int[] spec = computeWindowSpecLocked(ws.frame, enterFs, ws.profile, ws.pkg);
                     ws.contentWidth = spec[0];
                     ws.contentHeight = spec[1];
                     ws.contentDpi = spec[2];
@@ -592,6 +688,7 @@ public final class CompositorEngine {
                     return true;
                 }
                 case BridgeProtocol.WIN_ACTION_CLOSE: {
+                    rememberWindowBoundsLocked(ws);
                     sessionsById.remove(windowId);
                     Object surf = attachedSurfaces.remove(windowId);
                     if (surf != null) runtimeBridge.releaseSurfaceHandle(surf);
@@ -602,6 +699,7 @@ public final class CompositorEngine {
                     }
                     taskToRemove = ws.taskId;
                     promoteTopVisibleFocusLocked(now);
+                    allSurfacesNowDetached = attachedSurfaces.isEmpty();
                     markDirtyAndNotifyLocked();
                     break;
                 }
@@ -627,6 +725,7 @@ public final class CompositorEngine {
                     ws.taskId = -1;
                     ws.lastLaunchAtMs = now;
                     ws.emptyDisplayTicks = 0;
+                    ws.emptySinceMs = 0L;
                     focusWindowLocked(ws, now);
                     markDirtyAndNotifyLocked();
                     break;
@@ -646,6 +745,9 @@ public final class CompositorEngine {
         if (displayToRelease > 0) {
             vdPool.releaseLease(windowId);
             runtimeBridge.onDisplayReleased(displayToRelease);
+        }
+        if (allSurfacesNowDetached) {
+            runtimeBridge.onAllClientSurfacesDetached();
         }
         if (pkgToReload != null && !pkgToReload.isEmpty()) {
             runtimeBridge.forceStopPackage(pkgToReload);
@@ -705,6 +807,7 @@ public final class CompositorEngine {
                 WindowSession ws = sessionsById.get(windowId);
                 if (ws != null) {
                     ws.emptyDisplayTicks = 0;
+                    ws.emptySinceMs = 0L;
                     if (ws.taskId != visibleTid) {
                         ws.taskId = visibleTid;
                         markDirtyAndNotifyLocked();
@@ -729,6 +832,14 @@ public final class CompositorEngine {
      * moved to background (preventing blank white zombie windows).
      */
     public void reconcileWithSystemTasks() {
+        reconcileWithSystemTasks(System.currentTimeMillis());
+    }
+
+    /**
+     * Deterministic clock-injected reconciliation overload for JVM unit testing of transient
+     * fullscreen / landscape Activity handoffs (e.g. Moonlight, UU远程).
+     */
+    public void reconcileWithSystemTasks(long now) {
         List<Integer> checkWindowIds = new ArrayList<>();
         List<Integer> checkDisplayIds = new ArrayList<>();
         List<Integer> checkTaskIds = new ArrayList<>();
@@ -764,12 +875,12 @@ public final class CompositorEngine {
         List<Integer> toClose = new ArrayList<>();
         synchronized (lock) {
             boolean dirty = false;
-            long now = System.currentTimeMillis();
 
             for (WindowSession ws : sessionsById.values()) {
                 Integer liveTid = discoveredVisibleTasks.get(ws.windowId);
                 if (liveTid != null && liveTid > 0) {
                     ws.emptyDisplayTicks = 0;
+                    ws.emptySinceMs = 0L;
                     if (ws.taskId != liveTid) {
                         ws.taskId = liveTid;
                         dirty = true;
@@ -778,18 +889,25 @@ public final class CompositorEngine {
                         && aliveTids != null
                         && !aliveTids.isEmpty()
                         && !aliveTids.contains(ws.taskId)
+                        && !Boolean.TRUE.equals(stillRunningBg.get(ws.windowId))
                         && (now - ws.lastActiveAtMs) > 2200L) {
                     toClose.add(ws.windowId);
                 } else if (ws.isLive() && ws.displayId > 0 && (now - ws.lastLaunchAtMs) > 2500L) {
                     boolean runningBg = Boolean.TRUE.equals(stillRunningBg.get(ws.windowId));
+                    if (ws.emptySinceMs <= 0L) {
+                        ws.emptySinceMs = now;
+                    }
                     ws.emptyDisplayTicks++;
-                    if (!runningBg && ws.taskId > 0 && (now - ws.lastActiveAtMs) > 1500L) {
-                        toClose.add(ws.windowId);
-                    } else if (ws.emptyDisplayTicks >= 2) {
-                        if (runningBg) {
-                            toMinimize.add(ws.windowId);
-                        } else {
+                    long emptyDurationMs = now - ws.emptySinceMs;
+                    if (emptyDurationMs >= EMPTY_DISPLAY_SETTLE_MS) {
+                        if (!runningBg && ws.taskId > 0 && (now - ws.lastActiveAtMs) > 1500L) {
                             toClose.add(ws.windowId);
+                        } else if (ws.emptyDisplayTicks >= 2) {
+                            if (runningBg) {
+                                toMinimize.add(ws.windowId);
+                            } else {
+                                toClose.add(ws.windowId);
+                            }
                         }
                     }
                 }
@@ -831,7 +949,7 @@ public final class CompositorEngine {
                     ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
                             ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
                             : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
-                    int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile);
+                    int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile, ws.pkg);
                     ws.contentWidth = spec[0];
                     ws.contentHeight = spec[1];
                     ws.contentDpi = spec[2];
@@ -847,6 +965,7 @@ public final class CompositorEngine {
         for (Object s : surfacesToRelease) {
             runtimeBridge.releaseSurfaceHandle(s);
         }
+        runtimeBridge.onAllClientSurfacesDetached();
     }
 
     public void closeAllWindows(boolean removeUnderlyingTasks) {
@@ -856,6 +975,7 @@ public final class CompositorEngine {
 
         synchronized (lock) {
             for (WindowSession ws : sessionsById.values()) {
+                rememberWindowBoundsLocked(ws);
                 if (ws.displayId > 0) {
                     vdPool.detachSurfaceOnly(ws.windowId);
                     displaysToClean.add(ws.displayId);
@@ -872,6 +992,7 @@ public final class CompositorEngine {
         for (int t : tasksToRemove) runtimeBridge.removeTask(t);
         vdPool.releaseAll();
         for (int d : displaysToClean) runtimeBridge.onDisplayReleased(d);
+        runtimeBridge.onAllClientSurfacesDetached();
     }
 
     public String toSceneJson() {
@@ -894,14 +1015,26 @@ public final class CompositorEngine {
         }
     }
 
-    private int[] computeWindowSpecLocked(IntRect frame, boolean fullscreen, WindowProfile profile) {
+    private int[] computeWindowSpecLocked(IntRect frame, boolean fullscreen, WindowProfile profile, String pkg) {
         return DisplayGeometryUtil.resolveWindowBufferSpec(
                 frame,
                 config.getCanvasDpi(),
                 fullscreen,
                 profile,
                 config.getWindowDpiScalePct(),
-                runtimeBridge.getHostDisplayDpi());
+                runtimeBridge.getHostDisplayDpi(),
+                config.resolveEffectiveCustomDpi(pkg));
+    }
+
+    private void rememberWindowBoundsLocked(WindowSession ws) {
+        if (ws == null) return;
+        IntRect rectToSave = BridgeProtocol.PRES_FLOATING.equals(ws.presentation)
+                ? ws.frame
+                : (ws.restoreFrame != null && !ws.restoreFrame.isEmpty() ? ws.restoreFrame : ws.frame);
+        String presToSave = BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation)
+                ? BridgeProtocol.PRES_FLOATING : ws.presentation;
+        config.rememberWindowBounds(
+                ws.pkg, rectToSave, config.getCanvasWidth(), config.getCanvasHeight(), presToSave);
     }
 
     private void applyProfileChangeLocked(WindowSession ws, WindowProfile nextProfile) {
@@ -913,7 +1046,7 @@ public final class CompositorEngine {
         ws.presentation = BridgeProtocol.PRES_FLOATING;
         ws.frame = DisplayGeometryUtil.computeInitialWindowFrame(nextProfile, 0, canvasW, canvasH, canvasDpi);
         ws.restoreFrame = ws.frame;
-        int[] spec = computeWindowSpecLocked(ws.frame, false, nextProfile);
+        int[] spec = computeWindowSpecLocked(ws.frame, false, nextProfile, ws.pkg);
         ws.contentWidth = spec[0];
         ws.contentHeight = spec[1];
         ws.contentDpi = spec[2];

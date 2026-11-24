@@ -1085,6 +1085,30 @@ fun TilingLayoutPreviewIcon(
                 drawPane(pad, pad + ch + gap, cw, ch)
                 drawPane(pad + cw + gap, pad + ch + gap, cw, ch)
             }
+            WindowTilingLayout.SPLIT_5_COLS -> {
+                val g = gap * 0.72f
+                val cw = (innerW - g * 4f) / 5f
+                for (i in 0..4) drawPane(pad + i * (cw + g), pad, cw, innerH)
+            }
+            WindowTilingLayout.SPLIT_6_GRID -> {
+                val cw = (innerW - gap * 2f) / 3f
+                val ch = (innerH - gap) / 2f
+                for (r in 0..1) {
+                    for (c in 0..2) {
+                        drawPane(pad + c * (cw + gap), pad + r * (ch + gap), cw, ch)
+                    }
+                }
+            }
+            WindowTilingLayout.SPLIT_8_GRID -> {
+                val g = gap * 0.78f
+                val cw = (innerW - g * 3f) / 4f
+                val ch = (innerH - gap) / 2f
+                for (r in 0..1) {
+                    for (c in 0..3) {
+                        drawPane(pad + c * (cw + g), pad + r * (ch + gap), cw, ch)
+                    }
+                }
+            }
             WindowTilingLayout.CASCADE -> {
                 val pw = innerW * 0.62f
                 val ph = innerH * 0.64f
@@ -1104,31 +1128,17 @@ fun TilingLayoutPreviewIcon(
 fun OpalAmbientBackdrop(
     modifier: Modifier = Modifier,
     wallpaperPreset: Int = 0,
+    suspendBackdrop: Boolean = false,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val isDark = OpalPalette.isDark
     val customWallpaperPath by AppPrefs.customWallpaperPathFlow.collectAsState()
-    val customBitmap = remember(customWallpaperPath) {
-        WallpaperStorage.loadCachedWallpaper(customWallpaperPath)
-    }
-
-    if (customBitmap != null) {
-        Box(modifier = modifier) {
-            Image(
-                bitmap = customBitmap,
-                contentDescription = "Desktop Wallpaper",
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-            // Subtle atmospheric veil so frosted liquid glass & text maintain crisp readability over any photo
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(if (isDark) Color(0x38060910) else Color(0x16FFFFFF)),
-            )
-            content()
+    val customBitmap = if (suspendBackdrop) {
+        null
+    } else {
+        remember(customWallpaperPath) {
+            WallpaperStorage.loadCachedWallpaper(customWallpaperPath)
         }
-        return
     }
 
     val stops = if (isDark) {
@@ -1187,43 +1197,66 @@ fun OpalAmbientBackdrop(
         }
     }
 
-    val blurModifier = if (Build.VERSION.SDK_INT >= 31) {
-        Modifier.fillMaxSize().blur(26.dp)
-    } else {
-        Modifier.fillMaxSize()
+    val rootModifier = when {
+        suspendBackdrop -> modifier.background(OpalPalette.WindowCanvasBg)
+        customBitmap != null -> modifier
+        else -> modifier.background(Brush.linearGradient(colors = stops))
     }
 
-    Box(
-        modifier = modifier.background(Brush.linearGradient(colors = stops)),
-    ) {
-        Canvas(modifier = blurModifier) {
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(glowA, Color.Transparent),
-                    center = Offset(size.width * 0.20f, size.height * 0.22f),
-                    radius = size.maxDimension * 0.56f,
-                ),
-                center = Offset(size.width * 0.20f, size.height * 0.22f),
-                radius = size.maxDimension * 0.56f,
-            )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(glowB, Color.Transparent),
-                    center = Offset(size.width * 0.82f, size.height * 0.72f),
-                    radius = size.maxDimension * 0.54f,
-                ),
-                center = Offset(size.width * 0.82f, size.height * 0.72f),
-                radius = size.maxDimension * 0.54f,
-            )
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colors = listOf(glowC, Color.Transparent),
-                    center = Offset(size.width * 0.52f, size.height * 0.88f),
-                    radius = size.maxDimension * 0.42f,
-                ),
-                center = Offset(size.width * 0.52f, size.height * 0.88f),
-                radius = size.maxDimension * 0.42f,
-            )
+    // IMPORTANT: Keep a single unconditional Box + content() call site across suspendBackdrop /
+    // customBitmap transitions so entering or exiting 100% fullscreen NEVER unmounts/remounts
+    // OpalCompositorWorkspace or destroys active WindowSurfaceHost TextureViews!
+    Box(modifier = rootModifier) {
+        if (!suspendBackdrop) {
+            if (customBitmap != null) {
+                Image(
+                    bitmap = customBitmap,
+                    contentDescription = "Desktop Wallpaper",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                // Subtle atmospheric veil so frosted liquid glass & text maintain crisp readability over any photo
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(if (isDark) Color(0x38060910) else Color(0x16FFFFFF)),
+                )
+            } else {
+                val blurModifier = if (Build.VERSION.SDK_INT >= 31) {
+                    Modifier.fillMaxSize().blur(26.dp)
+                } else {
+                    Modifier.fillMaxSize()
+                }
+                Canvas(modifier = blurModifier) {
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(glowA, Color.Transparent),
+                            center = Offset(size.width * 0.20f, size.height * 0.22f),
+                            radius = size.maxDimension * 0.56f,
+                        ),
+                        center = Offset(size.width * 0.20f, size.height * 0.22f),
+                        radius = size.maxDimension * 0.56f,
+                    )
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(glowB, Color.Transparent),
+                            center = Offset(size.width * 0.82f, size.height * 0.72f),
+                            radius = size.maxDimension * 0.54f,
+                        ),
+                        center = Offset(size.width * 0.82f, size.height * 0.72f),
+                        radius = size.maxDimension * 0.54f,
+                    )
+                    drawCircle(
+                        brush = Brush.radialGradient(
+                            colors = listOf(glowC, Color.Transparent),
+                            center = Offset(size.width * 0.52f, size.height * 0.88f),
+                            radius = size.maxDimension * 0.42f,
+                        ),
+                        center = Offset(size.width * 0.52f, size.height * 0.88f),
+                        radius = size.maxDimension * 0.42f,
+                    )
+                }
+            }
         }
         content()
     }

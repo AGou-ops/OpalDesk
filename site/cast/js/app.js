@@ -203,6 +203,7 @@ class OpalCastWebApp {
       },
       onFileDrop: (files) => this.sendDroppedFiles(files),
       onUserGesture: () => this.audio.resumeFromGesture(),
+      onSoftKeyboardStateChange: (open) => this.syncKeyboardUi(open),
     });
 
     this.activation = new LanActivationClient({
@@ -429,7 +430,11 @@ class OpalCastWebApp {
     });
     $('tbHomeBtn').addEventListener('click', () => {
       this.sendOpalFrame(TYPE_SYSTEM_ACTION, 0, encodeSystemAction(SYS_HOME));
-      this.input.focusIme();
+      if (this.input.virtualKeyboardDevice) {
+        this.input.dismissSoftKeyboard();
+      } else {
+        this.input.focusIme();
+      }
     });
     $('tbInputModeBtn').addEventListener('click', () => {
       const nextTouch = !this.input.primaryLeftAsTouch;
@@ -439,6 +444,11 @@ class OpalCastWebApp {
       btn.classList.toggle('active', nextTouch);
       this.showToast(nextTouch ? '左键拖拽已切换为「触控滑动」模式（支持列表拖拽滚动）' : '左键拖拽已切换为「鼠标指针」模式（支持文本框选）');
       this.input.focusIme();
+    });
+    $('tbKeyboardBtn').addEventListener('click', () => {
+      const open = this.input.toggleSoftKeyboard();
+      this.syncKeyboardUi(open);
+      this.bumpToolbarVisibility();
     });
     $('tbAudioBtn').addEventListener('click', async () => {
       await this.audio.resumeFromGesture();
@@ -481,7 +491,9 @@ class OpalCastWebApp {
       $('appsPopover').hidden = !opening;
       if (opening) {
         this.sendOpalFrame(TYPE_LIST_APPS);
-        $('appSearchInput').focus();
+        if (!this.input.virtualKeyboardDevice) {
+          $('appSearchInput').focus();
+        }
       } else {
         this.input.focusIme();
       }
@@ -742,7 +754,7 @@ class OpalCastWebApp {
       case TYPE_IME_REQUEST: {
         try {
           const req = decodeImeRequest(frame.payload);
-          this.input.handleRemoteImeRequest(req.show);
+          this.input.handleRemoteImeRequest(req.show, req.inputType);
         } catch {
           // Ignore
         }
@@ -1033,6 +1045,13 @@ class OpalCastWebApp {
     if (this.remoteFps > 0) parts.push(`${this.remoteFps}fps`);
     if (this.lastRttMs > 0) parts.push(`${this.lastRttMs}ms`);
     $('stageTelemetry').textContent = parts.join(' · ');
+  }
+
+  syncKeyboardUi(open) {
+    const btn = $('tbKeyboardBtn');
+    if (!btn) return;
+    btn.classList.toggle('active', Boolean(open));
+    btn.textContent = open ? '收起键盘' : '键盘';
   }
 
   syncAudioUi(st) {

@@ -209,23 +209,50 @@ class DesktopActivity : ComponentActivity() {
         applyImmersiveFullscreen()
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (!BridgeClient.remoteStatusFlow.value.connected) {
+            BridgeClient.setLocalDesktopMousePinAsync(true)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         if (BridgeClient.remoteStatusFlow.value.connected) {
             Toast.makeText(this, "投屏进行中，已锁定本机桌面", Toast.LENGTH_SHORT).show()
+            BridgeClient.setLocalDesktopMousePinAsync(false)
             finish()
             return
         }
         applyImmersiveFullscreen()
         BridgeClient.requestBinder(this)
+        BridgeClient.setLocalDesktopMousePinAsync(true)
         Thread({
             BridgeClient.refreshStatus()
             BridgeClient.refreshSceneSnapshot()
             val r = BridgeClient.refreshRemoteStatus()
             if (r.connected) {
-                runOnUiThread { finish() }
+                runOnUiThread {
+                    BridgeClient.setLocalDesktopMousePinAsync(false)
+                    finish()
+                }
             }
         }, "OpalDesktopSync").start()
+    }
+
+    override fun onStop() {
+        BridgeClient.setLocalDesktopMousePinAsync(false)
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        BridgeClient.setLocalDesktopMousePinAsync(false)
+        super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        BridgeClient.onTrimMemory(level)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

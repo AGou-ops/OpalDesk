@@ -239,11 +239,24 @@ class BridgeService : Service() {
         return START_STICKY
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        OpalLogStore.i("Service", "App task swiped from Recents -> restoring Display 0 mouse focus")
+        BridgeClient.onHostTaskRemoved(
+            hasPhysicalExternal = ExternalTrackpadBridge.sessionFlow.value.isPhysicalActive,
+        )
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         displayManager?.unregisterDisplayListener(displayListener)
         displayManager = null
         _externalDisplayFlow.value = null
         super.onDestroy()
+    }
+
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        BridgeClient.onTrimMemory(level)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

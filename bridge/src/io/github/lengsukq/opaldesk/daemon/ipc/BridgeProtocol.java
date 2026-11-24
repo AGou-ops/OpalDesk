@@ -68,6 +68,10 @@ public final class BridgeProtocol {
     public static final int TX_RESPOND_PAIRING = 36;
     public static final int TX_INJECT_REMOTE_TRACKPAD = 37;
     public static final int TX_GET_DAEMON_LOGS = 38;
+    public static final int TX_SET_ADVANCED_DPI_CONFIG = 39;
+    public static final int TX_SET_APP_CUSTOM_DPI = 40;
+    public static final int TX_SYNC_APP_WINDOW_BOUNDS = 41;
+    public static final int TX_GET_ADVANCED_CONFIG_STATE = 42;
     public static final int TX_SHUTDOWN = 99;
 
     // ---- Interactive Pairing Approval Decisions (TX_RESPOND_PAIRING) ----
@@ -78,6 +82,12 @@ public final class BridgeProtocol {
     // ---- Physical External Mouse Output Routing Targets ----
     public static final int MOUSE_TARGET_LOCAL = 0;
     public static final int MOUSE_TARGET_EXTERNAL = 1;
+    /** Transient runtime pin: associates external physical mice/keyboards to Display 0 while Local DeX is active. */
+    public static final int MOUSE_TARGET_PIN_LOCAL_DISPLAY0 = 2;
+    /** Releases transient Display 0 pin when Local DeX pauses or closes. */
+    public static final int MOUSE_TARGET_UNPIN_LOCAL_DISPLAY0 = 3;
+    /** Releases active external/remote display routing back to Display 0 without overwriting saved user prefs. */
+    public static final int MOUSE_TARGET_RELEASE_EXTERNAL = 4;
 
     // ---- Standard AOSP Windowing Mode (the ONLY mode used per isolated VirtualDisplay) ----
     public static final int WINDOWING_MODE_FULLSCREEN = 1;

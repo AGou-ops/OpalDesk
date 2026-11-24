@@ -496,7 +496,7 @@ class ExternalDesktopActivity : ComponentActivity() {
     }
 
     private fun dismissPresentation() {
-        BridgeClient.setMouseTargetAsync(BridgeProtocol.MouseTarget.LOCAL, -1)
+        BridgeClient.releaseExternalMouseRoutingAsync()
         val p = presentation
         presentation = null
         if (p != null) {

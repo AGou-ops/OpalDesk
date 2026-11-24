@@ -19,6 +19,9 @@ import io.github.lengsukq.opaldesk.daemon.stream.OpalCastCompositorBridge;
 import io.github.lengsukq.opaldesk.daemon.stream.RemoteStreamServer;
 import io.github.lengsukq.opaldesk.daemon.util.DaemonLogBuffer;
 
+import java.util.LinkedHashMap;
+import java.util.Map;
+
 /**
  * Binder IPC dispatcher for the OpalDesk Universal Compositor, External Display EDID controls,
  * physical mouse display routing, and MacOS OpalCast v1.1 remote streaming.
@@ -91,6 +94,7 @@ public final class BridgeBinderService extends Binder {
                     reply.writeInt(mouseRouter != null ? mouseRouter.getConnectedMouseCount() : 0);
                     reply.writeInt(mouseRouter != null ? mouseRouter.getBoundDisplayId() : -1);
                     reply.writeInt(services != null && services.isHostScreenOff() ? 1 : 0);
+                    reply.writeInt(config.getGlobalCustomDpi());
                 }
                 return true;
             }
@@ -430,11 +434,41 @@ public final class BridgeBinderService extends Binder {
                 if (reply != null) reply.writeString(logs);
                 return true;
             }
+            case BridgeProtocol.TX_SET_ADVANCED_DPI_CONFIG: {
+                int globalCustomDpi = data.readInt();
+                boolean replaceAppDpis = data.readInt() != 0;
+                String appDpisRaw = data.readString();
+                config.setGlobalCustomDpi(globalCustomDpi);
+                if (replaceAppDpis) {
+                    config.replaceAllAppCustomDpis(parseAppDpisPayload(appDpisRaw));
+                }
+                compositor.reapplyWindowDpiScale();
+                if (reply != null) reply.writeInt(1);
+                return true;
+            }
+            case BridgeProtocol.TX_SET_APP_CUSTOM_DPI: {
+                String pkg = data.readString();
+                int customDpi = data.readInt();
+                config.setAppCustomDpi(pkg, customDpi);
+                compositor.reapplyAppDpi(pkg);
+                if (reply != null) reply.writeInt(1);
+                return true;
+            }
+            case BridgeProtocol.TX_SYNC_APP_WINDOW_BOUNDS: {
+                String boundsRaw = data.readString();
+                config.replaceAllWindowBounds(parseAppBoundsPayload(boundsRaw));
+                if (reply != null) reply.writeInt(1);
+                return true;
+            }
+            case BridgeProtocol.TX_GET_ADVANCED_CONFIG_STATE: {
+                if (reply != null) reply.writeString(config.toAdvancedStateJson());
+                return true;
+            }
             case BridgeProtocol.TX_SHUTDOWN: {
                 shutdownTrigger.run();
                 if (reply != null) reply.writeInt(1);
                 new Thread(() -> {
-                    SystemClock.sleep(80L);
+                    SystemClock.sleep(150L);
                     System.exit(0);
                 }, "OpalBinderExit").start();
                 return true;
@@ -442,5 +476,43 @@ public final class BridgeBinderService extends Binder {
             default:
                 return super.onTransact(code, data, reply, flags);
         }
+    }
+
+    private static Map<String, Integer> parseAppDpisPayload(String raw) {
+        Map<String, Integer> out = new LinkedHashMap<>();
+        if (raw == null || raw.isEmpty()) return out;
+        for (String line : raw.split("\r?\n")) {
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String pkg = line.substring(0, eq).trim();
+            try {
+                int dpi = Integer.parseInt(line.substring(eq + 1).trim());
+                if (dpi > 0) out.put(pkg, dpi);
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return out;
+    }
+
+    private static Map<String, DaemonConfig.SavedWindowBounds> parseAppBoundsPayload(String raw) {
+        Map<String, DaemonConfig.SavedWindowBounds> out = new LinkedHashMap<>();
+        if (raw == null || raw.isEmpty()) return out;
+        for (String line : raw.split("\r?\n")) {
+            int eq = line.indexOf('=');
+            if (eq <= 0) continue;
+            String pkg = line.substring(0, eq).trim();
+            String[] parts = line.substring(eq + 1).trim().split(",");
+            if (parts.length < 4) continue;
+            try {
+                float l = Float.parseFloat(parts[0].trim());
+                float t = Float.parseFloat(parts[1].trim());
+                float r = Float.parseFloat(parts[2].trim());
+                float b = Float.parseFloat(parts[3].trim());
+                String pres = parts.length >= 5 ? parts[4].trim() : BridgeProtocol.PRES_FLOATING;
+                out.put(pkg, new DaemonConfig.SavedWindowBounds(l, t, r, b, pres));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return out;
     }
 }

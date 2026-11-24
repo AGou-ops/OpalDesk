@@ -84,6 +84,7 @@ public class CompositorEngineTest {
         final List<String> events;
         int launchCount = 0;
         int focusDisplayCount = 0;
+        int allSurfacesDetachedCount = 0;
 
         FakeRuntime() {
             this(new ArrayList<>());
@@ -124,7 +125,11 @@ public class CompositorEngineTest {
 
         @Override
         public boolean isTaskRunningWithActivities(int taskId, int displayId) {
-            return aliveTasks.contains(taskId) && runningBgTasks.contains(taskId);
+            if (aliveTasks.contains(taskId) && runningBgTasks.contains(taskId)) {
+                return true;
+            }
+            Integer dispTid = topTaskByDisplay.get(displayId);
+            return dispTid != null && aliveTasks.contains(dispTid) && runningBgTasks.contains(dispTid);
         }
 
         @Override
@@ -146,6 +151,12 @@ public class CompositorEngineTest {
         public void focusDisplay(int displayId) {
             focusDisplayCount++;
             events.add("focusDisplay:" + displayId);
+        }
+
+        @Override
+        public void onAllClientSurfacesDetached() {
+            allSurfacesDetachedCount++;
+            events.add("allSurfacesDetached");
         }
 
         @Override
@@ -372,5 +383,149 @@ public class CompositorEngineTest {
         assertEquals(0, after.emptyDisplayTicks);
         assertTrue("Reload must refresh lastLaunchAtMs grace window", after.lastLaunchAtMs > 1L);
         assertEquals(launchesBefore + 1, runtime.launchCount);
+    }
+
+    @Test
+    public void transientFullscreenActivityHandoffDoesNotPrematurelyMinimizeOrCloseWindow() throws Exception {
+        DaemonConfig cfg = new DaemonConfig(new File(tmpDir.getRoot(), "c5.conf"), new File(tmpDir.getRoot(), "p5.conf"));
+        cfg.updateRuntimeConfig(BridgeProtocol.INPUT_BACKEND_AUTO, 4, 2560, 1600, 360);
+        RecordingDriver driver = new RecordingDriver();
+        VirtualDisplayPool pool = new VirtualDisplayPool(driver, 4, false);
+        FakeRuntime runtime = new FakeRuntime(driver.events);
+        CompositorEngine engine = new CompositorEngine(cfg, pool, runtime, null);
+
+        int w1 = engine.openOrFocusWindow("com.limelight", "", BridgeProtocol.PROFILE_DESKTOP, 0, 0, 0, 0);
+        int d1 = engine.attachWindowSurface(w1, new Object(), 1920, 1080, 240, 120f);
+        assertTrue(engine.performWindowAction(w1, BridgeProtocol.WIN_ACTION_TOGGLE_FULLSCREEN, null));
+
+        WindowSession ws = engine.getWindowSnapshot(w1);
+        long t0 = 100_000L;
+        ws.lastLaunchAtMs = t0 - 10_000L;
+        ws.lastActiveAtMs = t0 - 500L;
+
+        // Simulate Moonlight / UU远程 launching its fullscreen streaming Activity:
+        // top visible task momentarily disappears across three rapid 40ms TaskStackObserver callbacks.
+        runtime.visibleTaskByDisplay.remove(d1);
+        engine.reconcileWithSystemTasks(t0);
+        engine.reconcileWithSystemTasks(t0 + 40L);
+        engine.reconcileWithSystemTasks(t0 + 180L);
+
+        WindowSession duringTransition = engine.getWindowSnapshot(w1);
+        assertNotNull("Rapid TaskStackObserver callbacks must NOT close streaming window", duringTransition);
+        assertEquals("Fullscreen streaming window must remain LIVE during sub-900ms Activity handoff",
+                BridgeProtocol.STATE_LIVE, duringTransition.state);
+        assertEquals(BridgeProtocol.PRES_FULLSCREEN, duringTransition.presentation);
+
+        // Streaming Activity becomes visible at +320ms -> emptySinceMs & emptyDisplayTicks reset cleanly!
+        int streamTid = 999;
+        runtime.aliveTasks.add(streamTid);
+        runtime.runningBgTasks.add(streamTid);
+        runtime.topTaskByDisplay.put(d1, streamTid);
+        runtime.visibleTaskByDisplay.put(d1, streamTid);
+        engine.reconcileWithSystemTasks(t0 + 320L);
+        assertEquals(0, engine.getWindowSnapshot(w1).emptyDisplayTicks);
+        assertEquals(0L, engine.getWindowSnapshot(w1).emptySinceMs);
+        assertEquals(streamTid, engine.getWindowSnapshot(w1).taskId);
+
+        // Simulate lobby task finishing right after spawning NEW_TASK fullscreen stream on same display:
+        // aliveTasks no longer has streamTid (999), while new task 1005 is running on d1 but briefly invisible!
+        runtime.aliveTasks.remove(streamTid);
+        runtime.runningBgTasks.remove(streamTid);
+        int newStreamTid = 1005;
+        runtime.aliveTasks.add(newStreamTid);
+        runtime.runningBgTasks.add(newStreamTid);
+        runtime.topTaskByDisplay.put(d1, newStreamTid);
+        runtime.visibleTaskByDisplay.remove(d1);
+        ws.lastActiveAtMs = t0 - 3_000L;
+        engine.reconcileWithSystemTasks(t0 + 400L);
+        assertNotNull("Finishing lobby task while new stream task runs on same display must NOT close window",
+                engine.getWindowSnapshot(w1));
+        assertEquals(BridgeProtocol.STATE_LIVE, engine.getWindowSnapshot(w1).state);
+
+        runtime.visibleTaskByDisplay.put(d1, newStreamTid);
+        engine.reconcileWithSystemTasks(t0 + 520L);
+        assertEquals(newStreamTid, engine.getWindowSnapshot(w1).taskId);
+
+        // Detaching last client surface (e.g. exiting DesktopActivity) triggers Display 0 focus restore callback
+        int beforeDetachCb = runtime.allSurfacesDetachedCount;
+        assertTrue(engine.detachWindowSurface(w1, false));
+        assertEquals(beforeDetachCb + 1, runtime.allSurfacesDetachedCount);
+
+        // Re-attach and verify helper-death detachAllClientSurfaces also triggers Display 0 focus restore
+        engine.attachWindowSurface(w1, new Object(), 1920, 1080, 240, 120f);
+        ws.lastLaunchAtMs = t0 - 10_000L;
+        ws.lastActiveAtMs = t0 - 500L;
+        engine.detachAllClientSurfaces();
+        assertEquals(beforeDetachCb + 2, runtime.allSurfacesDetachedCount);
+
+        // Later, if the app truly moves itself to background for >= EMPTY_DISPLAY_SETTLE_MS, it minimizes cleanly
+        runtime.visibleTaskByDisplay.remove(d1);
+        engine.reconcileWithSystemTasks(t0 + 5_000L);
+        assertEquals(BridgeProtocol.STATE_LIVE, engine.getWindowSnapshot(w1).state);
+        engine.reconcileWithSystemTasks(t0 + 5_000L + CompositorEngine.EMPTY_DISPLAY_SETTLE_MS + 50L);
+        assertEquals(BridgeProtocol.STATE_MINIMIZED, engine.getWindowSnapshot(w1).state);
+    }
+
+    @Test
+    public void testCustomGlobalAndPerAppDpiOverridesAndReapply() throws Exception {
+        File confF = new File(tmpDir.getRoot(), "dpi_main.conf");
+        File profF = new File(tmpDir.getRoot(), "dpi_prof.conf");
+        DaemonConfig cfg = new DaemonConfig(confF, profF);
+        cfg.updateRuntimeConfig(BridgeProtocol.INPUT_BACKEND_AUTO, 4, 1920, 1200, 240);
+        cfg.setGlobalCustomDpi(260);
+        cfg.setAppCustomDpi("com.tencent.mm", 340);
+
+        RecordingDriver driver = new RecordingDriver();
+        VirtualDisplayPool pool = new VirtualDisplayPool(driver, 4, false);
+        FakeRuntime runtime = new FakeRuntime();
+        CompositorEngine engine = new CompositorEngine(cfg, pool, runtime, null);
+
+        int w1 = engine.openOrFocusWindow("org.mozilla.firefox", "", BridgeProtocol.PROFILE_DESKTOP, 0, 0, 0, 0);
+        assertEquals(260, engine.getWindowSnapshot(w1).contentDpi);
+
+        int w2 = engine.openOrFocusWindow("com.tencent.mm", "", BridgeProtocol.PROFILE_PORTRAIT, 0, 0, 0, 0);
+        assertEquals(340, engine.getWindowSnapshot(w2).contentDpi);
+
+        engine.attachWindowSurface(w2, new Object(), 0, 0, 0, 60f);
+        assertEquals(340, engine.getWindowSnapshot(w2).contentDpi);
+        cfg.setAppCustomDpi("com.tencent.mm", 300);
+        engine.reapplyAppDpi("com.tencent.mm");
+        assertEquals(300, engine.getWindowSnapshot(w2).contentDpi);
+        assertTrue(driver.resizeCount >= 1);
+
+        DaemonConfig reloaded = new DaemonConfig(confF, profF);
+        reloaded.loadAll();
+        assertEquals(260, reloaded.getGlobalCustomDpi());
+        assertEquals(300, reloaded.getAppCustomDpi("com.tencent.mm"));
+        assertEquals(260, reloaded.resolveEffectiveCustomDpi("org.mozilla.firefox"));
+        assertEquals(300, reloaded.resolveEffectiveCustomDpi("com.tencent.mm"));
+    }
+
+    @Test
+    public void testPerAppLastClosedWindowBoundsPersistenceAndRestore() throws Exception {
+        File confF = new File(tmpDir.getRoot(), "bounds_main.conf");
+        File profF = new File(tmpDir.getRoot(), "bounds_prof.conf");
+        DaemonConfig cfg = new DaemonConfig(confF, profF);
+        cfg.updateRuntimeConfig(BridgeProtocol.INPUT_BACKEND_AUTO, 4, 2000, 1000, 240);
+
+        RecordingDriver driver = new RecordingDriver();
+        VirtualDisplayPool pool = new VirtualDisplayPool(driver, 4, false);
+        FakeRuntime runtime = new FakeRuntime();
+        CompositorEngine engine = new CompositorEngine(cfg, pool, runtime, null);
+
+        int w1 = engine.openOrFocusWindow("com.example.notes", "", BridgeProtocol.PROFILE_DESKTOP, 0, 0, 0, 0);
+        assertTrue(engine.updateWindowFrame(w1, 200, 120, 1000, 720, BridgeProtocol.PRES_FLOATING));
+        assertTrue(engine.performWindowAction(w1, BridgeProtocol.WIN_ACTION_CLOSE, null));
+        assertNull(engine.getWindowSnapshot(w1));
+
+        DaemonConfig reloaded = new DaemonConfig(confF, profF);
+        reloaded.loadAll();
+        CompositorEngine engine2 = new CompositorEngine(reloaded, new VirtualDisplayPool(driver, 4, false), runtime, null);
+        int w2 = engine2.openOrFocusWindow("com.example.notes", "", BridgeProtocol.PROFILE_AUTO, 0, 0, 0, 0);
+        IntRect restored = engine2.getWindowSnapshot(w2).frame;
+        assertEquals(200, restored.left);
+        assertEquals(120, restored.top);
+        assertEquals(800, restored.width());
+        assertEquals(600, restored.height());
     }
 }

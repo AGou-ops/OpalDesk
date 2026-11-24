@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
@@ -51,6 +52,7 @@ import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -75,6 +77,7 @@ fun WindowSurfaceHost(
 
     var hibernateBitmap by remember(window.windowId) { mutableStateOf<Bitmap?>(null) }
     var hasRenderedLiveFrame by remember(window.windowId) { mutableStateOf(false) }
+    val lastHoverEventTime = remember(window.windowId) { AtomicLong(-1L) }
 
     LaunchedEffect(window.windowId, window.isHibernated, window.snapshotVersion) {
         if (window.hasSnapshot) {
@@ -94,15 +97,17 @@ fun WindowSurfaceHost(
         modifier = modifier
             .fillMaxSize()
             .background(OpalPalette.WindowCanvasBg)
-            // Intercept Compose PointerEventType.Scroll directly: AndroidComposeView routes
-            // ACTION_SCROLL into Compose PointerInput rather than AndroidView.onGenericMotionListener
-            // whenever ancestor pointerInput modifiers exist.
-            .pointerInput(window.windowId, "mouse_wheel_scroll") {
+            // Intercept Compose PointerEventType.Scroll AND unpressed Mouse Hover directly:
+            // AndroidComposeView intercepts GenericMotionEvents (ACTION_SCROLL & ACTION_HOVER_MOVE)
+            // into Compose PointerInput rather than AndroidView.onGenericMotionListener whenever
+            // ancestor pointerInput modifiers exist. Forwarding hover here keeps the VirtualDisplay
+            // cursor continuously synchronized before every USB mouse click!
+            .pointerInput(window.windowId, "mouse_hover_and_scroll") {
                 awaitPointerEventScope {
                     while (true) {
                         val ev = awaitPointerEvent(PointerEventPass.Initial)
+                        val change = ev.changes.firstOrNull() ?: continue
                         if (ev.type == PointerEventType.Scroll) {
-                            val change = ev.changes.firstOrNull() ?: continue
                             val delta = change.scrollDelta
                             val vScroll = -delta.y
                             val hScroll = delta.x
@@ -139,6 +144,59 @@ fun WindowSurfaceHost(
                                         actionButton = 0,
                                         hScroll = hScroll,
                                         vScroll = vScroll,
+                                        pointerIds = intArrayOf(0),
+                                        toolTypes = intArrayOf(MotionEvent.TOOL_TYPE_MOUSE),
+                                        xs = floatArrayOf(mappedX),
+                                        ys = floatArrayOf(mappedY),
+                                        pressures = floatArrayOf(0f),
+                                    )
+                                }
+                            }
+                        } else if (
+                            change.type == PointerType.Mouse &&
+                            !change.pressed &&
+                            !change.previousPressed &&
+                            (ev.type == PointerEventType.Move ||
+                                ev.type == PointerEventType.Enter ||
+                                ev.type == PointerEventType.Exit)
+                        ) {
+                            val win = currentWin
+                            if (win.isLive && win.displayId > 0 && size.width > 0 && size.height > 0) {
+                                val canvasX = win.frame.left + change.position.x
+                                val canvasY = win.frame.top + currentHeaderPx + change.position.y
+                                val occluded = ev.type != PointerEventType.Exit && CompositorGeometry.isPointOccludedByHigherWindow(
+                                    target = win,
+                                    canvasX = canvasX,
+                                    canvasY = canvasY,
+                                    visibleWindows = BridgeClient.sceneFlow.value.visibleWindows,
+                                )
+                                val evtTime = change.uptimeMillis.takeIf { it > 0L } ?: SystemClock.uptimeMillis()
+                                if (!occluded && lastHoverEventTime.getAndSet(evtTime) != evtTime) {
+                                    val hoverAction = when (ev.type) {
+                                        PointerEventType.Enter -> MotionEvent.ACTION_HOVER_ENTER
+                                        PointerEventType.Exit -> MotionEvent.ACTION_HOVER_EXIT
+                                        else -> MotionEvent.ACTION_HOVER_MOVE
+                                    }
+                                    val mappedX = CompositorGeometry.mapViewToDisplayCoord(
+                                        change.position.x,
+                                        size.width,
+                                        win.contentWidth.coerceAtLeast(2),
+                                    )
+                                    val mappedY = CompositorGeometry.mapViewToDisplayCoord(
+                                        change.position.y,
+                                        size.height,
+                                        win.contentHeight.coerceAtLeast(2),
+                                    )
+                                    BridgeClient.injectWindowMotionOneway(
+                                        windowId = win.windowId,
+                                        action = hoverAction,
+                                        downTime = evtTime,
+                                        eventTime = evtTime,
+                                        source = InputDevice.SOURCE_MOUSE,
+                                        buttonState = 0,
+                                        actionButton = 0,
+                                        hScroll = 0f,
+                                        vScroll = 0f,
                                         pointerIds = intArrayOf(0),
                                         toolTypes = intArrayOf(MotionEvent.TOOL_TYPE_MOUSE),
                                         xs = floatArrayOf(mappedX),
@@ -199,8 +257,10 @@ fun WindowSurfaceHost(
                             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                                 OpalLogStore.i("Surface", "TextureView destroyed wid=${currentWin.windowId} hadFrame=$hasRenderedLiveFrame")
                                 hasRenderedLiveFrame = false
-                                holderState.releaseAll(notifyDaemon = false)
-                                return true
+                                holderState.onTextureDestroyed(st)
+                                // Return false so OpalSurfBind releases Surface BEFORE SurfaceTexture,
+                                // preventing native BufferQueue/writeToParcel use-after-free races.
+                                return false
                             }
 
                             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
@@ -223,8 +283,8 @@ fun WindowSurfaceHost(
                             )
                         }
                         setOnGenericMotionListener { v, ev ->
-                            forwardMotionEventToWindow(
-                                v.width, v.height, ev, currentWin, currentHeaderPx, currentFocusCb,
+                            handleGenericMotionForWindow(
+                                v.width, v.height, ev, currentWin, currentHeaderPx, lastHoverEventTime, currentFocusCb,
                             )
                         }
                     }
@@ -233,15 +293,13 @@ fun WindowSurfaceHost(
                     val cw = window.contentWidth.coerceAtLeast(240)
                     val ch = window.contentHeight.coerceAtLeast(200)
                     textureView.syncBufferSize(cw, ch)
-                    // Keep native Android View Z-order strictly aligned with Compose zIndex
-                    // so AndroidViewsHandler hit-testing never clicks through to lower windows.
+                    // Keep native Android View Z-order strictly aligned with Compose zIndex via translationZ
+                    // (never call bringToFront() here: mutating AndroidViewsHandler child array mid-click
+                    // aborts the active touch target and requires a double-click on unfocused windows!).
                     val zVal = window.zOrder.toFloat()
                     textureView.translationZ = zVal
                     (textureView.parent as? View)?.let { holderView ->
                         holderView.translationZ = zVal
-                        if (window.focused) {
-                            holderView.bringToFront()
-                        }
                     }
                 },
             )
@@ -363,39 +421,151 @@ private fun resolveHostDisplayRefreshRate(view: TextureView): Float {
     return active.coerceIn(60f, 165f)
 }
 
-private class SurfaceBindHolder(private val windowId: Int) {
-    private val generation = AtomicLong(0L)
+/**
+ * Pure JVM-testable per-window Surface ownership & generation gate.
+ * Prevents stale `onDispose` callbacks from detaching a newly mounted `TextureView` for the same
+ * `windowId` and cancels queued attach tasks if the `SurfaceTexture` is destroyed first.
+ */
+internal class WindowSurfaceGenerationGate {
+    private val lock = Any()
+    private var nextOpGen = 0L
+    private val activeHolderByWindow = HashMap<Int, Long>()
+    private val latestOpGenByWindow = HashMap<Int, Long>()
+    private val pendingDaemonDetachByWindow = HashMap<Int, Boolean>()
 
-    @Volatile
-    private var surfaceTexture: SurfaceTexture? = null
+    fun onAttachRequested(windowId: Int, holderToken: Long): Long = synchronized(lock) {
+        val gen = ++nextOpGen
+        activeHolderByWindow[windowId] = holderToken
+        latestOpGenByWindow[windowId] = gen
+        pendingDaemonDetachByWindow[windowId] = true
+        gen
+    }
 
-    @Volatile
-    private var boundSurface: Surface? = null
+    fun isAttachStillValid(windowId: Int, holderToken: Long, opGen: Long): Boolean = synchronized(lock) {
+        activeHolderByWindow[windowId] == holderToken && latestOpGenByWindow[windowId] == opGen
+    }
 
-    fun attachAsync(st: SurfaceTexture, w: Int, h: Int, dpi: Int, fps: Float) {
-        val gen = generation.incrementAndGet()
-        surfaceTexture = st
-        val surf = Surface(st)
-        val prev = boundSurface
-        boundSurface = surf
-        try {
-            prev?.release()
-        } catch (_: Throwable) {
+    /**
+     * Invalidates queued attaches for [holderToken] and returns `true` iff the daemon's
+     * VirtualDisplay should detach its Surface immediately BEFORE `st.release()` abandons the
+     * BufferQueue consumer.
+     */
+    fun onTextureDestroyed(windowId: Int, holderToken: Long): Boolean = synchronized(lock) {
+        if (activeHolderByWindow[windowId] == holderToken) {
+            latestOpGenByWindow[windowId] = ++nextOpGen
+            pendingDaemonDetachByWindow.remove(windowId) == true
+        } else {
+            false
         }
-        Thread({
-            if (generation.get() != gen) {
+    }
+
+    /**
+     * Returns `true` iff [holderToken] is still the active owner of [windowId] and has not yet
+     * detached the daemon surface in [onTextureDestroyed].
+     */
+    fun onHolderDisposed(windowId: Int, holderToken: Long): Boolean = synchronized(lock) {
+        if (activeHolderByWindow[windowId] == holderToken) {
+            activeHolderByWindow.remove(windowId)
+            latestOpGenByWindow[windowId] = ++nextOpGen
+            pendingDaemonDetachByWindow.remove(windowId) == true
+        } else {
+            false
+        }
+    }
+}
+
+private object WindowSurfaceCoordinator {
+    private val nextHolderToken = AtomicLong(1L)
+    val gate = WindowSurfaceGenerationGate()
+    private val bindExec = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "OpalSurfBind").apply { isDaemon = true }
+    }
+    // Confined strictly to bindExec so Surface creation, Parcel marshaling, and release() never race.
+    private val boundSurfaceByHolder = HashMap<Long, Surface>()
+
+    fun allocateHolderToken(): Long = nextHolderToken.getAndIncrement()
+
+    fun attachAsync(
+        windowId: Int,
+        holderToken: Long,
+        st: SurfaceTexture,
+        w: Int,
+        h: Int,
+        dpi: Int,
+        fps: Float,
+    ) {
+        val opGen = gate.onAttachRequested(windowId, holderToken)
+        bindExec.execute {
+            if (!gate.isAttachStillValid(windowId, holderToken, opGen)) {
+                return@execute
+            }
+            val surf = try {
+                st.setDefaultBufferSize(w, h)
+                Surface(st)
+            } catch (_: Throwable) {
+                return@execute
+            }
+            val prev = boundSurfaceByHolder.put(holderToken, surf)
+            try {
+                prev?.release()
+            } catch (_: Throwable) {
+            }
+            if (!gate.isAttachStillValid(windowId, holderToken, opGen)) {
+                boundSurfaceByHolder.remove(holderToken, surf)
                 try {
                     surf.release()
                 } catch (_: Throwable) {
                 }
-                return@Thread
-            }
-            try {
-                st.setDefaultBufferSize(w, h)
-            } catch (_: Throwable) {
+                return@execute
             }
             BridgeClient.attachWindowSurface(windowId, surf, w, h, dpi, fps)
-        }, "OpalSurfAttach-$windowId").start()
+        }
+    }
+
+    fun releaseDestroyedTexture(windowId: Int, holderToken: Long, st: SurfaceTexture) {
+        val shouldDetachFirst = gate.onTextureDestroyed(windowId, holderToken)
+        bindExec.execute {
+            // Detach VirtualDisplay producer BEFORE releasing Surface & SurfaceTexture consumer
+            // so high-FPS MediaCodec/GLES producers never hit an abandoned BufferQueue.
+            if (shouldDetachFirst) {
+                BridgeClient.detachWindowSurface(windowId, releaseDisplay = false)
+            }
+            val prev = boundSurfaceByHolder.remove(holderToken)
+            try {
+                prev?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                st.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun disposeHolder(windowId: Int, holderToken: Long, notifyDaemon: Boolean) {
+        val shouldDetach = gate.onHolderDisposed(windowId, holderToken) && notifyDaemon
+        bindExec.execute {
+            if (shouldDetach) {
+                BridgeClient.detachWindowSurface(windowId, releaseDisplay = false)
+            }
+            val prev = boundSurfaceByHolder.remove(holderToken)
+            try {
+                prev?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+}
+
+private class SurfaceBindHolder(private val windowId: Int) {
+    private val holderToken = WindowSurfaceCoordinator.allocateHolderToken()
+
+    @Volatile
+    private var surfaceTexture: SurfaceTexture? = null
+
+    fun attachAsync(st: SurfaceTexture, w: Int, h: Int, dpi: Int, fps: Float) {
+        surfaceTexture = st
+        WindowSurfaceCoordinator.attachAsync(windowId, holderToken, st, w, h, dpi, fps)
     }
 
     fun updateBufferSize(w: Int, h: Int) {
@@ -405,29 +575,70 @@ private class SurfaceBindHolder(private val windowId: Int) {
         }
     }
 
+    fun onTextureDestroyed(st: SurfaceTexture) {
+        if (surfaceTexture === st) {
+            surfaceTexture = null
+        }
+        WindowSurfaceCoordinator.releaseDestroyedTexture(windowId, holderToken, st)
+    }
+
     fun releaseAll(notifyDaemon: Boolean) {
-        val gen = generation.incrementAndGet()
         surfaceTexture = null
-        val prev = boundSurface
-        boundSurface = null
-        if (notifyDaemon) {
-            Thread({
-                // Only detach if no newer Surface attached in the meantime
-                if (generation.get() == gen) {
-                    BridgeClient.detachWindowSurface(windowId, releaseDisplay = false)
-                }
-                try {
-                    prev?.release()
-                } catch (_: Throwable) {
-                }
-            }, "OpalSurfDetach-$windowId").start()
-        } else {
-            try {
-                prev?.release()
-            } catch (_: Throwable) {
+        WindowSurfaceCoordinator.disposeHolder(windowId, holderToken, notifyDaemon)
+    }
+}
+
+private fun isMouseMotionEvent(ev: MotionEvent): Boolean =
+    (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE ||
+        (ev.pointerCount > 0 && ev.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE)
+
+private fun handleGenericMotionForWindow(
+    viewW: Int,
+    viewH: Int,
+    ev: MotionEvent?,
+    win: CompositorWindow,
+    headerHeightPx: Int,
+    lastHoverEventTime: AtomicLong,
+    onFocusRequested: () -> Unit,
+): Boolean {
+    if (ev == null || viewW <= 0 || viewH <= 0) return false
+    val masked = ev.actionMasked
+    if (masked == MotionEvent.ACTION_BUTTON_PRESS || masked == MotionEvent.ACTION_BUTTON_RELEASE) {
+        val canvasX = win.frame.left + ev.x
+        val canvasY = win.frame.top + headerHeightPx + ev.y
+        if (CompositorGeometry.isPointOccludedByHigherWindow(
+                target = win,
+                canvasX = canvasX,
+                canvasY = canvasY,
+                visibleWindows = BridgeClient.sceneFlow.value.visibleWindows,
+            )
+        ) {
+            return false
+        }
+        if (masked == MotionEvent.ACTION_BUTTON_PRESS) {
+            if (!win.focused) onFocusRequested()
+            if (ev.actionButton == MotionEvent.BUTTON_BACK && win.isLive && win.displayId > 0) {
+                BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.SEND_BACK)
+                return true
             }
         }
+        // Consume mouse button generic events locally without injecting invalid ACTION_BUTTON_PRESS/RELEASE
+        // into IInputManager (actual click press/release is delivered cleanly via onTouchListener ACTION_DOWN/UP).
+        return isMouseMotionEvent(ev)
     }
+    if (masked == MotionEvent.ACTION_HOVER_ENTER ||
+        masked == MotionEvent.ACTION_HOVER_MOVE ||
+        masked == MotionEvent.ACTION_HOVER_EXIT
+    ) {
+        if (lastHoverEventTime.getAndSet(ev.eventTime) == ev.eventTime) {
+            return true
+        }
+        return forwardMotionEventToWindow(viewW, viewH, ev, win, headerHeightPx, onFocusRequested)
+    }
+    if (masked == MotionEvent.ACTION_SCROLL) {
+        return forwardMotionEventToWindow(viewW, viewH, ev, win, headerHeightPx, onFocusRequested)
+    }
+    return false
 }
 
 private fun forwardMotionEventToWindow(
@@ -442,7 +653,7 @@ private fun forwardMotionEventToWindow(
     val masked = ev.actionMasked
     // Geometric Z-order occlusion guard: never accept clicks/hovers underneath a higher-Z floating window
     if (masked == MotionEvent.ACTION_DOWN ||
-        masked == MotionEvent.ACTION_BUTTON_PRESS ||
+        masked == MotionEvent.ACTION_HOVER_ENTER ||
         masked == MotionEvent.ACTION_HOVER_MOVE ||
         masked == MotionEvent.ACTION_SCROLL
     ) {
@@ -458,7 +669,7 @@ private fun forwardMotionEventToWindow(
             return false
         }
     }
-    if (!win.focused && (masked == MotionEvent.ACTION_DOWN || masked == MotionEvent.ACTION_BUTTON_PRESS)) {
+    if (!win.focused && masked == MotionEvent.ACTION_DOWN) {
         onFocusRequested()
     }
     if (!win.isLive || win.displayId <= 0) return true
@@ -480,24 +691,23 @@ private fun forwardMotionEventToWindow(
         pressures[i] = ev.getPressure(i)
     }
 
-    val isMouse = (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE ||
-        toolTypes[0] == MotionEvent.TOOL_TYPE_MOUSE
+    val isMouse = isMouseMotionEvent(ev)
     val effSource = when {
         isMouse -> InputDevice.SOURCE_MOUSE
         toolTypes[0] == MotionEvent.TOOL_TYPE_STYLUS -> InputDevice.SOURCE_STYLUS
         else -> InputDevice.SOURCE_TOUCHSCREEN
     }
+    val normButtonState = if (
+        isMouse &&
+        (masked == MotionEvent.ACTION_DOWN || masked == MotionEvent.ACTION_MOVE) &&
+        ev.buttonState == 0
+    ) {
+        MotionEvent.BUTTON_PRIMARY
+    } else {
+        ev.buttonState
+    }
     val hScroll = if (masked == MotionEvent.ACTION_SCROLL) ev.getAxisValue(MotionEvent.AXIS_HSCROLL) else 0f
     val vScroll = if (masked == MotionEvent.ACTION_SCROLL) ev.getAxisValue(MotionEvent.AXIS_VSCROLL) else 0f
-    val actionButton = if (masked == MotionEvent.ACTION_BUTTON_PRESS || masked == MotionEvent.ACTION_BUTTON_RELEASE) {
-        ev.actionButton
-    } else {
-        0
-    }
-    if (masked == MotionEvent.ACTION_BUTTON_PRESS && actionButton == MotionEvent.BUTTON_BACK) {
-        BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.SEND_BACK)
-        return true
-    }
 
     BridgeClient.injectWindowMotionOneway(
         windowId = win.windowId,
@@ -505,8 +715,8 @@ private fun forwardMotionEventToWindow(
         downTime = ev.downTime,
         eventTime = ev.eventTime,
         source = effSource,
-        buttonState = ev.buttonState,
-        actionButton = actionButton,
+        buttonState = normButtonState,
+        actionButton = 0,
         hScroll = hScroll,
         vScroll = vScroll,
         pointerIds = ids,

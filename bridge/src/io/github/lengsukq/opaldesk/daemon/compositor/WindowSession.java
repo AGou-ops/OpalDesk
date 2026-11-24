@@ -32,6 +32,7 @@ public final class WindowSession {
     public long lastActiveAtMs = 0L;
     public long lastLaunchAtMs = 0L;
     public int emptyDisplayTicks = 0;
+    public long emptySinceMs = 0L;
     public long snapshotVersion = 0L;
     public byte[] hibernatedSnapshotBytes;
 

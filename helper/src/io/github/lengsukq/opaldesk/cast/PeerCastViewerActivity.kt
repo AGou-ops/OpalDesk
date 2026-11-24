@@ -223,8 +223,8 @@ class PeerCastViewerActivity : ComponentActivity() {
                             if (c.isMouseMotion(ev)) c.sendMouseEvent(ev, w, h) else c.sendTouchEvent(ev, w, h)
                         },
                         onDispatchGenericMotion = { ev, w, h ->
-                            val c = client ?: return@PeerCastViewerContent
-                            if (c.isMouseMotion(ev)) c.sendMouseEvent(ev, w, h)
+                            val c = client ?: return@PeerCastViewerContent false
+                            c.handleGenericMouseMotion(ev, w, h)
                         },
                         onOpenFloatingPicker = {
                             client?.requestAppList()
@@ -415,7 +415,7 @@ private fun PeerCastViewerContent(
     onSurfaceCreated: (android.view.Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
     onDispatchTouch: (android.view.MotionEvent, Int, Int) -> Unit,
-    onDispatchGenericMotion: (android.view.MotionEvent, Int, Int) -> Unit,
+    onDispatchGenericMotion: (android.view.MotionEvent, Int, Int) -> Boolean,
     onOpenFloatingPicker: () -> Unit,
     onRetryConnect: () -> Unit,
     onSendBack: () -> Unit,
@@ -471,7 +471,6 @@ private fun PeerCastViewerContent(
                     }
                     setOnGenericMotionListener { v, ev ->
                         onDispatchGenericMotion(ev, v.width, v.height)
-                        true
                     }
                 }
             },

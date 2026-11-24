@@ -126,6 +126,80 @@ export function shouldPreventDefaultForKeyEvent(ev, { imeFocused = false, isModi
   return true;
 }
 
+/**
+ * Detects touch / tablet / mobile environments where focusing a text field summons an on-screen
+ * virtual keyboard (Android tablets/phones, iOS, iPadOS desktop-class Safari `MacIntel` with
+ * `maxTouchPoints > 1`, and primary coarse-pointer tablets), vs. desktop PC browsers where
+ * `#imeBridge` can remain silently focused in the background for hardware CJK IME composition.
+ */
+export function isVirtualKeyboardDevice({
+  userAgent = '',
+  platform = '',
+  maxTouchPoints = 0,
+  coarsePointer = false,
+  anyCoarsePointer = false,
+  uaDataMobile = false,
+} = {}) {
+  if (uaDataMobile) return true;
+  const ua = String(userAgent || '');
+  const plat = String(platform || '');
+  const touchPts = Number(maxTouchPoints || 0);
+  if (/Android|iPhone|iPad|iPod|Mobile|Tablet|Silk|HarmonyOS|OpenHarmony/i.test(ua)) {
+    return true;
+  }
+  // iPadOS 13+ desktop Safari ('MacIntel') and Android/HarmonyOS Chrome "Request Desktop Site"
+  // ('Linux x86_64' / 'Linux armv81') report desktop platforms alongside multi-touch support.
+  if ((plat === 'MacIntel' || /^Linux/i.test(plat)) && touchPts > 1) {
+    return true;
+  }
+  if (coarsePointer) {
+    return true;
+  }
+  if (anyCoarsePointer && !/^Win/i.test(plat)) {
+    return true;
+  }
+  return touchPts > 0 && !/Win32|Win64|Linux x86_64|MacIntel/.test(plat);
+}
+
+/**
+ * Maps Android `EditorInfo.inputType` flags onto HTML `inputmode` values when summoning
+ * a tablet/mobile virtual keyboard.
+ */
+export function resolveWebInputMode(androidInputType = 0) {
+  const raw = Number(androidInputType || 0);
+  const cls = raw & 0x0f;
+  const variation = raw & 0x0ff0;
+  if (cls === 2) {
+    // TYPE_CLASS_NUMBER (TYPE_NUMBER_FLAG_DECIMAL = 0x2000)
+    return (raw & 0x2000) !== 0 ? 'decimal' : 'numeric';
+  }
+  if (cls === 3) {
+    // TYPE_CLASS_PHONE
+    return 'tel';
+  }
+  if (cls === 1) {
+    if (variation === 0x10) return 'url';
+    if (variation === 0x20 || variation === 0xd0) return 'email';
+  }
+  return 'text';
+}
+
+function detectBrowserVirtualKeyboardDevice() {
+  if (typeof navigator === 'undefined') return false;
+  const hasMatchMedia = typeof window !== 'undefined' && typeof window.matchMedia === 'function';
+  const coarse = hasMatchMedia && window.matchMedia('(pointer: coarse)').matches;
+  const anyCoarse = hasMatchMedia && window.matchMedia('(any-pointer: coarse)').matches;
+  const uaMobile = Boolean(navigator.userAgentData && navigator.userAgentData.mobile);
+  return isVirtualKeyboardDevice({
+    userAgent: navigator.userAgent || '',
+    platform: navigator.platform || '',
+    maxTouchPoints: navigator.maxTouchPoints || 0,
+    coarsePointer: coarse,
+    anyCoarsePointer: anyCoarse,
+    uaDataMobile: uaMobile,
+  });
+}
+
 export function clampImeBridgeCoords(clientX, clientY, viewportWidth, viewportHeight, margin = 16) {
   const maxX = Math.max(margin, (viewportWidth || 0) - margin);
   const maxY = Math.max(margin, (viewportHeight || 0) - margin);
@@ -136,8 +210,12 @@ export function clampImeBridgeCoords(clientX, clientY, viewportWidth, viewportHe
 }
 
 export function mapDomKeyboardEvent(ev, mapMacCommandToCtrl = true) {
-  const androidKeyCode = DOM_CODE_TO_ANDROID_KEYCODE[ev.code];
-  if (!androidKeyCode) return null;
+  let androidKeyCode = DOM_CODE_TO_ANDROID_KEYCODE[ev.code];
+  if (!androidKeyCode) {
+    if (ev.key === 'Backspace') androidKeyCode = 67;
+    else if (ev.key === 'Enter') androidKeyCode = 66;
+    else return null;
+  }
 
   const promoteCmd = mapMacCommandToCtrl && ev.metaKey && !ev.ctrlKey && MAC_CMD_TO_CTRL_CODES.has(ev.code);
   let meta = 0;
@@ -181,6 +259,8 @@ export class OpalInputController {
     onImageClipboard,
     onFileDrop,
     onUserGesture,
+    onSoftKeyboardStateChange,
+    virtualKeyboardDevice,
   }) {
     this.canvas = canvas;
     this.imeInput = imeInput;
@@ -192,6 +272,14 @@ export class OpalInputController {
     this.onImageClipboard = onImageClipboard;
     this.onFileDrop = onFileDrop;
     this.onUserGesture = onUserGesture || (() => {});
+    this.onSoftKeyboardStateChange = onSoftKeyboardStateChange || (() => {});
+
+    this.virtualKeyboardDevice = typeof virtualKeyboardDevice === 'boolean'
+      ? virtualKeyboardDevice
+      : detectBrowserVirtualKeyboardDevice();
+    this.softKeyboardOpen = false;
+    this.suppressedEchoChar = '';
+    this.suppressedEchoAt = 0;
 
     this.enabled = false;
     this.composing = false;
@@ -206,6 +294,7 @@ export class OpalInputController {
     );
     this.touchMap = new Map();
     this.boundHandlers = [];
+    this.applyImeInputMode(this.virtualKeyboardDevice ? 'none' : 'text');
   }
 
   setPrimaryLeftAsTouch(useTouch) {
@@ -392,10 +481,21 @@ export class OpalInputController {
       const val = this.imeInput.value;
       if (val) {
         this.imeInput.value = '';
-        // Non-ASCII / IME committed text (e.g. direct Chinese punctuation `，。？！`, soft keyboard, voice dictation)
-        if (/[^\x20-\x7e]/.test(val)) {
-          this.onText(val, true);
+        const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (val === this.suppressedEchoChar && (nowMs - this.suppressedEchoAt) < 120) {
+          this.suppressedEchoChar = '';
+          return;
         }
+        this.suppressedEchoChar = '';
+        // Commit both CJK/non-ASCII punctuation AND mobile/tablet soft-keyboard ASCII/swipe words
+        this.onText(val, true);
+      }
+    });
+    add(this.imeInput, 'blur', () => {
+      if (this.virtualKeyboardDevice && this.softKeyboardOpen) {
+        this.softKeyboardOpen = false;
+        this.applyImeInputMode('none');
+        this.onSoftKeyboardStateChange(false);
       }
     });
     add(this.imeInput, 'paste', async (e) => {
@@ -475,11 +575,21 @@ export class OpalInputController {
 
       const mapped = mapDomKeyboardEvent(ev, this.isMac);
       if (!mapped) return;
-      if (shouldPreventDefaultForKeyEvent(ev, {
+      const prevent = shouldPreventDefaultForKeyEvent(ev, {
         imeFocused: active === this.imeInput,
         isModifier: isModifierDomCode(ev.code),
-      })) {
+      });
+      if (prevent) {
         ev.preventDefault();
+      } else if (
+        action === KEY_DOWN
+        && active === this.imeInput
+        && typeof ev.key === 'string'
+        && ev.key.length === 1
+        && /[\x20-\x7e]/.test(ev.key)
+      ) {
+        this.suppressedEchoChar = ev.key;
+        this.suppressedEchoAt = nowMs;
       }
       this.onKey(action, mapped.androidKeyCode, mapped.metaState, ev.repeat ? 1 : 0);
     };
@@ -509,21 +619,79 @@ export class OpalInputController {
     });
   }
 
+  applyImeInputMode(mode) {
+    if (!this.imeInput) return;
+    if (typeof this.imeInput.setAttribute === 'function') {
+      this.imeInput.setAttribute('inputmode', mode);
+    }
+    try {
+      this.imeInput.inputMode = mode;
+    } catch {
+      // Ignore read-only stub in tests
+    }
+  }
+
   setEnabled(enabled) {
     this.enabled = Boolean(enabled);
     if (!this.enabled) {
       this.composing = false;
+      this.suppressedEchoChar = '';
       this.imeConsumedCodes.clear();
+      this.dismissSoftKeyboard();
       return;
     }
-    this.focusIme();
+    if (this.virtualKeyboardDevice) {
+      this.applyImeInputMode('none');
+    } else {
+      this.applyImeInputMode('text');
+      this.focusIme();
+    }
   }
 
+  /**
+   * Passive background focus for desktop hardware CJK IME.
+   * On tablets / touch devices (`virtualKeyboardDevice === true`), this intentionally avoids
+   * focusing `#imeBridge` unless the user or remote app explicitly requested the soft keyboard,
+   * preventing the virtual keyboard from popping up on every tap or toolbar button click.
+   */
   focusIme() {
     if (!this.enabled || !this.imeInput) return;
+    if (this.virtualKeyboardDevice && !this.softKeyboardOpen) return;
     if (typeof document !== 'undefined' && document.activeElement !== this.imeInput) {
       this.imeInput.focus({ preventScroll: true });
     }
+  }
+
+  openSoftKeyboard(androidInputType = 0) {
+    if (!this.enabled || !this.imeInput) return false;
+    const mode = resolveWebInputMode(androidInputType);
+    this.applyImeInputMode(mode);
+    this.softKeyboardOpen = true;
+    this.imeInput.focus({ preventScroll: true });
+    this.onSoftKeyboardStateChange(true);
+    return true;
+  }
+
+  dismissSoftKeyboard() {
+    const wasOpen = this.softKeyboardOpen;
+    this.softKeyboardOpen = false;
+    if (this.imeInput && this.virtualKeyboardDevice) {
+      this.applyImeInputMode('none');
+      if (typeof document !== 'undefined' && document.activeElement === this.imeInput) {
+        this.imeInput.blur();
+      }
+    }
+    if (wasOpen) {
+      this.onSoftKeyboardStateChange(false);
+    }
+  }
+
+  toggleSoftKeyboard() {
+    if (this.softKeyboardOpen) {
+      this.dismissSoftKeyboard();
+      return false;
+    }
+    return this.openSoftKeyboard(0);
   }
 
   positionImeBridge(clientX, clientY) {
@@ -533,10 +701,16 @@ export class OpalInputController {
     this.imeInput.style.top = `${top}px`;
   }
 
-  handleRemoteImeRequest(show) {
+  handleRemoteImeRequest(show, inputType = 0) {
     if (!this.enabled) return;
     if (show) {
-      this.focusIme();
+      if (this.virtualKeyboardDevice) {
+        this.openSoftKeyboard(inputType);
+      } else {
+        this.focusIme();
+      }
+    } else if (this.virtualKeyboardDevice) {
+      this.dismissSoftKeyboard();
     }
   }
 

@@ -188,9 +188,20 @@ public final class DisplayGeometryUtil {
         return new int[]{baseW, baseH, baseDpi};
     }
 
+    public static int[] resolveWindowBufferSpec(
+            IntRect windowFrame,
+            int canvasDpi,
+            boolean fullscreen,
+            WindowProfile profile,
+            int dpiScalePct,
+            int hostDisplayDpi) {
+        return resolveWindowBufferSpec(windowFrame, canvasDpi, fullscreen, profile, dpiScalePct, hostDisplayDpi, 0);
+    }
+
     /**
      * Resolves {@code [bufW, bufH, vdDpi]} for a compositor window's isolated VirtualDisplay.
-     * When a window is shrunk small on screen, scales buffer pixels and VirtualDisplay DPI together
+     * When {@code customDpiOverride} is in {@code [MIN_DPI, MAX_DPI]}, applies that exact DPI directly
+     * without supersampling distortion. Otherwise scales buffer pixels and VirtualDisplay DPI together
      * toward {@code hostDisplayDpi} (keeping exact logical dp invariant!) so apps that pin Display 0
      * compat density (e.g. WeChat {@code compat={440/560dpi}}) never explode or clip when shrunk.
      */
@@ -200,10 +211,14 @@ public final class DisplayGeometryUtil {
             boolean fullscreen,
             WindowProfile profile,
             int dpiScalePct,
-            int hostDisplayDpi) {
+            int hostDisplayDpi,
+            int customDpiOverride) {
         int[] raw = computeContentBufferSize(windowFrame, canvasDpi, fullscreen);
         int rawW = raw[0];
         int rawH = raw[1];
+        if (customDpiOverride >= MIN_DPI && customDpiOverride <= MAX_DPI) {
+            return new int[]{rawW, rawH, clampDpi(customDpiOverride)};
+        }
         WindowProfile effProfile = (profile != null) ? profile : WindowProfile.DESKTOP;
         int baseDpi = effProfile.resolveContentDpi(rawW, rawH, dpiScalePct);
         int targetHostDpi = (hostDisplayDpi >= 240 && hostDisplayDpi <= MAX_DPI) ? hostDisplayDpi : 0;

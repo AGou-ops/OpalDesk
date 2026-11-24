@@ -128,6 +128,36 @@ class CompositorGeometryAndSceneTest {
         assertTrue(grid4[2].top > grid4[0].bottom)
         assertTrue(grid4[3].left > grid4[2].right)
 
+        // 5-column side-by-side split
+        val cols5 = CompositorGeometry.computeTilingFrames(WindowTilingLayout.SPLIT_5_COLS, 5, w, h, d)
+        assertEquals(5, cols5.size)
+        for (i in cols5.indices) {
+            assertEquals(0, cols5[i].width % 2)
+            assertEquals(0, cols5[i].height % 2)
+            assertTrue(cols5[i].right <= w)
+            if (i > 0) assertTrue("Column $i overlaps previous", cols5[i].left > cols5[i - 1].right)
+        }
+
+        // 6-pane 3x2 grid (3 top, 3 bottom)
+        val grid6 = CompositorGeometry.computeTilingFrames(WindowTilingLayout.SPLIT_6_GRID, 6, w, h, d)
+        assertEquals(6, grid6.size)
+        assertTrue(grid6[1].left > grid6[0].right)
+        assertTrue(grid6[2].left > grid6[1].right)
+        assertTrue(grid6[3].top > grid6[0].bottom)
+        assertTrue(grid6[4].left > grid6[3].right)
+        assertTrue(grid6[5].left > grid6[4].right)
+        assertTrue(grid6.all { it.width % 2 == 0 && it.height % 2 == 0 && it.right <= w && it.bottom <= h })
+
+        // 8-pane 4x2 grid (4 top, 4 bottom)
+        val grid8 = CompositorGeometry.computeTilingFrames(WindowTilingLayout.SPLIT_8_GRID, 8, w, h, d)
+        assertEquals(8, grid8.size)
+        for (c in 1..3) {
+            assertTrue(grid8[c].left > grid8[c - 1].right)
+            assertTrue(grid8[4 + c].left > grid8[4 + c - 1].right)
+        }
+        assertTrue(grid8[4].top > grid8[0].bottom)
+        assertTrue(grid8.all { it.width % 2 == 0 && it.height % 2 == 0 && it.right <= w && it.bottom <= h })
+
         // Fewer windows than layout maxSlots degrades cleanly
         val partial = CompositorGeometry.computeTilingFrames(WindowTilingLayout.SPLIT_4_COLS, 2, w, h, d)
         assertEquals(2, partial.size)
@@ -214,6 +244,38 @@ class CompositorGeometryAndSceneTest {
         val st = DaemonStatus(connected = true, daemonUid = 2000, injectStatus = BridgeProtocol.InputBackend.STATUS_UHID)
         assertTrue(st.injectBackendLabel.contains("uhid"))
         assertTrue(st.privilegeSummary.contains("2000"))
+    }
+
+    @Test
+    fun surfaceGenerationGatePreventsCrossHolderDetachClobberAndStaleAttach() {
+        val gate = io.github.lengsukq.opaldesk.compositor.WindowSurfaceGenerationGate()
+
+        // Holder 1 attaches window 42, then Holder 2 remounts and attaches window 42 before Holder 1 disposes
+        val gen1 = gate.onAttachRequested(windowId = 42, holderToken = 101L)
+        assertTrue(gate.isAttachStillValid(windowId = 42, holderToken = 101L, opGen = gen1))
+
+        val gen2 = gate.onAttachRequested(windowId = 42, holderToken = 102L)
+        assertFalse("Superseded holder attach must be invalidated", gate.isAttachStillValid(42, 101L, gen1))
+        assertTrue(gate.isAttachStillValid(42, 102L, gen2))
+
+        // Holder 1's delayed onTextureDestroyed & onDispose MUST NOT detach Holder 2's live surface!
+        assertFalse(gate.onTextureDestroyed(windowId = 42, holderToken = 101L))
+        assertTrue(gate.isAttachStillValid(42, 102L, gen2))
+        assertFalse("Stale holder onDispose must not detach active holder", gate.onHolderDisposed(42, 101L))
+        assertTrue(gate.isAttachStillValid(42, 102L, gen2))
+
+        // Normal unmount when onTextureDestroyed fires BEFORE onDispose:
+        // onTextureDestroyed claims the single daemon detach (before st.release()), and subsequent
+        // onHolderDisposed returns false so daemon detach is never sent twice!
+        assertTrue("onTextureDestroyed must detach producer before st.release()", gate.onTextureDestroyed(42, 102L))
+        assertFalse(gate.isAttachStillValid(42, 102L, gen2))
+        assertFalse("onHolderDisposed must not duplicate detach after onTextureDestroyed", gate.onHolderDisposed(42, 102L))
+
+        // Unmount when onHolderDisposed fires BEFORE onTextureDestroyed:
+        val gen3 = gate.onAttachRequested(windowId = 42, holderToken = 103L)
+        assertTrue(gate.isAttachStillValid(42, 103L, gen3))
+        assertTrue("onHolderDisposed must detach when texture not yet destroyed", gate.onHolderDisposed(42, 103L))
+        assertFalse("Subsequent onTextureDestroyed must not duplicate detach", gate.onTextureDestroyed(42, 103L))
     }
 
     private fun sampleWin(id: Int, state: String, z: Int, focused: Boolean) = CompositorWindow(

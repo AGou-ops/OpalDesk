@@ -103,6 +103,14 @@ public final class PerDisplayInputRouter {
         if (ws == null || !ws.isLive() || ws.displayId <= 0 || pointerIds == null || pointerIds.length == 0) {
             return false;
         }
+        int masked = action & MotionEvent.ACTION_MASK;
+        if (masked == MotionEvent.ACTION_BUTTON_PRESS || masked == MotionEvent.ACTION_BUTTON_RELEASE) {
+            if (masked == MotionEvent.ACTION_BUTTON_PRESS && actionButton == MotionEvent.BUTTON_BACK) {
+                return sendBackToWindow(ws);
+            }
+            return true;
+        }
+
         int count = pointerIds.length;
         MotionEvent.PointerProperties[] props = new MotionEvent.PointerProperties[count];
         MotionEvent.PointerCoords[] coords = new MotionEvent.PointerCoords[count];
@@ -117,24 +125,28 @@ public final class PerDisplayInputRouter {
             c.y = ys[i];
             c.pressure = pressures[i];
             c.size = 1.0f;
-            if (i == 0 && (action & MotionEvent.ACTION_MASK) == MotionEvent.ACTION_SCROLL) {
+            if (i == 0 && masked == MotionEvent.ACTION_SCROLL) {
                 c.setAxisValue(MotionEvent.AXIS_HSCROLL, hScroll);
                 c.setAxisValue(MotionEvent.AXIS_VSCROLL, vScroll);
             }
             coords[i] = c;
         }
 
-        int masked = action & MotionEvent.ACTION_MASK;
+        boolean isMouse = (source & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE
+                || (toolTypes.length > 0 && toolTypes[0] == MotionEvent.TOOL_TYPE_MOUSE);
         boolean triggerTapUpCheck = false;
         long tapDownTs = 0L;
         if (masked == MotionEvent.ACTION_DOWN) {
+            ws.lastActiveAtMs = System.currentTimeMillis();
             lastDownWinId = ws.windowId;
             lastDownX = xs[0];
             lastDownY = ys[0];
             lastDownUptimeMs = SystemClock.uptimeMillis();
             tapMovedTooFar = false;
             if (!localImeActive) {
-                services.focusDisplay(ws.displayId);
+                // Focus the task inside its VirtualDisplay WITHOUT calling moveDisplayToTop mid-press,
+                // which would steal top display focus from Display 0 and abort external USB mouse clicks!
+                services.focusDisplayTaskOnly(ws.displayId);
             }
         } else if (masked == MotionEvent.ACTION_MOVE && ws.windowId == lastDownWinId && !tapMovedTooFar) {
             float dx = xs[0] - lastDownX;
@@ -143,13 +155,18 @@ public final class PerDisplayInputRouter {
                 tapMovedTooFar = true;
             }
         } else if (masked == MotionEvent.ACTION_UP) {
+            ws.lastActiveAtMs = System.currentTimeMillis();
             if (ws.windowId == lastDownWinId && !tapMovedTooFar) {
                 triggerTapUpCheck = !localImeActive;
                 tapDownTs = lastDownUptimeMs;
                 if (!localImeActive) {
-                    // Ensure target VirtualDisplay is top-focused right as EditText.onTouchEvent(ACTION_UP)
-                    // invokes InputMethodManager.showSoftInput().
-                    services.focusDisplay(ws.displayId);
+                    if (isMouse) {
+                        // Keep hardware mouse pointer anchored on Display 0 / External Monitor while
+                        // TapUpListener still probes IMMS to raise NativeImeBridgeHost if an EditText focused.
+                        services.focusDisplayTaskOnly(ws.displayId);
+                    } else {
+                        services.focusDisplay(ws.displayId);
+                    }
                 }
             }
             lastDownWinId = -1;
@@ -159,24 +176,34 @@ public final class PerDisplayInputRouter {
         boolean isScroll = (masked == MotionEvent.ACTION_SCROLL);
         int effSource = isScroll
                 ? InputDevice.SOURCE_MOUSE
-                : ((source != 0) ? source : InputDevice.SOURCE_TOUCHSCREEN);
+                : (isMouse ? InputDevice.SOURCE_MOUSE : ((source != 0) ? source : InputDevice.SOURCE_TOUCHSCREEN));
+        int normButtonState = isScroll
+                ? 0
+                : MouseRoutingPolicy.normalizeMouseButtonState(masked, isMouse, buttonState);
         long effEventTime = (eventTime > 0L) ? eventTime : SystemClock.uptimeMillis();
         long effDownTime = isScroll
                 ? effEventTime
                 : (downTime > 0L ? downTime : effEventTime);
 
-        if (isScroll) {
-            props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
-            coords[0].pressure = 0.0f;
+        if (isScroll || (isMouse && masked == MotionEvent.ACTION_DOWN)) {
+            MotionEvent.PointerProperties hoverProp = new MotionEvent.PointerProperties();
+            hoverProp.id = props[0].id;
+            hoverProp.toolType = MotionEvent.TOOL_TYPE_MOUSE;
+            if (isScroll) {
+                props[0].toolType = MotionEvent.TOOL_TYPE_MOUSE;
+                coords[0].pressure = 0.0f;
+            }
             MotionEvent.PointerCoords hoverCoord = new MotionEvent.PointerCoords();
             hoverCoord.x = coords[0].x;
             hoverCoord.y = coords[0].y;
             hoverCoord.pressure = 0.0f;
             hoverCoord.size = 1.0f;
-            // Prime hover target on this VirtualDisplay so InputDispatcher reliably routes ACTION_SCROLL
+            // Prime hover target at (x, y) with 0 buttons BEFORE mouse ACTION_DOWN or ACTION_SCROLL so
+            // InputDispatcher / ViewGroup hover state & /dev/uhid cursor position never jump mid-press
+            // from an old coordinate (eliminating USB mouse double-click-to-click inside apps!).
             MotionEvent hoverPrime = MotionEvent.obtain(
                     effEventTime, effEventTime, MotionEvent.ACTION_HOVER_MOVE,
-                    1, new MotionEvent.PointerProperties[]{props[0]},
+                    1, new MotionEvent.PointerProperties[]{hoverProp},
                     new MotionEvent.PointerCoords[]{hoverCoord},
                     0, 0, 1.0f, 1.0f, 0, 0, InputDevice.SOURCE_MOUSE, 0);
             try {
@@ -194,7 +221,7 @@ public final class PerDisplayInputRouter {
                 props,
                 coords,
                 0,
-                isScroll ? 0 : buttonState,
+                normButtonState,
                 1.0f,
                 1.0f,
                 0,
@@ -220,6 +247,7 @@ public final class PerDisplayInputRouter {
 
     public boolean injectWindowKey(WindowSession ws, int action, int keyCode, int metaState) {
         if (ws == null || !ws.isLive() || ws.displayId <= 0) return false;
+        ws.lastActiveAtMs = System.currentTimeMillis();
         if (localImeActive) {
             services.focusDisplayTaskOnly(ws.displayId);
         } else {

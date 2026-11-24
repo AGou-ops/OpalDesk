@@ -330,7 +330,13 @@ fun ConsoleDashboardTab(
                         }
                     }
 
-                    Spacer(Modifier.height(16.dp))
+                    Spacer(Modifier.height(12.dp))
+                    QuickSlotSwitcherStrip(
+                        compact = true,
+                        showRestoreButton = false,
+                    )
+
+                    Spacer(Modifier.height(12.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                         OpalButton(
                             label = "进入本机 DeX 桌面",
@@ -1059,7 +1065,7 @@ fun ConsoleDisplaySettingsTab(
                 options = listOf("100% 精细", "125% 标准", "150% 舒适"),
                 selectedIndex = scaleIdx,
                 onSelect = { idx ->
-                    AppPrefs.setExternalUiScale(ctx, scaleOpts[idx])
+                    io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingExternalUiScale(ctx, scaleOpts[idx])
                 },
             )
         }
@@ -1285,6 +1291,7 @@ fun ConsoleDisplaySettingsTab(
 @Composable
 fun ConsoleEngineSettingsTab(
     status: DaemonStatus,
+    scene: CompositorScene,
     onOpenActivation: () -> Unit,
     onOpenUpdateModal: () -> Unit,
     onStopEngine: () -> Unit,
@@ -1296,6 +1303,7 @@ fun ConsoleEngineSettingsTab(
     val currentVersion = remember(ctx) { AppUpdateManager.getCurrentVersionName(ctx) }
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        ConsoleAdvancedSettingsSection(status = status, scene = scene)
         MacGlassSectionCard {
             OpalText(text = "应用列表与启动器", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
@@ -1433,23 +1441,25 @@ fun ConsoleEngineSettingsTab(
                         2 -> BridgeProtocol.InputBackend.UHID
                         else -> BridgeProtocol.InputBackend.AUTO
                     }
+                    io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingInputBackendMode(mode)
                     BridgeClient.updateCompositorConfigAsync(inputBackendMode = mode)
                 },
             )
 
             Spacer(Modifier.height(16.dp))
             OpalText(
-                text = "活跃 VirtualDisplay 并发上限（超出上限的后台窗口自动冻结为 TaskSnapshot 零显存卡片，点击秒唤醒）",
+                text = "活跃 VirtualDisplay 并发上限（6 屏 / 8 屏布局建议设为 6–10；超出上限的后台窗口自动休眠为快照卡片）",
                 fontSize = 12.sp,
                 color = OpalPalette.TextSecondary,
             )
             Spacer(Modifier.height(8.dp))
-            val poolOptions = listOf(3, 4, 5, 6, 8)
+            val poolOptions = listOf(3, 4, 5, 6, 8, 10)
             val curMaxIdx = poolOptions.indexOf(status.maxVdCount).let { if (it >= 0) it else 3 }
             OpalSegmentedRow(
-                options = poolOptions.map { "$it 实时屏" },
+                options = poolOptions.map { "$it 屏" },
                 selectedIndex = curMaxIdx,
                 onSelect = { idx ->
+                    io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingMaxVdCount(poolOptions[idx])
                     BridgeClient.updateCompositorConfigAsync(maxVdCount = poolOptions[idx])
                 },
             )

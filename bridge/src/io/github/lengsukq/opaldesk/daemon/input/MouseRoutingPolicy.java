@@ -19,7 +19,68 @@ public final class MouseRoutingPolicy {
     public static final float DEFAULT_SENSITIVITY = 1.45f;
     public static final float MAX_SENSITIVITY = 3.00f;
 
+    // Standard android.view.MotionEvent action & button constants
+    public static final int ACTION_MASK = 0xff;
+    public static final int ACTION_DOWN = 0;
+    public static final int ACTION_UP = 1;
+    public static final int ACTION_MOVE = 2;
+    public static final int ACTION_HOVER_MOVE = 7;
+    public static final int ACTION_SCROLL = 8;
+    public static final int ACTION_HOVER_ENTER = 9;
+    public static final int ACTION_HOVER_EXIT = 10;
+    public static final int ACTION_BUTTON_PRESS = 11;
+    public static final int ACTION_BUTTON_RELEASE = 12;
+    public static final int BUTTON_PRIMARY = 1;
+
     private MouseRoutingPolicy() {}
+
+    /**
+     * Returns {@code true} only for generic motion actions that are valid to inject into
+     * {@code IInputManager.injectInputEvent} ({@code HOVER_ENTER}, {@code HOVER_MOVE},
+     * {@code HOVER_EXIT}, {@code SCROLL}).
+     *
+     * <p>Explicitly rejects {@code ACTION_BUTTON_PRESS (11)} and {@code ACTION_BUTTON_RELEASE (12)},
+     * which Android's {@code InputDispatcher} synthesizes internally from {@code ACTION_DOWN}/{@code UP};
+     * injecting them directly corrupts button state tracking and causes first-click drops.
+     */
+    public static boolean isInjectableGenericMotionAction(int actionMasked) {
+        return actionMasked == ACTION_HOVER_MOVE
+                || actionMasked == ACTION_HOVER_ENTER
+                || actionMasked == ACTION_HOVER_EXIT
+                || actionMasked == ACTION_SCROLL;
+    }
+
+    /**
+     * Normalizes mouse {@code buttonState} so composite USB / 2.4GHz OTG HID receivers that emit
+     * {@code ACTION_DOWN} or {@code ACTION_MOVE} with {@code buttonState == 0} still report
+     * {@link #BUTTON_PRIMARY}.
+     */
+    public static int normalizeMouseButtonState(int actionMasked, boolean isMouseSource, int rawButtonState) {
+        if (isMouseSource
+                && (actionMasked == ACTION_DOWN || actionMasked == ACTION_MOVE)
+                && rawButtonState == 0) {
+            return BUTTON_PRIMARY;
+        }
+        return rawButtonState;
+    }
+
+    /**
+     * Returns {@code true} when a virtual UHID pointer is transitioning from released ({@code 0})
+     * to pressed ({@code != 0}) at a new coordinate {@code (nextAbsX, nextAbsY)} different from
+     * {@code (lastAbsX, lastAbsY)}. Sending a 0-button position report first prevents Android's
+     * {@code InputReader} from interpreting a single click at a new spot as a drag from the old spot.
+     */
+    public static boolean needsPrePressPositionReport(
+            int lastButtons,
+            int nextButtons,
+            int lastAbsX,
+            int lastAbsY,
+            int nextAbsX,
+            int nextAbsY) {
+        return lastButtons == 0
+                && nextButtons != 0
+                && (nextAbsX != lastAbsX || nextAbsY != lastAbsY);
+    }
 
     /** Decides whether an InputDevice represents a routable physical external mouse. */
     public static boolean shouldRouteDevice(String name, int sources, boolean isVirtual, boolean isExternal) {
@@ -39,6 +100,19 @@ public final class MouseRoutingPolicy {
         boolean isAlphaKeyboard = (sources & SOURCE_KEYBOARD) == SOURCE_KEYBOARD
                 && keyboardType == KEYBOARD_TYPE_ALPHABETIC;
         return isMouse || isAlphaKeyboard;
+    }
+
+    /**
+     * Returns {@code true} when exiting/unpinning a local desktop or detaching client surfaces
+     * must explicitly restore Android's {@code mTopFocusedDisplayId} back to {@code Display 0}
+     * so hardware USB/Bluetooth mice never get stranded on an invisible {@code OWN_FOCUS}
+     * {@code OpalWin-*} VirtualDisplay.
+     */
+    public static boolean shouldRestoreDefaultDisplayFocusOnLocalExit(
+            boolean localDesktopPinned,
+            int boundExternalDisplayId,
+            boolean remoteDesktopActive) {
+        return !localDesktopPinned && boundExternalDisplayId <= 0 && !remoteDesktopActive;
     }
 
     /**

@@ -431,6 +431,33 @@ public final class AndroidServices {
     }
 
     /**
+     * Restores Android's global {@code mTopFocusedDisplayId} and mouse {@code PointerChoreographer}
+     * default target back onto physical {@link Display#DEFAULT_DISPLAY} (0) when OpalDesk exits,
+     * unpins Local Desktop, detaches all window surfaces, or tears down an external/cast session.
+     *
+     * <p>Without this, offscreen {@code OpalWin-*} VirtualDisplays created with {@code OWN_FOCUS}
+     * remain at the top of {@code RootWindowContainer} (or retain {@code PointerCapture}), trapping
+     * hardware USB/Bluetooth mice on an invisible surface-less VirtualDisplay and hiding the cursor!
+     */
+    public void restoreDefaultDisplayTopFocus() {
+        ensurePointerIconVisible();
+        focusDisplay(Display.DEFAULT_DISPLAY);
+    }
+
+    /** Ensures Android 14+ {@code IInputManager.setPointerIconVisible(true)} is restored if supported. */
+    public void ensurePointerIconVisible() {
+        if (iInputManager != null) {
+            Method m = findMethodOrNull(iInputManager.getClass(), "setPointerIconVisible", boolean.class);
+            if (m != null) {
+                try {
+                    m.invoke(iInputManager, true);
+                } catch (ReflectiveOperationException | RuntimeException ignored) {
+                }
+            }
+        }
+    }
+
+    /**
      * Focuses the top task inside {@code displayId} without moving that VirtualDisplay above
      * Display 0, preserving Display 0 window focus whenever a local IME bridge or search box is active.
      */

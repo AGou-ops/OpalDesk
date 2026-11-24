@@ -34,6 +34,7 @@ public final class AndroidDisplayDriver
     private final TaskApiAdapter taskApi;
     private final VirtualDisplayStatusBarInset statusBarInset;
     private volatile PerDisplayInputRouter inputRouter;
+    private volatile Runnable allSurfacesDetachedListener;
 
     public AndroidDisplayDriver(AndroidServices services, TaskApiAdapter taskApi) {
         this.services = services;
@@ -43,6 +44,10 @@ public final class AndroidDisplayDriver
 
     public void setInputRouter(PerDisplayInputRouter inputRouter) {
         this.inputRouter = inputRouter;
+    }
+
+    public void setAllSurfacesDetachedListener(Runnable listener) {
+        this.allSurfacesDetachedListener = listener;
     }
 
     public void shutdown() {
@@ -259,6 +264,14 @@ public final class AndroidDisplayDriver
     public void focusDisplay(int displayId) {
         if (displayId > 0) {
             services.focusDisplay(displayId);
+        }
+    }
+
+    @Override
+    public void onAllClientSurfacesDetached() {
+        Runnable listener = allSurfacesDetachedListener;
+        if (listener != null) {
+            listener.run();
         }
     }
 

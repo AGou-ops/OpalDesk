@@ -14,6 +14,7 @@ import io.github.lengsukq.opaldesk.daemon.compositor.VirtualDisplayPool;
 import io.github.lengsukq.opaldesk.daemon.compositor.WindowSession;
 import io.github.lengsukq.opaldesk.daemon.input.ExternalMouseRouter;
 import io.github.lengsukq.opaldesk.daemon.input.ImmsDumpInspector;
+import io.github.lengsukq.opaldesk.daemon.input.MouseRoutingPolicy;
 import io.github.lengsukq.opaldesk.daemon.input.PerDisplayInputRouter;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeBinderService;
 import io.github.lengsukq.opaldesk.daemon.ipc.BridgeProtocol;
@@ -112,6 +113,14 @@ public final class OpalDeskDaemon implements Runnable {
                 mouseRouter);
         this.remoteBridge.setPairingEventConsumer(helperBridge::pushPairingEvent);
         this.remoteBridge.setRemoteStateChangeListener(helperBridge::pushRemoteStateChanged);
+        this.displayDriver.setAllSurfacesDetachedListener(() -> {
+            if (services != null && MouseRoutingPolicy.shouldRestoreDefaultDisplayFocusOnLocalExit(
+                    mouseRouter.isLocalDesktopPinned(),
+                    mouseRouter.getBoundDisplayId(),
+                    remoteBridge.hasActiveDesktopSession())) {
+                services.restoreDefaultDisplayTopFocus();
+            }
+        });
         this.taskStackObserver = new TaskStackObserver(
                 services.iActivityTaskManager,
                 mainHandler,
@@ -135,9 +144,19 @@ public final class OpalDeskDaemon implements Runnable {
             }
         });
         helperBridge.setOnHelperDeath(() -> {
-            // Detach orphaned surfaces & restore hardware mice to Display 0 when client UI exits
+            // Detach orphaned surfaces, wake host screen if dimmed, & restore hardware mice + focus to Display 0
+            try {
+                if (services != null && services.isHostScreenOff()) {
+                    services.setPrimaryPhysicalDisplayPower(true);
+                }
+            } catch (RuntimeException ignored) {
+            }
+            compositor.detachAllClientSurfaces();
             mouseRouter.releaseToLocal();
             inputRouter.releaseAllDisplays();
+            if (services != null && !remoteBridge.hasActiveDesktopSession()) {
+                services.restoreDefaultDisplayTopFocus();
+            }
         });
     }
 
@@ -304,6 +323,12 @@ public final class OpalDeskDaemon implements Runnable {
             }
         } catch (RuntimeException ignored) {
         }
+        // Unbind hardware mice FIRST before tearing down VirtualDisplays so InputReader never sees
+        // an active UniqueIdAssociation pointing at a destroyed VirtualDisplay.
+        try {
+            mouseRouter.shutdown();
+        } catch (RuntimeException ignored) {
+        }
         try {
             remoteBridge.shutdown();
         } catch (RuntimeException ignored) {
@@ -317,15 +342,17 @@ public final class OpalDeskDaemon implements Runnable {
         } catch (RuntimeException ignored) {
         }
         try {
-            mouseRouter.shutdown();
-        } catch (RuntimeException ignored) {
-        }
-        try {
             inputRouter.releaseAllDisplays();
         } catch (RuntimeException ignored) {
         }
         try {
             displayDriver.shutdown();
+        } catch (RuntimeException ignored) {
+        }
+        try {
+            if (services != null) {
+                services.restoreDefaultDisplayTopFocus();
+            }
         } catch (RuntimeException ignored) {
         }
     }

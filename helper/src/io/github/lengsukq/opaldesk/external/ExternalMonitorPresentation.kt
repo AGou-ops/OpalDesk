@@ -98,7 +98,7 @@ class ExternalMonitorPresentation(
         }
 
         val view = ComposeView(context).apply {
-            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnDetachedFromWindow)
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -155,8 +155,13 @@ class ExternalMonitorPresentation(
     }
 
     override fun onStop() {
-        ownLifecycle.onDestroy()
+        ownLifecycle.onStop()
         super.onStop()
+    }
+
+    override fun dismiss() {
+        ownLifecycle.onDestroy()
+        super.dismiss()
     }
 
     fun moveCursorBy(dxPx: Float, dyPx: Float) = pointerDispatcher.moveCursorBy(dxPx, dyPx)
@@ -205,14 +210,24 @@ private class PresentationLifecycleOwner : LifecycleOwner, ViewModelStoreOwner, 
     }
 
     fun onResume() {
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
-        lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED) {
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_RESUME)
+        }
+    }
+
+    fun onStop() {
+        if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
+        }
+        if (lifecycleRegistry.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        }
     }
 
     fun onDestroy() {
-        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED) {
-            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_PAUSE)
-            lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_STOP)
+        if (lifecycleRegistry.currentState != Lifecycle.State.DESTROYED && lifecycleRegistry.currentState != Lifecycle.State.INITIALIZED) {
+            onStop()
             lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_DESTROY)
         }
         store.clear()

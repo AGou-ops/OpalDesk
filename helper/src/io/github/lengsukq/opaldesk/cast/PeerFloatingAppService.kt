@@ -569,12 +569,7 @@ class PeerFloatingAppService : Service() {
             }
             setOnGenericMotionListener { v, ev ->
                 val c = client ?: return@setOnGenericMotionListener false
-                if (c.isMouseMotion(ev)) {
-                    c.sendMouseEvent(ev, v.width, v.height)
-                    true
-                } else {
-                    false
-                }
+                c.handleGenericMouseMotion(ev, v.width, v.height)
             }
         }
         textureView = tv
