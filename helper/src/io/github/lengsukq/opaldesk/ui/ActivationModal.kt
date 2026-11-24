@@ -58,6 +58,8 @@ import io.github.lengsukq.opaldesk.web.WebActivationService
  */
 @Composable
 fun ActivationModal(
+    needsLocalNetworkPerm: Boolean = false,
+    onRequestLocalNetworkPerm: () -> Unit = {},
     onDismiss: () -> Unit,
     onActivated: () -> Unit,
 ) {
@@ -112,6 +114,17 @@ fun ActivationModal(
                 feedbackText = message.orEmpty()
                 if (success) {
                     onActivated()
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(needsLocalNetworkPerm) {
+        if (!needsLocalNetworkPerm) {
+            AdbBootstrap.startDiscovery(ctx) { state ->
+                if (state != null) {
+                    if (state.pairingPort > 0) pairPortText = state.pairingPort.toString()
+                    if (state.connectPort > 0) connectPortText = state.connectPort.toString()
                 }
             }
         }
@@ -198,6 +211,8 @@ fun ActivationModal(
                     0 -> WirelessAdbActivationPane(
                         ctx = ctx,
                         isBusy = isBusy,
+                        needsLocalNetworkPerm = needsLocalNetworkPerm,
+                        onRequestLocalNetworkPerm = onRequestLocalNetworkPerm,
                         pairPortText = pairPortText,
                         onPairPortChange = { pairPortText = it.filter(Char::isDigit) },
                         pairCodeText = pairCodeText,
@@ -325,6 +340,8 @@ fun ActivationModal(
 private fun WirelessAdbActivationPane(
     ctx: Context,
     isBusy: Boolean,
+    needsLocalNetworkPerm: Boolean,
+    onRequestLocalNetworkPerm: () -> Unit,
     pairPortText: String,
     onPairPortChange: (String) -> Unit,
     pairCodeText: String,
@@ -342,6 +359,32 @@ private fun WirelessAdbActivationPane(
         color = OpalPalette.TextSecondary,
         lineHeight = 18.sp,
     )
+    if (needsLocalNetworkPerm) {
+        Spacer(Modifier.height(10.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(OpalPalette.AccentAmber.copy(alpha = 0.14f))
+                .border(1.dp, OpalPalette.AccentAmber.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                .padding(12.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OpalText(
+                    text = "Android 17 需要「本地网络」权限才能自动发现本机无线调试端口（未授权时仍可手动输入端口）。",
+                    fontSize = 12.sp,
+                    color = OpalPalette.TextPrimary,
+                    lineHeight = 17.sp,
+                )
+                OpalButton(
+                    label = "立即授权本地网络权限",
+                    enabled = !isBusy,
+                    accent = OpalPalette.AccentAmber,
+                    onClick = onRequestLocalNetworkPerm,
+                )
+            }
+        }
+    }
     Spacer(Modifier.height(12.dp))
 
     OpalButton(

@@ -112,10 +112,12 @@ object BridgeClient {
             level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
                 level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
                 snapshotCache.evictAll()
+                io.github.lengsukq.opaldesk.compositor.LiveWindowPreviewRegistry.trimMemory(clearAll = true)
             }
             level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN ||
                 level == ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
                 snapshotCache.trimToSize(MAX_SNAPSHOT_CACHE_KB / 2)
+                io.github.lengsukq.opaldesk.compositor.LiveWindowPreviewRegistry.trimMemory(clearAll = false)
             }
         }
     }

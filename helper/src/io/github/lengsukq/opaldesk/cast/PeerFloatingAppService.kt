@@ -1063,7 +1063,12 @@ class PeerFloatingAppService : Service() {
 
         try {
             if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                startForeground(
+                    NOTIF_ID,
+                    notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+                )
             } else {
                 startForeground(NOTIF_ID, notif)
             }

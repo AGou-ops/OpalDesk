@@ -222,7 +222,7 @@ public final class AndroidDisplayDriver
             return existingOnTarget;
         }
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
-        if (!services.startActivityAsShell(launchIntent, launchOpts)) {
+        if (!startActivityWithAmFallback(launchIntent, launchOpts, displayId, false)) {
             System.err.println("OPALDESK_LAUNCH_START_FAIL pkg=" + pkg + " displayId=" + displayId);
             return existingOnTarget;
         }
@@ -235,7 +235,7 @@ public final class AndroidDisplayDriver
             taskApi.removeTask(candidateTid);
             SystemClock.sleep(80L);
             launchIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
-            services.startActivityAsShell(launchIntent, launchOpts);
+            startActivityWithAmFallback(launchIntent, launchOpts, displayId, true);
             services.focusDisplay(displayId);
             SystemClock.sleep(80L);
             topTid = taskApi.findTopTaskIdOnDisplay(displayId, pkg);
@@ -260,20 +260,7 @@ public final class AndroidDisplayDriver
                 Intent.FLAG_ACTIVITY_NEW_TASK
                         | Intent.FLAG_ACTIVITY_CLEAR_TASK
                         | Intent.FLAG_ACTIVITY_NO_ANIMATION);
-        boolean started = services.startActivityAsShell(launchIntent, launchOpts);
-        if (!started) {
-            ComponentName cn = launchIntent.getComponent();
-            if (cn != null) {
-                ShellCommand.runOutput(
-                        "am", "start",
-                        "--display", String.valueOf(displayId),
-                        "--windowingMode", "1",
-                        "-f", "0x10008000",
-                        "-n", cn.flattenToShortString());
-                started = true;
-            }
-        }
-        if (!started) {
+        if (!startActivityWithAmFallback(launchIntent, launchOpts, displayId, true)) {
             System.err.println("OPALDESK_RELOAD_START_FAIL pkg=" + pkg + " displayId=" + displayId);
             return -1;
         }
@@ -284,6 +271,36 @@ public final class AndroidDisplayDriver
         System.out.println("OPALDESK_RELOAD_FRESH_OK pkg=" + pkg
                 + " displayId=" + displayId + " tid=" + resolvedTid);
         return resolvedTid;
+    }
+
+    /**
+     * Launches an Activity via {@code IActivityTaskManager.startActivity} and falls back to
+     * {@code am start --display <id> --windowingMode 1} if a future Android/OEM AIDL signature
+     * change breaks hidden-API reflection.
+     */
+    private boolean startActivityWithAmFallback(
+            Intent launchIntent, Bundle launchOpts, int displayId, boolean clearTask) {
+        if (services.startActivityAsShell(launchIntent, launchOpts)) {
+            return true;
+        }
+        ComponentName cn = launchIntent.getComponent();
+        if (cn == null) {
+            return false;
+        }
+        int flags = Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION
+                | (clearTask ? Intent.FLAG_ACTIVITY_CLEAR_TASK : 0);
+        String out = ShellCommand.runOutput(
+                "am", "start",
+                "--display", String.valueOf(displayId),
+                "--windowingMode", String.valueOf(BridgeProtocol.WINDOWING_MODE_FULLSCREEN),
+                "-f", "0x" + Integer.toHexString(flags),
+                "-n", cn.flattenToShortString());
+        if (out != null && out.contains("Error")) {
+            System.err.println("OPALDESK_AM_START_FALLBACK_ERR displayId=" + displayId + ": " + out.trim());
+            return false;
+        }
+        System.out.println("OPALDESK_AM_START_FALLBACK_OK displayId=" + displayId + " comp=" + cn.flattenToShortString());
+        return true;
     }
 
     @Override

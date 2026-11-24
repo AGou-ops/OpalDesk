@@ -4,12 +4,16 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import io.github.lengsukq.opaldesk.AdbBootstrap
 import io.github.lengsukq.opaldesk.cast.OpalPeerDiscovery
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.util.ArrayDeque
+import java.util.concurrent.Executor
 
 /**
  * Serialized NsdManager mDNS discovery for Android Wireless Debugging pairing & connect services,
@@ -21,7 +25,9 @@ internal object AdbMdnsDiscovery {
     private const val SERVICE_CONNECT = "_adb-tls-connect._tcp."
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainExecutor = Executor { cmd -> mainHandler.post(cmd) }
     private val resolveQueue = ArrayDeque<NsdServiceInfo>()
+    private val activeInfoCallbacks = HashMap<String, NsdManager.ServiceInfoCallback>()
     private val state = AdbBootstrap.DiscoveryState()
 
     private var nsdManager: NsdManager? = null
@@ -97,6 +103,7 @@ internal object AdbMdnsDiscovery {
         listener = null
         val nsd = nsdManager
         if (nsd != null) {
+            unregisterAllServiceInfoCallbacks(nsd)
             pairDiscoveryListener?.let { stopDiscoverySafely(nsd, it) }
             connDiscoveryListener?.let { stopDiscoverySafely(nsd, it) }
         }
@@ -158,9 +165,73 @@ internal object AdbMdnsDiscovery {
         }
 
     private fun enqueueResolve(info: NsdServiceInfo) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            registerServiceInfoCallbackApi34(info)
+            return
+        }
         synchronized(resolveQueue) {
             resolveQueue.addLast(info)
             pumpResolveLocked()
+        }
+    }
+
+    private fun registerServiceInfoCallbackApi34(info: NsdServiceInfo) {
+        if (Build.VERSION.SDK_INT < 34) return
+        val nsd = nsdManager ?: return
+        val key = "${info.serviceType.orEmpty()}|${info.serviceName.orEmpty()}"
+        synchronized(activeInfoCallbacks) {
+            activeInfoCallbacks.remove(key)?.let { prev ->
+                try { nsd.unregisterServiceInfoCallback(prev) } catch (_: Throwable) {}
+            }
+            val cb = object : NsdManager.ServiceInfoCallback {
+                override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                    Log.w(TAG, "registerServiceInfoCallback failed key=$key code=$errorCode")
+                    synchronized(activeInfoCallbacks) { activeInfoCallbacks.remove(key) }
+                }
+
+                override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                    handleResolved(serviceInfo)
+                }
+
+                override fun onServiceLost() {
+                    val lostType = info.serviceType.orEmpty()
+                    val lostName = info.serviceName.orEmpty()
+                    synchronized(this@AdbMdnsDiscovery) {
+                        if (lostType.contains("pairing") && (activePairSvcName.isEmpty() || lostName == activePairSvcName)) {
+                            state.pairingPort = 0
+                            activePairSvcName = ""
+                            notifyListenerLocked()
+                        } else if (lostType.contains("connect") && (activeConnSvcName.isEmpty() || lostName == activeConnSvcName)) {
+                            state.connectPort = 0
+                            activeConnSvcName = ""
+                            notifyListenerLocked()
+                        }
+                    }
+                }
+
+                override fun onServiceInfoCallbackUnregistered() {
+                    synchronized(activeInfoCallbacks) { activeInfoCallbacks.remove(key) }
+                }
+            }
+            try {
+                activeInfoCallbacks[key] = cb
+                nsd.registerServiceInfoCallback(info, mainExecutor, cb)
+            } catch (t: Throwable) {
+                activeInfoCallbacks.remove(key)
+                Log.w(TAG, "registerServiceInfoCallback threw for $key", t)
+            }
+        }
+    }
+
+    private fun unregisterAllServiceInfoCallbacks(nsd: NsdManager) {
+        if (Build.VERSION.SDK_INT < 34) return
+        val callbacks = synchronized(activeInfoCallbacks) {
+            val copy = activeInfoCallbacks.values.toList()
+            activeInfoCallbacks.clear()
+            copy
+        }
+        for (cb in callbacks) {
+            try { nsd.unregisterServiceInfoCallback(cb) } catch (_: Throwable) {}
         }
     }
 
@@ -195,9 +266,20 @@ internal object AdbMdnsDiscovery {
     }
 
     @Suppress("DEPRECATION")
+    private fun resolvePreferredLocalAddress(resolved: NsdServiceInfo): InetAddress? {
+        if (Build.VERSION.SDK_INT >= 34) {
+            val addrs = resolved.hostAddresses
+            val localV4 = addrs.firstOrNull { it is Inet4Address && AdbProcessRunner.isLocalDeviceAddress(it) }
+            if (localV4 != null) return localV4
+            val anyLocal = addrs.firstOrNull { AdbProcessRunner.isLocalDeviceAddress(it) }
+            if (anyLocal != null) return anyLocal
+        }
+        return resolved.host
+    }
+
     private fun handleResolved(resolved: NsdServiceInfo) {
         val type = resolved.serviceType.orEmpty()
-        val addr = resolved.host
+        val addr = resolvePreferredLocalAddress(resolved)
         if (!AdbProcessRunner.isLocalDeviceAddress(addr)) return
         var host = addr?.hostAddress.orEmpty().substringBefore('%')
         if (host.contains(':') && !host.startsWith("[")) {

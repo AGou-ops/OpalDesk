@@ -444,6 +444,8 @@ private fun OpalConsoleScreen(
 
         if (showActivationModal) {
             ActivationModal(
+                needsLocalNetworkPerm = needsLocalNetworkPerm,
+                onRequestLocalNetworkPerm = onRequestLocalNetworkPerm,
                 onDismiss = { showActivationModal = false },
                 onActivated = { showActivationModal = false },
             )

@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.os.SystemClock
+import android.util.LruCache
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.Surface
@@ -62,8 +63,11 @@ import java.util.concurrent.atomic.AtomicLong
  * crisp real-time window previews in <5ms directly on the UI thread without daemon snapshot IPC.
  */
 object LiveWindowPreviewRegistry {
+    private const val MAX_PREVIEW_CACHE_KB = 12 * 1024 // 12 MiB cap for Android 17 MemoryLimiter safety
     private val liveViews = ConcurrentHashMap<Int, WeakReference<TextureView>>()
-    private val cachedPreviews = ConcurrentHashMap<Int, Bitmap>()
+    private val cachedPreviews = object : LruCache<Int, Bitmap>(MAX_PREVIEW_CACHE_KB) {
+        override fun sizeOf(key: Int, value: Bitmap): Int = (value.allocationByteCount / 1024).coerceAtLeast(1)
+    }
 
     fun register(windowId: Int, view: TextureView) {
         liveViews[windowId] = WeakReference(view)
@@ -87,13 +91,21 @@ object LiveWindowPreviewRegistry {
     }
 
     fun getCachedPreview(windowId: Int): Bitmap? {
-        val bmp = cachedPreviews[windowId]
+        val bmp = cachedPreviews.get(windowId)
         return if (bmp != null && !bmp.isRecycled) bmp else null
     }
 
     fun evict(windowId: Int) {
         liveViews.remove(windowId)
         cachedPreviews.remove(windowId)
+    }
+
+    fun trimMemory(clearAll: Boolean) {
+        if (clearAll) {
+            cachedPreviews.evictAll()
+        } else {
+            cachedPreviews.trimToSize(MAX_PREVIEW_CACHE_KB / 2)
+        }
     }
 
     private fun captureAndCache(windowId: Int, view: TextureView, maxLongEdge: Int = 540): Bitmap? {
@@ -105,7 +117,7 @@ object LiveWindowPreviewRegistry {
         return try {
             val bmp = view.getBitmap(bw, bh)
             if (bmp != null && !bmp.isRecycled) {
-                cachedPreviews[windowId] = bmp
+                cachedPreviews.put(windowId, bmp)
             }
             bmp
         } catch (_: Throwable) {
