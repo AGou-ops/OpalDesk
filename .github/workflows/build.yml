@@ -124,6 +124,8 @@ jobs:
         env:
           OPALDESK_KEYSTORE_PASS: ${{ secrets.OPALDESK_KEYSTORE_PASS }}
           OPALDESK_EXPECTED_CERT_SHA256: ${{ secrets.OPALDESK_EXPECTED_CERT_SHA256 }}
+          OPALDESK_SENTRY_DSN: ${{ secrets.OPALDESK_SENTRY_DSN }}
+          OPALDESK_SENTRY_TUNNEL_URL: ${{ secrets.OPALDESK_SENTRY_TUNNEL_URL }}
         run: |
           chmod +x ./gradlew
           GRADLE_ARGS=(

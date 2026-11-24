@@ -1,9 +1,11 @@
 package io.github.lengsukq.opaldesk.prefs
 
 import android.content.Context
+import io.github.lengsukq.opaldesk.diagnostics.FeedbackQuotaStorage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.UUID
 
 /**
  * SharedPreferences store + live reactive flows for OpalDesk preferences:
@@ -49,6 +51,10 @@ object AppPrefs {
     private const val KEY_LAST_UPDATE_CHECK_MS = "last_update_check_ms"
     private const val KEY_IGNORED_UPDATE_TAG = "ignored_update_tag"
     private const val KEY_UPDATE_DOWNLOAD_ROUTE = "update_download_route"
+    private const val KEY_INSTALLATION_ID = "anonymous_installation_id_v1"
+    private const val KEY_FEEDBACK_REPORT_DATE = "feedback_report_date_v1"
+    private const val KEY_FEEDBACK_REPORT_COUNT = "feedback_report_count_v1"
+    private const val KEY_FEEDBACK_USERNAME = "feedback_reporter_username_v1"
 
     private val DEFAULT_PINNED = listOf(
         "com.android.chrome",
@@ -395,5 +401,42 @@ object AppPrefs {
         val clamped = route.coerceIn(UPDATE_ROUTE_DIRECT, UPDATE_ROUTE_PROXY_2)
         prefs(ctx)?.edit()?.putInt(KEY_UPDATE_DOWNLOAD_ROUTE, clamped)?.apply()
         _updateDownloadRouteFlow.value = clamped
+    }
+
+    fun getOrCreateInstallationId(ctx: Context?): String {
+        val p = prefs(ctx) ?: return UUID.randomUUID().toString()
+        val existing = p.getString(KEY_INSTALLATION_ID, null)?.trim().orEmpty()
+        if (existing.isNotEmpty()) return existing
+        val created = UUID.randomUUID().toString()
+        p.edit().putString(KEY_INSTALLATION_ID, created).apply()
+        return created
+    }
+
+    fun getFeedbackUsername(ctx: Context?): String =
+        prefs(ctx)?.getString(KEY_FEEDBACK_USERNAME, "").orEmpty()
+
+    fun setFeedbackUsername(ctx: Context?, username: String) {
+        prefs(ctx)?.edit()?.putString(KEY_FEEDBACK_USERNAME, username.trim().take(64))?.apply()
+    }
+
+    fun createFeedbackQuotaStorage(ctx: Context): FeedbackQuotaStorage {
+        val appCtx = ctx.applicationContext
+        return object : FeedbackQuotaStorage {
+            override fun getOrCreateInstallationId(): String =
+                this@AppPrefs.getOrCreateInstallationId(appCtx)
+
+            override fun getLastReportDate(): String =
+                prefs(appCtx)?.getString(KEY_FEEDBACK_REPORT_DATE, "").orEmpty()
+
+            override fun getDailyReportCount(): Int =
+                prefs(appCtx)?.getInt(KEY_FEEDBACK_REPORT_COUNT, 0) ?: 0
+
+            override fun saveDailyReportState(dateYyyyMmDd: String, count: Int) {
+                prefs(appCtx)?.edit()
+                    ?.putString(KEY_FEEDBACK_REPORT_DATE, dateYyyyMmDd)
+                    ?.putInt(KEY_FEEDBACK_REPORT_COUNT, count)
+                    ?.apply()
+            }
+        }
     }
 }

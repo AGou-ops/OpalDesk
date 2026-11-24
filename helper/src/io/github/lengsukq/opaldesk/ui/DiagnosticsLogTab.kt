@@ -37,9 +37,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.lengsukq.opaldesk.BridgeClient
+import io.github.lengsukq.opaldesk.diagnostics.FeedbackRateLimiter
 import io.github.lengsukq.opaldesk.diagnostics.OpalLogFilter
 import io.github.lengsukq.opaldesk.diagnostics.OpalLogLevel
 import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
+import io.github.lengsukq.opaldesk.diagnostics.OpalSentry
 import io.github.lengsukq.opaldesk.protocol.CompositorScene
 import io.github.lengsukq.opaldesk.protocol.DaemonStatus
 import io.github.lengsukq.opaldesk.protocol.RemoteStreamStatus
@@ -73,6 +75,8 @@ fun ConsoleLogsTab(
     var searchQuery by remember { mutableStateOf("") }
     var showAllLines by remember { mutableStateOf(false) }
     var refreshing by remember { mutableStateOf(false) }
+    var showReportModal by remember { mutableStateOf(false) }
+    var feedbackQuota by remember(ctx) { mutableStateOf(OpalSentry.currentQuota(ctx)) }
 
     fun refreshDaemonLogs() {
         if (!status.connected) {
@@ -208,6 +212,40 @@ fun ConsoleLogsTab(
                     modifier = Modifier.weight(1f),
                 )
             }
+            Spacer(Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OpalButton(
+                    label = if (feedbackQuota.isExhausted) "上报日志（已达上限）" else "上报日志 / 反馈问题",
+                    compact = true,
+                    filled = true,
+                    enabled = !feedbackQuota.isExhausted,
+                    accent = OpalPalette.AccentBlue,
+                    onClick = {
+                        feedbackQuota = OpalSentry.currentQuota(ctx)
+                        if (!feedbackQuota.isExhausted) {
+                            showReportModal = true
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+                OpalStatusBadge(
+                    label = feedbackQuota.remainingLabel(),
+                    color = if (feedbackQuota.isExhausted) OpalPalette.AccentDanger else OpalPalette.AccentEmerald,
+                )
+            }
+            if (feedbackQuota.isExhausted) {
+                Spacer(Modifier.height(6.dp))
+                OpalText(
+                    text = FeedbackRateLimiter.LIMIT_REACHED_MESSAGE,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = OpalPalette.AccentDanger,
+                )
+            }
         }
 
         // Card 2: Filters & Log Stream
@@ -326,6 +364,20 @@ fun ConsoleLogsTab(
                 }
             }
         }
+    }
+
+    if (showReportModal) {
+        ReportIssueModal(
+            appVersion = appVersion,
+            status = status,
+            scene = scene,
+            remote = remote,
+            helperEntries = helperEntries,
+            daemonLogText = daemonLogText,
+            quota = feedbackQuota,
+            onQuotaChanged = { updated -> feedbackQuota = updated },
+            onDismiss = { showReportModal = false },
+        )
     }
 }
 

@@ -23,6 +23,7 @@
     </queries>
 
     <application
+        android:name=".OpalDeskApplication"
         android:allowBackup="false"
         android:enableOnBackInvokedCallback="true"
         android:hardwareAccelerated="true"
@@ -30,6 +31,10 @@
         android:roundIcon="@mipmap/ic_launcher"
         android:label="OpalDesk"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <meta-data
+            android:name="io.sentry.auto-init"
+            android:value="false" />
 
         <property
             android:name="android.window.PROPERTY_SUPPORTS_MULTI_INSTANCE_SYSTEM_UI"

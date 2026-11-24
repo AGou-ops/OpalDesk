@@ -5,8 +5,12 @@
 -keep class moe.shizuku.** { *; }
 -keep interface moe.shizuku.** { *; }
 -keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
+-keepattributes LineNumberTable,SourceFile
+-keep class io.sentry.** { *; }
+-keep interface io.sentry.** { *; }
 -dontwarn io.github.lengsukq.opaldesk.**
 -dontwarn rikka.shizuku.**
 -dontwarn moe.shizuku.**
+-dontwarn io.sentry.**
 -dontwarn android.**
 -dontwarn dalvik.**

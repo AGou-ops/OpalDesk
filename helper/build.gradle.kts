@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
@@ -10,6 +12,32 @@ kotlin {
 val resolvedSdkDir = (rootProject.extra["opalDeskAndroidSdkDir"] as? String).orEmpty()
 val hasAndroid37Minor2 = resolvedSdkDir.isNotBlank() &&
     file("$resolvedSdkDir/platforms/android-37.2/android.jar").isFile
+val localProps = Properties().apply {
+    val f = rootProject.file("local.properties")
+    if (f.isFile) {
+        f.inputStream().use { load(it) }
+    }
+}
+fun resolveBuildSecret(propName: String, localKey: String, vararg envNames: String): String {
+    val fromProp = project.findProperty(propName)?.toString()?.trim().orEmpty()
+    if (fromProp.isNotEmpty()) return fromProp
+    val fromLocal = localProps.getProperty(localKey)?.trim().orEmpty()
+    if (fromLocal.isNotEmpty()) return fromLocal
+    for (envName in envNames) {
+        val fromEnv = System.getenv(envName)?.trim().orEmpty()
+        if (fromEnv.isNotEmpty()) return fromEnv
+    }
+    return ""
+}
+fun escapeBuildConfigString(raw: String): String =
+    "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+val resolvedSentryDsn = resolveBuildSecret("sentryDsn", "opaldesk.sentry.dsn", "OPALDESK_SENTRY_DSN", "SENTRY_DSN")
+val resolvedSentryTunnelUrl = resolveBuildSecret(
+    "sentryTunnelUrl",
+    "opaldesk.sentry.tunnelUrl",
+    "OPALDESK_SENTRY_TUNNEL_URL",
+    "SENTRY_TUNNEL_URL",
+)
 
 @Suppress("UnstableApiUsage")
 android {
@@ -25,8 +53,10 @@ android {
         applicationId = "io.github.lengsukq.opaldesk"
         minSdk = 30
         targetSdk = 37
-        versionCode = 10009
-        versionName = "1.0.9"
+        versionCode = 10010
+        versionName = "1.0.10"
+        buildConfigField("String", "SENTRY_DSN", escapeBuildConfigString(resolvedSentryDsn))
+        buildConfigField("String", "SENTRY_TUNNEL_URL", escapeBuildConfigString(resolvedSentryTunnelUrl))
         ndk {
             abiFilters += "arm64-v8a"
         }
@@ -56,6 +86,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     androidResources {
@@ -162,6 +193,7 @@ dependencies {
     implementation("dev.rikka.shizuku:aidl:13.1.5")
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("io.sentry:sentry-android:8.64.0")
 
     testImplementation("junit:junit:4.13.2")
 }
