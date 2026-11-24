@@ -244,15 +244,16 @@ fun ConsoleAdvancedSettingsSection(
             )
 
             if (isCustomGlobal) {
+                var draftGlobalDpi by remember(working.globalCustomDpi) { mutableIntStateOf(working.globalCustomDpi) }
                 Spacer(Modifier.height(12.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
-                    OpalText(text = "全局固定 DPI 数值", fontSize = 12.sp, color = OpalPalette.TextSecondary)
+                    OpalText(text = "全局固定 DPI 数值（松手生效）", fontSize = 12.sp, color = OpalPalette.TextSecondary)
                     OpalText(
-                        text = "${working.globalCustomDpi} DPI",
+                        text = "$draftGlobalDpi DPI",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
                         fontFamily = FontFamily.Monospace,
@@ -261,12 +262,17 @@ fun ConsoleAdvancedSettingsSection(
                 }
                 Spacer(Modifier.height(4.dp))
                 OpalGlassSlider(
-                    value = working.globalCustomDpi.toFloat(),
+                    value = draftGlobalDpi.toFloat(),
                     valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
                     onValueChange = { v ->
                         val stepped = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
+                        draftGlobalDpi = stepped
                         customDpiInput = stepped.toString()
-                        BridgeClient.setGlobalCustomDpiAsync(ctx, stepped)
+                    },
+                    onValueChangeFinished = {
+                        if (draftGlobalDpi != working.globalCustomDpi) {
+                            BridgeClient.setGlobalCustomDpiAsync(ctx, draftGlobalDpi)
+                        }
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -352,6 +358,7 @@ fun ConsoleAdvancedSettingsSection(
                     working.appCustomDpis.entries.forEach { (pkg, dpi) ->
                         val label = appLabelByPkg[pkg] ?: pkg
                         val icon = remember(pkg) { AppCatalogRepository.getAppIcon(ctx, pkg) }
+                        var draftAppDpi by remember(pkg, dpi) { mutableIntStateOf(dpi) }
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -388,7 +395,7 @@ fun ConsoleAdvancedSettingsSection(
                                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 ) {
                                     OpalText(
-                                        text = "$dpi DPI",
+                                        text = "$draftAppDpi DPI",
                                         fontSize = 12.5.sp,
                                         fontWeight = FontWeight.Bold,
                                         fontFamily = FontFamily.Monospace,
@@ -404,11 +411,15 @@ fun ConsoleAdvancedSettingsSection(
                                 }
                             }
                             OpalGlassSlider(
-                                value = dpi.toFloat(),
+                                value = draftAppDpi.toFloat(),
                                 valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
                                 onValueChange = { v ->
-                                    val stepped = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
-                                    BridgeClient.setAppCustomDpiAsync(ctx, pkg, stepped)
+                                    draftAppDpi = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
+                                },
+                                onValueChangeFinished = {
+                                    if (draftAppDpi != dpi) {
+                                        BridgeClient.setAppCustomDpiAsync(ctx, pkg, draftAppDpi)
+                                    }
                                 },
                                 modifier = Modifier.fillMaxWidth(),
                             )
@@ -940,7 +951,9 @@ fun DexDpiSettingsPopover(
             OpalButton(label = "完成", compact = true, filled = false, onClick = onDismiss)
         }
 
-        // Section 1: Global Custom DPI
+        // Section 1: Global Custom DPI (commit once on release to prevent VirtualDisplay.resize storms)
+        val isCustomGlobal = working.globalCustomDpi > 0
+        var draftGlobalDpi by remember(working.globalCustomDpi) { mutableIntStateOf(working.globalCustomDpi.coerceAtLeast(ProfileConfigStore.MIN_DPI)) }
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -955,16 +968,15 @@ fun DexDpiSettingsPopover(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                OpalText(text = "全局自定义 DPI", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                OpalText(text = "全局自定义 DPI（松手生效）", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 OpalText(
-                    text = if (working.globalCustomDpi > 0) "${working.globalCustomDpi} DPI" else "自动适配",
+                    text = if (isCustomGlobal) "$draftGlobalDpi DPI" else "自动适配",
                     fontSize = 12.5.sp,
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
                     color = OpalPalette.AccentBlue,
                 )
             }
-            val isCustomGlobal = working.globalCustomDpi > 0
             OpalSegmentedRow(
                 options = listOf("自动适配", "自定义全局 DPI"),
                 selectedIndex = if (isCustomGlobal) 1 else 0,
@@ -973,17 +985,22 @@ fun DexDpiSettingsPopover(
                         BridgeClient.setGlobalCustomDpiAsync(ctx, 0)
                     } else {
                         val initDpi = if (working.globalCustomDpi > 0) working.globalCustomDpi else 240
+                        draftGlobalDpi = initDpi
                         BridgeClient.setGlobalCustomDpiAsync(ctx, initDpi)
                     }
                 },
             )
             if (isCustomGlobal) {
                 OpalGlassSlider(
-                    value = working.globalCustomDpi.toFloat(),
+                    value = draftGlobalDpi.toFloat(),
                     valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
                     onValueChange = { v ->
-                        val stepped = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
-                        BridgeClient.setGlobalCustomDpiAsync(ctx, stepped)
+                        draftGlobalDpi = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
+                    },
+                    onValueChangeFinished = {
+                        if (draftGlobalDpi != working.globalCustomDpi) {
+                            BridgeClient.setGlobalCustomDpiAsync(ctx, draftGlobalDpi)
+                        }
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -992,9 +1009,12 @@ fun DexDpiSettingsPopover(
                         OpalButton(
                             label = "$preset",
                             compact = true,
-                            filled = working.globalCustomDpi == preset,
-                            accent = if (working.globalCustomDpi == preset) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
-                            onClick = { BridgeClient.setGlobalCustomDpiAsync(ctx, preset) },
+                            filled = draftGlobalDpi == preset,
+                            accent = if (draftGlobalDpi == preset) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
+                            onClick = {
+                                draftGlobalDpi = preset
+                                BridgeClient.setGlobalCustomDpiAsync(ctx, preset)
+                            },
                             modifier = Modifier.weight(1f),
                         )
                     }
@@ -1037,6 +1057,7 @@ fun DexDpiSettingsPopover(
                         working.globalCustomDpi > 0 -> working.globalCustomDpi
                         else -> 240
                     }
+                    var draftWinDpi by remember(win.pkg, effectiveDpi) { mutableIntStateOf(effectiveDpi) }
                     val icon = remember(win.pkg) { AppCatalogRepository.getAppIcon(ctx, win.pkg) }
                     Column(
                         modifier = Modifier
@@ -1071,9 +1092,13 @@ fun DexDpiSettingsPopover(
                                 Column(modifier = Modifier.weight(1f)) {
                                     OpalText(text = win.title, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                                     OpalText(
-                                        text = if (customDpi > 0) "独立覆盖 · $customDpi DPI" else "跟随全局 · 当前 ${win.contentDpi} DPI",
+                                        text = when {
+                                            draftWinDpi != effectiveDpi -> "松手应用 · $draftWinDpi DPI"
+                                            customDpi > 0 -> "独立覆盖 · $customDpi DPI"
+                                            else -> "跟随全局 · 当前 ${win.contentDpi} DPI"
+                                        },
                                         fontSize = 10.sp,
-                                        color = if (customDpi > 0) OpalPalette.AccentBlue else OpalPalette.TextMuted,
+                                        color = if (customDpi > 0 || draftWinDpi != effectiveDpi) OpalPalette.AccentBlue else OpalPalette.TextMuted,
                                         maxLines = 1,
                                     )
                                 }
@@ -1089,11 +1114,15 @@ fun DexDpiSettingsPopover(
                             }
                         }
                         OpalGlassSlider(
-                            value = effectiveDpi.toFloat(),
+                            value = draftWinDpi.toFloat(),
                             valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
                             onValueChange = { v ->
-                                val stepped = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
-                                BridgeClient.setAppCustomDpiAsync(ctx, win.pkg, stepped)
+                                draftWinDpi = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
+                            },
+                            onValueChangeFinished = {
+                                if (draftWinDpi != customDpi) {
+                                    BridgeClient.setAppCustomDpiAsync(ctx, win.pkg, draftWinDpi)
+                                }
                             },
                             modifier = Modifier.fillMaxWidth(),
                         )
@@ -1102,10 +1131,10 @@ fun DexDpiSettingsPopover(
             }
         }
 
-        // Section 3: Other saved per-app overrides (not currently open) + Add app picker
+        // Section 3: Other saved per-app overrides (not currently open) — directly adjustable without launching
         val closedOverrides = working.appCustomDpis.entries.filter { !openByPkg.containsKey(it.key) }
         if (closedOverrides.isNotEmpty()) {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 OpalText(
                     text = "本方案其他已设应用 DPI (${closedOverrides.size})",
                     fontSize = 11.5.sp,
@@ -1114,24 +1143,44 @@ fun DexDpiSettingsPopover(
                 )
                 closedOverrides.forEach { (pkg, dpi) ->
                     val label = appLabelByPkg[pkg] ?: pkg
-                    Row(
+                    val icon = remember(pkg) { AppCatalogRepository.getAppIcon(ctx, pkg) }
+                    var draftClosedDpi by remember(pkg, dpi) { mutableIntStateOf(dpi) }
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(11.dp))
+                            .clip(cardShape)
                             .background(OpalPalette.ChipFill)
-                            .padding(horizontal = 10.dp, vertical = 7.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
+                            .border(0.8.dp, OpalPalette.AccentBlue.copy(alpha = 0.42f), cardShape)
+                            .padding(horizontal = 11.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        OpalText(text = label, fontSize = 12.sp, fontWeight = FontWeight.Medium, maxLines = 1, modifier = Modifier.weight(1f))
-                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            OpalText(
-                                text = "$dpi DPI",
-                                fontSize = 11.5.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace,
-                                color = OpalPalette.AccentBlue,
-                            )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                if (icon != null) {
+                                    Image(
+                                        bitmap = icon,
+                                        contentDescription = label,
+                                        modifier = Modifier.size(22.dp).clip(RoundedCornerShape(5.dp)),
+                                    )
+                                }
+                                Column(modifier = Modifier.weight(1f)) {
+                                    OpalText(text = label, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                                    OpalText(
+                                        text = if (draftClosedDpi != dpi) "松手应用 · $draftClosedDpi DPI" else "独立覆盖 · $draftClosedDpi DPI",
+                                        fontSize = 10.sp,
+                                        color = OpalPalette.AccentBlue,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
                             OpalButton(
                                 label = "移除",
                                 compact = true,
@@ -1139,6 +1188,34 @@ fun DexDpiSettingsPopover(
                                 accent = OpalPalette.AccentDanger,
                                 onClick = { BridgeClient.setAppCustomDpiAsync(ctx, pkg, 0) },
                             )
+                        }
+                        OpalGlassSlider(
+                            value = draftClosedDpi.toFloat(),
+                            valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
+                            onValueChange = { v ->
+                                draftClosedDpi = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
+                            },
+                            onValueChangeFinished = {
+                                if (draftClosedDpi != dpi) {
+                                    BridgeClient.setAppCustomDpiAsync(ctx, pkg, draftClosedDpi)
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                            listOf(160, 240, 320, 400).forEach { preset ->
+                                OpalButton(
+                                    label = "$preset",
+                                    compact = true,
+                                    filled = draftClosedDpi == preset,
+                                    accent = if (draftClosedDpi == preset) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
+                                    onClick = {
+                                        draftClosedDpi = preset
+                                        BridgeClient.setAppCustomDpiAsync(ctx, pkg, preset)
+                                    },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
                         }
                     }
                 }

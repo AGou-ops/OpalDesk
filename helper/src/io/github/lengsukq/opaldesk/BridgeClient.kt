@@ -476,10 +476,18 @@ object BridgeClient {
         }
     }
 
+    private val dpiExec = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "OpalDpiApply").apply { isDaemon = true }
+    }
+    private val globalDpiGen = java.util.concurrent.atomic.AtomicLong(0L)
+    private val appDpiGenByPkg = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     fun setGlobalCustomDpiAsync(ctx: Context?, globalCustomDpi: Int) {
         bindAppContext(ctx)
         val updated = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingGlobalCustomDpi(globalCustomDpi)
-        ioExec.execute {
+        val gen = globalDpiGen.incrementAndGet()
+        dpiExec.execute {
+            if (globalDpiGen.get() != gen) return@execute
             val svc = getService() ?: return@execute
             transact(
                 svc,
@@ -491,15 +499,21 @@ object BridgeClient {
                     d.writeString("")
                 },
             ) { it.readInt() }
-            refreshStatus()
-            refreshSceneSnapshot()
+            if (globalDpiGen.get() == gen) {
+                refreshStatus()
+                refreshSceneSnapshot()
+            }
         }
     }
 
     fun setAppCustomDpiAsync(ctx: Context?, pkg: String, customDpi: Int) {
         bindAppContext(ctx)
-        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingAppCustomDpi(pkg, customDpi)
-        ioExec.execute {
+        val clamped = io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.clampDpiOrAuto(customDpi)
+        io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingAppCustomDpi(pkg, clamped)
+        val gen = globalDpiGen.incrementAndGet()
+        appDpiGenByPkg[pkg] = gen
+        dpiExec.execute {
+            if (appDpiGenByPkg[pkg] != gen) return@execute
             val svc = getService() ?: return@execute
             transact(
                 svc,
@@ -507,10 +521,12 @@ object BridgeClient {
                 oneway = false,
                 writeArgs = { d ->
                     d.writeString(pkg)
-                    d.writeInt(io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.clampDpiOrAuto(customDpi))
+                    d.writeInt(clamped)
                 },
             ) { it.readInt() }
-            refreshSceneSnapshot()
+            if (appDpiGenByPkg[pkg] == gen) {
+                refreshSceneSnapshot()
+            }
         }
     }
 

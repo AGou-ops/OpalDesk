@@ -716,11 +716,13 @@ fun OpalGlassSlider(
     value: Float,
     valueRange: ClosedFloatingPointRange<Float>,
     onValueChange: (Float) -> Unit,
+    onValueChangeFinished: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val colors = LocalOpalColors.current
     val density = LocalDensity.current
     val curOnChange by rememberUpdatedState(onValueChange)
+    val curOnFinished by rememberUpdatedState(onValueChangeFinished)
     var trackWidthPx by remember { mutableIntStateOf(1) }
 
     val span = (valueRange.endInclusive - valueRange.start).coerceAtLeast(0.0001f)
@@ -739,10 +741,16 @@ fun OpalGlassSlider(
             .height(30.dp)
             .onSizeChanged { trackWidthPx = it.width.coerceAtLeast(1) }
             .pointerInput(valueRange) {
-                detectTapGestures { offset -> updateFromPx(offset.x) }
+                detectTapGestures { offset ->
+                    updateFromPx(offset.x)
+                    curOnFinished?.invoke()
+                }
             }
             .pointerInput(valueRange) {
-                detectHorizontalDragGestures { change, _ ->
+                detectHorizontalDragGestures(
+                    onDragEnd = { curOnFinished?.invoke() },
+                    onDragCancel = { curOnFinished?.invoke() },
+                ) { change, _ ->
                     change.consume()
                     updateFromPx(change.position.x)
                 }
