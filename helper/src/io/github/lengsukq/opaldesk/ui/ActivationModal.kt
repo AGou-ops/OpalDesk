@@ -251,6 +251,8 @@ fun ActivationModal(
                     1 -> WebLanActivationPane(
                         ctx = ctx,
                         state = webActState,
+                        needsLocalNetworkPerm = needsLocalNetworkPerm,
+                        onRequestLocalNetworkPerm = onRequestLocalNetworkPerm,
                         onCopyUrl = { url ->
                             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                             cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk Web Activation", url))
@@ -569,6 +571,8 @@ private fun OptionalRootActivationPane(
 private fun WebLanActivationPane(
     ctx: Context,
     state: WebActivationService.State,
+    needsLocalNetworkPerm: Boolean,
+    onRequestLocalNetworkPerm: () -> Unit,
     onCopyUrl: (String) -> Unit,
 ) {
     OpalText(
@@ -577,11 +581,37 @@ private fun WebLanActivationPane(
         color = OpalPalette.TextSecondary,
         lineHeight = 18.sp,
     )
+    if (needsLocalNetworkPerm) {
+        Spacer(Modifier.height(10.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .background(OpalPalette.AccentAmber.copy(alpha = 0.14f))
+                .border(1.dp, OpalPalette.AccentAmber.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                .padding(12.dp),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OpalText(
+                    text = "Android 17 需要「本地网络」权限，才能开启局域网 Web 激活服务并接收电脑/平板浏览器连接。",
+                    fontSize = 12.sp,
+                    color = OpalPalette.TextPrimary,
+                    lineHeight = 17.sp,
+                )
+                OpalButton(
+                    label = "立即授权本地网络权限",
+                    accent = OpalPalette.AccentAmber,
+                    onClick = onRequestLocalNetworkPerm,
+                )
+            }
+        }
+    }
     Spacer(Modifier.height(12.dp))
 
     if (!state.running) {
         OpalButton(
             label = "开启 Web 局域网激活服务（5 分钟自动关闭）",
+            enabled = !needsLocalNetworkPerm,
             accent = OpalPalette.AccentBlue,
             modifier = Modifier.fillMaxWidth(),
             onClick = { WebActivationService.start(ctx) },

@@ -64,7 +64,7 @@ class WebActivationService : Service(), MiniWebSocketServer.Listener {
     companion object {
         private const val TAG = "OpalWebActSvc"
         private const val CHANNEL_ID = "opaldesk_web_activation"
-        private const val NOTIF_ID = 3930
+        private const val NOTIF_ID = 3935
         private const val ACTION_START = "io.github.lengsukq.opaldesk.action.WEB_ACT_START"
         private const val ACTION_STOP = "io.github.lengsukq.opaldesk.action.WEB_ACT_STOP"
         private const val DISCOVERY_POLL_MS = 1000L
@@ -79,6 +79,14 @@ class WebActivationService : Service(), MiniWebSocketServer.Listener {
 
         fun start(ctx: Context) {
             val appCtx = ctx.applicationContext
+            if (!OpalPeerDiscovery.hasLocalNetworkPermission(appCtx)) {
+                _stateFlow.value = _stateFlow.value.copy(
+                    running = false,
+                    lastError = true,
+                    lastMessage = "Android 17 需要先授予「本地网络」权限，才能接收局域网浏览器连接。",
+                )
+                return
+            }
             val intent = Intent(appCtx, WebActivationService::class.java).apply { action = ACTION_START }
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

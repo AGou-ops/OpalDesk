@@ -139,7 +139,7 @@ object DaemonBootstrapScripts {
             "unzip -p $srcApk assets/$ASSET_JAR_NAME > $newJar && " +
             "rm -f $srcApk && " +
             "test -s $newJar && " +
-            "chmod 644 $newJar && " +
+            "chmod 444 $newJar && " +
             "timeout 6 env CLASSPATH=$newJar app_process /data/local/tmp $DAEMON_CLASS --verify-helper >/dev/null 2>&1 && " +
             "(timeout 8 env CLASSPATH=$newJar app_process /data/local/tmp $DAEMON_CLASS --stop >/dev/null 2>&1 || true) && " +
             "$killBlock && " +
@@ -192,7 +192,7 @@ object DaemonBootstrapScripts {
         return "rm -f '$qTmp' 2>/dev/null; " +
             "if ! (umask 022; set -C; cat > '$qTmp') 2>/dev/null || [ -L '$qTmp' ] || [ ! -s '$qTmp' ]; then " +
             "rm -f '$qTmp' 2>/dev/null; echo ERR_SHIZUKU_STDIN; exit 21; fi; " +
-            "chmod 644 '$qTmp' 2>/dev/null; " +
+            "chmod 444 '$qTmp' 2>/dev/null; " +
             "chown -h 2000:2000 '$qTmp' 2>/dev/null || true; " +
             "echo STAGE_OK"
     }
@@ -219,7 +219,7 @@ object DaemonBootstrapScripts {
         return ensureStaged +
             "UID_NOW=\$(id -u 2>/dev/null || echo 2000); " +
             "if [ \"\$UID_NOW\" = \"0\" ]; then " +
-            "chmod 644 '$qTmp' 2>/dev/null; chown -h 2000:2000 '$qTmp' 2>/dev/null || true; " +
+            "chmod 444 '$qTmp' 2>/dev/null; chown -h 2000:2000 '$qTmp' 2>/dev/null || true; " +
             "run_as_shell() { " +
             "su 2000 -c \"\$1\" && return 0; rc=\$?; [ \"\$rc\" -ge 20 ] && [ \"\$rc\" -le 29 ] && return \"\$rc\"; " +
             "su shell -c \"\$1\" 2>/dev/null && return 0; rc=\$?; [ \"\$rc\" -ge 20 ] && [ \"\$rc\" -le 29 ] && return \"\$rc\"; " +
@@ -270,7 +270,7 @@ object DaemonBootstrapScripts {
             "fi; " +
             "if [ \"\$SRC_SHA\" != '$expSha' ] || [ \"\$(dd if='$rootTmp' bs=1 count=2 2>/dev/null)\" != \"PK\" ]; then " +
             "rm -f '$rootTmp' 2>/dev/null; echo ERR_STAGE_HASH:\$SRC_SHA; exit 21; fi; " +
-            "chmod 644 '$rootTmp' && chown -h 2000:2000 '$rootTmp' " +
+            "chmod 444 '$rootTmp' && chown -h 2000:2000 '$rootTmp' " +
             "|| { rm -f '$rootTmp' 2>/dev/null; echo ERR_STAGE_CHOWN; exit 21; }; " +
             preDropEnhance +
             "run_as_shell() { " +
@@ -323,7 +323,7 @@ object DaemonBootstrapScripts {
             "|| [ \"\$(dd if=$tmpJarExpr bs=1 count=2 2>/dev/null)\" != \"PK\" ]; then " +
             "rm -f $tmpJarExpr; echo ERR_STAGE_JAR; exit 21; fi; " +
             shaGuard +
-            "chmod 644 $tmpJarExpr || { rm -f $tmpJarExpr; echo ERR_CHMOD_JAR; exit 21; }; " +
+            "chmod 444 $tmpJarExpr || { rm -f $tmpJarExpr; echo ERR_CHMOD_JAR; exit 21; }; " +
             "(CLASSPATH=$tmpJarExpr /system/bin/app_process /data/local/tmp $DAEMON_CLASS --stop >/dev/null 2>&1 || true); " +
             "if $aliveExpr; then $killExpr; fi; " +
             "rm -f $DST_JAR; " +

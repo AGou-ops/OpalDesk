@@ -4,6 +4,7 @@ import android.app.Presentation
 import android.os.Bundle
 import android.view.Display
 import android.view.KeyEvent
+import android.view.Surface
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -53,8 +54,9 @@ class ExternalMonitorPresentation(
     private val onExitDesktop: () -> Unit,
 ) : Presentation(hostActivity, targetDisplay, android.R.style.Theme_DeviceDefault_NoActionBar_Fullscreen) {
 
-    val displayWidthPx: Int = targetDisplay.mode?.physicalWidth?.coerceAtLeast(640) ?: 1920
-    val displayHeightPx: Int = targetDisplay.mode?.physicalHeight?.coerceAtLeast(480) ?: 1080
+    private val logicalBoundsPx: Pair<Int, Int> = resolveLogicalDisplaySizePx(targetDisplay)
+    val displayWidthPx: Int = logicalBoundsPx.first
+    val displayHeightPx: Int = logicalBoundsPx.second
     val refreshRateHz: Int = resolvePeakRefreshRateMode(targetDisplay)?.refreshRate?.toInt()
         ?: (targetDisplay.mode?.refreshRate ?: 60f).toInt()
 
@@ -182,6 +184,13 @@ class ExternalMonitorPresentation(
     fun dispatchKeyEventToPresentation(event: KeyEvent): Boolean {
         val target = composeView ?: return false
         return target.dispatchKeyEvent(event)
+    }
+
+    private fun resolveLogicalDisplaySizePx(display: Display): Pair<Int, Int> {
+        val physW = display.mode?.physicalWidth?.coerceAtLeast(480) ?: 1920
+        val physH = display.mode?.physicalHeight?.coerceAtLeast(480) ?: 1080
+        val rotated = display.rotation == Surface.ROTATION_90 || display.rotation == Surface.ROTATION_270
+        return if (rotated) (physH to physW) else (physW to physH)
     }
 
     private fun resolvePeakRefreshRateMode(display: Display): Display.Mode? {

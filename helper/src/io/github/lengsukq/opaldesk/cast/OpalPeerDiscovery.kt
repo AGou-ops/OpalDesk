@@ -5,13 +5,18 @@ import android.content.pm.PackageManager
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.nio.charset.StandardCharsets
+import java.util.ArrayDeque
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executor
 
 data class DiscoveredOpalPeer(
     val serviceName: String,
@@ -43,6 +48,10 @@ object OpalPeerDiscovery {
         }
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainExecutor = Executor { cmd -> mainHandler.post(cmd) }
+    private val resolveQueue = ArrayDeque<NsdServiceInfo>()
+    private val activeInfoCallbacks = HashMap<String, NsdManager.ServiceInfoCallback>()
     private val peersByKey = ConcurrentHashMap<String, DiscoveredOpalPeer>()
     private val _discoveredPeersFlow = MutableStateFlow<List<DiscoveredOpalPeer>>(emptyList())
     val discoveredPeersFlow: StateFlow<List<DiscoveredOpalPeer>> = _discoveredPeersFlow.asStateFlow()
@@ -50,6 +59,7 @@ object OpalPeerDiscovery {
     private var nsdManager: NsdManager? = null
     private var regListener: NsdManager.RegistrationListener? = null
     private var discListener: NsdManager.DiscoveryListener? = null
+    private var resolving = false
 
     @Volatile
     private var registeredPort: Int = -1
@@ -153,46 +163,143 @@ object OpalPeerDiscovery {
         val mgr = nsdManager
         val listener = discListener
         discListener = null
-        if (mgr != null && listener != null) {
+        if (mgr != null) {
+            unregisterAllInfoCallbacks(mgr)
+            if (listener != null) {
+                try {
+                    mgr.stopServiceDiscovery(listener)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        synchronized(resolveQueue) {
+            resolveQueue.clear()
+            resolving = false
+        }
+    }
+
+    private fun resolvePeer(mgr: NsdManager, service: NsdServiceInfo) {
+        if (Build.VERSION.SDK_INT >= 34) {
+            registerPeerInfoCallbackApi34(mgr, service)
+            return
+        }
+        synchronized(resolveQueue) {
+            resolveQueue.addLast(service)
+            pumpResolveQueueLocked(mgr)
+        }
+    }
+
+    private fun registerPeerInfoCallbackApi34(mgr: NsdManager, service: NsdServiceInfo) {
+        if (Build.VERSION.SDK_INT < 34) return
+        val svcName = service.serviceName.orEmpty()
+        val key = "${service.serviceType.orEmpty()}|$svcName"
+        synchronized(activeInfoCallbacks) {
+            activeInfoCallbacks.remove(key)?.let { prev ->
+                try { mgr.unregisterServiceInfoCallback(prev) } catch (_: Throwable) {}
+            }
+            val cb = object : NsdManager.ServiceInfoCallback {
+                override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                    Log.w(TAG, "registerServiceInfoCallback failed key=$key code=$errorCode")
+                    synchronized(activeInfoCallbacks) { activeInfoCallbacks.remove(key) }
+                }
+
+                override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                    handleResolvedPeer(serviceInfo)
+                }
+
+                override fun onServiceLost() {
+                    val removed = peersByKey.entries.removeIf { it.value.serviceName == svcName }
+                    if (removed) publishSorted()
+                }
+
+                override fun onServiceInfoCallbackUnregistered() {
+                    synchronized(activeInfoCallbacks) { activeInfoCallbacks.remove(key) }
+                }
+            }
             try {
-                mgr.stopServiceDiscovery(listener)
-            } catch (_: Throwable) {
+                activeInfoCallbacks[key] = cb
+                mgr.registerServiceInfoCallback(service, mainExecutor, cb)
+            } catch (t: Throwable) {
+                activeInfoCallbacks.remove(key)
+                Log.w(TAG, "registerServiceInfoCallback threw for $key: ${t.message}")
             }
         }
     }
 
+    private fun unregisterAllInfoCallbacks(mgr: NsdManager) {
+        if (Build.VERSION.SDK_INT < 34) return
+        val callbacks = synchronized(activeInfoCallbacks) {
+            val copy = activeInfoCallbacks.values.toList()
+            activeInfoCallbacks.clear()
+            copy
+        }
+        for (cb in callbacks) {
+            try { mgr.unregisterServiceInfoCallback(cb) } catch (_: Throwable) {}
+        }
+    }
+
     @Suppress("DEPRECATION")
-    private fun resolvePeer(mgr: NsdManager, service: NsdServiceInfo) {
+    private fun pumpResolveQueueLocked(mgr: NsdManager) {
+        if (resolving || resolveQueue.isEmpty()) return
+        val next = resolveQueue.pollFirst() ?: return
+        resolving = true
         try {
             mgr.resolveService(
-                service,
+                next,
                 object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) = Unit
+                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                        synchronized(resolveQueue) {
+                            resolving = false
+                            pumpResolveQueueLocked(mgr)
+                        }
+                    }
+
                     override fun onServiceResolved(resolved: NsdServiceInfo) {
-                        val hostAddr = resolved.host
-                        val ip = (hostAddr as? Inet4Address)?.hostAddress
-                            ?: hostAddr?.hostAddress.orEmpty()
-                        val port = resolved.port
-                        if (ip.isBlank() || port <= 0) return
-                        if (OpalPeerCastMutex.isSelfAddress(ip, localLanIp)) return
-                        val attrs = resolved.attributes
-                        val devName = attrs?.get("device")?.let { String(it, StandardCharsets.UTF_8) }
-                            ?.takeIf { it.isNotBlank() }
-                            ?: resolved.serviceName.removePrefix("OpalDesk-").ifBlank { resolved.serviceName }
-                        val fp = attrs?.get("fp")?.let { String(it, StandardCharsets.UTF_8) }.orEmpty()
-                        peersByKey["$ip:$port"] = DiscoveredOpalPeer(
-                            serviceName = resolved.serviceName,
-                            displayName = devName,
-                            host = ip,
-                            port = port,
-                            shortFingerprint = fp,
-                        )
-                        publishSorted()
+                        handleResolvedPeer(resolved)
+                        synchronized(resolveQueue) {
+                            resolving = false
+                            pumpResolveQueueLocked(mgr)
+                        }
                     }
                 },
             )
         } catch (_: Throwable) {
+            resolving = false
+            pumpResolveQueueLocked(mgr)
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun resolvePreferredPeerAddress(resolved: NsdServiceInfo): InetAddress? {
+        if (Build.VERSION.SDK_INT >= 34) {
+            val addrs = resolved.hostAddresses
+            val v4 = addrs.firstOrNull { it is Inet4Address }
+            if (v4 != null) return v4
+            if (addrs.isNotEmpty()) return addrs.first()
+        }
+        return resolved.host
+    }
+
+    private fun handleResolvedPeer(resolved: NsdServiceInfo) {
+        val hostAddr = resolvePreferredPeerAddress(resolved)
+        val ip = (hostAddr as? Inet4Address)?.hostAddress
+            ?: hostAddr?.hostAddress.orEmpty().substringBefore('%')
+        val port = resolved.port
+        if (ip.isBlank() || port <= 0) return
+        if (OpalPeerCastMutex.isSelfAddress(ip, localLanIp)) return
+        val attrs = resolved.attributes
+        val devName = attrs?.get("device")?.let { String(it, StandardCharsets.UTF_8) }
+            ?.takeIf { it.isNotBlank() }
+            ?: resolved.serviceName.removePrefix("OpalDesk-").ifBlank { resolved.serviceName }
+        val fp = attrs?.get("fp")?.let { String(it, StandardCharsets.UTF_8) }.orEmpty()
+        peersByKey["$ip:$port"] = DiscoveredOpalPeer(
+            serviceName = resolved.serviceName,
+            displayName = devName,
+            host = ip,
+            port = port,
+            shortFingerprint = fp,
+        )
+        publishSorted()
     }
 
     private fun publishSorted() {
