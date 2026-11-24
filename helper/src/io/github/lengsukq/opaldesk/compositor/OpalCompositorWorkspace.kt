@@ -200,6 +200,7 @@ fun OpalCompositorWorkspace(
     var wallpaperMenuPos by remember { mutableStateOf<Offset?>(null) }
     var snapPreviewRect by remember { mutableStateOf<WindowRect?>(null) }
     var trayInfo by remember { mutableStateOf(SystemTrayInfo()) }
+    val dockLastTapMsByPkg = remember { mutableMapOf<String, Long>() }
 
     LaunchedEffect(Unit) {
         io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.hydrate(ctx)
@@ -306,6 +307,7 @@ fun OpalCompositorWorkspace(
 
             fun minimizeAllWindows() {
                 scene.visibleWindows.forEach { win ->
+                    LiveWindowPreviewRegistry.captureLivePreview(win.windowId)
                     BridgeClient.sendWindowActionAsync(win.windowId, BridgeProtocol.WinAction.MINIMIZE)
                 }
             }
@@ -453,7 +455,14 @@ fun OpalCompositorWorkspace(
                     },
                     onReturnToDesktop = {
                         dismissAllPopovers()
-                        minimizeAllWindows()
+                        BridgeClient.sendWindowActionAsync(
+                            fullscreenWin.windowId,
+                            BridgeProtocol.WinAction.TOGGLE_FULLSCREEN,
+                        )
+                        BridgeClient.sendWindowActionAsync(
+                            fullscreenWin.windowId,
+                            BridgeProtocol.WinAction.MINIMIZE,
+                        )
                     },
                     onOpenControlCenter = {
                         val next = !showControlCenter
@@ -510,9 +519,14 @@ fun OpalCompositorWorkspace(
                         }
                     },
                     onLaunchOrToggleApp = { pkg, cls ->
+                        val nowMs = android.os.SystemClock.uptimeMillis()
+                        val prevTapMs = dockLastTapMsByPkg[pkg] ?: 0L
+                        if (nowMs - prevTapMs < 280L) return@DexMacTaskbar
+                        dockLastTapMsByPkg[pkg] = nowMs
                         dismissAllPopovers()
                         val existing = scene.windows.firstOrNull { it.pkg == pkg }
                         if (existing != null && existing.focused && !existing.isMinimized) {
+                            LiveWindowPreviewRegistry.captureLivePreview(existing.windowId)
                             BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.MINIMIZE)
                         } else if (existing != null) {
                             BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.FOCUS)
@@ -1114,10 +1128,17 @@ private fun ExposeWindowSwitcherOverlay(
                 ) {
                     items(windows, key = { it.windowId }) { win ->
                         val icon = remember(win.pkg) { AppCatalogRepository.getAppIcon(ctx, win.pkg) }
-                        var previewBmp by remember(win.windowId, win.snapshotVersion) { mutableStateOf<Bitmap?>(null) }
+                        var previewBmp by remember(win.windowId, win.snapshotVersion) {
+                            mutableStateOf<Bitmap?>(LiveWindowPreviewRegistry.captureLivePreview(win.windowId))
+                        }
                         LaunchedEffect(win.windowId, win.snapshotVersion) {
-                            previewBmp = withContext(Dispatchers.IO) {
-                                BridgeClient.fetchWindowSnapshotBitmap(win.windowId, win.snapshotVersion)
+                            val liveSnap = LiveWindowPreviewRegistry.captureLivePreview(win.windowId)
+                            if (liveSnap != null && !liveSnap.isRecycled) {
+                                previewBmp = liveSnap
+                            } else {
+                                previewBmp = withContext(Dispatchers.IO) {
+                                    BridgeClient.fetchWindowSnapshotBitmap(win.windowId, win.snapshotVersion)
+                                } ?: LiveWindowPreviewRegistry.getCachedPreview(win.windowId)
                             }
                         }
 

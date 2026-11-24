@@ -38,6 +38,14 @@ public final class CompositorEngine {
          */
         int launchOrMoveFullscreenApp(String pkg, String cls, int displayId, int existingTaskId);
 
+        /**
+         * Cold-launches {@code pkg}/{@code cls} directly onto {@code displayId} without reusing
+         * a stale Recents task (used after {@link #forceStopPackage(String)} during window reload).
+         */
+        default int relaunchFreshFullscreenApp(String pkg, String cls, int displayId) {
+            return launchOrMoveFullscreenApp(pkg, cls, displayId, -1);
+        }
+
         /** Queries the active user taskId currently running on {@code displayId} (or {@code -1}). */
         int findTopTaskIdOnDisplay(int displayId, String expectedPkg);
 
@@ -579,6 +587,7 @@ public final class CompositorEngine {
         int displayToRelease = -1;
         String pkgToClose = null;
         String pkgToReload = null;
+        int reloadOldTaskId = -1;
         int reloadDisplayId = -1;
         String reloadCls = "";
         boolean allSurfacesNowDetached = false;
@@ -666,6 +675,8 @@ public final class CompositorEngine {
                     int canvasDpi = config.getCanvasDpi();
                     boolean enterFs = !BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation);
                     if (enterFs) {
+                        ws.preFullscreenFrame = ws.frame;
+                        ws.preFullscreenPresentation = ws.presentation;
                         if (BridgeProtocol.PRES_FLOATING.equals(ws.presentation)) {
                             ws.restoreFrame = ws.frame;
                         }
@@ -673,10 +684,7 @@ public final class CompositorEngine {
                         ws.frame = DisplayGeometryUtil.computeSnapFrame(
                                 BridgeProtocol.PRES_FULLSCREEN, canvasW, canvasH, canvasDpi);
                     } else {
-                        ws.presentation = BridgeProtocol.PRES_FLOATING;
-                        ws.frame = (ws.restoreFrame != null && !ws.restoreFrame.isEmpty())
-                                ? DisplayGeometryUtil.clampWindowFrame(ws.restoreFrame, canvasW, canvasH, canvasDpi)
-                                : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
+                        restoreFromFullscreenLocked(ws, canvasW, canvasH, canvasDpi);
                     }
                     int[] spec = computeWindowSpecLocked(ws.frame, enterFs, ws.profile, ws.pkg);
                     ws.contentWidth = spec[0];
@@ -722,8 +730,10 @@ public final class CompositorEngine {
                     pkgToReload = ws.pkg;
                     reloadCls = ws.activityClass;
                     reloadDisplayId = ws.displayId;
+                    reloadOldTaskId = ws.taskId;
                     ws.taskId = -1;
                     ws.lastLaunchAtMs = now;
+                    ws.lastActiveAtMs = now;
                     ws.emptyDisplayTicks = 0;
                     ws.emptySinceMs = 0L;
                     focusWindowLocked(ws, now);
@@ -750,16 +760,24 @@ public final class CompositorEngine {
             runtimeBridge.onAllClientSurfacesDetached();
         }
         if (pkgToReload != null && !pkgToReload.isEmpty()) {
+            if (reloadOldTaskId > 0) {
+                runtimeBridge.removeTask(reloadOldTaskId);
+            }
             runtimeBridge.forceStopPackage(pkgToReload);
             if (reloadDisplayId > 0) {
-                int newTid = runtimeBridge.launchOrMoveFullscreenApp(pkgToReload, reloadCls, reloadDisplayId, -1);
-                if (newTid > 0) {
-                    synchronized (lock) {
-                        WindowSession ws = sessionsById.get(windowId);
-                        if (ws != null) {
+                int newTid = runtimeBridge.relaunchFreshFullscreenApp(pkgToReload, reloadCls, reloadDisplayId);
+                long relaunchedAt = System.currentTimeMillis();
+                synchronized (lock) {
+                    WindowSession ws = sessionsById.get(windowId);
+                    if (ws != null) {
+                        ws.lastLaunchAtMs = relaunchedAt;
+                        ws.lastActiveAtMs = relaunchedAt;
+                        ws.emptyDisplayTicks = 0;
+                        ws.emptySinceMs = 0L;
+                        if (newTid > 0) {
                             ws.taskId = newTid;
-                            markDirtyAndNotifyLocked();
                         }
+                        markDirtyAndNotifyLocked();
                     }
                 }
             }
@@ -923,6 +941,55 @@ public final class CompositorEngine {
         for (int wid : toClose) {
             performWindowAction(wid, BridgeProtocol.WIN_ACTION_CLOSE, null);
         }
+    }
+
+    /**
+     * If any visible window is currently in true fullscreen, exits fullscreen and restores it
+     * to its exact pre-fullscreen frame & presentation on the desktop (keeping the app LIVE and
+     * visible rather than hiding or closing it). Returns {@code true} if a fullscreen window was restored.
+     */
+    public boolean exitFullscreenIfActive() {
+        synchronized (lock) {
+            int canvasW = config.getCanvasWidth();
+            int canvasH = config.getCanvasHeight();
+            int canvasDpi = config.getCanvasDpi();
+            long now = System.currentTimeMillis();
+            boolean restoredAny = false;
+            for (WindowSession ws : sessionsById.values()) {
+                if (ws.isMinimized() || !BridgeProtocol.PRES_FULLSCREEN.equals(ws.presentation)) continue;
+                restoreFromFullscreenLocked(ws, canvasW, canvasH, canvasDpi);
+                int[] spec = computeWindowSpecLocked(ws.frame, false, ws.profile, ws.pkg);
+                ws.contentWidth = spec[0];
+                ws.contentHeight = spec[1];
+                ws.contentDpi = spec[2];
+                vdPool.resizeIfActive(ws.windowId, spec[0], spec[1], spec[2]);
+                focusWindowLocked(ws, now);
+                restoredAny = true;
+            }
+            if (restoredAny) {
+                markDirtyAndNotifyLocked();
+            }
+            return restoredAny;
+        }
+    }
+
+    private void restoreFromFullscreenLocked(WindowSession ws, int canvasW, int canvasH, int canvasDpi) {
+        String prevPres = (ws.preFullscreenPresentation != null
+                && !ws.preFullscreenPresentation.isEmpty()
+                && !BridgeProtocol.PRES_FULLSCREEN.equals(ws.preFullscreenPresentation))
+                ? ws.preFullscreenPresentation : BridgeProtocol.PRES_FLOATING;
+        ws.presentation = prevPres;
+        if (!BridgeProtocol.PRES_FLOATING.equals(prevPres)) {
+            ws.frame = DisplayGeometryUtil.computeSnapFrame(prevPres, canvasW, canvasH, canvasDpi);
+        } else {
+            IntRect target = (ws.preFullscreenFrame != null && !ws.preFullscreenFrame.isEmpty())
+                    ? ws.preFullscreenFrame : ws.restoreFrame;
+            ws.frame = (target != null && !target.isEmpty())
+                    ? DisplayGeometryUtil.clampWindowFrame(target, canvasW, canvasH, canvasDpi)
+                    : DisplayGeometryUtil.computeInitialWindowFrame(ws.profile, 0, canvasW, canvasH, canvasDpi);
+        }
+        ws.preFullscreenFrame = null;
+        ws.preFullscreenPresentation = null;
     }
 
     /**

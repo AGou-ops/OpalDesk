@@ -158,6 +158,8 @@ object AppUpdateManager {
             _stateFlow.value = UpdateState.Error("该版本未提供有效的安装包下载链接，请前往 GitHub 页面下载", release)
             return
         }
+        val route = AppUpdateLogic.DownloadRoute.fromIndex(AppPrefs.getUpdateDownloadRoute(appCtx))
+        val effectiveUrl = AppUpdateLogic.buildDownloadUrl(release.apkDownloadUrl, route)
         if (!downloadInFlight.compareAndSet(false, true)) return
         downloadCancelFlag.set(false)
         _stateFlow.value = UpdateState.Downloading(release, 0L, release.apkSizeBytes)
@@ -173,9 +175,10 @@ object AppUpdateManager {
             try {
                 if (partFile.exists()) partFile.delete()
                 conn = openValidatedHttpsGet(
-                    urlStr = release.apkDownloadUrl,
+                    urlStr = effectiveUrl,
                     accept = "application/octet-stream",
                     userAgent = "OpalDesk/${getCurrentVersionName(appCtx)}",
+                    allowProxyRoute = route != AppUpdateLogic.DownloadRoute.DIRECT,
                 )
                 val code = conn.responseCode
                 if (code !in 200..299) {
@@ -372,11 +375,17 @@ object AppUpdateManager {
         urlStr: String,
         accept: String,
         userAgent: String,
+        allowProxyRoute: Boolean = false,
     ): HttpURLConnection {
         var current = urlStr
         for (hop in 0..MAX_REDIRECTS) {
-            if (!AppUpdateLogic.isAllowedReleaseUrl(current)) {
-                throw SecurityException("Blocked non-GitHub redirect host")
+            val allowed = if (allowProxyRoute) {
+                current.startsWith("https://", ignoreCase = true)
+            } else {
+                AppUpdateLogic.isAllowedReleaseUrl(current)
+            }
+            if (!allowed) {
+                throw SecurityException("Blocked non-HTTPS or untrusted host")
             }
             val conn = (URL(current).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -459,8 +468,8 @@ object AppUpdateManager {
     private fun friendlyNetworkError(t: Throwable): String {
         val raw = t.message.orEmpty()
         return when {
-            t is java.net.UnknownHostException -> "无法解析 GitHub 域名，请检查网络连接"
-            t is java.net.SocketTimeoutException -> "连接 GitHub 超时，请稍后重试或用浏览器下载"
+            t is java.net.UnknownHostException -> "无法解析服务器域名，可切换下方代理线路后重试"
+            t is java.net.SocketTimeoutException -> "连接超时，可切换下方代理一 / 代理二或用浏览器下载"
             t is SecurityException -> "下载链接安全校验未通过"
             raw.isNotBlank() -> raw.take(80)
             else -> "网络连接异常"

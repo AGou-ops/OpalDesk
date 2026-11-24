@@ -196,34 +196,92 @@ public final class AndroidDisplayDriver
         if (displayId <= 0 || PackagePolicy.isBlockedWindowPkg(pkg)) return -1;
         Bundle launchOpts = TaskApiAdapter.makeFullscreenLaunchOptions(displayId).toBundle();
 
+        // Fast path: task is already alive on this VirtualDisplay (e.g. waking from minimize).
+        // NEVER call startActivityFromRecents() here: on ColorOS / OEM ROMs it invokes
+        // moveTaskToFront on Display 0 and hijacks the host phone screen over DesktopActivity!
+        int existingOnTarget = taskApi.findTopTaskIdOnDisplay(displayId, pkg);
+        if (existingOnTarget > 0) {
+            if (taskApi.findTopVisibleTaskIdOnDisplay(displayId, pkg) == existingOnTarget) {
+                services.focusDisplay(displayId);
+                System.out.println("OPALDESK_LAUNCH_FOCUS_OK pkg=" + pkg
+                        + " displayId=" + displayId + " tid=" + existingOnTarget);
+                return existingOnTarget;
+            }
+        }
+
         int candidateTid = (existingTaskId > 0)
                 ? existingTaskId
                 : taskApi.findRunningOrRecentTaskForPackage(pkg);
-        if (candidateTid > 0) {
+        if (candidateTid > 0 && candidateTid != existingOnTarget) {
             taskApi.moveRootTaskToDisplay(candidateTid, displayId);
-            if (taskApi.startActivityFromRecents(candidateTid, launchOpts)) {
-                services.focusDisplay(displayId);
-                System.out.println("OPALDESK_LAUNCH_RECENTS_OK pkg=" + pkg
-                        + " displayId=" + displayId + " tid=" + candidateTid);
-                return candidateTid;
-            }
         }
 
         Intent launchIntent = resolveSafeLaunchIntent(pkg, cls);
         if (launchIntent == null) {
             System.err.println("OPALDESK_LAUNCH_NO_INTENT pkg=" + pkg + " cls=" + cls + " displayId=" + displayId);
-            return -1;
+            return existingOnTarget;
         }
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_NO_ANIMATION);
         if (!services.startActivityAsShell(launchIntent, launchOpts)) {
             System.err.println("OPALDESK_LAUNCH_START_FAIL pkg=" + pkg + " displayId=" + displayId);
+            return existingOnTarget;
+        }
+        services.focusDisplay(displayId);
+        SystemClock.sleep(60L);
+        int topTid = taskApi.findTopTaskIdOnDisplay(displayId, pkg);
+        // On ColorOS / OEM ROMs where a background Display-0 task refuses to reparent via moveRootTaskToDisplay,
+        // remove the stale Display-0 task and cold-launch directly into the target VirtualDisplay.
+        if (topTid <= 0 && candidateTid > 0 && candidateTid != existingOnTarget) {
+            taskApi.removeTask(candidateTid);
+            SystemClock.sleep(80L);
+            launchIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            services.startActivityAsShell(launchIntent, launchOpts);
+            services.focusDisplay(displayId);
+            SystemClock.sleep(80L);
+            topTid = taskApi.findTopTaskIdOnDisplay(displayId, pkg);
+        }
+        int resolvedTid = (topTid > 0) ? topTid
+                : (existingOnTarget > 0 ? existingOnTarget : taskApi.findRunningOrRecentTaskForPackage(pkg));
+        System.out.println("OPALDESK_LAUNCH_START_OK pkg=" + pkg
+                + " displayId=" + displayId + " tid=" + resolvedTid);
+        return resolvedTid;
+    }
+
+    @Override
+    public int relaunchFreshFullscreenApp(String pkg, String cls, int displayId) {
+        if (displayId <= 0 || PackagePolicy.isBlockedWindowPkg(pkg)) return -1;
+        Bundle launchOpts = TaskApiAdapter.makeFullscreenLaunchOptions(displayId).toBundle();
+        Intent launchIntent = resolveSafeLaunchIntent(pkg, cls);
+        if (launchIntent == null) {
+            System.err.println("OPALDESK_RELOAD_NO_INTENT pkg=" + pkg + " cls=" + cls + " displayId=" + displayId);
+            return -1;
+        }
+        launchIntent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK
+                        | Intent.FLAG_ACTIVITY_CLEAR_TASK
+                        | Intent.FLAG_ACTIVITY_NO_ANIMATION);
+        boolean started = services.startActivityAsShell(launchIntent, launchOpts);
+        if (!started) {
+            ComponentName cn = launchIntent.getComponent();
+            if (cn != null) {
+                ShellCommand.runOutput(
+                        "am", "start",
+                        "--display", String.valueOf(displayId),
+                        "--windowingMode", "1",
+                        "-f", "0x10008000",
+                        "-n", cn.flattenToShortString());
+                started = true;
+            }
+        }
+        if (!started) {
+            System.err.println("OPALDESK_RELOAD_START_FAIL pkg=" + pkg + " displayId=" + displayId);
             return -1;
         }
         services.focusDisplay(displayId);
-        SystemClock.sleep(45L);
+        SystemClock.sleep(100L);
         int topTid = taskApi.findTopTaskIdOnDisplay(displayId, pkg);
         int resolvedTid = (topTid > 0) ? topTid : taskApi.findRunningOrRecentTaskForPackage(pkg);
-        System.out.println("OPALDESK_LAUNCH_START_OK pkg=" + pkg
+        System.out.println("OPALDESK_RELOAD_FRESH_OK pkg=" + pkg
                 + " displayId=" + displayId + " tid=" + resolvedTid);
         return resolvedTid;
     }
@@ -257,7 +315,7 @@ public final class AndroidDisplayDriver
     public void forceStopPackage(String pkg) {
         if (PackagePolicy.isBlockedWindowPkg(pkg)) return;
         ShellCommand.runOutput("am", "force-stop", pkg);
-        SystemClock.sleep(90L);
+        SystemClock.sleep(150L);
     }
 
     @Override

@@ -1,11 +1,14 @@
 package io.github.lengsukq.opaldesk.compositor
 
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.BatteryManager
+import android.provider.Settings
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -61,6 +64,7 @@ import io.github.lengsukq.opaldesk.protocol.CompositorWindow
 import io.github.lengsukq.opaldesk.protocol.WindowTilingLayout
 import io.github.lengsukq.opaldesk.ui.ChromeGlyph
 import io.github.lengsukq.opaldesk.ui.OpalButton
+import io.github.lengsukq.opaldesk.ui.OpalGlassSlider
 import io.github.lengsukq.opaldesk.ui.OpalGlyphIcon
 import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalSegmentedRow
@@ -73,6 +77,7 @@ import io.github.lengsukq.opaldesk.ui.onTapOrContextAction
 import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 data class SystemTrayInfo(
     val clockText: String = "",
@@ -805,11 +810,36 @@ fun MacControlCenterPopover(
         )
     }
 
+    val ctx = LocalContext.current
+    val audioMgr = remember(ctx) { ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager }
+    val maxVolume = remember(audioMgr) {
+        (try { audioMgr?.getStreamMaxVolume(AudioManager.STREAM_MUSIC) } catch (_: Throwable) { null } ?: 15).coerceAtLeast(1)
+    }
+    var mediaVolume by remember(audioMgr) {
+        mutableIntStateOf(
+            (try { audioMgr?.getStreamVolume(AudioManager.STREAM_MUSIC) } catch (_: Throwable) { null } ?: (maxVolume / 2))
+                .coerceIn(0, maxVolume),
+        )
+    }
+    var lastNonZeroVolume by remember { mutableIntStateOf(mediaVolume.coerceAtLeast(1)) }
+    var selectedTab by remember { mutableIntStateOf(0) } // 0=常用, 1=显示与 DPI, 2=外观
+    var showMoreTiling by remember { mutableStateOf(false) }
+
+    fun applyMediaVolume(target: Int) {
+        val clamped = target.coerceIn(0, maxVolume)
+        mediaVolume = clamped
+        if (clamped > 0) lastNonZeroVolume = clamped
+        try {
+            audioMgr?.setStreamVolume(AudioManager.STREAM_MUSIC, clamped, 0)
+        } catch (_: Throwable) {
+        }
+    }
+
     val shape = RoundedCornerShape(24.dp)
     val infoCardShape = RoundedCornerShape(15.dp)
     Column(
         modifier = modifier
-            .widthIn(max = 364.dp)
+            .widthIn(max = 368.dp)
             .fillMaxWidth()
             .heightIn(max = maxHeight)
             .liquidGlassSurface(
@@ -819,18 +849,17 @@ fun MacControlCenterPopover(
                 elevation = 28.dp,
             )
             .pointerInput(Unit) { detectTapGestures {} }
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+            .padding(14.dp),
     ) {
-        // Unified Status Summary Header with always-visible 1-tap Exit DeX button
+        // Pinned Compact Status Header
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(infoCardShape)
                 .background(OpalPalette.ChipFill)
                 .border(0.75.dp, OpalPalette.BorderHairline, infoCardShape)
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp),
+                .padding(horizontal = 12.dp, vertical = 9.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -869,325 +898,528 @@ fun MacControlCenterPopover(
                     onClick = onExitDesktop,
                 )
             }
-            if (displaySummary.isNotBlank()) {
-                OpalText(
-                    text = displaySummary,
-                    fontSize = 11.5.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = OpalPalette.TextPrimary,
-                    maxLines = 1,
-                )
-            }
             val netLabel = if (tray.wifiConnected) "Wi-Fi 已连" else "未连 Wi-Fi"
             val batLabel = if (tray.charging) "充电中 ${tray.batteryPct}%" else "电量 ${tray.batteryPct}%"
             OpalText(
-                text = "$inputBackendLabel · $netLabel · $batLabel",
+                text = if (displaySummary.isNotBlank()) "$displaySummary · $batLabel" else "$inputBackendLabel · $netLabel · $batLabel",
                 fontSize = 10.5.sp,
                 color = OpalPalette.TextSecondary,
                 maxLines = 1,
             )
         }
 
-        // Host Phone Physical Screen Off / Power Saving Control (supports double-tap to wake!)
-        if (showHostScreenToggle || hostScreenOff) {
-            Spacer(Modifier.height(10.dp))
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(infoCardShape)
-                    .background(
-                        if (hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.14f) else OpalPalette.ChipFill,
-                    )
-                    .border(
-                        width = 0.8.dp,
-                        color = if (hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.42f) else OpalPalette.BorderHairline,
-                        shape = infoCardShape,
-                    )
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    OpalText(
-                        text = if (hostScreenOff) "手机屏幕已物理熄屏（省电中）" else "本机屏幕省电控制",
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.TextPrimary,
-                    )
-                    Spacer(Modifier.height(2.dp))
-                    OpalText(
-                        text = "熄屏后支持双击手机屏幕随时亮屏，断开投屏也会自动亮屏",
-                        fontSize = 10.5.sp,
-                        color = OpalPalette.TextSecondary,
-                    )
-                }
-                Spacer(Modifier.width(8.dp))
-                OpalButton(
-                    label = if (hostScreenOff) "点亮手机屏" else "熄灭手机屏",
-                    compact = true,
-                    filled = !hostScreenOff,
-                    accent = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
-                    onClick = { onToggleHostScreenPower(hostScreenOff) },
-                )
-            }
-        }
-
-        // Phone Trackpad On-Screen Control & Auto-Display Setting (External Monitor / Cast)
-        if (showPhoneTrackpadSection) {
-            Spacer(Modifier.height(10.dp))
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(infoCardShape)
-                    .background(
-                        if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.12f) else OpalPalette.ChipFill,
-                    )
-                    .border(
-                        width = 0.8.dp,
-                        color = if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.40f) else OpalPalette.BorderHairline,
-                        shape = infoCardShape,
-                    )
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        OpalText(
-                            text = if (phoneTrackpadVisible) "手机触控板运行中" else "手机屏幕触控板",
-                            fontSize = 12.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (phoneTrackpadVisible) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        OpalText(
-                            text = if (phoneTrackpadVisible) {
-                                "手机当前正作为外接屏多指触控板使用"
-                            } else {
-                                "在手机屏幕上显示多指触控板与虚拟键鼠，随时操控外接屏"
-                            },
-                            fontSize = 10.5.sp,
-                            color = OpalPalette.TextSecondary,
-                        )
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    OpalButton(
-                        label = if (phoneTrackpadVisible) "关闭触控板" else "显示触控板",
-                        compact = true,
-                        filled = !phoneTrackpadVisible,
-                        accent = if (phoneTrackpadVisible) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
-                        onClick = onTogglePhoneTrackpad,
-                    )
-                }
-                if (showAutoTrackpadSwitch) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(0.8.dp)
-                            .background(OpalPalette.DividerColor),
-                    )
-                    OpalSwitchRow(
-                        title = "接入外接屏时自动显示手机触控板",
-                        subtitle = "原生扩展屏启动后自动在手机拉起触控板，关闭后仅手动打开",
-                        checked = autoShowPhoneTrackpad,
-                        onCheckedChange = onToggleAutoPhoneTrackpad,
-                    )
-                }
-            }
-        }
-
-        // Quick 1–5 Configuration Slot Switcher & Layout Restore
-        Spacer(Modifier.height(12.dp))
-        io.github.lengsukq.opaldesk.ui.QuickSlotSwitcherStrip(
-            compact = true,
-            showRestoreButton = true,
-            canvasW = canvasW,
-            canvasH = canvasH,
-        )
-
-        // Unified Live Display & Quality Quick Controls (FPS, Window DPI, UI Scale)
-        Spacer(Modifier.height(12.dp))
-        OpalText(text = "帧率设置（实时生效）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
-        Spacer(Modifier.height(6.dp))
-        val fpsOpts = listOf(0, 60, 90, 120)
-        val fpsIdx = fpsOpts.indexOf(targetFps).let { if (it >= 0) it else 0 }
+        // Top Segmented Tab Bar
+        Spacer(Modifier.height(10.dp))
         OpalSegmentedRow(
-            options = listOf("自动", "60Hz", "90Hz", "120Hz"),
-            selectedIndex = fpsIdx,
-            onSelect = { onSelectTargetFps(fpsOpts[it]) },
+            options = listOf("常用", "显示与 DPI", "外观"),
+            selectedIndex = selectedTab,
+            onSelect = { selectedTab = it },
         )
 
         Spacer(Modifier.height(10.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
+        // Scrollable Tab Body
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f, fill = false)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            OpalText(text = "应用窗口密度 DPI（实时热刷新）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
-            OpalText(
-                text = "自定义 / 单应用 DPI…",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = OpalPalette.AccentBlue,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(onClick = onOpenDpiSettings)
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
-            )
-        }
-        Spacer(Modifier.height(6.dp))
-        val dpiOpts = listOf(80, 100, 125)
-        val dpiIdx = dpiOpts.indexOfFirst { abs(it - windowDpiScalePct) <= 8 }.let { if (it >= 0) it else 1 }
-        OpalSegmentedRow(
-            options = listOf("紧凑 80%", "标准 100%", "大号 125%"),
-            selectedIndex = dpiIdx,
-            onSelect = { onSelectWindowDpiPct(dpiOpts[it]) },
-        )
-
-        if (isExternalMonitor) {
-            Spacer(Modifier.height(10.dp))
-            OpalText(text = "桌面界面缩放比例 (UI Scale)", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
-            Spacer(Modifier.height(6.dp))
-            val scaleOpts = listOf(1.0f, 1.25f, 1.5f)
-            val scaleIdx = scaleOpts.indexOfFirst { abs(it - externalUiScale) < 0.08f }.let { if (it >= 0) it else 1 }
-            OpalSegmentedRow(
-                options = listOf("100%", "125%", "150%"),
-                selectedIndex = scaleIdx,
-                onSelect = { onSelectUiScale(scaleOpts[it]) },
-            )
-        }
-
-        Spacer(Modifier.height(12.dp))
-        OpalText(text = "液态毛玻璃外观", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
-        Spacer(Modifier.height(6.dp))
-        OpalSegmentedRow(
-            options = listOf("浅色", "跟随系统", "深色"),
-            selectedIndex = themeMode.coerceIn(AppPrefs.THEME_LIGHT, AppPrefs.THEME_DARK),
-            onSelect = onSelectThemeMode,
-        )
-
-        if (isExternalMonitor) {
-            Spacer(Modifier.height(12.dp))
-            OpalText(
-                text = "外接键鼠输出目标（优先投屏端）",
-                fontSize = 11.5.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = OpalPalette.TextSecondary,
-            )
-            Spacer(Modifier.height(6.dp))
-            OpalSegmentedRow(
-                options = listOf("跟随本机", "优先投屏端"),
-                selectedIndex = mouseTargetMode.coerceIn(AppPrefs.MOUSE_TARGET_LOCAL, AppPrefs.MOUSE_TARGET_EXTERNAL),
-                onSelect = onSelectMouseTarget,
-            )
-        }
-
-        Spacer(Modifier.height(12.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            OpalText(text = "分屏布局", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
-            OpalText(
-                text = "全部最小化",
-                fontSize = 11.sp,
-                color = OpalPalette.AccentBlue,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(onClick = onMinimizeAll)
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
-            )
-        }
-        Spacer(Modifier.height(6.dp))
-        val quickTiles = listOf(
-            WindowTilingLayout.SPLIT_2_COLS,
-            WindowTilingLayout.SPLIT_2_MAIN_SIDE,
-            WindowTilingLayout.SPLIT_3_COLS,
-            WindowTilingLayout.SPLIT_3_MAIN_STACK,
-            WindowTilingLayout.SPLIT_4_COLS,
-            WindowTilingLayout.SPLIT_4_GRID,
-            WindowTilingLayout.SPLIT_5_COLS,
-            WindowTilingLayout.SPLIT_6_GRID,
-            WindowTilingLayout.SPLIT_8_GRID,
-            WindowTilingLayout.CASCADE,
-        )
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            quickTiles.chunked(3).forEach { row ->
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
-                    row.forEach { layout ->
-                        TilingPresetTile(
-                            layout = layout,
-                            enabled = totalWindows > 0,
-                            onClick = { onApplyTilingLayout(layout) },
-                            modifier = Modifier.weight(1f),
-                        )
+            when (selectedTab) {
+                0 -> {
+                    // Quick Connectivity Tiles (Wi-Fi & Bluetooth — tap to jump directly to system settings)
+                    val btEnabled = remember(ctx, selectedTab) {
+                        try {
+                            val bm = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+                            bm?.adapter?.isEnabled
+                        } catch (_: Throwable) {
+                            null
+                        }
                     }
-                    repeat(3 - row.size) {
-                        Spacer(Modifier.weight(1f))
+                    fun openSystemSettings(action: String) {
+                        try {
+                            ctx.startActivity(Intent(action).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        } catch (_: Throwable) {
+                            try {
+                                ctx.startActivity(Intent(Settings.ACTION_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                            } catch (_: Throwable) {
+                            }
+                        }
                     }
-                }
-            }
-        }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        // Wi-Fi Quick Tile
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(infoCardShape)
+                                .background(if (tray.wifiConnected) OpalPalette.AccentBlue.copy(alpha = 0.14f) else OpalPalette.ChipFill)
+                                .border(
+                                    width = 0.8.dp,
+                                    color = if (tray.wifiConnected) OpalPalette.AccentBlue.copy(alpha = 0.42f) else OpalPalette.BorderHairline,
+                                    shape = infoCardShape,
+                                )
+                                .clickable { openSystemSettings(Settings.ACTION_WIFI_SETTINGS) }
+                                .padding(horizontal = 11.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(9.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .background(if (tray.wifiConnected) OpalPalette.AccentBlue else OpalPalette.ChipActiveFill),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                OpalGlyphIcon(
+                                    glyph = ChromeGlyph.WIFI,
+                                    tint = if (tray.wifiConnected) Color.White else OpalPalette.TextSecondary,
+                                    size = 14.dp,
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                OpalText(
+                                    text = "Wi-Fi",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = OpalPalette.TextPrimary,
+                                    maxLines = 1,
+                                )
+                                OpalText(
+                                    text = if (tray.wifiConnected) "已连接 · 设置" else "未连接 · 设置",
+                                    fontSize = 10.sp,
+                                    color = if (tray.wifiConnected) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
 
-        Spacer(Modifier.height(12.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            OpalText(text = "桌面壁纸", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
-            OpalText(
-                text = "自定义相册壁纸…",
-                fontSize = 11.sp,
-                color = OpalPalette.AccentBlue,
-                fontWeight = FontWeight.Medium,
-                modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(onClick = onPickCustomWallpaper)
-                    .padding(horizontal = 6.dp, vertical = 2.dp),
-            )
-        }
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            wallpaperColors.forEachIndexed { idx, (name, grad) ->
-                val selected = idx == wallpaperPreset
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier
-                        .weight(1f)
-                        .clip(RoundedCornerShape(10.dp))
-                        .clickable { onSelectWallpaper(idx) }
-                        .padding(vertical = 3.dp),
-                ) {
-                    Box(
+                        // Bluetooth Quick Tile
+                        val btOn = btEnabled == true
+                        Row(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(infoCardShape)
+                                .background(if (btOn) OpalPalette.AccentBlue.copy(alpha = 0.14f) else OpalPalette.ChipFill)
+                                .border(
+                                    width = 0.8.dp,
+                                    color = if (btOn) OpalPalette.AccentBlue.copy(alpha = 0.42f) else OpalPalette.BorderHairline,
+                                    shape = infoCardShape,
+                                )
+                                .clickable { openSystemSettings(Settings.ACTION_BLUETOOTH_SETTINGS) }
+                                .padding(horizontal = 11.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(9.dp),
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .background(if (btOn) OpalPalette.AccentBlue else OpalPalette.ChipActiveFill),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                OpalText(
+                                    text = "B",
+                                    fontSize = 12.5.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (btOn) Color.White else OpalPalette.TextSecondary,
+                                )
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                OpalText(
+                                    text = "蓝牙",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = OpalPalette.TextPrimary,
+                                    maxLines = 1,
+                                )
+                                OpalText(
+                                    text = when (btEnabled) {
+                                        true -> "已开启 · 设置"
+                                        false -> "已关闭 · 设置"
+                                        null -> "点击进入设置"
+                                    },
+                                    fontSize = 10.sp,
+                                    color = if (btOn) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    }
+
+                    // Media Volume Control Card
+                    val volPct = ((mediaVolume * 100f) / maxVolume.toFloat()).roundToInt().coerceIn(0, 100)
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(28.dp)
-                            .clip(RoundedCornerShape(9.dp))
-                            .background(Brush.linearGradient(grad))
-                            .border(
-                                width = if (selected) 1.6.dp else 0.7.dp,
-                                color = if (selected) OpalPalette.AccentBlue else OpalPalette.BorderSubtle,
-                                shape = RoundedCornerShape(9.dp),
-                            ),
+                            .clip(infoCardShape)
+                            .background(OpalPalette.ChipFill)
+                            .border(0.75.dp, OpalPalette.BorderHairline, infoCardShape)
+                            .padding(horizontal = 12.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            OpalText(
+                                text = if (mediaVolume == 0) "媒体音量（已静音）" else "媒体音量 · $volPct%",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (mediaVolume == 0) OpalPalette.TextMuted else OpalPalette.TextPrimary,
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                                OpalButton(
+                                    label = "−",
+                                    compact = true,
+                                    filled = false,
+                                    onClick = { applyMediaVolume(mediaVolume - 1) },
+                                )
+                                OpalButton(
+                                    label = if (mediaVolume == 0) "取消静音" else "静音",
+                                    compact = true,
+                                    filled = false,
+                                    accent = if (mediaVolume == 0) OpalPalette.AccentAmber else OpalPalette.TextSecondary,
+                                    onClick = {
+                                        if (mediaVolume == 0) applyMediaVolume(lastNonZeroVolume) else applyMediaVolume(0)
+                                    },
+                                )
+                                OpalButton(
+                                    label = "+",
+                                    compact = true,
+                                    filled = false,
+                                    onClick = { applyMediaVolume(mediaVolume + 1) },
+                                )
+                            }
+                        }
+                        OpalGlassSlider(
+                            value = mediaVolume.toFloat(),
+                            valueRange = 0f..maxVolume.toFloat(),
+                            onValueChange = { v -> applyMediaVolume(v.roundToInt()) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+
+                    // Quick 1–5 Configuration Slot Switcher & Layout Restore
+                    io.github.lengsukq.opaldesk.ui.QuickSlotSwitcherStrip(
+                        compact = true,
+                        showRestoreButton = true,
+                        canvasW = canvasW,
+                        canvasH = canvasH,
                     )
-                    Spacer(Modifier.height(3.dp))
-                    OpalText(
-                        text = name,
-                        fontSize = 9.5.sp,
-                        color = if (selected) OpalPalette.TextPrimary else OpalPalette.TextMuted,
-                        maxLines = 1,
-                    )
+
+                    // Multi-Window Tiling Layouts (top 4 common presets + collapsible extra 6)
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            OpalText(text = "常用分屏", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                                OpalText(
+                                    text = if (showMoreTiling) "收起 ▴" else "更多 (6) ▾",
+                                    fontSize = 11.sp,
+                                    color = OpalPalette.TextSecondary,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable { showMoreTiling = !showMoreTiling }
+                                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                                )
+                                OpalText(
+                                    text = "全部最小化",
+                                    fontSize = 11.sp,
+                                    color = OpalPalette.AccentBlue,
+                                    fontWeight = FontWeight.Medium,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .clickable(onClick = onMinimizeAll)
+                                        .padding(horizontal = 5.dp, vertical = 2.dp),
+                                )
+                            }
+                        }
+                        val primaryTiles = listOf(
+                            WindowTilingLayout.SPLIT_2_COLS,
+                            WindowTilingLayout.SPLIT_2_MAIN_SIDE,
+                            WindowTilingLayout.SPLIT_3_COLS,
+                            WindowTilingLayout.SPLIT_4_GRID,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                            primaryTiles.forEach { layout ->
+                                TilingPresetTile(
+                                    layout = layout,
+                                    enabled = totalWindows > 0,
+                                    onClick = { onApplyTilingLayout(layout) },
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                        if (showMoreTiling) {
+                            val extraTiles = listOf(
+                                WindowTilingLayout.SPLIT_3_MAIN_STACK,
+                                WindowTilingLayout.SPLIT_4_COLS,
+                                WindowTilingLayout.SPLIT_5_COLS,
+                                WindowTilingLayout.SPLIT_6_GRID,
+                                WindowTilingLayout.SPLIT_8_GRID,
+                                WindowTilingLayout.CASCADE,
+                            )
+                            extraTiles.chunked(3).forEach { row ->
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                                    row.forEach { layout ->
+                                        TilingPresetTile(
+                                            layout = layout,
+                                            enabled = totalWindows > 0,
+                                            onClick = { onApplyTilingLayout(layout) },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                    }
+                                    repeat(3 - row.size) {
+                                        Spacer(Modifier.weight(1f))
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Host Phone Screen Off / Power Saving Control
+                    if (showHostScreenToggle || hostScreenOff) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(infoCardShape)
+                                .background(
+                                    if (hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.14f) else OpalPalette.ChipFill,
+                                )
+                                .border(
+                                    width = 0.8.dp,
+                                    color = if (hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.42f) else OpalPalette.BorderHairline,
+                                    shape = infoCardShape,
+                                )
+                                .padding(horizontal = 12.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                OpalText(
+                                    text = if (hostScreenOff) "手机已物理熄屏（省电中）" else "本机屏幕省电控制",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.TextPrimary,
+                                )
+                                OpalText(
+                                    text = "熄屏后双击手机随时亮屏，断开自动亮屏",
+                                    fontSize = 10.sp,
+                                    color = OpalPalette.TextSecondary,
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            OpalButton(
+                                label = if (hostScreenOff) "点亮手机屏" else "熄灭手机屏",
+                                compact = true,
+                                filled = !hostScreenOff,
+                                accent = if (hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
+                                onClick = { onToggleHostScreenPower(hostScreenOff) },
+                            )
+                        }
+                    }
+
+                    // Phone Trackpad On-Screen Control
+                    if (showPhoneTrackpadSection) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(infoCardShape)
+                                .background(
+                                    if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.12f) else OpalPalette.ChipFill,
+                                )
+                                .border(
+                                    width = 0.8.dp,
+                                    color = if (phoneTrackpadVisible) OpalPalette.AccentBlue.copy(alpha = 0.40f) else OpalPalette.BorderHairline,
+                                    shape = infoCardShape,
+                                )
+                                .padding(horizontal = 12.dp, vertical = 9.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    OpalText(
+                                        text = if (phoneTrackpadVisible) "手机触控板运行中" else "手机屏幕触控板",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (phoneTrackpadVisible) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                                    )
+                                    OpalText(
+                                        text = if (phoneTrackpadVisible) "手机正作为外接屏多指触控板使用" else "在手机上显示触控板与虚拟键鼠",
+                                        fontSize = 10.sp,
+                                        color = OpalPalette.TextSecondary,
+                                    )
+                                }
+                                Spacer(Modifier.width(8.dp))
+                                OpalButton(
+                                    label = if (phoneTrackpadVisible) "关闭触控板" else "显示触控板",
+                                    compact = true,
+                                    filled = !phoneTrackpadVisible,
+                                    accent = if (phoneTrackpadVisible) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
+                                    onClick = onTogglePhoneTrackpad,
+                                )
+                            }
+                            if (showAutoTrackpadSwitch) {
+                                Box(modifier = Modifier.fillMaxWidth().height(0.8.dp).background(OpalPalette.DividerColor))
+                                OpalSwitchRow(
+                                    title = "接入外接屏时自动显示手机触控板",
+                                    subtitle = "关闭后仅在此手动打开",
+                                    checked = autoShowPhoneTrackpad,
+                                    onCheckedChange = onToggleAutoPhoneTrackpad,
+                                )
+                            }
+                        }
+                    }
+                }
+
+                1 -> {
+                    // Display, FPS, Custom/Per-App DPI, UI Scale & Mouse Routing
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OpalText(text = "帧率设置（实时生效）", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+                        val fpsOpts = listOf(0, 60, 90, 120)
+                        val fpsIdx = fpsOpts.indexOf(targetFps).let { if (it >= 0) it else 0 }
+                        OpalSegmentedRow(
+                            options = listOf("自动", "60Hz", "90Hz", "120Hz"),
+                            selectedIndex = fpsIdx,
+                            onSelect = { onSelectTargetFps(fpsOpts[it]) },
+                        )
+                    }
+
+                    // Unified Real-time Visual DPI Entry (removes overlapping legacy 80/100/125% toggle)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(infoCardShape)
+                            .background(OpalPalette.ChipFill)
+                            .border(0.75.dp, OpalPalette.BorderHairline, infoCardShape)
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            OpalText(text = "窗口 DPI 调节", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            OpalText(
+                                text = "在 DeX 桌面内直接拖动滑块实时预览全局与当前窗口 DPI",
+                                fontSize = 10.5.sp,
+                                color = OpalPalette.TextSecondary,
+                            )
+                        }
+                        OpalButton(
+                            label = "打开实时 DPI 面板",
+                            compact = true,
+                            filled = true,
+                            onClick = onOpenDpiSettings,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+
+                    if (isExternalMonitor) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OpalText(text = "桌面界面缩放比例 (UI Scale)", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+                            val scaleOpts = listOf(1.0f, 1.25f, 1.5f)
+                            val scaleIdx = scaleOpts.indexOfFirst { abs(it - externalUiScale) < 0.08f }.let { if (it >= 0) it else 1 }
+                            OpalSegmentedRow(
+                                options = listOf("100%", "125%", "150%"),
+                                selectedIndex = scaleIdx,
+                                onSelect = { onSelectUiScale(scaleOpts[it]) },
+                            )
+                        }
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OpalText(
+                                text = "外接键鼠输出目标（优先投屏端）",
+                                fontSize = 11.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = OpalPalette.TextSecondary,
+                            )
+                            OpalSegmentedRow(
+                                options = listOf("跟随本机", "优先投屏端"),
+                                selectedIndex = mouseTargetMode.coerceIn(AppPrefs.MOUSE_TARGET_LOCAL, AppPrefs.MOUSE_TARGET_EXTERNAL),
+                                onSelect = onSelectMouseTarget,
+                            )
+                        }
+                    }
+                }
+
+                else -> {
+                    // Appearance & Wallpapers
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        OpalText(text = "液态毛玻璃外观", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+                        OpalSegmentedRow(
+                            options = listOf("浅色", "跟随系统", "深色"),
+                            selectedIndex = themeMode.coerceIn(AppPrefs.THEME_LIGHT, AppPrefs.THEME_DARK),
+                            onSelect = onSelectThemeMode,
+                        )
+                    }
+
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            OpalText(text = "桌面壁纸", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.TextSecondary)
+                            OpalText(
+                                text = "自定义相册壁纸…",
+                                fontSize = 11.sp,
+                                color = OpalPalette.AccentBlue,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable(onClick = onPickCustomWallpaper)
+                                    .padding(horizontal = 6.dp, vertical = 2.dp),
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                            wallpaperColors.forEachIndexed { idx, (name, grad) ->
+                                val selected = idx == wallpaperPreset
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .clickable { onSelectWallpaper(idx) }
+                                        .padding(vertical = 3.dp),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(34.dp)
+                                            .clip(RoundedCornerShape(9.dp))
+                                            .background(Brush.linearGradient(grad))
+                                            .border(
+                                                width = if (selected) 1.6.dp else 0.7.dp,
+                                                color = if (selected) OpalPalette.AccentBlue else OpalPalette.BorderSubtle,
+                                                shape = RoundedCornerShape(9.dp),
+                                            ),
+                                    )
+                                    Spacer(Modifier.height(4.dp))
+                                    OpalText(
+                                        text = name,
+                                        fontSize = 10.sp,
+                                        color = if (selected) OpalPalette.TextPrimary else OpalPalette.TextMuted,
+                                        maxLines = 1,
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        Spacer(Modifier.height(14.dp))
+        // Pinned Bottom Action Row
+        Spacer(Modifier.height(10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             OpalButton(
                 label = "主控制台",
@@ -1549,7 +1781,7 @@ fun FullscreenExitOverlay(
                     },
                 )
                 OpalButton(
-                    label = "回到桌面",
+                    label = "显示桌面",
                     compact = true,
                     filled = false,
                     accent = OpalPalette.AccentCyan,

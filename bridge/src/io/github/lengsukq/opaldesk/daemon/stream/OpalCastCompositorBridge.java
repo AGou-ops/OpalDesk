@@ -633,7 +633,9 @@ public final class OpalCastCompositorBridge implements RemoteStreamServer.Sessio
                 break;
             case OpalCastProtocol.SYS_HOME:
                 if (!s.standalone) {
-                    compositor.minimizeAllWindows();
+                    if (!compositor.exitFullscreenIfActive()) {
+                        compositor.minimizeAllWindows();
+                    }
                 }
                 break;
             case OpalCastProtocol.SYS_SET_AUDIO_ENABLED:

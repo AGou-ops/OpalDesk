@@ -17,6 +17,24 @@ object AppUpdateLogic {
     const val ALL_RELEASES_WEB_URL =
         "https://github.com/$REPO_OWNER/$REPO_NAME/releases"
 
+    enum class DownloadRoute(
+        val index: Int,
+        val label: String,
+        val detail: String,
+        val proxyPrefix: String,
+        val proxyHost: String,
+    ) {
+        DIRECT(0, "直连", "GitHub 官方直连", "", "github.com"),
+        PROXY_1(1, "代理一", "国内加速 · gh-proxy.com", "https://gh-proxy.com/", "gh-proxy.com"),
+        PROXY_2(2, "代理二", "国内加速 · ghfast.top", "https://ghfast.top/", "ghfast.top"),
+        ;
+
+        companion object {
+            fun fromIndex(index: Int): DownloadRoute =
+                entries.firstOrNull { it.index == index } ?: DIRECT
+        }
+    }
+
     private val ALLOWED_HOSTS = setOf(
         "github.com",
         "api.github.com",
@@ -24,6 +42,11 @@ object AppUpdateLogic {
         "release-assets.githubusercontent.com",
         "github-releases.githubusercontent.com",
         "codeload.github.com",
+    )
+
+    private val ALLOWED_PROXY_HOSTS = setOf(
+        "gh-proxy.com",
+        "ghfast.top",
     )
 
     data class ReleaseInfo(
@@ -74,7 +97,17 @@ object AppUpdateLogic {
         return compareVersions(candidateVersion, currentVersion) > 0
     }
 
-    fun isAllowedReleaseUrl(url: String): Boolean {
+    fun buildDownloadUrl(rawGithubUrl: String, route: DownloadRoute): String {
+        val clean = rawGithubUrl.trim()
+        if (clean.isEmpty() || route == DownloadRoute.DIRECT) return clean
+        return if (clean.startsWith("https://github.com/", ignoreCase = true)) {
+            route.proxyPrefix + clean
+        } else {
+            clean
+        }
+    }
+
+    fun isAllowedReleaseUrl(url: String, allowProxyHost: Boolean = false): Boolean {
         val trimmed = url.trim()
         if (trimmed.isEmpty()) return false
         val uri = try {
@@ -84,7 +117,8 @@ object AppUpdateLogic {
         }
         if (!"https".equals(uri.scheme, ignoreCase = true)) return false
         val host = uri.host?.lowercase(Locale.US) ?: return false
-        return ALLOWED_HOSTS.contains(host) || host.endsWith(".githubusercontent.com")
+        if (ALLOWED_HOSTS.contains(host) || host.endsWith(".githubusercontent.com")) return true
+        return allowProxyHost && ALLOWED_PROXY_HOSTS.contains(host)
     }
 
     /**

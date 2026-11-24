@@ -52,8 +52,67 @@ import io.github.lengsukq.opaldesk.ui.OpalPalette
 import io.github.lengsukq.opaldesk.ui.OpalText
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.lang.ref.WeakReference
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * Lightweight registry of mounted live [TextureView]s so Mission Control / Exposé can capture
+ * crisp real-time window previews in <5ms directly on the UI thread without daemon snapshot IPC.
+ */
+object LiveWindowPreviewRegistry {
+    private val liveViews = ConcurrentHashMap<Int, WeakReference<TextureView>>()
+    private val cachedPreviews = ConcurrentHashMap<Int, Bitmap>()
+
+    fun register(windowId: Int, view: TextureView) {
+        liveViews[windowId] = WeakReference(view)
+    }
+
+    fun unregister(windowId: Int, view: TextureView) {
+        val current = liveViews[windowId]?.get()
+        if (current == null || current === view) {
+            liveViews.remove(windowId)
+        }
+    }
+
+    /** Must be called on the Android main thread (uses [TextureView.getBitmap]). */
+    fun captureLivePreview(windowId: Int, maxLongEdge: Int = 540): Bitmap? {
+        val view = liveViews[windowId]?.get()
+        if (view != null && view.isAvailable && view.width > 0 && view.height > 0) {
+            val fresh = captureAndCache(windowId, view, maxLongEdge)
+            if (fresh != null && !fresh.isRecycled) return fresh
+        }
+        return getCachedPreview(windowId)
+    }
+
+    fun getCachedPreview(windowId: Int): Bitmap? {
+        val bmp = cachedPreviews[windowId]
+        return if (bmp != null && !bmp.isRecycled) bmp else null
+    }
+
+    fun evict(windowId: Int) {
+        liveViews.remove(windowId)
+        cachedPreviews.remove(windowId)
+    }
+
+    private fun captureAndCache(windowId: Int, view: TextureView, maxLongEdge: Int = 540): Bitmap? {
+        val vw = view.width.coerceAtLeast(1)
+        val vh = view.height.coerceAtLeast(1)
+        val scale = (maxLongEdge.toFloat() / maxOf(vw, vh).toFloat()).coerceAtMost(1f)
+        val bw = (vw * scale).toInt().coerceAtLeast(64)
+        val bh = (vh * scale).toInt().coerceAtLeast(64)
+        return try {
+            val bmp = view.getBitmap(bw, bh)
+            if (bmp != null && !bmp.isRecycled) {
+                cachedPreviews[windowId] = bmp
+            }
+            bmp
+        } catch (_: Throwable) {
+            null
+        }
+    }
+}
 
 /**
  * Hardware-accelerated `TextureView` (`GL_TEXTURE_EXTERNAL_OES`) client surface host for a single
@@ -232,8 +291,10 @@ fun WindowSurfaceHost(
                 factory = { ctx ->
                     FixedBufferTextureView(ctx).apply {
                         isOpaque = false
+                        LiveWindowPreviewRegistry.register(window.windowId, this)
                         surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                                LiveWindowPreviewRegistry.register(currentWin.windowId, this@apply)
                                 val w = currentWin.contentWidth.coerceAtLeast(240)
                                 val h = currentWin.contentHeight.coerceAtLeast(200)
                                 val dpi = currentWin.contentDpi.coerceAtLeast(120)
@@ -255,6 +316,7 @@ fun WindowSurfaceHost(
                             }
 
                             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                                LiveWindowPreviewRegistry.unregister(currentWin.windowId, this@apply)
                                 OpalLogStore.i("Surface", "TextureView destroyed wid=${currentWin.windowId} hadFrame=$hasRenderedLiveFrame")
                                 hasRenderedLiveFrame = false
                                 holderState.onTextureDestroyed(st)

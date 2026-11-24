@@ -19,6 +19,8 @@ public final class WindowSession {
     public String presentation;   // FLOATING | MAXIMIZED | SNAP_*
     public IntRect frame;         // Outer window frame on compositor canvas (includes header chrome)
     public IntRect restoreFrame;  // Saved floating frame prior to maximize/snap
+    public IntRect preFullscreenFrame; // Exact frame immediately before entering fullscreen
+    public String preFullscreenPresentation; // Exact presentation immediately before entering fullscreen
 
     public int contentWidth;      // VirtualDisplay internal pixel width
     public int contentHeight;     // VirtualDisplay internal pixel height

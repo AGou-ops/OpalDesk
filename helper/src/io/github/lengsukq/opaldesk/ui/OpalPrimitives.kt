@@ -434,15 +434,23 @@ fun Modifier.onTapOrContextAction(
                 }
 
                 // 3. Primary click / finger touch: wait for release within slop or long-press timeout
+                var lastPos = downPos
                 val releasedCleanly = withTimeoutOrNull(longPressTimeout) {
                     while (true) {
                         val ev = awaitPointerEvent()
                         val change = ev.changes.firstOrNull { it.id == down.id } ?: return@withTimeoutOrNull false
-                        if (change.isConsumed) return@withTimeoutOrNull false
-                        if ((change.position - downPos).getDistance() > touchSlop) {
+                        lastPos = change.position
+                        val movedDist = (change.position - downPos).getDistance()
+                        if (movedDist > touchSlop) {
+                            return@withTimeoutOrNull false
+                        }
+                        // Only treat as cancelled by a parent scroll container if a movement event was consumed;
+                        // ignore parent backdrop tap-shields that consume the stationary initial down event.
+                        if (change.isConsumed && change.position != change.previousPosition) {
                             return@withTimeoutOrNull false
                         }
                         if (!change.pressed) {
+                            if (change.isConsumed) return@withTimeoutOrNull false
                             change.consume()
                             return@withTimeoutOrNull true
                         }
@@ -452,13 +460,11 @@ fun Modifier.onTapOrContextAction(
                 if (releasedCleanly == true) {
                     curPrimary()
                 } else if (releasedCleanly == null) {
-                    // Timed out while still holding inside slop -> Long-Press == Right-Click!
+                    // Timed out while still holding inside touchSlop -> Long-Press == Right-Click!
                     val held = currentEvent.changes.firstOrNull { it.id == down.id }
-                    if (held != null && held.pressed && !held.isConsumed &&
-                        (held.position - downPos).getDistance() <= touchSlop
-                    ) {
+                    if (held != null && held.pressed && (lastPos - downPos).getDistance() <= touchSlop) {
                         held.consume()
-                        curContext(rootOriginRef.value + held.position)
+                        curContext(rootOriginRef.value + lastPos)
                         while (true) {
                             val ev = awaitPointerEvent()
                             ev.changes.forEach { it.consume() }

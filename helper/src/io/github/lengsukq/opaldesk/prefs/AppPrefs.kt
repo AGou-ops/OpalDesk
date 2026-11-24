@@ -18,6 +18,10 @@ object AppPrefs {
     const val MOUSE_TARGET_LOCAL = 0
     const val MOUSE_TARGET_EXTERNAL = 1
 
+    const val UPDATE_ROUTE_DIRECT = 0
+    const val UPDATE_ROUTE_PROXY_1 = 1
+    const val UPDATE_ROUTE_PROXY_2 = 2
+
     const val MIN_TRACKPAD_SENSITIVITY = 0.50f
     const val MAX_TRACKPAD_SENSITIVITY = 3.00f
     const val DEFAULT_TRACKPAD_SENSITIVITY = 1.45f
@@ -44,6 +48,7 @@ object AppPrefs {
     private const val KEY_AUTO_CHECK_UPDATE = "auto_check_app_update"
     private const val KEY_LAST_UPDATE_CHECK_MS = "last_update_check_ms"
     private const val KEY_IGNORED_UPDATE_TAG = "ignored_update_tag"
+    private const val KEY_UPDATE_DOWNLOAD_ROUTE = "update_download_route"
 
     private val DEFAULT_PINNED = listOf(
         "com.android.chrome",
@@ -93,6 +98,9 @@ object AppPrefs {
     private val _autoShowPhoneTrackpadFlow = MutableStateFlow(true)
     val autoShowPhoneTrackpadFlow: StateFlow<Boolean> = _autoShowPhoneTrackpadFlow.asStateFlow()
 
+    private val _updateDownloadRouteFlow = MutableStateFlow(UPDATE_ROUTE_DIRECT)
+    val updateDownloadRouteFlow: StateFlow<Int> = _updateDownloadRouteFlow.asStateFlow()
+
     private fun prefs(ctx: Context?) =
         ctx?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -114,6 +122,8 @@ object AppPrefs {
         _appLaunchCountsFlow.value = parseLaunchCounts(p.getString(KEY_APP_LAUNCH_COUNTS, null))
         _autoCheckUpdateFlow.value = p.getBoolean(KEY_AUTO_CHECK_UPDATE, true)
         _autoShowPhoneTrackpadFlow.value = p.getBoolean(KEY_AUTO_SHOW_PHONE_TRACKPAD, true)
+        _updateDownloadRouteFlow.value = p.getInt(KEY_UPDATE_DOWNLOAD_ROUTE, UPDATE_ROUTE_DIRECT)
+            .coerceIn(UPDATE_ROUTE_DIRECT, UPDATE_ROUTE_PROXY_2)
     }
 
     private fun loadPkgList(p: android.content.SharedPreferences, key: String, fallbackKey: String): List<String> {
@@ -373,5 +383,17 @@ object AppPrefs {
 
     fun setIgnoredUpdateTag(ctx: Context?, tagName: String) {
         prefs(ctx)?.edit()?.putString(KEY_IGNORED_UPDATE_TAG, tagName.trim())?.apply()
+    }
+
+    fun getUpdateDownloadRoute(ctx: Context?): Int {
+        hydrateFlows(ctx)
+        return (prefs(ctx)?.getInt(KEY_UPDATE_DOWNLOAD_ROUTE, UPDATE_ROUTE_DIRECT) ?: UPDATE_ROUTE_DIRECT)
+            .coerceIn(UPDATE_ROUTE_DIRECT, UPDATE_ROUTE_PROXY_2)
+    }
+
+    fun setUpdateDownloadRoute(ctx: Context?, route: Int) {
+        val clamped = route.coerceIn(UPDATE_ROUTE_DIRECT, UPDATE_ROUTE_PROXY_2)
+        prefs(ctx)?.edit()?.putInt(KEY_UPDATE_DOWNLOAD_ROUTE, clamped)?.apply()
+        _updateDownloadRouteFlow.value = clamped
     }
 }

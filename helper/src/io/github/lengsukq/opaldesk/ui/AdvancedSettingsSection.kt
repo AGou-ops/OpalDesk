@@ -9,6 +9,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -56,9 +57,7 @@ import kotlin.math.roundToInt
  * - 5 persistent Android-side workspace configuration slots (load any slot for local / external
  *   monitor / casting / receiving device setups; runtime tweaks apply live without auto-overwriting
  *   saved slots until the user chooses a target slot on exit)
- * - Global custom DPI (Auto or exact 120–560 DPI)
- * - Per-app custom DPI overrides (with live hot-apply and searchable app picker)
- * - Layout restore & exit save defaults
+ * - Layout restore & exit save defaults (visual DPI tuning lives exclusively inside DeX)
  */
 @Composable
 fun ConsoleAdvancedSettingsSection(
@@ -77,22 +76,6 @@ fun ConsoleAdvancedSettingsSection(
 
     var editingProfileName by remember(activeSlot.id, activeSlot.name) { mutableStateOf(activeSlot.name) }
     var showRenameRow by remember(activeSlot.id) { mutableStateOf(false) }
-    var customDpiInput by remember(working.globalCustomDpi) {
-        mutableStateOf(if (working.globalCustomDpi > 0) working.globalCustomDpi.toString() else "240")
-    }
-    var showAddAppPicker by remember { mutableStateOf(false) }
-    var appSearchQuery by remember { mutableStateOf("") }
-    var installedApps by remember { mutableStateOf<List<InstalledAppEntry>>(emptyList()) }
-
-    LaunchedEffect(showAddAppPicker, working.appCustomDpis.size) {
-        if (installedApps.isEmpty() && (showAddAppPicker || working.appCustomDpis.isNotEmpty())) {
-            installedApps = AppCatalogRepository.loadLaunchableApps(ctx)
-        }
-    }
-
-    val appLabelByPkg = remember(installedApps) {
-        installedApps.associate { it.pkg to it.label }
-    }
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         // Card A: 5 Persistent Configuration Slots
@@ -217,275 +200,6 @@ fun ConsoleAdvancedSettingsSection(
             }
         }
 
-        // Card B: Global Custom DPI & Per-App Custom DPI
-        MacGlassSectionCard {
-            OpalText(text = "自定义 DPI（全局与单应用独立覆盖）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(4.dp))
-            OpalText(
-                text = "DPI 越高界面元素越大，DPI 越低视野越宽广（120–560）；修改后实时热刷新，退出时可选择保存到指定槽位",
-                fontSize = 12.sp,
-                color = OpalPalette.TextSecondary,
-            )
-            Spacer(Modifier.height(10.dp))
-
-            val isCustomGlobal = working.globalCustomDpi > 0
-            OpalSegmentedRow(
-                options = listOf("自动适配 (推荐)", "自定义全局 DPI"),
-                selectedIndex = if (isCustomGlobal) 1 else 0,
-                onSelect = { idx ->
-                    if (idx == 0) {
-                        BridgeClient.setGlobalCustomDpiAsync(ctx, 0)
-                    } else {
-                        val parsed = customDpiInput.toIntOrNull()?.coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI) ?: 240
-                        customDpiInput = parsed.toString()
-                        BridgeClient.setGlobalCustomDpiAsync(ctx, parsed)
-                    }
-                },
-            )
-
-            if (isCustomGlobal) {
-                var draftGlobalDpi by remember(working.globalCustomDpi) { mutableIntStateOf(working.globalCustomDpi) }
-                Spacer(Modifier.height(12.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    OpalText(text = "全局固定 DPI 数值（松手生效）", fontSize = 12.sp, color = OpalPalette.TextSecondary)
-                    OpalText(
-                        text = "$draftGlobalDpi DPI",
-                        fontSize = 13.sp,
-                        fontWeight = FontWeight.Bold,
-                        fontFamily = FontFamily.Monospace,
-                        color = OpalPalette.AccentBlue,
-                    )
-                }
-                Spacer(Modifier.height(4.dp))
-                OpalGlassSlider(
-                    value = draftGlobalDpi.toFloat(),
-                    valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
-                    onValueChange = { v ->
-                        val stepped = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
-                        draftGlobalDpi = stepped
-                        customDpiInput = stepped.toString()
-                    },
-                    onValueChangeFinished = {
-                        if (draftGlobalDpi != working.globalCustomDpi) {
-                            BridgeClient.setGlobalCustomDpiAsync(ctx, draftGlobalDpi)
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(6.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    listOf(160, 200, 240, 320, 400).forEach { preset ->
-                        OpalButton(
-                            label = "$preset",
-                            compact = true,
-                            filled = working.globalCustomDpi == preset,
-                            accent = if (working.globalCustomDpi == preset) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
-                            onClick = {
-                                customDpiInput = preset.toString()
-                                BridgeClient.setGlobalCustomDpiAsync(ctx, preset)
-                            },
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    OpalTextInput(
-                        value = customDpiInput,
-                        onValueChange = { txt -> customDpiInput = txt.filter { it.isDigit() }.take(3) },
-                        placeholder = "精确输入 120–560",
-                        modifier = Modifier.weight(1f),
-                    )
-                    OpalButton(
-                        label = "应用 DPI",
-                        compact = true,
-                        onClick = {
-                            val parsed = customDpiInput.toIntOrNull()
-                            if (parsed == null || parsed !in ProfileConfigStore.MIN_DPI..ProfileConfigStore.MAX_DPI) {
-                                Toast.makeText(ctx, "请输入 120 到 560 之间的 DPI 数值", Toast.LENGTH_SHORT).show()
-                            } else {
-                                BridgeClient.setGlobalCustomDpiAsync(ctx, parsed)
-                                Toast.makeText(ctx, "全局 DPI 已设为 $parsed", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                    )
-                }
-            }
-
-            Spacer(Modifier.height(14.dp))
-            Box(modifier = Modifier.fillMaxWidth().height(0.8.dp).background(OpalPalette.DividerColor))
-            Spacer(Modifier.height(12.dp))
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    OpalText(
-                        text = "单应用自定义 DPI (${working.appCustomDpis.size})",
-                        fontSize = 13.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    OpalText(
-                        text = "优先级高于全局 DPI，也可在桌面右键任意应用图标随时调整",
-                        fontSize = 11.5.sp,
-                        color = OpalPalette.TextSecondary,
-                    )
-                }
-                Spacer(Modifier.width(8.dp))
-                OpalButton(
-                    label = if (showAddAppPicker) "收起列表" else "+ 添加应用",
-                    compact = true,
-                    onClick = { showAddAppPicker = !showAddAppPicker },
-                )
-            }
-
-            if (working.appCustomDpis.isNotEmpty()) {
-                Spacer(Modifier.height(10.dp))
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    working.appCustomDpis.entries.forEach { (pkg, dpi) ->
-                        val label = appLabelByPkg[pkg] ?: pkg
-                        val icon = remember(pkg) { AppCatalogRepository.getAppIcon(ctx, pkg) }
-                        var draftAppDpi by remember(pkg, dpi) { mutableIntStateOf(dpi) }
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(OpalPalette.ChipFill)
-                                .border(0.75.dp, OpalPalette.BorderSubtle, RoundedCornerShape(14.dp))
-                                .padding(horizontal = 12.dp, vertical = 9.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                    modifier = Modifier.weight(1f),
-                                ) {
-                                    if (icon != null) {
-                                        Image(
-                                            bitmap = icon,
-                                            contentDescription = label,
-                                            modifier = Modifier.size(24.dp).clip(RoundedCornerShape(6.dp)),
-                                        )
-                                    }
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        OpalText(text = label, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                                        OpalText(text = pkg, fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = OpalPalette.TextMuted, maxLines = 1)
-                                    }
-                                }
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                ) {
-                                    OpalText(
-                                        text = "$draftAppDpi DPI",
-                                        fontSize = 12.5.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        fontFamily = FontFamily.Monospace,
-                                        color = OpalPalette.AccentBlue,
-                                    )
-                                    OpalButton(
-                                        label = "恢复默认",
-                                        compact = true,
-                                        filled = false,
-                                        accent = OpalPalette.AccentDanger,
-                                        onClick = { BridgeClient.setAppCustomDpiAsync(ctx, pkg, 0) },
-                                    )
-                                }
-                            }
-                            OpalGlassSlider(
-                                value = draftAppDpi.toFloat(),
-                                valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
-                                onValueChange = { v ->
-                                    draftAppDpi = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
-                                },
-                                onValueChangeFinished = {
-                                    if (draftAppDpi != dpi) {
-                                        BridgeClient.setAppCustomDpiAsync(ctx, pkg, draftAppDpi)
-                                    }
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                            )
-                        }
-                    }
-                }
-            }
-
-            if (showAddAppPicker) {
-                Spacer(Modifier.height(10.dp))
-                OpalTextInput(
-                    value = appSearchQuery,
-                    onValueChange = { appSearchQuery = it },
-                    placeholder = "搜索已安装应用名称或包名…",
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Spacer(Modifier.height(8.dp))
-                val q = appSearchQuery.trim().lowercase()
-                val filtered = remember(installedApps, q, working.appCustomDpis) {
-                    installedApps
-                        .filter { !working.appCustomDpis.containsKey(it.pkg) }
-                        .filter { q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q) }
-                        .take(24)
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 220.dp)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    filtered.forEach { app ->
-                        val icon = remember(app.pkg) { AppCatalogRepository.getAppIcon(ctx, app.pkg) }
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(11.dp))
-                                .background(OpalPalette.ChipFill)
-                                .clickable {
-                                    val defaultDpi = if (working.globalCustomDpi > 0) working.globalCustomDpi else 260
-                                    BridgeClient.setAppCustomDpiAsync(ctx, app.pkg, defaultDpi)
-                                    showAddAppPicker = false
-                                    appSearchQuery = ""
-                                    Toast.makeText(ctx, "已为「${app.label}」应用自定义 DPI ($defaultDpi)", Toast.LENGTH_SHORT).show()
-                                }
-                                .padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            if (icon != null) {
-                                Image(
-                                    bitmap = icon,
-                                    contentDescription = app.label,
-                                    modifier = Modifier.size(22.dp).clip(RoundedCornerShape(5.dp)),
-                                )
-                            }
-                            Column(modifier = Modifier.weight(1f)) {
-                                OpalText(text = app.label, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, maxLines = 1)
-                                OpalText(text = app.pkg, fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = OpalPalette.TextMuted, maxLines = 1)
-                            }
-                            OpalText(text = "添加", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.AccentBlue)
-                        }
-                    }
-                }
-            }
-        }
 
         // Card C: Layout Restore & Window Memory Policy
         MacGlassSectionCard {
@@ -648,95 +362,143 @@ fun ExitSaveSlotModal(
     val storeState by ProfileConfigStore.stateFlow.collectAsState()
     var selectedSlotId by remember { mutableIntStateOf(storeState.activeSlotId) }
     var includeLayout by remember { mutableStateOf(storeState.workingConfig.keepLayoutOnExit) }
+    var showSlotPicker by remember { mutableStateOf(false) }
+    val selectedSlot = storeState.slots.firstOrNull { it.id == selectedSlotId } ?: storeState.activeSavedSlot
+    val hasChangesToSave = storeState.hasUnsavedChanges || openWindowCount > 0
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxSize()
             .background(OpalPalette.ScrimColor)
             .clickable(enabled = !busy, onClick = onDismiss)
-            .padding(20.dp),
+            .padding(horizontal = 16.dp, vertical = 14.dp),
         contentAlignment = Alignment.Center,
     ) {
+        val modalMaxH = (maxHeight - 16.dp).coerceAtLeast(240.dp)
         OpalGlassCard(
             modifier = Modifier
-                .widthIn(max = 460.dp)
+                .widthIn(max = 440.dp)
                 .fillMaxWidth()
+                .heightIn(max = modalMaxH)
                 .pointerInput(Unit) { detectTapGestures {} },
             cornerRadius = 24.dp,
             fillColor = OpalPalette.GlassPopover,
-            contentPadding = PaddingValues(20.dp),
+            contentPadding = PaddingValues(18.dp),
         ) {
-            OpalText(text = title, fontSize = 17.5.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.height(6.dp))
+            // Pinned Header
+            OpalText(text = title, fontSize = 17.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(4.dp))
             OpalText(
-                text = subtitle,
-                fontSize = 12.5.sp,
-                color = OpalPalette.TextSecondary,
-                lineHeight = 18.sp,
-            )
-
-            Spacer(Modifier.height(14.dp))
-            OpalText(
-                text = "选择要保存到的配置槽位（保存当前 DPI、应用窗口位置与设置）：",
+                text = if (hasChangesToSave) subtitle else "本次会话未修改配置且无打开窗口，可直接退出或保存到配置槽位。",
                 fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = OpalPalette.TextPrimary,
+                color = OpalPalette.TextSecondary,
+                lineHeight = 17.sp,
             )
-            Spacer(Modifier.height(8.dp))
 
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                storeState.slots.forEach { slot ->
-                    val selected = slot.id == selectedSlotId
-                    val rowShape = RoundedCornerShape(12.dp)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(rowShape)
-                            .background(if (selected) OpalPalette.AccentBlue.copy(alpha = 0.16f) else OpalPalette.ChipFill)
-                            .border(
-                                width = if (selected) 1.2.dp else 0.7.dp,
-                                color = if (selected) OpalPalette.AccentBlue else OpalPalette.BorderSubtle,
-                                shape = rowShape,
-                            )
-                            .clickable(enabled = !busy) { selectedSlotId = slot.id }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            OpalText(
-                                text = "槽位 ${slot.id + 1} · ${slot.name}",
-                                fontSize = 13.sp,
-                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                                color = if (selected) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
-                                maxLines = 1,
-                            )
-                            val dpiSummary = if (slot.globalCustomDpi > 0) "${slot.globalCustomDpi} DPI" else "自动 DPI"
-                            OpalText(
-                                text = "已存：$dpiSummary · ${slot.appCustomDpis.size} 个应用 DPI · ${slot.savedLayout.size} 窗布局",
-                                fontSize = 10.5.sp,
-                                color = OpalPalette.TextMuted,
-                                maxLines = 1,
-                            )
-                        }
-                        if (selected) {
-                            OpalStatusBadge(label = "保存到此", color = OpalPalette.AccentBlue)
+            Spacer(Modifier.height(10.dp))
+            // Scrollable Body: Compact selected slot summary + collapsible 5-slot picker
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val summaryShape = RoundedCornerShape(13.dp)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(summaryShape)
+                        .background(OpalPalette.AccentBlue.copy(alpha = 0.14f))
+                        .border(1.dp, OpalPalette.AccentBlue.copy(alpha = 0.55f), summaryShape)
+                        .clickable(enabled = !busy) { showSlotPicker = !showSlotPicker }
+                        .padding(horizontal = 12.dp, vertical = 9.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        OpalText(
+                            text = "保存到：槽位 ${selectedSlot.id + 1} · ${selectedSlot.name}",
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = OpalPalette.AccentBlue,
+                            maxLines = 1,
+                        )
+                        val dpiSummary = if (selectedSlot.globalCustomDpi > 0) "${selectedSlot.globalCustomDpi} DPI" else "自动 DPI"
+                        OpalText(
+                            text = "已存：$dpiSummary · ${selectedSlot.appCustomDpis.size} 应用 · ${selectedSlot.savedLayout.size} 窗",
+                            fontSize = 10.5.sp,
+                            color = OpalPalette.TextSecondary,
+                            maxLines = 1,
+                        )
+                    }
+                    OpalText(
+                        text = if (showSlotPicker) "收起 ▴" else "切换槽位 ▾",
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OpalPalette.AccentBlue,
+                    )
+                }
+
+                if (showSlotPicker) {
+                    Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                        storeState.slots.forEach { slot ->
+                            val selected = slot.id == selectedSlotId
+                            val rowShape = RoundedCornerShape(11.dp)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(rowShape)
+                                    .background(if (selected) OpalPalette.AccentBlue.copy(alpha = 0.16f) else OpalPalette.ChipFill)
+                                    .border(
+                                        width = if (selected) 1.1.dp else 0.7.dp,
+                                        color = if (selected) OpalPalette.AccentBlue else OpalPalette.BorderSubtle,
+                                        shape = rowShape,
+                                    )
+                                    .clickable(enabled = !busy) {
+                                        selectedSlotId = slot.id
+                                        showSlotPicker = false
+                                    }
+                                    .padding(horizontal = 11.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    OpalText(
+                                        text = "槽位 ${slot.id + 1} · ${slot.name}",
+                                        fontSize = 12.5.sp,
+                                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                        color = if (selected) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                                        maxLines = 1,
+                                    )
+                                    val dpiSummary = if (slot.globalCustomDpi > 0) "${slot.globalCustomDpi} DPI" else "自动 DPI"
+                                    OpalText(
+                                        text = "$dpiSummary · ${slot.appCustomDpis.size} 应用 · ${slot.savedLayout.size} 窗",
+                                        fontSize = 10.sp,
+                                        color = OpalPalette.TextMuted,
+                                        maxLines = 1,
+                                    )
+                                }
+                                if (selected) {
+                                    OpalStatusBadge(label = "当前", color = OpalPalette.AccentBlue)
+                                }
+                            }
                         }
                     }
                 }
+
+                if (openWindowCount > 0) {
+                    OpalSwitchRow(
+                        title = "同时保留当前窗口布局（$openWindowCount 个窗口）",
+                        subtitle = "记录已打开窗口的位置、大小、贴边与最小化状态",
+                        checked = includeLayout,
+                        onCheckedChange = { includeLayout = it },
+                    )
+                }
             }
 
-            if (openWindowCount > 0) {
-                Spacer(Modifier.height(10.dp))
-                OpalSwitchRow(
-                    title = "同时保留当前窗口布局（$openWindowCount 个窗口）",
-                    subtitle = "记录所有已打开窗口的位置、大小、贴边与最小化状态",
-                    checked = includeLayout,
-                    onCheckedChange = { includeLayout = it },
-                )
-            }
-
-            Spacer(Modifier.height(14.dp))
+            // Pinned Bottom Action Row
+            Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 OpalButton(
                     label = "取消",
@@ -744,13 +506,13 @@ fun ExitSaveSlotModal(
                     filled = false,
                     enabled = !busy,
                     onClick = onDismiss,
-                    modifier = Modifier.weight(0.75f),
+                    modifier = Modifier.weight(0.7f),
                 )
                 OpalButton(
-                    label = "不保存退出",
+                    label = if (hasChangesToSave) "不保存退出" else "直接退出",
                     compact = true,
-                    filled = false,
-                    accent = OpalPalette.AccentDanger,
+                    filled = !hasChangesToSave,
+                    accent = if (hasChangesToSave) OpalPalette.AccentDanger else OpalPalette.AccentBlue,
                     enabled = !busy,
                     onClick = onExitWithoutSaving,
                     modifier = Modifier.weight(1f),
@@ -758,9 +520,10 @@ fun ExitSaveSlotModal(
                 OpalButton(
                     label = if (busy) "正在保存…" else confirmLabel,
                     compact = true,
+                    filled = hasChangesToSave,
                     enabled = !busy,
                     onClick = { onSaveToSlotAndExit(selectedSlotId, includeLayout) },
-                    modifier = Modifier.weight(1.3f),
+                    modifier = Modifier.weight(1.25f),
                 )
             }
         }
@@ -882,15 +645,15 @@ fun PerAppDpiEditorModal(
 }
 
 /**
- * In-DeX live-preview floating DPI panel (no opaque scrim so open windows remain visible while
- * adjusting Global DPI or Per-App DPI in real time). All edits mutate the active working profile
- * and are saved alongside the desktop layout into the user-selected slot (1..5) upon exit.
+ * Compact in-DeX live-preview floating DPI panel (no opaque scrim so open windows remain visible
+ * while adjusting Global DPI or currently open window DPI in real time). All edits mutate the
+ * active working profile and are saved alongside the desktop layout into the selected slot on exit.
  */
 @Composable
 fun DexDpiSettingsPopover(
     openWindows: List<CompositorWindow>,
     allApps: List<InstalledAppEntry>,
-    maxHeight: Dp = 600.dp,
+    maxHeight: Dp = 560.dp,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -899,59 +662,49 @@ fun DexDpiSettingsPopover(
     val working = storeState.workingConfig
     val activeSlot = storeState.activeSavedSlot
 
-    var showOtherApps by remember { mutableStateOf(false) }
-    var searchQuery by remember { mutableStateOf("") }
     val appLabelByPkg = remember(allApps) { allApps.associate { it.pkg to it.label } }
     val openByPkg = remember(openWindows) { openWindows.associateBy { it.pkg } }
 
-    val shape = RoundedCornerShape(24.dp)
-    val cardShape = RoundedCornerShape(14.dp)
+    val shape = RoundedCornerShape(20.dp)
+    val cardShape = RoundedCornerShape(12.dp)
 
     Column(
         modifier = modifier
-            .widthIn(max = 384.dp)
+            .widthIn(max = 344.dp)
             .fillMaxWidth()
             .heightIn(max = maxHeight)
             .liquidGlassSurface(
                 shape = shape,
                 fill = OpalPalette.LiquidPopoverFill,
                 rim = OpalPalette.LiquidGlassRim,
-                elevation = 28.dp,
+                elevation = 24.dp,
             )
             .pointerInput(Unit) { detectTapGestures {} }
             .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .padding(12.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        // Header
+        // Compact Header
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    OpalText(text = "实时 DPI 设置", fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                    OpalStatusBadge(
-                        label = if (storeState.hasUnsavedChanges) "槽位 ${activeSlot.id + 1} · 未保存" else "槽位 ${activeSlot.id + 1}",
-                        color = if (storeState.hasUnsavedChanges) OpalPalette.AccentAmber else OpalPalette.AccentBlue,
-                    )
-                }
-                Spacer(Modifier.height(2.dp))
-                OpalText(
-                    text = "拖动滑块即可实时看到窗口变化，退出时随布局保存到选定槽位",
-                    fontSize = 10.5.sp,
-                    color = OpalPalette.TextSecondary,
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f),
+            ) {
+                OpalText(text = "实时 DPI", fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                OpalStatusBadge(
+                    label = if (storeState.hasUnsavedChanges) "槽位 ${activeSlot.id + 1} · 未保存" else "槽位 ${activeSlot.id + 1}",
+                    color = if (storeState.hasUnsavedChanges) OpalPalette.AccentAmber else OpalPalette.AccentBlue,
                 )
             }
-            Spacer(Modifier.width(8.dp))
             OpalButton(label = "完成", compact = true, filled = false, onClick = onDismiss)
         }
 
-        // Section 1: Global Custom DPI (commit once on release to prevent VirtualDisplay.resize storms)
+        // Section 1: Global Custom DPI (commit once on release)
         val isCustomGlobal = working.globalCustomDpi > 0
         var draftGlobalDpi by remember(working.globalCustomDpi) { mutableIntStateOf(working.globalCustomDpi.coerceAtLeast(ProfileConfigStore.MIN_DPI)) }
         Column(
@@ -959,26 +712,26 @@ fun DexDpiSettingsPopover(
                 .fillMaxWidth()
                 .clip(cardShape)
                 .background(OpalPalette.ChipFill)
-                .border(0.75.dp, OpalPalette.BorderHairline, cardShape)
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+                .border(0.7.dp, OpalPalette.BorderHairline, cardShape)
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                OpalText(text = "全局自定义 DPI（松手生效）", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                OpalText(text = "全局 DPI", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 OpalText(
                     text = if (isCustomGlobal) "$draftGlobalDpi DPI" else "自动适配",
-                    fontSize = 12.5.sp,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     fontFamily = FontFamily.Monospace,
                     color = OpalPalette.AccentBlue,
                 )
             }
             OpalSegmentedRow(
-                options = listOf("自动适配", "自定义全局 DPI"),
+                options = listOf("自动适配", "自定义"),
                 selectedIndex = if (isCustomGlobal) 1 else 0,
                 onSelect = { idx ->
                     if (idx == 0) {
@@ -1004,7 +757,7 @@ fun DexDpiSettingsPopover(
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     listOf(160, 200, 240, 320, 400).forEach { preset ->
                         OpalButton(
                             label = "$preset",
@@ -1022,30 +775,30 @@ fun DexDpiSettingsPopover(
             }
         }
 
-        // Section 2: Open Windows Per-App Custom DPI (live preview right on desktop)
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // Section 2: Currently Open Windows Per-App DPI (live visual adjustment)
+        Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 OpalText(
-                    text = "当前窗口独立 DPI (${openWindows.size})",
-                    fontSize = 12.5.sp,
+                    text = "当前窗口 (${openWindows.distinctBy { it.pkg }.size})",
+                    fontSize = 11.5.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = OpalPalette.TextSecondary,
                 )
                 OpalText(
-                    text = "已设 ${working.appCustomDpis.size} 个应用",
-                    fontSize = 10.5.sp,
-                    color = OpalPalette.AccentCyan,
+                    text = "拖动松手实时生效",
+                    fontSize = 10.sp,
+                    color = OpalPalette.TextMuted,
                 )
             }
 
             if (openWindows.isEmpty()) {
                 OpalText(
-                    text = "当前暂无打开的窗口，打开应用后可在此实时拖动滑块预览效果",
-                    fontSize = 11.5.sp,
+                    text = "打开任意应用后，可在此实时拖动调节它的独立 DPI",
+                    fontSize = 11.sp,
                     color = OpalPalette.TextMuted,
                 )
             } else {
@@ -1065,12 +818,12 @@ fun DexDpiSettingsPopover(
                             .clip(cardShape)
                             .background(OpalPalette.ChipFill)
                             .border(
-                                width = if (customDpi > 0) 1.dp else 0.7.dp,
+                                width = if (customDpi > 0) 0.9.dp else 0.65.dp,
                                 color = if (customDpi > 0) OpalPalette.AccentBlue.copy(alpha = 0.55f) else OpalPalette.BorderHairline,
                                 shape = cardShape,
                             )
-                            .padding(horizontal = 11.dp, vertical = 9.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                            .padding(horizontal = 9.dp, vertical = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -1079,38 +832,41 @@ fun DexDpiSettingsPopover(
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(7.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
                                 modifier = Modifier.weight(1f),
                             ) {
                                 if (icon != null) {
                                     Image(
                                         bitmap = icon,
                                         contentDescription = win.title,
-                                        modifier = Modifier.size(22.dp).clip(RoundedCornerShape(5.dp)),
+                                        modifier = Modifier.size(18.dp).clip(RoundedCornerShape(4.dp)),
                                     )
                                 }
-                                Column(modifier = Modifier.weight(1f)) {
-                                    OpalText(text = win.title, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                                    OpalText(
-                                        text = when {
-                                            draftWinDpi != effectiveDpi -> "松手应用 · $draftWinDpi DPI"
-                                            customDpi > 0 -> "独立覆盖 · $customDpi DPI"
-                                            else -> "跟随全局 · 当前 ${win.contentDpi} DPI"
-                                        },
-                                        fontSize = 10.sp,
-                                        color = if (customDpi > 0 || draftWinDpi != effectiveDpi) OpalPalette.AccentBlue else OpalPalette.TextMuted,
-                                        maxLines = 1,
-                                    )
-                                }
+                                OpalText(text = win.title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
                             }
-                            if (customDpi > 0) {
-                                OpalButton(
-                                    label = "恢复默认",
-                                    compact = true,
-                                    filled = false,
-                                    accent = OpalPalette.AccentAmber,
-                                    onClick = { BridgeClient.setAppCustomDpiAsync(ctx, win.pkg, 0) },
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            ) {
+                                OpalText(
+                                    text = if (customDpi > 0 || draftWinDpi != effectiveDpi) "$draftWinDpi" else "自动 ${win.contentDpi}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = if (customDpi > 0 || draftWinDpi != effectiveDpi) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
                                 )
+                                if (customDpi > 0) {
+                                    OpalText(
+                                        text = "重置",
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = OpalPalette.AccentAmber,
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .clickable { BridgeClient.setAppCustomDpiAsync(ctx, win.pkg, 0) }
+                                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                                    )
+                                }
                             }
                         }
                         OpalGlassSlider(
@@ -1131,149 +887,65 @@ fun DexDpiSettingsPopover(
             }
         }
 
-        // Section 3: Other saved per-app overrides (not currently open) — directly adjustable without launching
+        // Section 3: Compact summary of saved per-app overrides not currently open (remove-only)
         val closedOverrides = working.appCustomDpis.entries.filter { !openByPkg.containsKey(it.key) }
         if (closedOverrides.isNotEmpty()) {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 OpalText(
-                    text = "本方案其他已设应用 DPI (${closedOverrides.size})",
-                    fontSize = 11.5.sp,
+                    text = "已存独立 DPI · 未打开 (${closedOverrides.size})",
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = OpalPalette.TextSecondary,
                 )
                 closedOverrides.forEach { (pkg, dpi) ->
                     val label = appLabelByPkg[pkg] ?: pkg
                     val icon = remember(pkg) { AppCatalogRepository.getAppIcon(ctx, pkg) }
-                    var draftClosedDpi by remember(pkg, dpi) { mutableIntStateOf(dpi) }
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(cardShape)
-                            .background(OpalPalette.ChipFill)
-                            .border(0.8.dp, OpalPalette.AccentBlue.copy(alpha = 0.42f), cardShape)
-                            .padding(horizontal = 11.dp, vertical = 9.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(7.dp),
-                                modifier = Modifier.weight(1f),
-                            ) {
-                                if (icon != null) {
-                                    Image(
-                                        bitmap = icon,
-                                        contentDescription = label,
-                                        modifier = Modifier.size(22.dp).clip(RoundedCornerShape(5.dp)),
-                                    )
-                                }
-                                Column(modifier = Modifier.weight(1f)) {
-                                    OpalText(text = label, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                                    OpalText(
-                                        text = if (draftClosedDpi != dpi) "松手应用 · $draftClosedDpi DPI" else "独立覆盖 · $draftClosedDpi DPI",
-                                        fontSize = 10.sp,
-                                        color = OpalPalette.AccentBlue,
-                                        maxLines = 1,
-                                    )
-                                }
-                            }
-                            OpalButton(
-                                label = "移除",
-                                compact = true,
-                                filled = false,
-                                accent = OpalPalette.AccentDanger,
-                                onClick = { BridgeClient.setAppCustomDpiAsync(ctx, pkg, 0) },
-                            )
-                        }
-                        OpalGlassSlider(
-                            value = draftClosedDpi.toFloat(),
-                            valueRange = ProfileConfigStore.MIN_DPI.toFloat()..ProfileConfigStore.MAX_DPI.toFloat(),
-                            onValueChange = { v ->
-                                draftClosedDpi = ((v / 10f).roundToInt() * 10).coerceIn(ProfileConfigStore.MIN_DPI, ProfileConfigStore.MAX_DPI)
-                            },
-                            onValueChangeFinished = {
-                                if (draftClosedDpi != dpi) {
-                                    BridgeClient.setAppCustomDpiAsync(ctx, pkg, draftClosedDpi)
-                                }
-                            },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-                            listOf(160, 240, 320, 400).forEach { preset ->
-                                OpalButton(
-                                    label = "$preset",
-                                    compact = true,
-                                    filled = draftClosedDpi == preset,
-                                    accent = if (draftClosedDpi == preset) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
-                                    onClick = {
-                                        draftClosedDpi = preset
-                                        BridgeClient.setAppCustomDpiAsync(ctx, pkg, preset)
-                                    },
-                                    modifier = Modifier.weight(1f),
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            OpalText(
-                text = "未打开的应用也可预先设置",
-                fontSize = 11.sp,
-                color = OpalPalette.TextMuted,
-            )
-            OpalButton(
-                label = if (showOtherApps) "收起列表" else "+ 选择其他应用",
-                compact = true,
-                filled = false,
-                onClick = { showOtherApps = !showOtherApps },
-            )
-        }
-
-        if (showOtherApps) {
-            OpalTextInput(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                placeholder = "搜索应用名称或包名…",
-                modifier = Modifier.fillMaxWidth(),
-            )
-            val q = searchQuery.trim().lowercase()
-            val candidates = remember(allApps, q, working.appCustomDpis, openByPkg) {
-                allApps
-                    .filter { !working.appCustomDpis.containsKey(it.pkg) && !openByPkg.containsKey(it.pkg) }
-                    .filter { q.isEmpty() || it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q) }
-                    .take(18)
-            }
-            Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                candidates.forEach { app ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(10.dp))
                             .background(OpalPalette.ChipFill)
-                            .clickable {
-                                val initDpi = if (working.globalCustomDpi > 0) working.globalCustomDpi else 260
-                                BridgeClient.setAppCustomDpiAsync(ctx, app.pkg, initDpi)
-                                showOtherApps = false
-                                searchQuery = ""
-                                Toast.makeText(ctx, "已为「${app.label}」添加 $initDpi DPI（退出时随槽位保存）", Toast.LENGTH_SHORT).show()
-                            }
-                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                            .border(0.6.dp, OpalPalette.BorderHairline, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 9.dp, vertical = 5.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        OpalText(text = app.label, fontSize = 12.sp, maxLines = 1, modifier = Modifier.weight(1f))
-                        OpalText(text = "添加", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = OpalPalette.AccentBlue)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.weight(1f),
+                        ) {
+                            if (icon != null) {
+                                Image(
+                                    bitmap = icon,
+                                    contentDescription = label,
+                                    modifier = Modifier.size(16.dp).clip(RoundedCornerShape(4.dp)),
+                                )
+                            }
+                            OpalText(text = label, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, maxLines = 1)
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OpalText(
+                                text = "$dpi DPI",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                fontFamily = FontFamily.Monospace,
+                                color = OpalPalette.AccentBlue,
+                            )
+                            OpalText(
+                                text = "移除",
+                                fontSize = 10.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = OpalPalette.AccentDanger,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable { BridgeClient.setAppCustomDpiAsync(ctx, pkg, 0) }
+                                    .padding(horizontal = 4.dp, vertical = 1.dp),
+                            )
+                        }
                     }
                 }
             }

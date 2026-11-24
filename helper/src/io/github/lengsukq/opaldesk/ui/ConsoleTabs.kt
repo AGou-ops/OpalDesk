@@ -1020,9 +1020,9 @@ fun ConsoleDisplaySettingsTab(
             }
         }
 
-        // 3. Target Frame Rate, Output UI Scale & App Window DPI Density (Unified for USB-C & Casting)
+        // 3. Target Frame Rate & Output UI Scale (Unified for USB-C & Casting; DPI is adjusted visually inside DeX)
         MacGlassSectionCard {
-            OpalText(text = "帧率、缩放与窗口密度（外接与投屏统一生效）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            OpalText(text = "帧率与界面缩放（外接与投屏统一生效）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(10.dp))
 
             OpalText(text = "桌面与虚拟屏目标帧率（同步作用于 USB-C 外接屏与投屏流）", fontSize = 12.sp, color = OpalPalette.TextSecondary)
@@ -1041,22 +1041,6 @@ fun ConsoleDisplaySettingsTab(
             )
 
             Spacer(Modifier.height(14.dp))
-            OpalText(text = "应用窗口内容密度 DPI（实时热刷新所有已打开窗口）", fontSize = 12.sp, color = OpalPalette.TextSecondary)
-            Spacer(Modifier.height(6.dp))
-            val dpiOptions = listOf(80, 100, 125)
-            val dpiIdx = dpiOptions.indexOfFirst { abs(it - status.windowDpiScalePct) <= 8 }.let { if (it >= 0) it else 1 }
-            OpalSegmentedRow(
-                options = listOf("紧凑视野 (80%)", "自动标准 (100%)", "大号易读 (125%)"),
-                selectedIndex = dpiIdx,
-                onSelect = { idx ->
-                    BridgeClient.updateDisplayPrefsAsync(
-                        targetFps = status.targetFps,
-                        windowDpiScalePct = dpiOptions[idx],
-                    )
-                },
-            )
-
-            Spacer(Modifier.height(14.dp))
             OpalText(text = "外接屏 / 投屏桌面界面缩放比例 (UI Scale)", fontSize = 12.sp, color = OpalPalette.TextSecondary)
             Spacer(Modifier.height(6.dp))
             val scaleOpts = listOf(1.0f, 1.25f, 1.5f)
@@ -1067,6 +1051,13 @@ fun ConsoleDisplaySettingsTab(
                 onSelect = { idx ->
                     io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.setWorkingExternalUiScale(ctx, scaleOpts[idx])
                 },
+            )
+
+            Spacer(Modifier.height(10.dp))
+            OpalText(
+                text = "应用窗口 DPI 请进入 DeX 桌面后，通过顶栏 DPI 入口实时可视化调节",
+                fontSize = 11.5.sp,
+                color = OpalPalette.TextMuted,
             )
         }
 
@@ -1163,16 +1154,19 @@ fun ConsoleDisplaySettingsTab(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 OpalText(
-                    text = "指针移动速度（无级调节 · 同步触控板与物理鼠标）",
+                    text = "指针移动速度（同步触控板与鼠标）",
                     fontSize = 12.sp,
                     color = OpalPalette.TextSecondary,
+                    modifier = Modifier.weight(1f),
                 )
+                Spacer(Modifier.width(10.dp))
                 OpalText(
-                    text = String.format(Locale.US, "%.2f× · 点此复位", trackpadSens),
+                    text = String.format(Locale.US, "%.2f× · 复位", trackpadSens),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     fontFamily = FontFamily.Monospace,
                     color = OpalPalette.AccentBlue,
+                    maxLines = 1,
                     modifier = Modifier.clickable {
                         AppPrefs.setTrackpadSensitivity(ctx, AppPrefs.DEFAULT_TRACKPAD_SENSITIVITY)
                         BridgeClient.setPointerSpeedAsync(AppPrefs.DEFAULT_TRACKPAD_SENSITIVITY)
@@ -1205,10 +1199,12 @@ fun ConsoleDisplaySettingsTab(
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 OpalText(
-                    text = if (customWallpaperPath.isNotBlank()) "桌面壁纸（当前已启用相册自定义壁纸）" else "桌面壁纸（支持右键 / 长按桌面自由更换）",
+                    text = if (customWallpaperPath.isNotBlank()) "桌面壁纸（已启用相册壁纸）" else "桌面壁纸（支持右键 / 长按更换）",
                     fontSize = 12.sp,
                     color = OpalPalette.TextSecondary,
+                    modifier = Modifier.weight(1f),
                 )
+                Spacer(Modifier.width(10.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (customWallpaperPath.isNotBlank()) {
                         OpalButton(

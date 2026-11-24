@@ -32,13 +32,15 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.update.AppUpdateLogic
 import io.github.lengsukq.opaldesk.update.AppUpdateManager
 import kotlin.math.roundToInt
 
 /**
  * Apple Liquid Glass in-app update dialog supporting changelog preview, live streaming APK
- * download progress with cancellation, one-tap PackageInstaller handoff, and browser fallback.
+ * download progress with cancellation, download route switching (Direct / China mirrors),
+ * one-tap PackageInstaller handoff, and browser fallback.
  */
 @Composable
 fun AppUpdateModal(
@@ -47,6 +49,8 @@ fun AppUpdateModal(
     val ctx = LocalContext.current
     val currentVersion = remember(ctx) { AppUpdateManager.getCurrentVersionName(ctx) }
     val state by AppUpdateManager.stateFlow.collectAsState()
+    val downloadRouteIdx by AppPrefs.updateDownloadRouteFlow.collectAsState()
+    val activeRoute = AppUpdateLogic.DownloadRoute.fromIndex(downloadRouteIdx)
     val release = when (val s = state) {
         is AppUpdateManager.UpdateState.UpdateAvailable -> s.release
         is AppUpdateManager.UpdateState.Downloading -> s.release
@@ -339,6 +343,45 @@ fun AppUpdateModal(
                         modifier = Modifier.fillMaxWidth(),
                     )
                 }
+            }
+
+            // Download Route Selector (Direct / China Proxy Mirrors for faster APK downloads)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(OpalPalette.ChipFill)
+                    .border(0.7.dp, OpalPalette.BorderHairline, RoundedCornerShape(14.dp))
+                    .padding(horizontal = 11.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    OpalText(
+                        text = "下载线路",
+                        fontSize = 11.5.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = OpalPalette.TextSecondary,
+                    )
+                    OpalText(
+                        text = activeRoute.detail,
+                        fontSize = 10.5.sp,
+                        color = OpalPalette.AccentCyan,
+                        maxLines = 1,
+                    )
+                }
+                OpalSegmentedRow(
+                    options = listOf("直连", "代理一", "代理二"),
+                    selectedIndex = activeRoute.index,
+                    onSelect = { idx ->
+                        if (!isDownloading) {
+                            AppPrefs.setUpdateDownloadRoute(ctx, idx)
+                        }
+                    },
+                )
             }
 
             // Secondary GitHub Releases browser link
