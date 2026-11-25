@@ -136,10 +136,13 @@ fun MacDesktopMenuBar(
     isCompactWidth: Boolean,
     showControlCenter: Boolean,
     showDpiPopover: Boolean = false,
+    notificationCount: Int = 0,
+    showNotificationCenter: Boolean = false,
     showPhoneTrackpadButton: Boolean = false,
     phoneTrackpadVisible: Boolean = false,
     onTogglePhoneTrackpad: () -> Unit = {},
     onToggleDpiPopover: () -> Unit = {},
+    onToggleNotificationCenter: () -> Unit = {},
     onToggleFullscreen: () -> Unit,
     onToggleControlCenter: () -> Unit,
     onOpenConsole: () -> Unit,
@@ -268,6 +271,40 @@ fun MacDesktopMenuBar(
             }
             Spacer(Modifier.width(6.dp))
         }
+
+        // Top-Right Notification Center Bell Trigger
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .background(if (showNotificationCenter) OpalPalette.ChipActiveFill else Color.Transparent)
+                .clickable(onClick = onToggleNotificationCenter)
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            DesktopBellIcon(
+                tint = if (showNotificationCenter || notificationCount > 0) OpalPalette.AccentBlue else OpalPalette.TextPrimary,
+                modifier = Modifier.size(13.dp),
+            )
+            if (notificationCount > 0) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(OpalPalette.AccentBlue)
+                        .padding(horizontal = 4.5.dp, vertical = 0.5.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    OpalText(
+                        text = if (notificationCount > 99) "99+" else "$notificationCount",
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        maxLines = 1,
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.width(4.dp))
 
         // Unified Top-Right Status Bar & Control Center Trigger
         Row(

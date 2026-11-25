@@ -263,6 +263,9 @@ object OpalLogStore {
     private var initialized = false
 
     @Volatile
+    private var lastUploadedDaemonTail: List<String> = emptyList()
+
+    @Volatile
     private var logFile: File? = null
 
     fun init(ctx: Context) {
@@ -297,7 +300,46 @@ object OpalLogStore {
     }
 
     fun updateDaemonLogs(rawText: String) {
-        _daemonLogsFlow.value = rawText.trimEnd()
+        val trimmed = rawText.trimEnd()
+        _daemonLogsFlow.value = stripUploadedDaemonPrefix(trimmed, lastUploadedDaemonTail)
+    }
+
+    /**
+     * Clears local helper logs and records a daemon-log watermark after a confirmed upload so
+     * reporting a second issue right afterwards only includes newly generated logs.
+     */
+    fun clearAfterConfirmedUpload(uploadedDaemonText: String) {
+        val tailLines = uploadedDaemonText
+            .lineSequence()
+            .map { it.trimEnd() }
+            .filter { it.isNotBlank() }
+            .toList()
+            .takeLast(5)
+        if (tailLines.isNotEmpty()) {
+            lastUploadedDaemonTail = tailLines
+        }
+        _daemonLogsFlow.value = ""
+        clearHelperLogs()
+    }
+
+    internal fun stripUploadedDaemonPrefix(rawText: String, uploadedTail: List<String>): String {
+        if (rawText.isBlank() || uploadedTail.isEmpty()) return rawText
+        val lines = rawText.lines()
+        val tailSize = uploadedTail.size
+        for (idx in lines.size - tailSize downTo 0) {
+            var matched = true
+            for (j in 0 until tailSize) {
+                if (lines[idx + j].trimEnd() != uploadedTail[j]) {
+                    matched = false
+                    break
+                }
+            }
+            if (matched) {
+                val remaining = lines.subList(idx + tailSize, lines.size)
+                return remaining.joinToString("\n").trimStart('\n').trimEnd()
+            }
+        }
+        return rawText
     }
 
     fun clearHelperLogs() {

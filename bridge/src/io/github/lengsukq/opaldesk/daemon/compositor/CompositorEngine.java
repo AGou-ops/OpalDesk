@@ -590,6 +590,7 @@ public final class CompositorEngine {
         int reloadOldTaskId = -1;
         int reloadDisplayId = -1;
         String reloadCls = "";
+        boolean shouldForceStopPkg = false;
         boolean allSurfacesNowDetached = false;
 
         synchronized (lock) {
@@ -705,6 +706,19 @@ public final class CompositorEngine {
                         displayToRelease = ws.displayId;
                         pkgToClose = ws.pkg;
                     }
+                    if (ws.pkg != null && !ws.pkg.isEmpty()) {
+                        boolean hasOtherWindowSamePkg = false;
+                        for (WindowSession other : sessionsById.values()) {
+                            if (ws.pkg.equals(other.pkg)) {
+                                hasOtherWindowSamePkg = true;
+                                break;
+                            }
+                        }
+                        if (!hasOtherWindowSamePkg) {
+                            pkgToClose = ws.pkg;
+                            shouldForceStopPkg = true;
+                        }
+                    }
                     taskToRemove = ws.taskId;
                     promoteTopVisibleFocusLocked(now);
                     allSurfacesNowDetached = attachedSurfaces.isEmpty();
@@ -755,6 +769,11 @@ public final class CompositorEngine {
         if (displayToRelease > 0) {
             vdPool.releaseLease(windowId);
             runtimeBridge.onDisplayReleased(displayToRelease);
+        }
+        // When the last window of a package is explicitly closed (not minimized), stop its
+        // background playback/media service so video apps never keep playing audio in background.
+        if (shouldForceStopPkg && pkgToClose != null && !pkgToClose.isEmpty()) {
+            runtimeBridge.forceStopPackage(pkgToClose);
         }
         if (allSurfacesNowDetached) {
             runtimeBridge.onAllClientSurfacesDetached();

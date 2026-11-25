@@ -192,6 +192,10 @@ fun OpalCompositorWorkspace(
     var showExposeOverview by remember { mutableStateOf(false) }
     var showControlCenter by remember { mutableStateOf(false) }
     var showDpiPopover by remember { mutableStateOf(false) }
+    var showNotificationCenter by remember { mutableStateOf(false) }
+    val notifications by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.notificationsFlow.collectAsState()
+    val liveNotificationBanner by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.bannerFlow.collectAsState()
+    val notifAccessGranted by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.accessGrantedFlow.collectAsState()
     var showExitSlotModal by remember { mutableStateOf(false) }
     var savingOnExit by remember { mutableStateOf(false) }
     var editingAppDpiTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -212,8 +216,24 @@ fun OpalCompositorWorkspace(
         showExposeOverview = false
         showControlCenter = false
         showDpiPopover = false
+        showNotificationCenter = false
         contextMenuTarget = null
         wallpaperMenuPos = null
+    }
+
+    fun openNotificationApp(pkg: String) {
+        dismissAllPopovers()
+        val existing = scene.windows.firstOrNull { it.pkg == pkg }
+        if (existing != null) {
+            BridgeClient.sendWindowActionAsync(existing.windowId, BridgeProtocol.WinAction.FOCUS)
+            return
+        }
+        val entry = allApps.firstOrNull { it.pkg == pkg }
+        val cls = entry?.activityClass.orEmpty()
+        AppPrefs.recordAppLaunch(ctx, pkg)
+        scope.launch(Dispatchers.IO) {
+            BridgeClient.openWindow(pkg, cls, BridgeProtocol.Profile.AUTO)
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -355,21 +375,6 @@ fun OpalCompositorWorkspace(
                 )
             }
 
-            // Subtle macOS-style resting hint pill when no windows are currently visible
-            if (status.connected && scene.visibleWindows.isEmpty() && !showAppDrawer && !showExposeOverview && fullscreenWin == null) {
-                EmptyDesktopPill(
-                    isExternalMonitor = isExternalMonitor,
-                    isCompactWidth = isCompactWidth,
-                    onOpenDrawer = {
-                        dismissAllPopovers()
-                        showAppDrawer = true
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(start = 14.dp, end = 14.dp, bottom = 84.dp),
-                )
-            }
-
             // Edge/corner snap frosted-glass preview frame
             snapPreviewRect?.let { snapRect ->
                 Box(
@@ -413,6 +418,8 @@ fun OpalCompositorWorkspace(
                     isCompactWidth = isCompactWidth,
                     showControlCenter = showControlCenter,
                     showDpiPopover = showDpiPopover,
+                    notificationCount = notifications.size,
+                    showNotificationCenter = showNotificationCenter,
                     showPhoneTrackpadButton = canControlPhoneTrackpad,
                     phoneTrackpadVisible = phoneTrackpadVisible,
                     onTogglePhoneTrackpad = {
@@ -423,6 +430,15 @@ fun OpalCompositorWorkspace(
                         val next = !showDpiPopover
                         dismissAllPopovers()
                         showDpiPopover = next
+                    },
+                    onToggleNotificationCenter = {
+                        val next = !showNotificationCenter
+                        dismissAllPopovers()
+                        showNotificationCenter = next
+                        if (next) {
+                            io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.refreshAccessState(ctx)
+                            io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.requestSync()
+                        }
                     },
                     onToggleFullscreen = {
                         val focused = scene.focusedWindow ?: return@MacDesktopMenuBar
@@ -570,6 +586,45 @@ fun OpalCompositorWorkspace(
                         .align(Alignment.BottomCenter)
                         .padding(start = 12.dp, end = 12.dp, bottom = 76.dp)
                         .zIndex(10_020f),
+                )
+            }
+
+            // macOS-style Notification Center Dropdown Popover
+            if (showNotificationCenter && fullscreenWin == null) {
+                val ncMaxH = (maxHeight - (CompositorGeometry.TOP_BAR_DP + 32f).dp).coerceAtLeast(240.dp)
+                DesktopNotificationCenterPopover(
+                    notifications = notifications,
+                    accessGranted = notifAccessGranted,
+                    maxHeight = ncMaxH,
+                    onOpenApp = ::openNotificationApp,
+                    onDismissNotification = { key ->
+                        io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.cancelNotification(key)
+                    },
+                    onClearAll = {
+                        io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.clearAllNotifications()
+                    },
+                    onRequestAccess = {
+                        showNotificationCenter = false
+                        io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.openNotificationAccessSettings(ctx)
+                    },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = (CompositorGeometry.TOP_BAR_DP + 8f).dp, end = 12.dp)
+                        .zIndex(10_028f),
+                )
+            }
+
+            // Live Heads-Up Glass Notification Banner (suppressed during true app fullscreen)
+            val activeBanner = liveNotificationBanner
+            if (activeBanner != null && !showNotificationCenter && fullscreenWin == null) {
+                DesktopNotificationBanner(
+                    item = activeBanner,
+                    onOpenApp = ::openNotificationApp,
+                    onDismiss = { io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.dismissBanner(activeBanner.key) },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(top = (CompositorGeometry.TOP_BAR_DP + 10f).dp, end = 12.dp)
+                        .zIndex(10_032f),
                 )
             }
 
@@ -1019,45 +1074,6 @@ private fun DesktopShortcutColumn(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun EmptyDesktopPill(
-    isExternalMonitor: Boolean,
-    isCompactWidth: Boolean = false,
-    onOpenDrawer: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    Row(
-        modifier = modifier
-            .liquidGlassSurface(
-                shape = CircleShape,
-                fill = OpalPalette.LiquidDockFill,
-                rim = OpalPalette.LiquidGlassRim,
-                elevation = 16.dp,
-            )
-            .clickable(onClick = onOpenDrawer)
-            .padding(horizontal = if (isCompactWidth) 12.dp else 16.dp, vertical = 9.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Box(
-            modifier = Modifier
-                .size(7.dp)
-                .clip(CircleShape)
-                .background(OpalPalette.AccentEmerald),
-        )
-        OpalText(
-            text = when {
-                isCompactWidth -> "桌面已就绪 · 点击打开应用抽屉"
-                isExternalMonitor -> "外接满屏桌面已就绪 · 点击桌面图标或底部 Dock 应用抽屉启动应用"
-                else -> "桌面已就绪 · 点击桌面图标或底部 Dock 应用抽屉开启多窗口"
-            },
-            fontSize = if (isCompactWidth) 11.5.sp else 12.sp,
-            color = OpalPalette.TextSecondary,
-            maxLines = 1,
-        )
     }
 }
 

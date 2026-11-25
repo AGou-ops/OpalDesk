@@ -54,6 +54,7 @@ import io.github.lengsukq.opaldesk.ui.rememberNativeImeHostController
 class DesktopActivity : ComponentActivity() {
 
     private var imeVisible by mutableStateOf(false)
+    private var activeImeController: io.github.lengsukq.opaldesk.ui.NativeImeHostController? = null
     private var composingText by mutableStateOf("")
 
     private val wallpaperPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -113,6 +114,7 @@ class DesktopActivity : ComponentActivity() {
         setContent {
             OpalTheme {
                 val imeController = rememberNativeImeHostController()
+                activeImeController = imeController
                 val imeRequest by BridgeClient.imeBridgeRequestFlow.collectAsState()
                 val scene by BridgeClient.sceneFlow.collectAsState()
                 val remote by BridgeClient.remoteStatusFlow.collectAsState()
@@ -262,6 +264,17 @@ class DesktopActivity : ComponentActivity() {
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
+
+        // Never swallow physical/Bluetooth keyboard IME language-switch shortcuts (Ctrl+Space,
+        // Shift+Space, Meta+Space, LanguageSwitch); ensure the native IME host is active and let
+        // Android's IME framework handle switching between Chinese and English.
+        if (WorkstationKeyDispatcher.isImeSwitchShortcut(event.keyCode, event.metaState)) {
+            if (event.action == KeyEvent.ACTION_DOWN && !imeVisible && !OpalImeFocusTracker.localComposeTextFieldFocused) {
+                val focused = BridgeClient.sceneFlow.value.focusedWindow
+                if (focused != null && !focused.isMinimized) activeImeController?.showKeyboard()
+            }
+            return super.dispatchKeyEvent(event)
+        }
 
         // Let active Compose text boxes (e.g. App Drawer search) or active soft IME consume keystrokes first
         if ((OpalImeFocusTracker.localComposeTextFieldFocused || imeVisible) && super.dispatchKeyEvent(event)) {

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.provider.Settings
 import android.widget.Toast
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -32,8 +33,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -61,12 +68,12 @@ import kotlin.math.abs
 fun MacGlassSectionCard(
     modifier: Modifier = Modifier,
     accentBorder: Color? = null,
-    contentPadding: PaddingValues = PaddingValues(18.dp),
+    contentPadding: PaddingValues = PaddingValues(16.dp),
     content: @Composable () -> Unit,
 ) {
-    val shape = RoundedCornerShape(24.dp)
+    val shape = RoundedCornerShape(22.dp)
     val rimBrush = if (accentBorder != null) {
-        Brush.verticalGradient(listOf(accentBorder.copy(alpha = 0.72f), accentBorder.copy(alpha = 0.22f)))
+        Brush.verticalGradient(listOf(accentBorder.copy(alpha = 0.62f), accentBorder.copy(alpha = 0.18f)))
     } else {
         OpalPalette.LiquidGlassRim
     }
@@ -77,7 +84,7 @@ fun MacGlassSectionCard(
                 shape = shape,
                 fill = OpalPalette.LiquidDockFill,
                 rim = rimBrush,
-                elevation = if (OpalPalette.isDark) 18.dp else 14.dp,
+                elevation = if (OpalPalette.isDark) 12.dp else 9.dp,
             )
             .padding(contentPadding),
     ) {
@@ -106,8 +113,6 @@ fun ConsoleDashboardTab(
     onRequestCompleteExit: () -> Unit,
 ) {
     val ctx = LocalContext.current
-    var autoExtDisplay by remember { mutableStateOf(AppPrefs.isAutoExternalDisplayEnabled(ctx)) }
-    val autoShowPhoneTrackpad by AppPrefs.autoShowPhoneTrackpadFlow.collectAsState()
     val extSession by ExternalTrackpadBridge.sessionFlow.collectAsState()
     val peerRole by OpalPeerCastMutex.roleFlow.collectAsState()
     val discoveredPeers by OpalPeerDiscovery.discoveredPeersFlow.collectAsState()
@@ -121,29 +126,83 @@ fun ConsoleDashboardTab(
     var peerHostText by remember { mutableStateOf("") }
     var peerLabelText by remember { mutableStateOf("") }
 
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-        // Card 1: Primary Workstation Hero Card — Single clear primary action per live state
-        val physicalExtActive = extSession.isPhysicalActive
-        val activeExtDisplayId = extSession.displayId.takeIf { it > 0 } ?: (extDisplay?.displayId ?: -1)
-        val activeExtSummary = extSession.summary.ifBlank {
-            extDisplay?.let { "${it.name} · ${it.width}×${it.height} @ ${it.refreshRateHz}Hz" }.orEmpty()
+    val isDark = OpalPalette.isDark
+    val physicalExtActive = extSession.isPhysicalActive
+    val hasPhysicalExt = extDisplay != null || physicalExtActive
+    val activeExtDisplayId = extSession.displayId.takeIf { it > 0 } ?: (extDisplay?.displayId ?: -1)
+    val activeExtSummary = extSession.summary.ifBlank {
+        extDisplay?.let { "${it.name} · ${it.width}×${it.height} @ ${it.refreshRateHz}Hz" }.orEmpty()
+    }
+
+    fun toggleWifiShare() {
+        if (!status.connected) {
+            onOpenActivation()
+            return
         }
+        if (wifiBusy) return
+        val enable = !remote.wifiEnabled
+        if (enable) {
+            val check = OpalPeerCastMutex.validateEnableSending(peerRole.isReceiving, peerRole.peerName)
+            if (!check.allowed) {
+                Toast.makeText(ctx, check.reason, Toast.LENGTH_LONG).show()
+                return
+            }
+        }
+        wifiBusy = true
+        BridgeClient.setWifiStreamEnabledAsync(enable, 19878) {
+            wifiBusy = false
+            val latest = BridgeClient.remoteStatusFlow.value
+            OpalPeerDiscovery.syncAdvertise(ctx, latest.wifiEnabled, latest.wifiPort, latest.shortCertFingerprint)
+            if (latest.wifiEnabled) castModeTab = 1
+        }
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        // 1. Luminous Spatial Hero Stage Card (Consumer Dashboard Focal Point)
         val heroAccent = when {
-            !status.connected -> null
+            !status.connected -> OpalPalette.AccentAmber
             remote.connected -> OpalPalette.AccentEmerald
             physicalExtActive -> OpalPalette.AccentBlue
-            else -> OpalPalette.AccentBlue.copy(alpha = 0.55f)
+            else -> OpalPalette.AccentBlue
         }
-        MacGlassSectionCard(accentBorder = heroAccent) {
+        val heroShape = RoundedCornerShape(26.dp)
+        val heroBgBrush = Brush.linearGradient(
+            colors = if (isDark) {
+                listOf(heroAccent.copy(alpha = 0.24f), Color(0xE6171E2E), Color(0xEC111622))
+            } else {
+                listOf(heroAccent.copy(alpha = 0.16f), Color(0xF2FFFFFF), Color(0xE8F6F9FF))
+            },
+        )
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .liquidGlassSurface(
+                    shape = heroShape,
+                    fill = heroBgBrush,
+                    rim = Brush.verticalGradient(listOf(heroAccent.copy(alpha = 0.65f), heroAccent.copy(alpha = 0.16f))),
+                    elevation = if (isDark) 16.dp else 12.dp,
+                )
+                .padding(20.dp),
+        ) {
             when {
                 !status.connected -> {
-                    OpalText(text = "多窗合成工作站", fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                    Spacer(Modifier.height(4.dp))
-                    OpalText(
-                        text = "免 Root 独立虚拟屏架构 · 激活引擎后即可开启桌面或跨设备投屏",
-                        fontSize = 12.5.sp,
-                        color = OpalPalette.TextSecondary,
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            OpalText(text = "开启多窗桌面", fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                            Spacer(Modifier.height(4.dp))
+                            OpalText(
+                                text = "激活引擎后即可进入桌面、满屏外接或无线投屏",
+                                fontSize = 12.5.sp,
+                                color = OpalPalette.TextSecondary,
+                            )
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        DashboardHeroIconBadge(accent = heroAccent, active = false)
+                    }
                     Spacer(Modifier.height(16.dp))
                     OpalButton(
                         label = "激活多窗引擎",
@@ -289,18 +348,28 @@ fun ConsoleDashboardTab(
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            OpalText(text = "多窗合成工作站", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            ) {
+                                OpalText(text = "多窗桌面", fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                                if (scene.windows.isNotEmpty()) {
+                                    OpalStatusBadge(label = "${scene.windows.size} 窗口", color = OpalPalette.AccentCyan)
+                                }
+                            }
                             Spacer(Modifier.height(3.dp))
                             OpalText(
                                 text = if (scene.windows.isNotEmpty()) {
-                                    "当前已打开 ${scene.windows.size} 个窗口 · ${status.injectBackendLabel}"
+                                    "工作站运行中 · 点击随时回到桌面"
                                 } else {
-                                    "引擎已就绪 · 随时进入本机多窗桌面"
+                                    "引擎已就绪 · 一键进入本机 DeX 桌面"
                                 },
                                 fontSize = 12.5.sp,
-                                color = if (scene.windows.isNotEmpty()) OpalPalette.AccentCyan else OpalPalette.TextSecondary,
+                                color = OpalPalette.TextSecondary,
                             )
                         }
+                        Spacer(Modifier.width(10.dp))
+                        DashboardHeroIconBadge(accent = heroAccent, active = true)
                     }
 
                     if (status.hostScreenOff) {
@@ -381,13 +450,64 @@ fun ConsoleDashboardTab(
             }
         }
 
-        // Compact Touch Input Troubleshooting Tip (highlighted in amber when input injection is blocked)
-        TouchInputTroubleshootingTipCard(
-            ctx = ctx,
-            inputBlocked = status.connected && status.injectStatus == BridgeProtocol.InputBackend.STATUS_BLOCKED,
-        )
+        // 2. Two-Column Consumer Bento Quick Tiles (External Display + Wireless Share)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            DashboardBentoTile(
+                title = "外接显示器",
+                subtitle = when {
+                    physicalExtActive -> "工作站运行中 · 点开触控板"
+                    extDisplay != null -> "${extDisplay.width}×${extDisplay.height} · 点击满屏"
+                    else -> "接入 USB-C / HDMI 自动识别"
+                },
+                badgeText = if (hasPhysicalExt) "已连接" else "未接入",
+                accent = if (hasPhysicalExt) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
+                active = hasPhysicalExt,
+                iconKind = 0,
+                onClick = {
+                    if (hasPhysicalExt && status.connected) {
+                        onOpenExternalOrTrackpad(activeExtDisplayId)
+                    } else if (!status.connected) {
+                        onOpenActivation()
+                    } else {
+                        Toast.makeText(ctx, "请通过 USB-C / HDMI 接入外接显示器", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            )
+            val sharingOn = status.connected && remote.wifiEnabled && !peerRole.isReceiving
+            DashboardBentoTile(
+                title = "无线共享",
+                subtitle = when {
+                    peerRole.isReceiving -> "正在接收其他设备"
+                    sharingOn -> if (remote.lanIp.isNotEmpty()) "${remote.lanIp}:${if (remote.wifiPort > 0) remote.wifiPort else 19878}" else "服务已开启"
+                    else -> "局域网免 PIN 投给电脑/平板"
+                },
+                badgeText = when {
+                    peerRole.isReceiving -> "接收中"
+                    sharingOn -> "已开启"
+                    else -> "未开启"
+                },
+                accent = if (sharingOn) OpalPalette.AccentEmerald else OpalPalette.AccentCyan,
+                active = sharingOn,
+                iconKind = 1,
+                onClick = ::toggleWifiShare,
+                modifier = Modifier.weight(1f),
+            )
+        }
 
-        // Card 2: Cross-Device Interconnect — Clean 2-Mode Switcher ("连接设备" / "共享本机")
+        // Urgent touch-blocked callout ONLY shown on Home if input injection is actually blocked
+        if (status.connected && status.injectStatus == BridgeProtocol.InputBackend.STATUS_BLOCKED) {
+            TouchInputTroubleshootingTipCard(
+                ctx = ctx,
+                inputBlocked = true,
+            )
+        }
+
+        // 3. Nearby Devices & Interconnect Card
+        ConsoleSectionTitle("跨设备互联")
         MacGlassSectionCard(
             accentBorder = when {
                 peerRole.isReceiving || activeFloating != null -> OpalPalette.AccentBlue
@@ -771,71 +891,38 @@ fun ConsoleDashboardTab(
             }
         }
 
-        // Card 3: Physical USB-C / HDMI External Monitor (Compact, Low-Noise)
-        val hasPhysicalExt = extDisplay != null || physicalExtActive
-        MacGlassSectionCard {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    OpalText(text = "USB-C / HDMI 外接显示器", fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(2.dp))
-                    OpalText(
-                        text = when {
-                            physicalExtActive && activeExtSummary.isNotBlank() -> activeExtSummary
-                            extDisplay != null ->
-                                "${extDisplay.name} · ${extDisplay.width}×${extDisplay.height} @ ${extDisplay.refreshRateHz}Hz"
-                            else -> "未检测到物理外接显示器"
-                        },
-                        fontSize = 12.sp,
-                        color = if (hasPhysicalExt) OpalPalette.AccentEmerald else OpalPalette.TextSecondary,
-                    )
-                }
-                if (hasPhysicalExt) {
-                    Spacer(Modifier.width(10.dp))
-                    OpalButton(
-                        label = if (physicalExtActive) "触控板" else "满屏投射",
-                        enabled = status.connected,
-                        compact = true,
-                        onClick = { onOpenExternalOrTrackpad(activeExtDisplayId) },
-                    )
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            OpalSwitchRow(
-                title = "接入时自动满屏工作站",
-                subtitle = "消除镜像黑边，按外接屏原生分辨率与高刷输出",
-                checked = autoExtDisplay,
-                onCheckedChange = {
-                    autoExtDisplay = it
-                    AppPrefs.setAutoExternalDisplayEnabled(ctx, it)
-                },
-            )
-            OpalSwitchRow(
-                title = "接入外接屏时自动显示手机触控板",
-                subtitle = "连上外接屏启动工作站时自动在手机拉起触控板，亦可在外接屏控制中心随时开关",
-                checked = autoShowPhoneTrackpad,
-                onCheckedChange = { enabled ->
-                    AppPrefs.setAutoShowPhoneTrackpadEnabled(ctx, enabled)
-                },
-            )
-        }
+        // 4. Whisper-Quiet Single-Line Upgrade Re-activation Tip
+        UpgradeReactivateTipCard(
+            connected = status.connected,
+            onOpenActivation = onOpenActivation,
+        )
 
-        // Bottom Footer Action: Complete App & Daemon Exit
-        MacGlassSectionCard(contentPadding = PaddingValues(horizontal = 18.dp, vertical = 14.dp)) {
-            OpalButton(
-                label = "完全退出 OpalDesk",
-                filled = false,
-                accent = OpalPalette.AccentDanger,
-                onClick = onRequestCompleteExit,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(6.dp))
+        // 5. Minimalist Footer Exit Action
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 2.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(OpalPalette.AccentDanger.copy(alpha = if (isDark) 0.14f else 0.08f))
+                    .border(0.8.dp, OpalPalette.AccentDanger.copy(alpha = 0.34f), CircleShape)
+                    .clickable(onClick = onRequestCompleteExit)
+                    .padding(horizontal = 24.dp, vertical = 10.dp),
+            ) {
+                OpalText(
+                    text = "完全退出 OpalDesk",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OpalPalette.AccentDanger,
+                )
+            }
             OpalText(
-                text = "将关闭多窗引擎守护进程、投屏及后台常驻服务，并彻底退出应用",
-                fontSize = 11.5.sp,
+                text = "先停止引擎守护进程，再彻底退出应用",
+                fontSize = 11.sp,
                 color = OpalPalette.TextMuted,
             )
         }
@@ -862,15 +949,69 @@ fun ConsoleDisplaySettingsTab(
     val wallpaperPreset by AppPrefs.wallpaperPresetFlow.collectAsState()
     val customWallpaperPath by AppPrefs.customWallpaperPathFlow.collectAsState()
     val mouseTarget by AppPrefs.mouseTargetFlow.collectAsState()
+    var autoExtDisplay by remember { mutableStateOf(AppPrefs.isAutoExternalDisplayEnabled(ctx)) }
+    val autoShowPhoneTrackpad by AppPrefs.autoShowPhoneTrackpadFlow.collectAsState()
     val isDark = OpalPalette.isDark
 
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        // Top 2-Column Bento Quick Tiles (Smart Auto-Adapt + Host Physical Screen-Off)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            DashboardBentoTile(
+                title = "一键智能适配",
+                subtitle = "恢复最佳分辨率、高刷与 DPI",
+                badgeText = "推荐",
+                accent = OpalPalette.AccentBlue,
+                active = true,
+                iconKind = 0,
+                onClick = {
+                    AppPrefs.setExternalUiScale(ctx, 1.25f)
+                    AppPrefs.setTrackpadSensitivity(ctx, AppPrefs.DEFAULT_TRACKPAD_SENSITIVITY)
+                    BridgeClient.setPointerSpeedAsync(AppPrefs.DEFAULT_TRACKPAD_SENSITIVITY)
+                    BridgeClient.updateDisplayPrefsAsync(targetFps = 0, windowDpiScalePct = 100)
+                    if (extDisplay != null) {
+                        val best = extDisplay.supportedModes.firstOrNull()
+                        if (best != null) {
+                            BridgeClient.setExternalDisplayModeAsync(
+                                extDisplay.displayId, best.width, best.height, best.refreshRateHz.toFloat(),
+                            )
+                        } else {
+                            BridgeClient.setExternalDisplayModeAsync(extDisplay.displayId, 0, 0, 0f)
+                        }
+                    } else if (remote.connected) {
+                        BridgeClient.setExternalDisplayModeAsync(-1, remote.width, remote.height, 60f)
+                    }
+                    Toast.makeText(ctx, "已恢复全自动最佳分辨率、帧率与 DPI 配置", Toast.LENGTH_SHORT).show()
+                },
+                modifier = Modifier.weight(1f),
+            )
+            DashboardBentoTile(
+                title = if (status.hostScreenOff) "点亮本机屏幕" else "本机物理息屏",
+                subtitle = if (status.hostScreenOff) "省电运行中 · 点按亮屏" else "外接/投屏时熄屏省电",
+                badgeText = if (status.hostScreenOff) "已息屏" else "亮屏",
+                accent = if (status.hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.AccentCyan,
+                active = status.hostScreenOff,
+                iconKind = 1,
+                onClick = {
+                    if (status.connected) {
+                        toggleHostScreenPowerWithToast(ctx, screenOn = status.hostScreenOff)
+                    } else {
+                        Toast.makeText(ctx, "请先激活多窗引擎", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            )
+        }
+
+        ConsoleSectionTitle("外观风格")
         // 0. Appearance Style (macOS Liquid Frosted Glass: Light / Follow System / Dark)
         MacGlassSectionCard {
             OpalText(text = "液态毛玻璃外观", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
             OpalText(
-                text = "整体采用 macOS 液态毛玻璃质感；默认通透浅色风格，支持跟随系统自动切换或常驻深色玻璃",
+                text = "默认通透浅色风格，支持跟随系统自动切换或常驻深色玻璃",
                 fontSize = 12.sp,
                 color = OpalPalette.TextSecondary,
             )
@@ -882,52 +1023,31 @@ fun ConsoleDisplaySettingsTab(
             )
         }
 
-        // 1. Smart Auto-Adapt Card (Unified across USB-C / HDMI / Wi-Fi / USB Casting / Local)
+        ConsoleSectionTitle("外接显示器行为")
         MacGlassSectionCard {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    OpalText(text = "智能自动适配（外接屏与投屏统一推荐）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(2.dp))
-                    OpalText(
-                        text = "统一重置 USB-C / HDMI 外接屏与无线 / USB 投屏至最佳分辨率、最高帧率与清晰桌面 DPI",
-                        fontSize = 12.sp,
-                        color = OpalPalette.TextSecondary,
-                    )
-                }
-                Spacer(Modifier.width(10.dp))
-                OpalButton(
-                    label = "一键自动",
-                    compact = true,
-                    onClick = {
-                        AppPrefs.setExternalUiScale(ctx, 1.25f)
-                        AppPrefs.setTrackpadSensitivity(ctx, AppPrefs.DEFAULT_TRACKPAD_SENSITIVITY)
-                        BridgeClient.setPointerSpeedAsync(AppPrefs.DEFAULT_TRACKPAD_SENSITIVITY)
-                        BridgeClient.updateDisplayPrefsAsync(targetFps = 0, windowDpiScalePct = 100)
-                        if (extDisplay != null) {
-                            val best = extDisplay.supportedModes.firstOrNull()
-                            if (best != null) {
-                                BridgeClient.setExternalDisplayModeAsync(
-                                    extDisplay.displayId, best.width, best.height, best.refreshRateHz.toFloat(),
-                                )
-                            } else {
-                                BridgeClient.setExternalDisplayModeAsync(extDisplay.displayId, 0, 0, 0f)
-                            }
-                        } else if (remote.connected) {
-                            BridgeClient.setExternalDisplayModeAsync(-1, remote.width, remote.height, 60f)
-                        }
-                        Toast.makeText(ctx, "已恢复全自动最佳分辨率、帧率与 DPI 配置", Toast.LENGTH_SHORT).show()
-                    },
-                )
-            }
+            OpalSwitchRow(
+                title = "接入时自动满屏工作站",
+                subtitle = "消除镜像黑边，按外接屏原生分辨率与高刷输出",
+                checked = autoExtDisplay,
+                onCheckedChange = {
+                    autoExtDisplay = it
+                    AppPrefs.setAutoExternalDisplayEnabled(ctx, it)
+                },
+            )
+            OpalSwitchRow(
+                title = "接入外接屏时自动显示手机触控板",
+                subtitle = "连上外接屏启动工作站时自动在手机拉起触控板",
+                checked = autoShowPhoneTrackpad,
+                onCheckedChange = { enabled ->
+                    AppPrefs.setAutoShowPhoneTrackpadEnabled(ctx, enabled)
+                },
+            )
         }
 
-        // 2. Unified Output Resolution & Refresh Rate Switcher (USB-C / HDMI EDID & Wi-Fi / USB Cast)
+        ConsoleSectionTitle("画质与自适应")
+        // 1. Unified Output Resolution & Refresh Rate Switcher (USB-C / HDMI EDID & Wi-Fi / USB Cast)
         MacGlassSectionCard {
-            OpalText(text = "输出分辨率与刷新率（USB-C / 投屏统一控制）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            OpalText(text = "分辨率与刷新率", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
             when {
                 extDisplay != null -> {
@@ -1022,10 +1142,10 @@ fun ConsoleDisplaySettingsTab(
 
         // 3. Target Frame Rate & Output UI Scale (Unified for USB-C & Casting; DPI is adjusted visually inside DeX)
         MacGlassSectionCard {
-            OpalText(text = "帧率与界面缩放（外接与投屏统一生效）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            OpalText(text = "帧率与界面缩放", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(10.dp))
 
-            OpalText(text = "桌面与虚拟屏目标帧率（同步作用于 USB-C 外接屏与投屏流）", fontSize = 12.sp, color = OpalPalette.TextSecondary)
+            OpalText(text = "目标帧率", fontSize = 12.sp, color = OpalPalette.TextSecondary)
             Spacer(Modifier.height(6.dp))
             val fpsOptions = listOf(0, 60, 90, 100, 120)
             val fpsIdx = fpsOptions.indexOf(status.targetFps).let { if (it >= 0) it else 0 }
@@ -1041,7 +1161,7 @@ fun ConsoleDisplaySettingsTab(
             )
 
             Spacer(Modifier.height(14.dp))
-            OpalText(text = "外接屏 / 投屏桌面界面缩放比例 (UI Scale)", fontSize = 12.sp, color = OpalPalette.TextSecondary)
+            OpalText(text = "桌面界面缩放", fontSize = 12.sp, color = OpalPalette.TextSecondary)
             Spacer(Modifier.height(6.dp))
             val scaleOpts = listOf(1.0f, 1.25f, 1.5f)
             val scaleIdx = scaleOpts.indexOfFirst { abs(it - extUiScale) < 0.08f }.let { if (it >= 0) it else 1 }
@@ -1061,56 +1181,14 @@ fun ConsoleDisplaySettingsTab(
             )
         }
 
-        // 4. Host Screen Off Power Control, Unified External Keyboard & Mouse Routing, Pointer Speed & Wallpapers
+        ConsoleSectionTitle("键鼠与壁纸")
+        // 4. Unified External Keyboard & Mouse Routing, Pointer Speed & Wallpapers
         MacGlassSectionCard {
-            OpalText(text = "息屏省电、外接键鼠与桌面壁纸", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            OpalText(text = "外接键鼠与桌面壁纸", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(10.dp))
 
-            if (status.connected) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(15.dp))
-                        .background(
-                            if (status.hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.14f) else OpalPalette.ChipFill,
-                        )
-                        .border(
-                            0.8.dp,
-                            if (status.hostScreenOff) OpalPalette.AccentEmerald.copy(alpha = 0.42f) else OpalPalette.BorderSubtle,
-                            RoundedCornerShape(15.dp),
-                        )
-                        .padding(horizontal = 14.dp, vertical = 11.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        OpalText(
-                            text = if (status.hostScreenOff) "本机屏幕已物理熄屏（省电运行中）" else "本机物理息屏（外接 / 投屏省电）",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (status.hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.TextPrimary,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        OpalText(
-                            text = "关闭手机本身屏幕避免亮屏耗电，支持双击手机屏幕随时亮屏；外接屏与投屏保持高刷运行，断开自动亮屏",
-                            fontSize = 11.sp,
-                            color = OpalPalette.TextSecondary,
-                        )
-                    }
-                    Spacer(Modifier.width(10.dp))
-                    OpalButton(
-                        label = if (status.hostScreenOff) "点亮屏幕" else "立即息屏",
-                        compact = true,
-                        filled = !status.hostScreenOff,
-                        accent = if (status.hostScreenOff) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
-                        onClick = { toggleHostScreenPowerWithToast(ctx, screenOn = status.hostScreenOff) },
-                    )
-                }
-                Spacer(Modifier.height(14.dp))
-            }
-
             OpalText(
-                text = "外接键盘与物理鼠标输出目标（USB-C 与投屏统一生效，默认优先投屏端）",
+                text = "外接键鼠输出目标",
                 fontSize = 12.sp,
                 color = OpalPalette.TextSecondary,
             )
@@ -1298,8 +1376,95 @@ fun ConsoleEngineSettingsTab(
     val updateState by AppUpdateManager.stateFlow.collectAsState()
     val currentVersion = remember(ctx) { AppUpdateManager.getCurrentVersionName(ctx) }
 
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        // Top 2-Column Bento Quick Tiles (Engine Status + App Update)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            DashboardBentoTile(
+                title = if (status.connected) "重新激活引擎" else "激活多窗引擎",
+                subtitle = if (status.connected) "uid=${status.daemonUid} · ${status.activeVdCount}/${status.maxVdCount} 虚拟屏" else "点击选择激活方式",
+                badgeText = if (status.connected) "运行中" else "未激活",
+                accent = if (status.connected) OpalPalette.AccentEmerald else OpalPalette.AccentAmber,
+                active = status.connected,
+                iconKind = 0,
+                onClick = onOpenActivation,
+                modifier = Modifier.weight(1f),
+            )
+            val hasUpdate = updateState is AppUpdateManager.UpdateState.UpdateAvailable ||
+                updateState is AppUpdateManager.UpdateState.ReadyToInstall
+            val updateBadge = when (val st = updateState) {
+                is AppUpdateManager.UpdateState.UpdateAvailable -> st.release.tagName
+                is AppUpdateManager.UpdateState.ReadyToInstall -> "待安装"
+                is AppUpdateManager.UpdateState.Downloading -> "下载中"
+                is AppUpdateManager.UpdateState.Checking -> "检查中"
+                else -> "v$currentVersion"
+            }
+            DashboardBentoTile(
+                title = "应用更新",
+                subtitle = if (hasUpdate) "发现新版本，点击查看" else "点击检查 GitHub 新版本",
+                badgeText = updateBadge,
+                accent = if (hasUpdate) OpalPalette.AccentBlue else OpalPalette.AccentCyan,
+                active = hasUpdate,
+                iconKind = 1,
+                onClick = {
+                    when (updateState) {
+                        is AppUpdateManager.UpdateState.UpdateAvailable,
+                        is AppUpdateManager.UpdateState.Downloading,
+                        is AppUpdateManager.UpdateState.ReadyToInstall,
+                        -> onOpenUpdateModal()
+                        else -> {
+                            AppUpdateManager.checkForUpdates(ctx, userInitiated = true)
+                            onOpenUpdateModal()
+                        }
+                    }
+                },
+                modifier = Modifier.weight(1f),
+            )
+        }
+
+        ConsoleSectionTitle("引擎配置与场景")
         ConsoleAdvancedSettingsSection(status = status, scene = scene)
+        TouchInputTroubleshootingTipCard(
+            ctx = ctx,
+            inputBlocked = status.connected && status.injectStatus == BridgeProtocol.InputBackend.STATUS_BLOCKED,
+        )
+        ConsoleSectionTitle("通用与更新")
+        MacGlassSectionCard {
+            val notifAccessGranted by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.accessGrantedFlow.collectAsState()
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.refreshAccessState(ctx)
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    OpalText(text = "DeX 桌面通知同步", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    OpalText(
+                        text = if (notifAccessGranted) {
+                            "已授权通知使用权 · 手机消息将实时同步到 DeX 右上角"
+                        } else {
+                            "开启通知使用权后，可在 DeX 桌面实时接收并点击打开手机消息"
+                        },
+                        fontSize = 12.sp,
+                        color = if (notifAccessGranted) OpalPalette.AccentEmerald else OpalPalette.TextSecondary,
+                    )
+                }
+                Spacer(Modifier.width(10.dp))
+                OpalButton(
+                    label = if (notifAccessGranted) "管理权限" else "去开启",
+                    compact = true,
+                    filled = !notifAccessGranted,
+                    accent = if (notifAccessGranted) OpalPalette.AccentEmerald else OpalPalette.AccentBlue,
+                    onClick = {
+                        io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.openNotificationAccessSettings(ctx)
+                    },
+                )
+            }
+        }
         MacGlassSectionCard {
             OpalText(text = "应用列表与启动器", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
@@ -1413,11 +1578,12 @@ fun ConsoleEngineSettingsTab(
             }
         }
 
+        ConsoleSectionTitle("引擎底层")
         MacGlassSectionCard {
-            OpalText(text = "底层输入路由与虚拟屏池配额", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+            OpalText(text = "输入路由与虚拟屏配额", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
             OpalText(
-                text = "默认走 AOSP InputManager 系统直通；若遇到 ROM 拦截跨屏触摸，可自动或手动切换至 Linux 内核 /dev/uhid 虚拟外设。",
+                text = "默认系统直通；如遇触摸被拦截，可切换至 Linux /dev/uhid 虚拟外设。",
                 fontSize = 12.sp,
                 color = OpalPalette.TextSecondary,
             )
@@ -1444,7 +1610,7 @@ fun ConsoleEngineSettingsTab(
 
             Spacer(Modifier.height(16.dp))
             OpalText(
-                text = "活跃 VirtualDisplay 并发上限（6 屏 / 8 屏布局建议设为 6–10；超出上限的后台窗口自动休眠为快照卡片）",
+                text = "活跃虚拟屏并发上限（超出部分自动休眠为快照）",
                 fontSize = 12.sp,
                 color = OpalPalette.TextSecondary,
             )
@@ -1461,37 +1627,24 @@ fun ConsoleEngineSettingsTab(
             )
         }
 
-        MacGlassSectionCard {
-            OpalText(text = "引擎与守护进程控制", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(10.dp))
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        if (status.connected) {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
                 OpalButton(
-                    label = if (status.connected) "重新激活引擎" else "激活多窗引擎",
-                    filled = !status.connected,
+                    label = "关闭所有窗口",
+                    filled = false,
                     compact = true,
-                    onClick = onOpenActivation,
-                    modifier = Modifier.fillMaxWidth(),
+                    accent = OpalPalette.AccentAmber,
+                    onClick = { BridgeClient.closeAllWindowsAsync(removeTasks = true) },
+                    modifier = Modifier.weight(1f),
                 )
-                if (status.connected) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                        OpalButton(
-                            label = "关闭所有窗口",
-                            filled = false,
-                            compact = true,
-                            accent = OpalPalette.AccentAmber,
-                            onClick = { BridgeClient.closeAllWindowsAsync(removeTasks = true) },
-                            modifier = Modifier.weight(1f),
-                        )
-                        OpalButton(
-                            label = "彻底停止守护进程",
-                            filled = false,
-                            compact = true,
-                            accent = OpalPalette.AccentDanger,
-                            onClick = onStopEngine,
-                            modifier = Modifier.weight(1f),
-                        )
-                    }
-                }
+                OpalButton(
+                    label = "停止引擎",
+                    filled = false,
+                    compact = true,
+                    accent = OpalPalette.AccentDanger,
+                    onClick = onStopEngine,
+                    modifier = Modifier.weight(1f),
+                )
             }
         }
     }
@@ -1558,44 +1711,199 @@ private fun openDeveloperSettings(ctx: Context) {
 }
 
 @Composable
-private fun TouchInputTroubleshootingTipCard(
-    ctx: Context,
-    inputBlocked: Boolean,
+private fun DashboardHeroIconBadge(
+    accent: Color,
+    active: Boolean,
 ) {
-    val accent = if (inputBlocked) OpalPalette.AccentAmber else OpalPalette.AccentCyan
-    MacGlassSectionCard(
-        accentBorder = if (inputBlocked) OpalPalette.AccentAmber else null,
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
+    val isDark = OpalPalette.isDark
+    Box(
+        modifier = Modifier
+            .size(46.dp)
+            .clip(RoundedCornerShape(15.dp))
+            .background(accent.copy(alpha = if (isDark) 0.24f else 0.14f))
+            .border(0.9.dp, accent.copy(alpha = 0.42f), RoundedCornerShape(15.dp)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(modifier = Modifier.size(22.dp)) {
+            val w = size.width
+            val h = size.height
+            val stroke = Stroke(width = w * 0.095f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+            val r = CornerRadius(w * 0.14f, w * 0.14f)
+            drawRoundRect(accent, Offset(w * 0.05f, h * 0.10f), Size(w * 0.90f, h * 0.62f), r, style = stroke)
+            if (active) {
+                drawRoundRect(accent.copy(alpha = 0.28f), Offset(w * 0.16f, h * 0.22f), Size(w * 0.30f, h * 0.36f), CornerRadius(w * 0.08f, w * 0.08f))
+                drawRoundRect(accent.copy(alpha = 0.45f), Offset(w * 0.54f, h * 0.22f), Size(w * 0.30f, h * 0.36f), CornerRadius(w * 0.08f, w * 0.08f))
+            }
+            drawLine(accent, Offset(w * 0.32f, h * 0.88f), Offset(w * 0.68f, h * 0.88f), strokeWidth = stroke.width, cap = StrokeCap.Round)
+        }
+    }
+}
+
+@Composable
+private fun DashboardBentoTile(
+    title: String,
+    subtitle: String,
+    badgeText: String,
+    accent: Color,
+    active: Boolean,
+    iconKind: Int,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val isDark = OpalPalette.isDark
+    val shape = RoundedCornerShape(22.dp)
+    val fillBrush = if (active) {
+        Brush.verticalGradient(
+            if (isDark) listOf(accent.copy(alpha = 0.22f), Color(0xE0161C29))
+            else listOf(accent.copy(alpha = 0.14f), Color(0xF0FFFFFF)),
+        )
+    } else {
+        OpalPalette.LiquidDockFill
+    }
+    val rimBrush = if (active) {
+        Brush.verticalGradient(listOf(accent.copy(alpha = 0.62f), accent.copy(alpha = 0.18f)))
+    } else {
+        OpalPalette.LiquidGlassRim
+    }
+    Column(
+        modifier = modifier
+            .liquidGlassSurface(
+                shape = shape,
+                fill = fillBrush,
+                rim = rimBrush,
+                elevation = if (isDark) 12.dp else 9.dp,
+            )
+            .clickable(onClick = onClick)
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
-            Column(modifier = Modifier.weight(1f)) {
-                OpalText(
-                    text = if (inputBlocked) "检测到触摸输入受限" else "触摸无反应排查提示",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = if (inputBlocked) OpalPalette.AccentAmber else OpalPalette.TextPrimary,
-                )
-                Spacer(Modifier.height(3.dp))
-                OpalText(
-                    text = "若进入桌面或投屏后无法触摸点击，请在系统「开发者选项」中开启「USB 调试」与「USB 调试（安全设置）」（部分机型为「禁止权限监控」），或在「设置」页将输入路由切换为 Linux /dev/uhid。",
-                    fontSize = 11.5.sp,
-                    color = OpalPalette.TextSecondary,
-                    lineHeight = 16.5.sp,
-                )
+            Box(
+                modifier = Modifier
+                    .size(34.dp)
+                    .clip(CircleShape)
+                    .background(accent.copy(alpha = if (isDark) 0.22f else 0.13f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Canvas(modifier = Modifier.size(17.dp)) {
+                    val w = size.width
+                    val h = size.height
+                    val stroke = Stroke(width = w * 0.105f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                    if (iconKind == 0) {
+                        drawRoundRect(accent, Offset(w * 0.06f, h * 0.12f), Size(w * 0.88f, h * 0.58f), CornerRadius(w * 0.14f, w * 0.14f), style = stroke)
+                        drawLine(accent, Offset(w * 0.50f, h * 0.70f), Offset(w * 0.50f, h * 0.88f), strokeWidth = stroke.width, cap = StrokeCap.Round)
+                        drawLine(accent, Offset(w * 0.28f, h * 0.88f), Offset(w * 0.72f, h * 0.88f), strokeWidth = stroke.width, cap = StrokeCap.Round)
+                    } else {
+                        drawArc(accent, startAngle = 215f, sweepAngle = 110f, useCenter = false, topLeft = Offset(w * 0.08f, h * 0.18f), size = Size(w * 0.84f, h * 0.84f), style = stroke)
+                        drawArc(accent, startAngle = 215f, sweepAngle = 110f, useCenter = false, topLeft = Offset(w * 0.26f, h * 0.36f), size = Size(w * 0.48f, h * 0.48f), style = stroke)
+                        drawCircle(accent, radius = w * 0.10f, center = Offset(w * 0.50f, h * 0.76f))
+                    }
+                }
             }
-            Spacer(Modifier.width(10.dp))
-            OpalButton(
-                label = "开发者选项",
-                compact = true,
-                filled = inputBlocked,
-                accent = accent,
-                onClick = { openDeveloperSettings(ctx) },
+            OpalStatusBadge(
+                label = badgeText,
+                color = if (active) accent else OpalPalette.TextMuted,
             )
         }
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            OpalText(text = title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+            OpalText(
+                text = subtitle,
+                fontSize = 11.5.sp,
+                color = if (active) accent else OpalPalette.TextSecondary,
+                maxLines = 1,
+            )
+        }
+    }
+}
+
+@Composable
+private fun UpgradeReactivateTipCard(
+    connected: Boolean,
+    onOpenActivation: () -> Unit,
+) {
+    val shape = CircleShape
+    val accent = OpalPalette.AccentBlue
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(OpalPalette.LiquidDockFill)
+            .border(0.8.dp, OpalPalette.BorderSubtle, shape)
+            .clickable(onClick = onOpenActivation)
+            .padding(horizontal = 14.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        OpalText(text = "↻", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = accent)
+        OpalText(
+            text = "升级版本后建议重新激活一次引擎以生效最新修复",
+            fontSize = 11.5.sp,
+            color = OpalPalette.TextSecondary,
+            maxLines = 1,
+            modifier = Modifier.weight(1f),
+        )
+        OpalText(
+            text = if (connected) "重新激活 ›" else "去激活 ›",
+            fontSize = 11.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = accent,
+        )
+    }
+}
+
+@Composable
+private fun TouchInputTroubleshootingTipCard(
+    ctx: Context,
+    inputBlocked: Boolean,
+) {
+    val accent = if (inputBlocked) OpalPalette.AccentAmber else OpalPalette.AccentCyan
+    val shape = RoundedCornerShape(18.dp)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(OpalPalette.LiquidDockFill)
+            .border(0.8.dp, accent.copy(alpha = if (inputBlocked) 0.55f else 0.24f), shape)
+            .padding(horizontal = 14.dp, vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(28.dp)
+                .clip(CircleShape)
+                .background(accent.copy(alpha = if (OpalPalette.isDark) 0.22f else 0.12f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            OpalText(text = if (inputBlocked) "!" else "i", fontSize = 13.5.sp, fontWeight = FontWeight.Bold, color = accent)
+        }
+        Column(modifier = Modifier.weight(1f)) {
+            OpalText(
+                text = if (inputBlocked) "检测到触摸输入受限" else "触摸无反应排查",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (inputBlocked) OpalPalette.AccentAmber else OpalPalette.TextPrimary,
+            )
+            Spacer(Modifier.height(2.dp))
+            OpalText(
+                text = "若桌面无法点击，请在开发者选项开启「USB 调试（安全设置）」，或在「设置」切至 /dev/uhid。",
+                fontSize = 11.5.sp,
+                color = OpalPalette.TextSecondary,
+                lineHeight = 16.sp,
+            )
+        }
+        OpalButton(
+            label = "去设置",
+            compact = true,
+            filled = inputBlocked,
+            accent = accent,
+            onClick = { openDeveloperSettings(ctx) },
+        )
     }
 }
 

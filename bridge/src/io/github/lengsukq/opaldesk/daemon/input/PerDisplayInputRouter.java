@@ -51,6 +51,7 @@ public final class PerDisplayInputRouter {
     private float lastDownY = 0f;
     private long lastDownUptimeMs = 0L;
     private boolean tapMovedTooFar = false;
+    private volatile boolean activeMouseTouchEmulation = false;
 
     public PerDisplayInputRouter(AndroidServices services, DaemonConfig config) {
         this.services = services;
@@ -174,10 +175,25 @@ public final class PerDisplayInputRouter {
             lastDownWinId = -1;
         }
         boolean isScroll = (masked == MotionEvent.ACTION_SCROLL);
+        boolean mapMouseClickToTouch = !isScroll && MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                masked, isMouse, buttonState, activeMouseTouchEmulation);
+        if (mapMouseClickToTouch) {
+            if (masked == MotionEvent.ACTION_DOWN) {
+                activeMouseTouchEmulation = true;
+            } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
+                activeMouseTouchEmulation = false;
+            }
+            props[0].toolType = MotionEvent.TOOL_TYPE_FINGER;
+            coords[0].pressure = (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) ? 0.0f : 1.0f;
+        } else if (masked == MotionEvent.ACTION_UP || masked == MotionEvent.ACTION_CANCEL) {
+            activeMouseTouchEmulation = false;
+        }
         int effSource = isScroll
                 ? InputDevice.SOURCE_MOUSE
-                : (isMouse ? InputDevice.SOURCE_MOUSE : ((source != 0) ? source : InputDevice.SOURCE_TOUCHSCREEN));
-        int normButtonState = isScroll
+                : (mapMouseClickToTouch
+                        ? InputDevice.SOURCE_TOUCHSCREEN
+                        : (isMouse ? InputDevice.SOURCE_MOUSE : ((source != 0) ? source : InputDevice.SOURCE_TOUCHSCREEN)));
+        int normButtonState = (isScroll || mapMouseClickToTouch)
                 ? 0
                 : MouseRoutingPolicy.normalizeMouseButtonState(masked, isMouse, buttonState);
         long effEventTime = (eventTime > 0L) ? eventTime : SystemClock.uptimeMillis();
@@ -185,7 +201,7 @@ public final class PerDisplayInputRouter {
                 ? effEventTime
                 : (downTime > 0L ? downTime : effEventTime);
 
-        if (isScroll || (isMouse && masked == MotionEvent.ACTION_DOWN)) {
+        if (isScroll || (isMouse && !mapMouseClickToTouch && masked == MotionEvent.ACTION_DOWN)) {
             MotionEvent.PointerProperties hoverProp = new MotionEvent.PointerProperties();
             hoverProp.id = props[0].id;
             hoverProp.toolType = MotionEvent.TOOL_TYPE_MOUSE;

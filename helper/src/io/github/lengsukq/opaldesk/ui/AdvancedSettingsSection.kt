@@ -77,19 +77,19 @@ fun ConsoleAdvancedSettingsSection(
     var editingProfileName by remember(activeSlot.id, activeSlot.name) { mutableStateOf(activeSlot.name) }
     var showRenameRow by remember(activeSlot.id) { mutableStateOf(false) }
 
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         // Card A: 5 Persistent Configuration Slots
-        MacGlassSectionCard(accentBorder = OpalPalette.AccentBlue.copy(alpha = 0.45f)) {
+        MacGlassSectionCard {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    OpalText(text = "高级配置槽位（5 套独立持久化）", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                    OpalText(text = "场景配置槽位", fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(2.dp))
                     OpalText(
-                        text = "分别应对本机、外接屏及不同投屏/被投屏端；运行中修改实时生效，主动退出时再统一选择保存到目标槽位",
+                        text = "为本机、外接屏和投屏端独立保存 DPI 与窗口布局",
                         fontSize = 12.sp,
                         color = OpalPalette.TextSecondary,
                     )
@@ -148,8 +148,8 @@ fun ConsoleAdvancedSettingsSection(
 
             Spacer(Modifier.height(8.dp))
             OpalSwitchRow(
-                title = "按被投屏端自动匹配槽位（默认开启）",
-                subtitle = "进入本机、外接屏或不同投屏设备时自动载入已绑定或默认槽位；退出保存到新槽位会自动记住该设备",
+                title = "按显示设备自动匹配槽位",
+                subtitle = "切换本机、外接屏或投屏端时自动载入对应配置",
                 checked = storeState.autoMatchTargetSlot,
                 onCheckedChange = { ProfileConfigStore.setAutoMatchTargetSlot(ctx, it) },
             )

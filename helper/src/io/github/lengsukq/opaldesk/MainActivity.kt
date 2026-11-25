@@ -25,7 +25,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -33,6 +33,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.key
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -65,10 +66,10 @@ import io.github.lengsukq.opaldesk.ui.ConsoleEngineSettingsTab
 import io.github.lengsukq.opaldesk.ui.ConsoleLogsTab
 import io.github.lengsukq.opaldesk.ui.OpalAmbientBackdrop
 import io.github.lengsukq.opaldesk.ui.OpalButton
+import io.github.lengsukq.opaldesk.ui.OpalConsoleBottomBar
+import io.github.lengsukq.opaldesk.ui.OpalConsoleHeader
 import io.github.lengsukq.opaldesk.ui.OpalGlassCard
 import io.github.lengsukq.opaldesk.ui.OpalPalette
-import io.github.lengsukq.opaldesk.ui.OpalSegmentedRow
-import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTheme
 import io.github.lengsukq.opaldesk.ui.PairingConsentModal
@@ -163,6 +164,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         BridgeClient.requestBinder(this)
+        io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.refreshAccessState(this)
         localNetworkPermGranted = OpalPeerDiscovery.hasLocalNetworkPermission(this)
         if (localNetworkPermGranted) {
             OpalPeerDiscovery.startBrowsing(this, BridgeClient.remoteStatusFlow.value.lanIp)
@@ -309,137 +311,93 @@ private fun OpalConsoleScreen(
         else -> null
     }
 
-    OpalAmbientBackdrop(modifier = Modifier.fillMaxSize(), wallpaperPreset = wallpaperPreset) {
+    OpalAmbientBackdrop(
+        modifier = Modifier.fillMaxSize(),
+        wallpaperPreset = wallpaperPreset,
+        consoleScrim = true,
+    ) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .systemBarsPadding(),
+                .statusBarsPadding(),
             contentAlignment = Alignment.TopCenter,
         ) {
-            Column(
-                modifier = Modifier
-                    .widthIn(max = 840.dp)
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = 20.dp, vertical = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
-            ) {
-                // Clean Apple-style Top Header Bar
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween,
+            key(selectedTab) {
+                val scrollState = rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .widthIn(max = 800.dp)
+                        .fillMaxWidth()
+                        .verticalScroll(scrollState)
+                        .padding(start = 18.dp, end = 18.dp, top = 14.dp, bottom = 112.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
                 ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.Bottom,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            OpalText(text = "OpalDesk", fontSize = 26.sp, fontWeight = FontWeight.Bold)
-                            OpalText(
-                                text = "v$currentVersion",
-                                fontSize = 12.sp,
-                                color = OpalPalette.TextMuted,
-                                modifier = Modifier.padding(bottom = 3.dp),
-                            )
-                        }
-                        if (availableReleaseTag != null) {
-                            val badgeColor = if (updateState is AppUpdateManager.UpdateState.ReadyToInstall) {
-                                OpalPalette.AccentEmerald
-                            } else {
-                                OpalPalette.AccentBlue
-                            }
-                            Box(
-                                modifier = Modifier
-                                    .clip(CircleShape)
-                                    .background(badgeColor.copy(alpha = if (OpalPalette.isDark) 0.22f else 0.14f))
-                                    .border(0.8.dp, badgeColor.copy(alpha = 0.42f), CircleShape)
-                                    .clickable { showUpdateModal = true }
-                                    .padding(horizontal = 9.dp, vertical = 3.5.dp),
-                            ) {
-                                OpalText(
-                                    text = if (updateState is AppUpdateManager.UpdateState.ReadyToInstall) {
-                                        "安装 $availableReleaseTag"
-                                    } else {
-                                        "新版本 $availableReleaseTag"
-                                    },
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = badgeColor,
-                                    maxLines = 1,
+                    OpalConsoleHeader(
+                        selectedTab = selectedTab,
+                        currentVersion = currentVersion,
+                        connected = status.connected,
+                        rootEnhanced = status.rootEnhanced,
+                        availableReleaseTag = availableReleaseTag,
+                        readyToInstallUpdate = updateState is AppUpdateManager.UpdateState.ReadyToInstall,
+                        onOpenActivation = { showActivationModal = true },
+                        onOpenUpdate = { showUpdateModal = true },
+                    )
+
+                    when (selectedTab) {
+                        0 -> ConsoleDashboardTab(
+                            status = status,
+                            scene = scene,
+                            remote = remote,
+                            extDisplay = extDisplay,
+                            needsLocalNetworkPerm = needsLocalNetworkPerm,
+                            onRequestLocalNetworkPerm = onRequestLocalNetworkPerm,
+                            onEnterLocalDesktop = onEnterDesktop,
+                            onOpenRemoteTrackpad = onOpenRemoteTrackpad,
+                            onOpenExternalOrTrackpad = onProjectExternalOrTrackpad,
+                            onConnectPeerCast = onConnectPeerCast,
+                            onOpenFloatingAppPicker = { host, port, label ->
+                                val check = OpalPeerCastMutex.validateStartReceiving(
+                                    daemonSending = remote.connected,
+                                    sendingPeerName = remote.peerName,
+                                    targetHost = host,
+                                    selfLanIp = remote.lanIp,
                                 )
-                            }
-                        }
-                    }
-                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        if (status.connected && status.rootEnhanced) {
-                            OpalStatusBadge(label = "Root 增强", color = OpalPalette.AccentEmerald)
-                        }
-                        OpalStatusBadge(
-                            label = if (status.connected) "引擎就绪" else "未激活",
-                            color = if (status.connected) OpalPalette.AccentEmerald else OpalPalette.AccentAmber,
+                                if (!check.allowed) {
+                                    Toast.makeText(ctx, check.reason, Toast.LENGTH_LONG).show()
+                                } else {
+                                    floatingPickerTarget = Triple(host, port, label)
+                                }
+                            },
+                            onOpenActivation = { showActivationModal = true },
+                            onRequestCompleteExit = { showExitConfirmModal = true },
+                        )
+                        1 -> ConsoleDisplaySettingsTab(
+                            status = status,
+                            remote = remote,
+                            extDisplay = extDisplay,
+                            onPickCustomWallpaper = onPickCustomWallpaper,
+                        )
+                        2 -> ConsoleEngineSettingsTab(
+                            status = status,
+                            scene = scene,
+                            onOpenActivation = { showActivationModal = true },
+                            onOpenUpdateModal = { showUpdateModal = true },
+                            onStopEngine = onStopEngine,
+                        )
+                        else -> ConsoleLogsTab(
+                            status = status,
+                            scene = scene,
+                            remote = remote,
                         )
                     }
                 }
-
-                // macOS Floating Glass Segmented Tab Switcher
-                OpalSegmentedRow(
-                    options = listOf("工作站", "显示外设", "设置", "日志"),
-                    selectedIndex = selectedTab,
-                    onSelect = { selectedTab = it },
-                )
-
-                when (selectedTab) {
-                    0 -> ConsoleDashboardTab(
-                        status = status,
-                        scene = scene,
-                        remote = remote,
-                        extDisplay = extDisplay,
-                        needsLocalNetworkPerm = needsLocalNetworkPerm,
-                        onRequestLocalNetworkPerm = onRequestLocalNetworkPerm,
-                        onEnterLocalDesktop = onEnterDesktop,
-                        onOpenRemoteTrackpad = onOpenRemoteTrackpad,
-                        onOpenExternalOrTrackpad = onProjectExternalOrTrackpad,
-                        onConnectPeerCast = onConnectPeerCast,
-                        onOpenFloatingAppPicker = { host, port, label ->
-                            val check = OpalPeerCastMutex.validateStartReceiving(
-                                daemonSending = remote.connected,
-                                sendingPeerName = remote.peerName,
-                                targetHost = host,
-                                selfLanIp = remote.lanIp,
-                            )
-                            if (!check.allowed) {
-                                Toast.makeText(ctx, check.reason, Toast.LENGTH_LONG).show()
-                            } else {
-                                floatingPickerTarget = Triple(host, port, label)
-                            }
-                        },
-                        onOpenActivation = { showActivationModal = true },
-                        onRequestCompleteExit = { showExitConfirmModal = true },
-                    )
-                    1 -> ConsoleDisplaySettingsTab(
-                        status = status,
-                        remote = remote,
-                        extDisplay = extDisplay,
-                        onPickCustomWallpaper = onPickCustomWallpaper,
-                    )
-                    2 -> ConsoleEngineSettingsTab(
-                        status = status,
-                        scene = scene,
-                        onOpenActivation = { showActivationModal = true },
-                        onOpenUpdateModal = { showUpdateModal = true },
-                        onStopEngine = onStopEngine,
-                    )
-                    else -> ConsoleLogsTab(
-                        status = status,
-                        scene = scene,
-                        remote = remote,
-                    )
-                }
             }
+
+            OpalConsoleBottomBar(
+                selectedTab = selectedTab,
+                onSelectTab = { selectedTab = it },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
         }
 
         if (showActivationModal) {

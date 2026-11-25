@@ -143,22 +143,23 @@ class BridgeService : Service() {
         }
 
         /**
-         * Performs an ordered full teardown of daemon, foreground services, NSD discovery,
-         * notifications, local ADB server, all Activity tasks, and finally terminates the process.
+         * Performs an ordered full teardown: stops the daemon engine first and waits for it to exit,
+         * then stops foreground/auxiliary services, local ADB server, all Activity tasks, and finally
+         * terminates the app process itself.
          */
         fun completeExitApp(activity: Activity) {
             val appCtx = activity.applicationContext
             sUserStopping = true
-            OpalLogStore.i("Service", "Complete exit requested by user")
+            OpalLogStore.i("Service", "Complete exit requested by user: stopping daemon engine first")
             stopAuxiliaryServicesAndDiscovery(appCtx)
             ExternalTrackpadBridge.requestClosePhoneTrackpad()
             ExternalTrackpadBridge.getDirectSink()?.closeExternalDesktop()
-            runCatching { appCtx.stopService(Intent(appCtx, BridgeService::class.java)) }
 
             val finished = AtomicBoolean(false)
             val mainHandler = Handler(Looper.getMainLooper())
             val finishAndTerminate = Runnable {
                 if (!finished.compareAndSet(false, true)) return@Runnable
+                runCatching { appCtx.stopService(Intent(appCtx, BridgeService::class.java)) }
                 runCatching {
                     val am = appCtx.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
                     am?.appTasks?.forEach { task -> runCatching { task.finishAndRemoveTask() } }
@@ -171,10 +172,18 @@ class BridgeService : Service() {
                 }, 120L)
             }
 
-            // Hard safety watchdog so UI exit never stalls if IPC or local ADB hangs
-            mainHandler.postDelayed(finishAndTerminate, 900L)
+            // Hard safety watchdog so UI exit never stalls if IPC or local ADB hangs,
+            // while giving the daemon enough time to finish closing VirtualDisplays and exit first.
+            mainHandler.postDelayed(finishAndTerminate, 3500L)
             Thread({
-                runCatching { BridgeClient.shutdownDaemonSync(closeWindows = true, removeTasks = false) }
+                runCatching {
+                    BridgeClient.shutdownDaemonSync(
+                        closeWindows = true,
+                        removeTasks = false,
+                        waitForExitMs = 2000L,
+                    )
+                }
+                runCatching { appCtx.stopService(Intent(appCtx, BridgeService::class.java)) }
                 runCatching {
                     if (AdbProcessRunner.getPrivateAdbSocketFile(appCtx).exists()) {
                         AdbProcessRunner.stopLocalAdbServerSync(appCtx)

@@ -206,6 +206,10 @@ object AdbBootstrap {
 
     private fun submitBootstrap(ctx: Context, listener: ProgressListener?, label: String, block: (Context) -> Unit) {
         val appCtx = ctx.applicationContext
+        // Reset user-stopping flag before any activation attempt so BridgeProvider accepts the
+        // newly started daemon's Binder handshake even right after "停止引擎".
+        BridgeService.sUserStopping = false
+        BridgeService.ensureStarted(appCtx)
         OpalLogStore.i("ADB", "Bootstrap started: $label")
         exec.execute {
             try { block(appCtx) }

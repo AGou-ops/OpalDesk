@@ -1143,6 +1143,7 @@ fun OpalAmbientBackdrop(
     modifier: Modifier = Modifier,
     wallpaperPreset: Int = 0,
     suspendBackdrop: Boolean = false,
+    consoleScrim: Boolean = false,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val isDark = OpalPalette.isDark
@@ -1223,17 +1224,28 @@ fun OpalAmbientBackdrop(
     Box(modifier = rootModifier) {
         if (!suspendBackdrop) {
             if (customBitmap != null) {
+                val wallpaperModifier = if (consoleScrim && Build.VERSION.SDK_INT >= 31) {
+                    Modifier.fillMaxSize().blur(18.dp)
+                } else {
+                    Modifier.fillMaxSize()
+                }
                 Image(
                     bitmap = customBitmap,
                     contentDescription = "Desktop Wallpaper",
                     contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = wallpaperModifier,
                 )
                 // Subtle atmospheric veil so frosted liquid glass & text maintain crisp readability over any photo
+                val veilColor = when {
+                    consoleScrim && isDark -> Color(0xBD0A101D)
+                    consoleScrim -> Color(0xCCEEF3FA)
+                    isDark -> Color(0x38060910)
+                    else -> Color(0x16FFFFFF)
+                }
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(if (isDark) Color(0x38060910) else Color(0x16FFFFFF)),
+                        .background(veilColor),
                 )
             } else {
                 val blurModifier = if (Build.VERSION.SDK_INT >= 31) {

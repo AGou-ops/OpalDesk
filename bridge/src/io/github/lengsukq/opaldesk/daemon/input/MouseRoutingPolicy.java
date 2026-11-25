@@ -24,6 +24,7 @@ public final class MouseRoutingPolicy {
     public static final int ACTION_DOWN = 0;
     public static final int ACTION_UP = 1;
     public static final int ACTION_MOVE = 2;
+    public static final int ACTION_CANCEL = 3;
     public static final int ACTION_HOVER_MOVE = 7;
     public static final int ACTION_SCROLL = 8;
     public static final int ACTION_HOVER_ENTER = 9;
@@ -62,6 +63,28 @@ public final class MouseRoutingPolicy {
             return BUTTON_PRIMARY;
         }
         return rawButtonState;
+    }
+
+    /**
+     * Returns {@code true} when a primary left-button mouse click sequence ({@code DOWN/MOVE/UP/CANCEL})
+     * should be delivered as {@code SOURCE_TOUCHSCREEN}/{@code TOOL_TYPE_FINGER} so both desktop web
+     * pages and mobile H5 pages (which rely on {@code touchstart}/{@code touchend} or reject synthetic
+     * {@code SOURCE_MOUSE} events without {@code ACTION_BUTTON_PRESS}) respond identically to touch.
+     * Hover, scroll wheel, and secondary/tertiary mouse buttons stay pure {@code SOURCE_MOUSE}.
+     */
+    public static boolean shouldMapPrimaryMouseClickToTouch(
+            int actionMasked,
+            boolean isMouseSource,
+            int rawButtonState,
+            boolean activePrimaryClick) {
+        if (!isMouseSource) return false;
+        if (actionMasked == ACTION_DOWN) {
+            return rawButtonState == 0 || rawButtonState == BUTTON_PRIMARY;
+        }
+        if (actionMasked == ACTION_MOVE) {
+            return activePrimaryClick && (rawButtonState == 0 || rawButtonState == BUTTON_PRIMARY);
+        }
+        return activePrimaryClick && (actionMasked == ACTION_UP || actionMasked == ACTION_CANCEL);
     }
 
     /**

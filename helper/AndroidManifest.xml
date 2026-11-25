@@ -129,6 +129,16 @@
                 android:value="Temporary opt-in LAN Web activation bridge for local wireless ADB bootstrap" />
         </service>
 
+        <service
+            android:name=".notifications.OpalNotificationListenerService"
+            android:exported="true"
+            android:label="OpalDesk 桌面通知桥接"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
         <receiver
             android:name=".AdbPairingReceiver"
             android:exported="false" />

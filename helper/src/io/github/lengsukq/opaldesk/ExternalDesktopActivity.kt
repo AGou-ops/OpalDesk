@@ -19,12 +19,22 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
@@ -47,10 +57,16 @@ import io.github.lengsukq.opaldesk.external.HardwareMouseDetectingFrameLayout
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.prefs.WallpaperStorage
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
+import io.github.lengsukq.opaldesk.ui.NativeImeBridgeHost
+import io.github.lengsukq.opaldesk.ui.NativeImeHostController
 import io.github.lengsukq.opaldesk.ui.OpalImeFocusTracker
 import io.github.lengsukq.opaldesk.ui.OpalPalette
+import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTheme
 import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
+import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
+import io.github.lengsukq.opaldesk.ui.rememberNativeImeHostController
+import androidx.compose.ui.unit.sp
 import kotlin.math.roundToInt
 
 /**
@@ -98,6 +114,9 @@ class ExternalDesktopActivity : ComponentActivity() {
     private var presentationSummary by mutableStateOf("")
     private var directDisplaySummary by mutableStateOf("")
     private var runningInPresentationMode by mutableStateOf(false)
+    private var directImeVisible by mutableStateOf(false)
+    private var directComposingText by mutableStateOf("")
+    private var directImeController: NativeImeHostController? = null
 
     private val presentationTrackpadCloser: () -> Unit = {
         runOnUiThread { openConsoleOnPrimaryDisplay() }
@@ -269,6 +288,35 @@ class ExternalDesktopActivity : ComponentActivity() {
                 OpalTheme {
                     val uiScale by AppPrefs.externalUiScaleFlow.collectAsState()
                     val remoteCursor by BridgeClient.remoteTrackpadCursorFlow.collectAsState()
+                    val scene by BridgeClient.sceneFlow.collectAsState()
+                    val imeRequest by BridgeClient.imeBridgeRequestFlow.collectAsState()
+                    val imeController = rememberNativeImeHostController()
+                    directImeController = imeController
+                    var lastHandledImeSeq by remember {
+                        mutableLongStateOf(BridgeClient.imeBridgeRequestFlow.value?.seq ?: 0L)
+                    }
+                    LaunchedEffect(imeRequest?.seq) {
+                        val req = imeRequest ?: return@LaunchedEffect
+                        if (req.seq <= lastHandledImeSeq) return@LaunchedEffect
+                        lastHandledImeSeq = req.seq
+                        if (req.show) {
+                            val focused = BridgeClient.sceneFlow.value.focusedWindow
+                            if (focused != null && !focused.isMinimized
+                                && (req.windowId <= 0 || req.windowId == focused.windowId)
+                                && !OpalImeFocusTracker.localComposeTextFieldFocused
+                            ) {
+                                imeController.showKeyboard(req.inputType)
+                            }
+                        } else if (directImeVisible) {
+                            imeController.hideKeyboard()
+                        }
+                    }
+                    LaunchedEffect(scene.focusedWindow?.windowId, scene.focusedWindow?.isMinimized) {
+                        val focused = scene.focusedWindow
+                        if (directImeVisible && !OpalImeFocusTracker.localComposeTextFieldFocused && (focused == null || focused.isMinimized)) {
+                            imeController.hideKeyboard()
+                        }
+                    }
                     val baseDensity = LocalDensity.current
                     val effDensity = Density(
                         density = (baseDensity.density * uiScale).coerceIn(0.85f, 3.5f),
@@ -280,14 +328,53 @@ class ExternalDesktopActivity : ComponentActivity() {
                         null
                     }
                     CompositionLocalProvider(LocalDensity provides effDensity) {
-                        OpalCompositorWorkspace(
-                            isExternalMonitor = true,
-                            externalMonitorSummary = directDisplaySummary,
-                            virtualCursorPx = directCursor ?: remoteCursor,
-                            onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
-                            onOpenConsole = ::openConsoleOnPrimaryDisplay,
-                            onExitDesktop = { finish() },
-                        )
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            NativeImeBridgeHost(
+                                controller = imeController,
+                                onSendKey = { action, keyCode, meta ->
+                                    val focused = BridgeClient.sceneFlow.value.focusedWindow
+                                    if (focused != null && !focused.isMinimized) {
+                                        BridgeClient.injectWindowKeyAsync(focused.windowId, action, keyCode, meta)
+                                    }
+                                },
+                                onCommitText = { txt ->
+                                    WorkstationKeyDispatcher.commitTextToFocusedWindow(this@ExternalDesktopActivity, txt)
+                                },
+                                onComposingChanged = { directComposingText = it },
+                                onImeVisibilityChanged = { vis ->
+                                    directImeVisible = vis
+                                    if (!vis) directComposingText = ""
+                                },
+                                modifier = Modifier.align(Alignment.BottomStart),
+                            )
+                            OpalCompositorWorkspace(
+                                isExternalMonitor = true,
+                                externalMonitorSummary = directDisplaySummary,
+                                imeActive = directImeVisible,
+                                onToggleSoftKeyboard = { imeController.toggleKeyboard(directImeVisible) },
+                                virtualCursorPx = directCursor ?: remoteCursor,
+                                onPickCustomWallpaper = { wallpaperPicker.launch("image/*") },
+                                onOpenConsole = ::openConsoleOnPrimaryDisplay,
+                                onExitDesktop = { finish() },
+                            )
+                            if (directComposingText.isNotEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .imePadding()
+                                        .padding(bottom = 12.dp)
+                                        .liquidGlassSurface(
+                                            shape = CircleShape,
+                                            fill = OpalPalette.LiquidPopoverFill,
+                                            rim = OpalPalette.LiquidGlassRim,
+                                            elevation = 16.dp,
+                                        )
+                                        .padding(horizontal = 16.dp, vertical = 7.dp),
+                                ) {
+                                    OpalText(text = directComposingText, fontSize = 14.sp, color = OpalPalette.TextPrimary)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -428,7 +515,23 @@ class ExternalDesktopActivity : ComponentActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
 
-        if (OpalImeFocusTracker.localComposeTextFieldFocused) {
+        if (WorkstationKeyDispatcher.isImeSwitchShortcut(event.keyCode, event.metaState)) {
+            if (event.action == KeyEvent.ACTION_DOWN && !OpalImeFocusTracker.localComposeTextFieldFocused) {
+                val focused = BridgeClient.sceneFlow.value.focusedWindow
+                if (focused != null && !focused.isMinimized) {
+                    if (runningInPresentationMode) {
+                        presentation?.ensureImeHostActive()
+                    } else if (!directImeVisible) {
+                        directImeController?.showKeyboard()
+                    }
+                }
+            }
+            if (super.dispatchKeyEvent(event)) return true
+            if (presentation?.dispatchKeyEventToPresentation(event) == true) return true
+            return false
+        }
+
+        if (OpalImeFocusTracker.localComposeTextFieldFocused || directImeVisible || (presentation?.isImeActive == true)) {
             if (super.dispatchKeyEvent(event)) return true
             if (presentation?.dispatchKeyEventToPresentation(event) == true) return true
         }
@@ -474,19 +577,7 @@ class ExternalDesktopActivity : ComponentActivity() {
     }
 
     private fun commitTextToFocusedWindow(text: String) {
-        if (text.isEmpty()) return
-        try {
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk", text))
-        } catch (_: Throwable) {
-        }
-        val focused = BridgeClient.sceneFlow.value.focusedWindow ?: return
-        if (focused.isMinimized) return
-        val ctrl = KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
-        handler.postDelayed({
-            BridgeClient.injectWindowKeyAsync(focused.windowId, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_V, ctrl)
-            BridgeClient.injectWindowKeyAsync(focused.windowId, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_V, ctrl)
-        }, 45L)
+        WorkstationKeyDispatcher.commitTextToFocusedWindow(this, text)
     }
 
     private fun syncExternalMouseRouting(extDisplayId: Int) {

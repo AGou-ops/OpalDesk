@@ -473,20 +473,26 @@ class WebActivationService : Service(), MiniWebSocketServer.Listener {
     }
 
     private fun broadcastState() {
-        server?.broadcastAuthenticated(buildStateJson())
+        ioExec.execute {
+            server?.broadcastAuthenticated(buildStateJson())
+        }
     }
 
     private fun broadcastJson(obj: JSONObject) {
-        server?.broadcastAuthenticated(obj.toString())
+        val payload = obj.toString()
+        ioExec.execute {
+            server?.broadcastAuthenticated(payload)
+        }
     }
 
     private fun sendError(client: MiniWebSocketServer.WsClient, message: String) {
-        client.sendText(
-            JSONObject().apply {
-                put("type", "error")
-                put("message", message)
-            }.toString(),
-        )
+        val payload = JSONObject().apply {
+            put("type", "error")
+            put("message", message)
+        }.toString()
+        ioExec.execute {
+            client.sendText(payload)
+        }
     }
 
     private fun updateUiStatus(msg: String, isError: Boolean) {

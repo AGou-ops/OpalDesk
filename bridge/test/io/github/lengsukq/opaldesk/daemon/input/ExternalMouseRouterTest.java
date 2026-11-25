@@ -133,6 +133,22 @@ public class ExternalMouseRouterTest {
         assertEquals(0,
                 MouseRoutingPolicy.normalizeMouseButtonState(MouseRoutingPolicy.ACTION_DOWN, false, 0));
 
+        // Primary left-button mouse clicks map to touch for web/H5 compatibility while hover/scroll/right-click stay mouse
+        assertTrue(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_DOWN, true, MouseRoutingPolicy.BUTTON_PRIMARY, false));
+        assertTrue(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_DOWN, true, 0, false));
+        assertTrue(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_MOVE, true, MouseRoutingPolicy.BUTTON_PRIMARY, true));
+        assertTrue(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_UP, true, 0, true));
+        assertFalse(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_DOWN, true, 2 /* BUTTON_SECONDARY */, false));
+        assertFalse(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_HOVER_MOVE, true, 0, false));
+        assertFalse(MouseRoutingPolicy.shouldMapPrimaryMouseClickToTouch(
+                MouseRoutingPolicy.ACTION_SCROLL, true, 0, false));
+
         // UHID pre-press positioning report prevents single-click-from-old-coord drag swallow
         assertTrue(MouseRoutingPolicy.needsPrePressPositionReport(0, 1, 100, 100, 420, 360));
         assertFalse(MouseRoutingPolicy.needsPrePressPositionReport(0, 1, 420, 360, 420, 360));

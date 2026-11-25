@@ -182,6 +182,7 @@ object OpalSentry {
             val outcome = when (uploadResult) {
                 is ManualUploadResult.Success -> {
                     val afterQuota = limiter.recordConfirmedUpload()
+                    OpalLogStore.clearAfterConfirmedUpload(daemonLogText)
                     OpalLogStore.i(
                         "Sentry",
                         "Manual diagnostic report confirmed: eventId=${uploadResult.eventId} (${afterQuota.usedToday}/${afterQuota.maxDaily})",

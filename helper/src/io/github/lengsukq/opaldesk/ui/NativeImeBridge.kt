@@ -28,6 +28,9 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.compositor.applyWindowTilingLayout
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
@@ -57,6 +60,9 @@ object OpalImeFocusTracker {
  */
 object WorkstationKeyDispatcher {
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val textCommitExec = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "OpalImeTextCommit").apply { isDaemon = true }
+    }
 
     fun handleGlobalShortcut(event: KeyEvent): Boolean {
         if (event.action != KeyEvent.ACTION_DOWN) return false
@@ -110,6 +116,31 @@ object WorkstationKeyDispatcher {
         return false
     }
 
+    /**
+     * Pure JVM-testable matcher for physical/Bluetooth keyboard IME language-switch keys and chords
+     * (e.g. Ctrl+Space, Shift+Space, Meta+Space, Globe/Language-Switch, CJK toggle keys).
+     * These must never be swallowed into raw VirtualDisplay key injection so Android's system IME
+     * can switch between Chinese and English cleanly.
+     */
+    fun isImeSwitchShortcut(keyCode: Int, metaState: Int): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_LANGUAGE_SWITCH,
+            KeyEvent.KEYCODE_SWITCH_CHARSET,
+            KeyEvent.KEYCODE_ZENKAKU_HANKAKU,
+            KeyEvent.KEYCODE_EISU,
+            KeyEvent.KEYCODE_KANA,
+            KeyEvent.KEYCODE_HENKAN,
+            KeyEvent.KEYCODE_MUHENKAN,
+            KeyEvent.KEYCODE_KATAKANA_HIRAGANA -> return true
+        }
+        if (keyCode == KeyEvent.KEYCODE_SPACE) {
+            val hasSwitchMod = (metaState and (KeyEvent.META_CTRL_ON or KeyEvent.META_SHIFT_ON or KeyEvent.META_META_ON)) != 0
+            val hasAlt = (metaState and KeyEvent.META_ALT_ON) != 0
+            if (hasSwitchMod && !hasAlt) return true
+        }
+        return false
+    }
+
     fun isForwardableKey(keyCode: Int): Boolean = when (keyCode) {
         KeyEvent.KEYCODE_VOLUME_UP,
         KeyEvent.KEYCODE_VOLUME_DOWN,
@@ -125,6 +156,7 @@ object WorkstationKeyDispatcher {
     fun forwardToFocusedWindow(event: KeyEvent): Boolean {
         if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) return false
         if (!isForwardableKey(event.keyCode)) return false
+        if (isImeSwitchShortcut(event.keyCode, event.metaState)) return false
         val focused = BridgeClient.sceneFlow.value.focusedWindow ?: return false
         if (focused.isMinimized) return false
         BridgeClient.injectWindowKeyAsync(
@@ -138,18 +170,33 @@ object WorkstationKeyDispatcher {
 
     fun commitTextToFocusedWindow(ctx: Context, text: String) {
         if (text.isEmpty()) return
-        try {
-            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk", text))
-        } catch (_: Throwable) {
+        val appCtx = ctx.applicationContext
+        // Serialize clipboard + Ctrl+V commits on a dedicated single thread so rapid consecutive
+        // Chinese IME phrases in apps like WeChat never overwrite each other before pasting lands.
+        textCommitExec.execute {
+            val focused = BridgeClient.sceneFlow.value.focusedWindow ?: return@execute
+            if (focused.isMinimized) return@execute
+            val clipLatch = CountDownLatch(1)
+            mainHandler.post {
+                try {
+                    val cm = appCtx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk", text))
+                } catch (_: Throwable) {
+                } finally {
+                    clipLatch.countDown()
+                }
+            }
+            try {
+                clipLatch.await(150L, TimeUnit.MILLISECONDS)
+                Thread.sleep(32L)
+                val ctrl = KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+                BridgeClient.injectWindowKeyAsync(focused.windowId, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_V, ctrl)
+                BridgeClient.injectWindowKeyAsync(focused.windowId, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_V, ctrl)
+                Thread.sleep(45L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
         }
-        val focused = BridgeClient.sceneFlow.value.focusedWindow ?: return
-        if (focused.isMinimized) return
-        val ctrl = KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
-        mainHandler.postDelayed({
-            BridgeClient.injectWindowKeyAsync(focused.windowId, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_V, ctrl)
-            BridgeClient.injectWindowKeyAsync(focused.windowId, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_V, ctrl)
-        }, 40L)
     }
 }
 

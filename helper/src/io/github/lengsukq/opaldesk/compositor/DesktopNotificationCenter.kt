@@ -1,0 +1,369 @@
+package io.github.lengsukq.opaldesk.compositor
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import io.github.lengsukq.opaldesk.notifications.DesktopNotificationItem
+import io.github.lengsukq.opaldesk.ui.OpalButton
+import io.github.lengsukq.opaldesk.ui.OpalPalette
+import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
+import io.github.lengsukq.opaldesk.ui.OpalText
+import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
+import kotlinx.coroutines.delay
+
+@Composable
+fun DesktopBellIcon(
+    tint: Color,
+    modifier: Modifier = Modifier,
+) {
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+        val stroke = Stroke(width = w * 0.11f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+        val bellPath = Path().apply {
+            moveTo(w * 0.22f, h * 0.68f)
+            lineTo(w * 0.28f, h * 0.42f)
+            cubicTo(w * 0.28f, h * 0.20f, w * 0.72f, h * 0.20f, w * 0.72f, h * 0.42f)
+            lineTo(w * 0.78f, h * 0.68f)
+            close()
+        }
+        drawPath(bellPath, color = tint, style = stroke)
+        drawLine(tint, Offset(w * 0.16f, h * 0.68f), Offset(w * 0.84f, h * 0.68f), strokeWidth = stroke.width, cap = StrokeCap.Round)
+        drawArc(
+            color = tint,
+            startAngle = 0f,
+            sweepAngle = 180f,
+            useCenter = false,
+            topLeft = Offset(w * 0.39f, h * 0.70f),
+            size = Size(w * 0.22f, h * 0.18f),
+            style = stroke,
+        )
+    }
+}
+
+/**
+ * macOS-style translucent Liquid Glass heads-up notification toast anchored in the top-right corner
+ * of the DeX desktop. Auto-dismisses after 4.5s and opens/focuses the app inside DeX when tapped.
+ */
+@Composable
+fun DesktopNotificationBanner(
+    item: DesktopNotificationItem,
+    onOpenApp: (String) -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LaunchedEffect(item.key, item.postTimeMs) {
+        delay(4500L)
+        onDismiss()
+    }
+
+    val shape = RoundedCornerShape(18.dp)
+    Row(
+        modifier = modifier
+            .widthIn(min = 240.dp, max = 340.dp)
+            .liquidGlassSurface(
+                shape = shape,
+                fill = OpalPalette.LiquidPopoverFill,
+                rim = OpalPalette.LiquidGlassRim,
+                elevation = 20.dp,
+            )
+            .clickable {
+                onDismiss()
+                onOpenApp(item.packageName)
+            }
+            .padding(horizontal = 13.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.Top,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .padding(top = 2.dp)
+                .size(32.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(OpalPalette.AccentBlue.copy(alpha = if (OpalPalette.isDark) 0.24f else 0.14f)),
+            contentAlignment = Alignment.Center,
+        ) {
+            OpalText(
+                text = item.appLabel.take(1).uppercase(),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+                color = OpalPalette.AccentBlue,
+            )
+        }
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                OpalText(
+                    text = item.appLabel,
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = OpalPalette.AccentBlue,
+                    maxLines = 1,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(6.dp))
+                OpalText(
+                    text = item.formattedTime(),
+                    fontSize = 10.sp,
+                    color = OpalPalette.TextMuted,
+                    maxLines = 1,
+                )
+            }
+            OpalText(
+                text = item.title,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = OpalPalette.TextPrimary,
+                maxLines = 1,
+            )
+            if (item.text.isNotBlank()) {
+                OpalText(
+                    text = item.text,
+                    fontSize = 11.5.sp,
+                    color = OpalPalette.TextSecondary,
+                    maxLines = 2,
+                    lineHeight = 15.5.sp,
+                )
+            }
+        }
+        Box(
+            modifier = Modifier
+                .size(20.dp)
+                .clip(CircleShape)
+                .background(OpalPalette.ChipFill)
+                .clickable(onClick = onDismiss),
+            contentAlignment = Alignment.Center,
+        ) {
+            OpalText(text = "×", fontSize = 12.sp, color = OpalPalette.TextMuted)
+        }
+    }
+}
+
+/**
+ * macOS-style Liquid Glass Notification Center dropdown anchored at the top-right of the DeX bar.
+ */
+@Composable
+fun DesktopNotificationCenterPopover(
+    notifications: List<DesktopNotificationItem>,
+    accessGranted: Boolean,
+    maxHeight: Dp,
+    onOpenApp: (String) -> Unit,
+    onDismissNotification: (String) -> Unit,
+    onClearAll: () -> Unit,
+    onRequestAccess: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val shape = RoundedCornerShape(22.dp)
+    Column(
+        modifier = modifier
+            .widthIn(min = 290.dp, max = 360.dp)
+            .heightIn(max = maxHeight)
+            .liquidGlassSurface(
+                shape = shape,
+                fill = OpalPalette.LiquidPopoverFill,
+                rim = OpalPalette.LiquidGlassRim,
+                elevation = 24.dp,
+            )
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp),
+            ) {
+                OpalText(text = "通知中心", fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                if (notifications.isNotEmpty()) {
+                    OpalStatusBadge(label = "${notifications.size}", color = OpalPalette.AccentBlue)
+                }
+            }
+            if (notifications.any { it.clearable }) {
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(OpalPalette.ChipFill)
+                        .clickable(onClick = onClearAll)
+                        .padding(horizontal = 10.dp, vertical = 4.dp),
+                ) {
+                    OpalText(
+                        text = "清空全部",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = OpalPalette.TextSecondary,
+                    )
+                }
+            }
+        }
+
+        if (!accessGranted) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(OpalPalette.ChipFill)
+                    .border(0.8.dp, OpalPalette.BorderSubtle, RoundedCornerShape(16.dp))
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                OpalText(
+                    text = "开启手机通知同步",
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                OpalText(
+                    text = "授予 OpalDesk「通知使用权」后，微信、短信等手机应用通知将实时同步到 DeX 桌面，点击可直接打开窗口。",
+                    fontSize = 11.5.sp,
+                    color = OpalPalette.TextSecondary,
+                    lineHeight = 16.sp,
+                )
+                OpalButton(
+                    label = "去开启通知使用权",
+                    compact = true,
+                    onClick = onRequestAccess,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        } else if (notifications.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(OpalPalette.ChipFill)
+                    .padding(vertical = 24.dp, horizontal = 14.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    OpalText(text = "暂无未读通知", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = OpalPalette.TextSecondary)
+                    OpalText(text = "手机收到新消息时会自动显示在这里", fontSize = 11.sp, color = OpalPalette.TextMuted)
+                }
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                notifications.forEach { item ->
+                    val itemShape = RoundedCornerShape(15.dp)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(itemShape)
+                            .background(OpalPalette.ChipFill)
+                            .border(0.7.dp, OpalPalette.BorderSubtle, itemShape)
+                            .clickable { onOpenApp(item.packageName) }
+                            .padding(horizontal = 11.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.Top,
+                        horizontalArrangement = Arrangement.spacedBy(9.dp),
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .padding(top = 2.dp)
+                                .size(28.dp)
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(OpalPalette.AccentBlue.copy(alpha = if (OpalPalette.isDark) 0.22f else 0.13f)),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            OpalText(
+                                text = item.appLabel.take(1).uppercase(),
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = OpalPalette.AccentBlue,
+                            )
+                        }
+                        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                OpalText(
+                                    text = item.appLabel,
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = OpalPalette.AccentBlue,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                OpalText(
+                                    text = item.formattedTime(),
+                                    fontSize = 10.sp,
+                                    color = OpalPalette.TextMuted,
+                                    maxLines = 1,
+                                )
+                            }
+                            OpalText(
+                                text = item.title,
+                                fontSize = 12.5.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                            )
+                            if (item.text.isNotBlank()) {
+                                OpalText(
+                                    text = item.text,
+                                    fontSize = 11.5.sp,
+                                    color = OpalPalette.TextSecondary,
+                                    maxLines = 3,
+                                    lineHeight = 15.5.sp,
+                                )
+                            }
+                        }
+                        if (item.clearable) {
+                            Box(
+                                modifier = Modifier
+                                    .size(20.dp)
+                                    .clip(CircleShape)
+                                    .clickable { onDismissNotification(item.key) },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                OpalText(text = "×", fontSize = 13.sp, color = OpalPalette.TextMuted)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -8,13 +8,27 @@ import android.view.Surface
 import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -29,11 +43,18 @@ import androidx.savedstate.SavedStateRegistry
 import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
+import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.compositor.OpalCompositorWorkspace
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
+import io.github.lengsukq.opaldesk.ui.NativeImeBridgeHost
+import io.github.lengsukq.opaldesk.ui.NativeImeHostController
 import io.github.lengsukq.opaldesk.ui.OpalImeFocusTracker
+import io.github.lengsukq.opaldesk.ui.OpalPalette
+import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.OpalTheme
 import io.github.lengsukq.opaldesk.ui.WorkstationKeyDispatcher
+import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
+import io.github.lengsukq.opaldesk.ui.rememberNativeImeHostController
 
 /**
  * Full-bleed native external monitor compositor host built on standard public AOSP [Presentation].
@@ -62,6 +83,10 @@ class ExternalMonitorPresentation(
 
     private val ownLifecycle = PresentationLifecycleOwner()
     private var composeView: ComposeView? = null
+    private var imeVisible by mutableStateOf(false)
+    private var composingText by mutableStateOf("")
+    private var imeController: NativeImeHostController? = null
+    val isImeActive: Boolean get() = imeVisible
     private val pointerDispatcher = ExternalPointerDispatcher(
         defaultWidthPx = displayWidthPx,
         defaultHeightPx = displayHeightPx,
@@ -108,24 +133,92 @@ class ExternalMonitorPresentation(
             setContent {
                 OpalTheme {
                     val uiScale by AppPrefs.externalUiScaleFlow.collectAsState()
+                    val scene by BridgeClient.sceneFlow.collectAsState()
+                    val imeRequest by BridgeClient.imeBridgeRequestFlow.collectAsState()
+                    val controller = rememberNativeImeHostController()
+                    imeController = controller
+                    var lastHandledImeSeq by remember {
+                        mutableLongStateOf(BridgeClient.imeBridgeRequestFlow.value?.seq ?: 0L)
+                    }
+                    LaunchedEffect(imeRequest?.seq) {
+                        val req = imeRequest ?: return@LaunchedEffect
+                        if (req.seq <= lastHandledImeSeq) return@LaunchedEffect
+                        lastHandledImeSeq = req.seq
+                        if (req.show) {
+                            val focused = BridgeClient.sceneFlow.value.focusedWindow
+                            if (focused != null && !focused.isMinimized
+                                && (req.windowId <= 0 || req.windowId == focused.windowId)
+                                && !OpalImeFocusTracker.localComposeTextFieldFocused
+                            ) {
+                                controller.showKeyboard(req.inputType)
+                            }
+                        } else if (imeVisible) {
+                            controller.hideKeyboard()
+                        }
+                    }
+                    LaunchedEffect(scene.focusedWindow?.windowId, scene.focusedWindow?.isMinimized) {
+                        val focused = scene.focusedWindow
+                        if (imeVisible && !OpalImeFocusTracker.localComposeTextFieldFocused && (focused == null || focused.isMinimized)) {
+                            controller.hideKeyboard()
+                        }
+                    }
                     val baseDensity = LocalDensity.current
                     val effDensity = Density(
                         density = (baseDensity.density * uiScale).coerceIn(0.85f, 3.5f),
                         fontScale = baseDensity.fontScale,
                     )
                     CompositionLocalProvider(LocalDensity provides effDensity) {
-                        OpalCompositorWorkspace(
-                            isExternalMonitor = true,
-                            externalMonitorSummary = monitorSummary,
-                            virtualCursorPx = if (pointerDispatcher.showVirtualCursorState.value) {
-                                pointerDispatcher.cursorPosState.value
-                            } else {
-                                null
-                            },
-                            onPickCustomWallpaper = onPickCustomWallpaper,
-                            onOpenConsole = onOpenConsole,
-                            onExitDesktop = onExitDesktop,
-                        )
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            NativeImeBridgeHost(
+                                controller = controller,
+                                onSendKey = { action, keyCode, meta ->
+                                    val focused = BridgeClient.sceneFlow.value.focusedWindow
+                                    if (focused != null && !focused.isMinimized) {
+                                        BridgeClient.injectWindowKeyAsync(focused.windowId, action, keyCode, meta)
+                                    }
+                                },
+                                onCommitText = { txt ->
+                                    WorkstationKeyDispatcher.commitTextToFocusedWindow(context, txt)
+                                },
+                                onComposingChanged = { composingText = it },
+                                onImeVisibilityChanged = { vis ->
+                                    imeVisible = vis
+                                    if (!vis) composingText = ""
+                                },
+                                modifier = Modifier.align(Alignment.BottomStart),
+                            )
+                            OpalCompositorWorkspace(
+                                isExternalMonitor = true,
+                                externalMonitorSummary = monitorSummary,
+                                imeActive = imeVisible,
+                                onToggleSoftKeyboard = { controller.toggleKeyboard(imeVisible) },
+                                virtualCursorPx = if (pointerDispatcher.showVirtualCursorState.value) {
+                                    pointerDispatcher.cursorPosState.value
+                                } else {
+                                    null
+                                },
+                                onPickCustomWallpaper = onPickCustomWallpaper,
+                                onOpenConsole = onOpenConsole,
+                                onExitDesktop = onExitDesktop,
+                            )
+                            if (composingText.isNotEmpty()) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomCenter)
+                                        .imePadding()
+                                        .padding(bottom = 12.dp)
+                                        .liquidGlassSurface(
+                                            shape = CircleShape,
+                                            fill = OpalPalette.LiquidPopoverFill,
+                                            rim = OpalPalette.LiquidGlassRim,
+                                            elevation = 16.dp,
+                                        )
+                                        .padding(horizontal = 16.dp, vertical = 7.dp),
+                                ) {
+                                    OpalText(text = composingText, fontSize = 14.sp, color = OpalPalette.TextPrimary)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -174,9 +267,22 @@ class ExternalMonitorPresentation(
 
     fun scrollAtCursor(hScroll: Float, vScroll: Float) = pointerDispatcher.scrollAtCursor(hScroll, vScroll)
 
+    fun ensureImeHostActive() {
+        if (!imeVisible) {
+            imeController?.showKeyboard()
+        }
+    }
+
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (WorkstationKeyDispatcher.handleGlobalShortcut(event)) return true
-        if (OpalImeFocusTracker.localComposeTextFieldFocused && super.dispatchKeyEvent(event)) return true
+        if (WorkstationKeyDispatcher.isImeSwitchShortcut(event.keyCode, event.metaState)) {
+            if (event.action == KeyEvent.ACTION_DOWN && !OpalImeFocusTracker.localComposeTextFieldFocused) {
+                val focused = BridgeClient.sceneFlow.value.focusedWindow
+                if (focused != null && !focused.isMinimized) ensureImeHostActive()
+            }
+            return super.dispatchKeyEvent(event)
+        }
+        if ((OpalImeFocusTracker.localComposeTextFieldFocused || imeVisible) && super.dispatchKeyEvent(event)) return true
         if (WorkstationKeyDispatcher.forwardToFocusedWindow(event)) return true
         return super.dispatchKeyEvent(event)
     }

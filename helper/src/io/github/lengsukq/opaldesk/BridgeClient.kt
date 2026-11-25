@@ -1095,7 +1095,11 @@ object BridgeClient {
         }
     }
 
-    fun shutdownDaemonSync(closeWindows: Boolean = true, removeTasks: Boolean = false) {
+    fun shutdownDaemonSync(
+        closeWindows: Boolean = true,
+        removeTasks: Boolean = false,
+        waitForExitMs: Long = 0L,
+    ) {
         localDesktopMousePinned = false
         val svc = getService()
         var sentShutdownViaBinder = false
@@ -1124,21 +1128,10 @@ object BridgeClient {
         if (!sentShutdownViaBinder) {
             // Fallback to abstract control socket so daemon shutdown & mouse/focus cleanup never
             // get skipped if the Activity exited before Binder finished connecting!
-            try {
-                LocalSocket().use { sock ->
-                    sock.connect(
-                        LocalSocketAddress(
-                            BridgeProtocol.CTL_SOCKET_NAME,
-                            LocalSocketAddress.Namespace.ABSTRACT,
-                        ),
-                    )
-                    sock.soTimeout = 1500
-                    sock.outputStream.write("SHUTDOWN\n".toByteArray(StandardCharsets.UTF_8))
-                    sock.outputStream.flush()
-                    sock.inputStream.read()
-                }
-            } catch (_: Throwable) {
-            }
+            sendControlSocketShutdown(timeoutMs = 1500)
+        }
+        if (waitForExitMs > 0L) {
+            waitForDaemonControlSocketExit(waitForExitMs)
         }
         binder = null
         _statusFlow.value = DaemonStatus(connected = false)
@@ -1146,6 +1139,57 @@ object BridgeClient {
         _remoteStatusFlow.value = RemoteStreamStatus()
         _pendingPairingFlow.value = null
         _trustedPeersFlow.value = emptyList()
+    }
+
+    private fun sendControlSocketShutdown(timeoutMs: Int): Boolean {
+        return try {
+            LocalSocket().use { sock ->
+                sock.connect(
+                    LocalSocketAddress(
+                        BridgeProtocol.CTL_SOCKET_NAME,
+                        LocalSocketAddress.Namespace.ABSTRACT,
+                    ),
+                )
+                sock.soTimeout = timeoutMs
+                sock.outputStream.write("SHUTDOWN\n".toByteArray(StandardCharsets.UTF_8))
+                sock.outputStream.flush()
+                sock.inputStream.read()
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun waitForDaemonControlSocketExit(timeoutMs: Long) {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var fallbackSent = false
+        while (System.currentTimeMillis() < deadline) {
+            val stillListening = try {
+                LocalSocket().use { sock ->
+                    sock.connect(
+                        LocalSocketAddress(
+                            BridgeProtocol.CTL_SOCKET_NAME,
+                            LocalSocketAddress.Namespace.ABSTRACT,
+                        ),
+                    )
+                }
+                true
+            } catch (_: Throwable) {
+                false
+            }
+            if (!stillListening) return
+            if (!fallbackSent && System.currentTimeMillis() + (timeoutMs / 2) >= deadline) {
+                fallbackSent = true
+                sendControlSocketShutdown(timeoutMs = 800)
+            }
+            try {
+                Thread.sleep(80L)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+        }
     }
 
     fun shutdownDaemonAsync(closeWindows: Boolean = false, removeTasks: Boolean = false) {

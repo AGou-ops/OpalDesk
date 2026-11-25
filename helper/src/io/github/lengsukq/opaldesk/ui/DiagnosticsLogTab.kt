@@ -30,6 +30,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -132,44 +133,105 @@ fun ConsoleLogsTab(
         displayedRows.take(DEFAULT_DISPLAY_LIMIT)
     }
 
-    Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-        // Card 1: Live Diagnostic Snapshot Header
-        MacGlassSectionCard {
+    val isDark = OpalPalette.isDark
+    val heroAccent = if (status.connected) OpalPalette.AccentBlue else OpalPalette.AccentAmber
+    val heroBrush = Brush.linearGradient(
+        colors = if (isDark) {
+            listOf(heroAccent.copy(alpha = 0.22f), Color(0xE6171E2E), Color(0xEC111622))
+        } else {
+            listOf(heroAccent.copy(alpha = 0.14f), Color(0xF2FFFFFF), Color(0xE8F6F9FF))
+        },
+    )
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        // 1. Luminous Diagnostic Hero Card (Feedback CTA + Live Telemetry Pills)
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .liquidGlassSurface(
+                    shape = RoundedCornerShape(24.dp),
+                    fill = heroBrush,
+                    rim = Brush.verticalGradient(listOf(heroAccent.copy(alpha = 0.60f), heroAccent.copy(alpha = 0.16f))),
+                    elevation = if (isDark) 14.dp else 10.dp,
+                )
+                .padding(18.dp),
+        ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    OpalText(text = "运行诊断与日志", fontSize = 17.sp, fontWeight = FontWeight.Bold)
+                    OpalText(text = "问题反馈与诊断", fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(3.dp))
                     OpalText(
-                        text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}) · v$appVersion",
+                        text = "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE} · v$appVersion",
                         fontSize = 11.5.sp,
                         color = OpalPalette.TextSecondary,
                     )
                 }
                 Spacer(Modifier.width(8.dp))
                 OpalStatusBadge(
-                    label = if (status.connected) "uid=${status.daemonUid}" else "守护离线",
+                    label = if (status.connected) "已连接" else "引擎离线",
                     color = if (status.connected) OpalPalette.AccentEmerald else OpalPalette.AccentAmber,
                 )
             }
             Spacer(Modifier.height(10.dp))
-            OpalText(
-                text = if (status.connected) {
-                    "虚拟屏池 ${status.activeVdCount}/${status.maxVdCount} · 窗口 ${scene.windows.size} · 画布 ${status.canvasWidth}×${status.canvasHeight} · ${status.injectBackendLabel}"
-                } else {
-                    "守护进程未连接：无线调试激活、配对及客户端报错均会实时记录于下方客户端日志中"
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                val metricBg = if (isDark) Color(0x22FFFFFF) else Color(0xB8FFFFFF)
+                val metricShape = RoundedCornerShape(12.dp)
+                listOf(
+                    "虚拟屏" to if (status.connected) "${status.activeVdCount}/${status.maxVdCount}" else "--",
+                    "窗口数" to if (status.connected) "${scene.windows.size}" else "0",
+                    "今日配额" to feedbackQuota.remainingLabel().removePrefix("今日剩余 ").trim(),
+                ).forEach { (k, v) ->
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clip(metricShape)
+                            .background(metricBg)
+                            .border(0.7.dp, OpalPalette.BorderSubtle, metricShape)
+                            .padding(horizontal = 10.dp, vertical = 7.dp),
+                    ) {
+                        OpalText(text = k, fontSize = 10.5.sp, color = OpalPalette.TextMuted, maxLines = 1)
+                        Spacer(Modifier.height(1.dp))
+                        OpalText(text = v, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            OpalButton(
+                label = if (feedbackQuota.isExhausted) "今日上报已达上限" else "一键上报日志 / 反馈问题",
+                compact = false,
+                filled = true,
+                enabled = !feedbackQuota.isExhausted,
+                accent = OpalPalette.AccentBlue,
+                onClick = {
+                    feedbackQuota = OpalSentry.currentQuota(ctx)
+                    if (!feedbackQuota.isExhausted) {
+                        showReportModal = true
+                    }
                 },
-                fontSize = 11.5.sp,
-                color = if (status.connected) OpalPalette.AccentCyan else OpalPalette.TextMuted,
+                modifier = Modifier.fillMaxWidth(),
             )
+            if (feedbackQuota.isExhausted) {
+                Spacer(Modifier.height(6.dp))
+                OpalText(
+                    text = FeedbackRateLimiter.LIMIT_REACHED_MESSAGE,
+                    fontSize = 11.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = OpalPalette.AccentDanger,
+                )
+            }
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 OpalButton(
                     label = if (refreshing) "刷新中…" else "刷新日志",
                     compact = true,
+                    filled = false,
                     enabled = !refreshing,
                     onClick = ::refreshDaemonLogs,
                     modifier = Modifier.weight(1f),
@@ -212,43 +274,10 @@ fun ConsoleLogsTab(
                     modifier = Modifier.weight(1f),
                 )
             }
-            Spacer(Modifier.height(10.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OpalButton(
-                    label = if (feedbackQuota.isExhausted) "上报日志（已达上限）" else "上报日志 / 反馈问题",
-                    compact = true,
-                    filled = true,
-                    enabled = !feedbackQuota.isExhausted,
-                    accent = OpalPalette.AccentBlue,
-                    onClick = {
-                        feedbackQuota = OpalSentry.currentQuota(ctx)
-                        if (!feedbackQuota.isExhausted) {
-                            showReportModal = true
-                        }
-                    },
-                    modifier = Modifier.weight(1f),
-                )
-                OpalStatusBadge(
-                    label = feedbackQuota.remainingLabel(),
-                    color = if (feedbackQuota.isExhausted) OpalPalette.AccentDanger else OpalPalette.AccentEmerald,
-                )
-            }
-            if (feedbackQuota.isExhausted) {
-                Spacer(Modifier.height(6.dp))
-                OpalText(
-                    text = FeedbackRateLimiter.LIMIT_REACHED_MESSAGE,
-                    fontSize = 11.5.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = OpalPalette.AccentDanger,
-                )
-            }
         }
 
-        // Card 2: Filters & Log Stream
+        // 2. Filters & Log Stream
+        ConsoleSectionTitle("实时日志流")
         MacGlassSectionCard {
             OpalSegmentedRow(
                 options = listOf(

@@ -16,6 +16,8 @@ import java.security.MessageDigest
 import java.util.Base64
 import java.util.Locale
 import java.util.concurrent.CopyOnWriteArraySet
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
@@ -44,6 +46,7 @@ class MiniWebSocketServer(
         val peerIp: String,
         private val socket: SSLSocket,
         private val out: OutputStream,
+        private val writeExec: ExecutorService? = null,
     ) {
         private val writeLock = Any()
         private val closed = AtomicBoolean(false)
@@ -54,6 +57,16 @@ class MiniWebSocketServer(
         fun isClosed(): Boolean = closed.get()
 
         fun sendText(text: String) {
+            if (closed.get()) return
+            val exec = writeExec
+            if (exec != null && !exec.isShutdown) {
+                exec.execute { sendTextBlocking(text) }
+            } else {
+                sendTextBlocking(text)
+            }
+        }
+
+        private fun sendTextBlocking(text: String) {
             if (closed.get()) return
             val bytes = text.toByteArray(StandardCharsets.UTF_8)
             try {
@@ -127,6 +140,9 @@ class MiniWebSocketServer(
     private var serverSocket: SSLServerSocket? = null
     private var acceptThread: Thread? = null
     private val clients = CopyOnWriteArraySet<WsClient>()
+    private val writeExec: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "OpalWebActWsWrite").apply { isDaemon = true }
+    }
 
     @Volatile
     var boundPort: Int = 0
@@ -159,9 +175,12 @@ class MiniWebSocketServer(
     }
 
     fun broadcastAuthenticated(jsonText: String) {
-        for (c in clients) {
-            if (!c.isClosed() && c.authenticated) {
-                c.sendText(jsonText)
+        if (writeExec.isShutdown) return
+        writeExec.execute {
+            for (c in clients) {
+                if (!c.isClosed() && c.authenticated) {
+                    c.sendText(jsonText)
+                }
             }
         }
     }
@@ -175,6 +194,7 @@ class MiniWebSocketServer(
             c.close()
         }
         clients.clear()
+        runCatching { writeExec.shutdownNow() }
     }
 
     private fun acceptLoop(ss: SSLServerSocket) {
@@ -281,7 +301,7 @@ class MiniWebSocketServer(
         output.flush()
         sock.soTimeout = 0
 
-        val client = WsClient(peerIp, sock, output)
+        val client = WsClient(peerIp, sock, output, writeExec)
         clients.add(client)
         listener.onClientConnected(client)
         try {

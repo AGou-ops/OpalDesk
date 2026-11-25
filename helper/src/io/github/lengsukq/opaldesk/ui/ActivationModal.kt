@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.lengsukq.opaldesk.AdbBootstrap
 import io.github.lengsukq.opaldesk.BridgeClient
+import io.github.lengsukq.opaldesk.BridgeService
 import io.github.lengsukq.opaldesk.adb.ShizukuBootstrap
 import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import io.github.lengsukq.opaldesk.web.WebActivationService
@@ -66,8 +67,21 @@ fun ActivationModal(
     val ctx = LocalContext.current
     val daemonStatus by BridgeClient.statusFlow.collectAsState()
     val webActState by WebActivationService.stateFlow.collectAsState()
+    // Clear sUserStopping whenever the user explicitly opens ActivationModal so a prior
+    // "停止引擎" action never causes BridgeProvider to reject the newly started daemon's Binder.
+    LaunchedEffect(Unit) {
+        BridgeService.sUserStopping = false
+        BridgeService.ensureStarted(ctx)
+    }
+    // Remember whether the daemon was already connected when the user explicitly opened this modal
+    // (e.g. tapping "重新激活"): never auto-dismiss immediately on open; only auto-dismiss after
+    // a fresh connection transition (disconnected -> connected) or explicit bootstrap completion.
+    val initiallyConnected = remember { BridgeClient.statusFlow.value.connected }
+    var sawDisconnected by remember { mutableStateOf(!initiallyConnected) }
     LaunchedEffect(daemonStatus.connected) {
-        if (daemonStatus.connected) {
+        if (!daemonStatus.connected) {
+            sawDisconnected = true
+        } else if (sawDisconnected) {
             onActivated()
         }
     }
