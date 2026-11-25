@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -118,7 +119,8 @@ fun CompositorWindowFrameNode(
     val frameWidthDp = with(density) { activeFrame.width.coerceAtLeast(220).toDp() }
     val frameHeightDp = with(density) { activeFrame.height.coerceAtLeast(220).toDp() }
     val headerHeightPx = if (isFullscreen) 0 else with(density) { CompositorGeometry.HEADER_HEIGHT_DP.dp.roundToPx() }
-    val showCompactTools = frameWidthDp >= 430.dp
+    val showSnapTools = frameWidthDp >= 540.dp
+    val showReloadButton = frameWidthDp >= 360.dp
 
     var frameCoords by remember(window.windowId) { mutableStateOf<LayoutCoordinates?>(null) }
 
@@ -180,7 +182,8 @@ fun CompositorWindowFrameNode(
             if (!isFullscreen) {
             // macOS 36dp Title Bar Chrome — unified root-space drag + tap/double-tap gesture
             var titleCoords by remember(window.windowId) { mutableStateOf<LayoutCoordinates?>(null) }
-            Box(
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(CompositorGeometry.HEADER_HEIGHT_DP.dp)
@@ -326,7 +329,6 @@ fun CompositorWindowFrameNode(
             ) {
                 // Left Cluster: macOS Traffic Lights + Android Back
                 Row(
-                    modifier = Modifier.align(Alignment.CenterStart),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(2.dp),
                 ) {
@@ -352,17 +354,12 @@ fun CompositorWindowFrameNode(
                     }
                 }
 
-                // Centered App Icon + Title (macOS Style)
+                // Flexible Centered App Icon + Title (physically isolated between left & right clusters)
                 Row(
                     modifier = Modifier
-                        .align(Alignment.Center)
-                        .padding(
-                            horizontal = when {
-                                showCompactTools -> 156.dp
-                                frameWidthDp < 360.dp -> 88.dp
-                                else -> 110.dp
-                            },
-                        ),
+                        .weight(1f)
+                        .padding(horizontal = 6.dp),
+                    horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     if (appIcon != null) {
@@ -375,22 +372,23 @@ fun CompositorWindowFrameNode(
                         )
                         Spacer(Modifier.width(6.dp))
                     }
-                    OpalText(
-                        text = window.title,
-                        fontSize = 12.5.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (window.focused) OpalPalette.TextPrimary else OpalPalette.TextSecondary,
-                        maxLines = 1,
-                    )
+                    if (frameWidthDp >= 250.dp) {
+                        OpalText(
+                            text = window.title,
+                            fontSize = 12.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (window.focused) OpalPalette.TextPrimary else OpalPalette.TextSecondary,
+                            maxLines = 1,
+                        )
+                    }
                 }
 
-                // Right Cluster: Tile Left/Right, Profile Switcher (Desktop/Tablet/Portrait), Reload
+                // Right Cluster: Optional Snap Left/Right (wide windows only), Pin icon, Profile Switcher, Reload
                 Row(
-                    modifier = Modifier.align(Alignment.CenterEnd),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(3.dp),
                 ) {
-                    if (showCompactTools) {
+                    if (showSnapTools) {
                         HeaderSubtleIconButton(glyph = ChromeGlyph.TILE_LEFT, focused = window.focused) {
                             val rect = CompositorGeometry.computeSnapPreviewRect(
                                 BridgeProtocol.Presentation.SNAP_LEFT, canvasW, canvasH, densityVal,
@@ -409,6 +407,15 @@ fun CompositorWindowFrameNode(
                                 BridgeProtocol.Presentation.SNAP_RIGHT,
                             )
                         }
+                    }
+
+                    val pinnedIds by io.github.lengsukq.opaldesk.protocol.OpalWindowPinStore.pinnedIdsFlow.collectAsState()
+                    val isPinned = pinnedIds.contains(window.windowId)
+                    HeaderPinIconButton(
+                        pinned = isPinned,
+                        focused = window.focused,
+                    ) {
+                        io.github.lengsukq.opaldesk.protocol.OpalWindowPinStore.toggle(window.windowId)
                     }
 
                     val profileLabel = when (window.profileCode) {
@@ -440,8 +447,10 @@ fun CompositorWindowFrameNode(
                         )
                     }
 
-                    HeaderSubtleIconButton(glyph = ChromeGlyph.RELOAD, focused = window.focused) {
-                        BridgeClient.sendWindowActionAsync(window.windowId, BridgeProtocol.WinAction.RELOAD_APP)
+                    if (showReloadButton) {
+                        HeaderSubtleIconButton(glyph = ChromeGlyph.RELOAD, focused = window.focused) {
+                            BridgeClient.sendWindowActionAsync(window.windowId, BridgeProtocol.WinAction.RELOAD_APP)
+                        }
                     }
                 }
             }
@@ -514,6 +523,43 @@ private fun HeaderSubtleIconButton(
             tint = if (focused) OpalPalette.TextSecondary else OpalPalette.TextMuted,
             size = 13.dp,
         )
+    }
+}
+
+@Composable
+private fun HeaderPinIconButton(
+    pinned: Boolean,
+    focused: Boolean,
+    onClick: () -> Unit,
+) {
+    val tint = when {
+        pinned -> OpalPalette.AccentBlue
+        focused -> OpalPalette.TextSecondary
+        else -> OpalPalette.TextMuted
+    }
+    Box(
+        modifier = Modifier
+            .size(24.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (pinned) OpalPalette.AccentBlue.copy(alpha = 0.18f) else Color.Transparent)
+            .border(
+                width = if (pinned) 0.75.dp else 0.dp,
+                color = if (pinned) OpalPalette.AccentBlue.copy(alpha = 0.50f) else Color.Transparent,
+                shape = RoundedCornerShape(6.dp),
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(modifier = Modifier.size(12.dp)) {
+            val w = size.width
+            val h = size.height
+            val stroke = 1.45.dp.toPx()
+            // Minimalist 45-degree pushpin: head bar, body stem, collar bar, needle
+            drawLine(tint, Offset(w * 0.56f, h * 0.12f), Offset(w * 0.88f, h * 0.44f), strokeWidth = stroke, cap = StrokeCap.Round)
+            drawLine(tint, Offset(w * 0.68f, h * 0.32f), Offset(w * 0.44f, h * 0.56f), strokeWidth = stroke * 1.15f, cap = StrokeCap.Round)
+            drawLine(tint, Offset(w * 0.30f, h * 0.42f), Offset(w * 0.58f, h * 0.70f), strokeWidth = stroke, cap = StrokeCap.Round)
+            drawLine(tint, Offset(w * 0.44f, h * 0.56f), Offset(w * 0.14f, h * 0.86f), strokeWidth = stroke, cap = StrokeCap.Round)
+        }
     }
 }
 

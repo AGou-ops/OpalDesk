@@ -2,6 +2,7 @@ package io.github.lengsukq.opaldesk.compositor
 
 import android.annotation.SuppressLint
 import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.os.SystemClock
 import android.util.LruCache
@@ -25,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,6 +35,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -40,12 +43,14 @@ import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import io.github.lengsukq.opaldesk.BridgeClient
 import io.github.lengsukq.opaldesk.diagnostics.OpalLogStore
+import io.github.lengsukq.opaldesk.prefs.ProfileConfigStore
 import io.github.lengsukq.opaldesk.protocol.BridgeProtocol
 import io.github.lengsukq.opaldesk.protocol.CompositorGeometry
 import io.github.lengsukq.opaldesk.protocol.CompositorWindow
@@ -57,6 +62,7 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
 
 /**
  * Lightweight registry of mounted live [TextureView]s so Mission Control / Exposé can capture
@@ -142,9 +148,20 @@ fun WindowSurfaceHost(
     onTouchFocusRequested: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val profileState by ProfileConfigStore.stateFlow.collectAsState()
+    val cropDp = profileState.workingConfig.appTopCropDps[window.pkg] ?: 0
+    val cropTopDisplayPx = if (cropDp > 0) {
+        val dpi = window.contentDpi.coerceAtLeast(120)
+        val maxCrop = (window.contentHeight * 0.14f).roundToInt().coerceAtLeast(0)
+        (cropDp * (dpi / 160f)).roundToInt().coerceIn(0, maxCrop)
+    } else {
+        0
+    }
+
     val currentWin by rememberUpdatedState(window)
     val currentHeaderPx by rememberUpdatedState(headerHeightPx)
     val currentFocusCb by rememberUpdatedState(onTouchFocusRequested)
+    val currentCropTopPx by rememberUpdatedState(cropTopDisplayPx)
 
     var hibernateBitmap by remember(window.windowId) { mutableStateOf<Bitmap?>(null) }
     var hasRenderedLiveFrame by remember(window.windowId) { mutableStateOf(false) }
@@ -167,6 +184,7 @@ fun WindowSurfaceHost(
     Box(
         modifier = modifier
             .fillMaxSize()
+            .clipToBounds()
             .background(OpalPalette.WindowCanvasBg)
             // Intercept Compose PointerEventType.Scroll AND unpressed Mouse Hover directly:
             // AndroidComposeView intercepts GenericMotionEvents (ACTION_SCROLL & ACTION_HOVER_MOVE)
@@ -199,10 +217,11 @@ fun WindowSurfaceHost(
                                         size.width,
                                         win.contentWidth.coerceAtLeast(2),
                                     )
-                                    val mappedY = CompositorGeometry.mapViewToDisplayCoord(
+                                    val mappedY = mapViewYToDisplayY(
                                         change.position.y,
                                         size.height,
                                         win.contentHeight.coerceAtLeast(2),
+                                        currentCropTopPx,
                                     )
                                     val now = SystemClock.uptimeMillis()
                                     BridgeClient.injectWindowMotionOneway(
@@ -253,10 +272,11 @@ fun WindowSurfaceHost(
                                         size.width,
                                         win.contentWidth.coerceAtLeast(2),
                                     )
-                                    val mappedY = CompositorGeometry.mapViewToDisplayCoord(
+                                    val mappedY = mapViewYToDisplayY(
                                         change.position.y,
                                         size.height,
                                         win.contentHeight.coerceAtLeast(2),
+                                        currentCropTopPx,
                                     )
                                     BridgeClient.injectWindowMotionOneway(
                                         windowId = win.windowId,
@@ -312,7 +332,10 @@ fun WindowSurfaceHost(
                                 val dpi = currentWin.contentDpi.coerceAtLeast(120)
                                 val activeFps = resolveHostDisplayRefreshRate(this@apply)
                                 syncBufferSize(w, h)
-                                post { syncBufferSize(w, h) }
+                                post {
+                                    syncBufferSize(w, h)
+                                    applyTopCropTransform(this@apply, currentCropTopPx, h)
+                                }
                                 holderState.attachAsync(st, w, h, dpi, activeFps)
                             }
 
@@ -323,7 +346,10 @@ fun WindowSurfaceHost(
                                 val cw = currentWin.contentWidth.coerceAtLeast(240)
                                 val ch = currentWin.contentHeight.coerceAtLeast(200)
                                 syncBufferSize(cw, ch)
-                                post { syncBufferSize(cw, ch) }
+                                post {
+                                    syncBufferSize(cw, ch)
+                                    applyTopCropTransform(this@apply, currentCropTopPx, ch)
+                                }
                                 holderState.updateBufferSize(cw, ch)
                             }
 
@@ -353,12 +379,12 @@ fun WindowSurfaceHost(
                                 v.parent?.requestDisallowInterceptTouchEvent(true)
                             }
                             forwardMotionEventToWindow(
-                                v.width, v.height, ev, currentWin, currentHeaderPx, currentFocusCb,
+                                v.width, v.height, ev, currentWin, currentHeaderPx, currentCropTopPx, currentFocusCb,
                             )
                         }
                         setOnGenericMotionListener { v, ev ->
                             handleGenericMotionForWindow(
-                                v.width, v.height, ev, currentWin, currentHeaderPx, lastHoverEventTime, currentFocusCb,
+                                v.width, v.height, ev, currentWin, currentHeaderPx, currentCropTopPx, lastHoverEventTime, currentFocusCb,
                             )
                         }
                     }
@@ -367,6 +393,7 @@ fun WindowSurfaceHost(
                     val cw = window.contentWidth.coerceAtLeast(240)
                     val ch = window.contentHeight.coerceAtLeast(200)
                     textureView.syncBufferSize(cw, ch)
+                    applyTopCropTransform(textureView, cropTopDisplayPx, ch)
                     // Keep native Android View Z-order strictly aligned with Compose zIndex via translationZ
                     // (never call bringToFront() here: mutating AndroidViewsHandler child array mid-click
                     // aborts the active touch target and requires a double-click on unfocused windows!).
@@ -666,12 +693,37 @@ private fun isMouseMotionEvent(ev: MotionEvent): Boolean =
     (ev.source and InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE ||
         (ev.pointerCount > 0 && ev.getToolType(0) == MotionEvent.TOOL_TYPE_MOUSE)
 
+private fun applyTopCropTransform(view: TextureView, cropTopDisplayPx: Int, contentH: Int) {
+    val viewH = view.height
+    if (cropTopDisplayPx <= 0 || contentH <= 2 || viewH <= 0 || cropTopDisplayPx >= contentH - 2) {
+        view.setTransform(null)
+        return
+    }
+    val cropRatio = cropTopDisplayPx.toFloat() / contentH.toFloat()
+    val scaleY = 1f / (1f - cropRatio)
+    val matrix = Matrix().apply {
+        setScale(1f, scaleY)
+        postTranslate(0f, -cropRatio * viewH * scaleY)
+    }
+    view.setTransform(matrix)
+}
+
+private fun mapViewYToDisplayY(viewY: Float, viewH: Int, contentH: Int, cropTopDisplayPx: Int): Float {
+    if (cropTopDisplayPx <= 0 || cropTopDisplayPx >= contentH - 2) {
+        return CompositorGeometry.mapViewToDisplayCoord(viewY, viewH, contentH)
+    }
+    val visibleH = (contentH - cropTopDisplayPx).coerceAtLeast(2)
+    val norm = (viewY / viewH.coerceAtLeast(1).toFloat()).coerceIn(0f, 1f)
+    return (cropTopDisplayPx + norm * (visibleH - 1)).coerceIn(0f, (contentH - 1).toFloat())
+}
+
 private fun handleGenericMotionForWindow(
     viewW: Int,
     viewH: Int,
     ev: MotionEvent?,
     win: CompositorWindow,
     headerHeightPx: Int,
+    cropTopDisplayPx: Int,
     lastHoverEventTime: AtomicLong,
     onFocusRequested: () -> Unit,
 ): Boolean {
@@ -707,10 +759,10 @@ private fun handleGenericMotionForWindow(
         if (lastHoverEventTime.getAndSet(ev.eventTime) == ev.eventTime) {
             return true
         }
-        return forwardMotionEventToWindow(viewW, viewH, ev, win, headerHeightPx, onFocusRequested)
+        return forwardMotionEventToWindow(viewW, viewH, ev, win, headerHeightPx, cropTopDisplayPx, onFocusRequested)
     }
     if (masked == MotionEvent.ACTION_SCROLL) {
-        return forwardMotionEventToWindow(viewW, viewH, ev, win, headerHeightPx, onFocusRequested)
+        return forwardMotionEventToWindow(viewW, viewH, ev, win, headerHeightPx, cropTopDisplayPx, onFocusRequested)
     }
     return false
 }
@@ -721,6 +773,7 @@ private fun forwardMotionEventToWindow(
     ev: MotionEvent?,
     win: CompositorWindow,
     headerHeightPx: Int,
+    cropTopDisplayPx: Int,
     onFocusRequested: () -> Unit,
 ): Boolean {
     if (ev == null || viewW <= 0 || viewH <= 0) return false
@@ -761,7 +814,7 @@ private fun forwardMotionEventToWindow(
         ids[i] = ev.getPointerId(i)
         toolTypes[i] = ev.getToolType(i)
         xs[i] = CompositorGeometry.mapViewToDisplayCoord(ev.getX(i), viewW, cw)
-        ys[i] = CompositorGeometry.mapViewToDisplayCoord(ev.getY(i), viewH, ch)
+        ys[i] = mapViewYToDisplayY(ev.getY(i), viewH, ch, cropTopDisplayPx)
         pressures[i] = ev.getPressure(i)
     }
 

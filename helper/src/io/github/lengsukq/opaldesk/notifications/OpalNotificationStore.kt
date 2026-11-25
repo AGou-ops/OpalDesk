@@ -73,6 +73,9 @@ object OpalNotificationStore {
     private val _accessGrantedFlow = MutableStateFlow(false)
     val accessGrantedFlow: StateFlow<Boolean> = _accessGrantedFlow.asStateFlow()
 
+    private val _doNotDisturbFlow = MutableStateFlow(false)
+    val doNotDisturbFlow: StateFlow<Boolean> = _doNotDisturbFlow.asStateFlow()
+
     @Volatile
     private var activeService: OpalNotificationListenerService? = null
 
@@ -101,9 +104,22 @@ object OpalNotificationStore {
             .sortedByDescending { it.postTimeMs }
             .take(40)
         _notificationsFlow.value = next
-        if (showBanner) {
+        if (showBanner && !_doNotDisturbFlow.value) {
             _bannerFlow.value = item
         }
+    }
+
+    fun setDoNotDisturb(enabled: Boolean) {
+        _doNotDisturbFlow.value = enabled
+        if (enabled) {
+            _bannerFlow.value = null
+        }
+    }
+
+    fun toggleDoNotDisturb(): Boolean {
+        val next = !_doNotDisturbFlow.value
+        setDoNotDisturb(next)
+        return next
     }
 
     fun onRemoved(key: String) {

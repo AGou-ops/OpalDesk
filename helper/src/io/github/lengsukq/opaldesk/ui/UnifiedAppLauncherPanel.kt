@@ -25,6 +25,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,6 +36,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -46,6 +48,10 @@ import io.github.lengsukq.opaldesk.prefs.AppPrefs
 import java.text.Collator
 import java.util.Locale
 import kotlin.math.abs
+
+private val APP_TILE_SHAPE = RoundedCornerShape(16.dp)
+private val APP_ICON_SHAPE = RoundedCornerShape(14.dp)
+private val LAUNCHER_PANEL_SHAPE = RoundedCornerShape(24.dp)
 
 /**
  * Unified app entry shared identically by both Local/External DeX App Drawer
@@ -138,14 +144,13 @@ fun UnifiedAppLauncherPanel(
         AppLauncherSorter.filterAndSort(items, query, sortByUsage)
     }
 
-    val shape = RoundedCornerShape(24.dp)
     Column(
         modifier = modifier
             .widthIn(max = maxWidth)
             .fillMaxWidth()
             .heightIn(max = maxHeight)
             .liquidGlassSurface(
-                shape = shape,
+                shape = LAUNCHER_PANEL_SHAPE,
                 fill = OpalPalette.LiquidPopoverFill,
                 rim = OpalPalette.LiquidGlassRim,
                 elevation = 28.dp,
@@ -254,13 +259,18 @@ fun UnifiedAppLauncherPanel(
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
-                    items(sortedItems, key = { it.pkg }) { app ->
-                        val icon = remember(app.pkg) { AppCatalogRepository.getAppIcon(ctx, app.pkg) }
+                    items(sortedItems, key = { it.pkg }, contentType = { "app_tile" }) { app ->
+                        var icon by remember(app.pkg) { mutableStateOf(AppCatalogRepository.getCachedIcon(app.pkg)) }
+                        LaunchedEffect(app.pkg) {
+                            if (icon == null) {
+                                icon = AppCatalogRepository.loadAppIconAsync(ctx, app.pkg)
+                            }
+                        }
                         val highlighted = app.isPinnedDesktop || app.isPinnedDock
                         val tileBg = if (highlighted) OpalPalette.ChipFill else Color.Transparent
                         val tileModifier = if (onContextApp != null) {
                             Modifier
-                                .clip(RoundedCornerShape(16.dp))
+                                .clip(APP_TILE_SHAPE)
                                 .background(tileBg)
                                 .onTapOrContextAction(
                                     app.pkg,
@@ -270,7 +280,7 @@ fun UnifiedAppLauncherPanel(
                                 .padding(vertical = 8.dp, horizontal = 4.dp)
                         } else {
                             Modifier
-                                .clip(RoundedCornerShape(16.dp))
+                                .clip(APP_TILE_SHAPE)
                                 .background(tileBg)
                                 .clickable { onSelectApp(app) }
                                 .padding(vertical = 8.dp, horizontal = 4.dp)
@@ -281,13 +291,15 @@ fun UnifiedAppLauncherPanel(
                             modifier = tileModifier,
                         ) {
                             Box(contentAlignment = Alignment.Center) {
-                                if (icon != null) {
+                                val resolvedIcon = icon
+                                if (resolvedIcon != null) {
                                     Image(
-                                        bitmap = icon,
+                                        bitmap = resolvedIcon,
                                         contentDescription = app.label,
+                                        filterQuality = FilterQuality.Medium,
                                         modifier = Modifier
                                             .size(50.dp)
-                                            .clip(RoundedCornerShape(14.dp)),
+                                            .clip(APP_ICON_SHAPE),
                                     )
                                 } else {
                                     val tint = seedAvatarColor(app.pkg)
@@ -295,12 +307,12 @@ fun UnifiedAppLauncherPanel(
                                     Box(
                                         modifier = Modifier
                                             .size(50.dp)
-                                            .clip(RoundedCornerShape(14.dp))
+                                            .clip(APP_ICON_SHAPE)
                                             .background(tint.copy(alpha = if (isDark) 0.24f else 0.14f))
                                             .border(
                                                 0.85.dp,
                                                 tint.copy(alpha = if (isDark) 0.45f else 0.28f),
-                                                RoundedCornerShape(14.dp),
+                                                APP_ICON_SHAPE,
                                             ),
                                         contentAlignment = Alignment.Center,
                                     ) {

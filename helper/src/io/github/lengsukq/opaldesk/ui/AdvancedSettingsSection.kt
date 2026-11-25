@@ -36,6 +36,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -882,6 +883,49 @@ fun DexDpiSettingsPopover(
                             },
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        val cropDp = working.appTopCropDps[win.pkg] ?: 0
+                        val isCropTop = cropDp > 0
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(if (isCropTop) OpalPalette.AccentBlue.copy(alpha = 0.14f) else Color.Transparent)
+                                    .clickable {
+                                        ProfileConfigStore.toggleWorkingAppTopCrop(win.pkg)
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                            ) {
+                                OpalText(
+                                    text = "裁切顶部状态栏留白",
+                                    fontSize = 10.5.sp,
+                                    color = if (isCropTop) OpalPalette.AccentBlue else OpalPalette.TextSecondary,
+                                    fontWeight = if (isCropTop) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                                OpalText(
+                                    text = if (isCropTop) "${cropDp}dp · 点击关闭" else "关闭",
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isCropTop) OpalPalette.AccentBlue else OpalPalette.TextMuted,
+                                )
+                            }
+                            if (isCropTop) {
+                                OpalGlassSlider(
+                                    value = cropDp.toFloat(),
+                                    valueRange = 8f..ProfileConfigStore.MAX_TOP_CROP_DP.toFloat(),
+                                    onValueChange = { v ->
+                                        val snapped = ((v / 2f).roundToInt() * 2)
+                                            .coerceIn(8, ProfileConfigStore.MAX_TOP_CROP_DP)
+                                        if (snapped != cropDp) {
+                                            ProfileConfigStore.setWorkingAppTopCropDp(win.pkg, snapped)
+                                        }
+                                    },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            }
+                        }
                     }
                 }
             }

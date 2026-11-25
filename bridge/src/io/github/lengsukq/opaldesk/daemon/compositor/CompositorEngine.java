@@ -583,6 +583,11 @@ public final class CompositorEngine {
      * Executes lifecycle & profile actions on {@code windowId}.
      */
     public boolean performWindowAction(int windowId, int action, byte[] optionalPreMinimizeSnapshot) {
+        return performWindowActionInternal(windowId, action, optionalPreMinimizeSnapshot, true);
+    }
+
+    private boolean performWindowActionInternal(
+            int windowId, int action, byte[] optionalPreMinimizeSnapshot, boolean forceStopOnClose) {
         int taskToRemove = -1;
         int displayToRelease = -1;
         String pkgToClose = null;
@@ -706,7 +711,7 @@ public final class CompositorEngine {
                         displayToRelease = ws.displayId;
                         pkgToClose = ws.pkg;
                     }
-                    if (ws.pkg != null && !ws.pkg.isEmpty()) {
+                    if (forceStopOnClose && ws.pkg != null && !ws.pkg.isEmpty()) {
                         boolean hasOtherWindowSamePkg = false;
                         for (WindowSession other : sessionsById.values()) {
                             if (ws.pkg.equals(other.pkg)) {
@@ -859,7 +864,7 @@ public final class CompositorEngine {
             performWindowAction(windowId, BridgeProtocol.WIN_ACTION_MINIMIZE, null);
         } else {
             System.out.println("OPALDESK_BACK_EXITED_CLOSE wid=" + windowId + " pkg=" + pkg);
-            performWindowAction(windowId, BridgeProtocol.WIN_ACTION_CLOSE, null);
+            performWindowActionInternal(windowId, BridgeProtocol.WIN_ACTION_CLOSE, null, false);
         }
     }
 
@@ -958,7 +963,7 @@ public final class CompositorEngine {
             performWindowAction(wid, BridgeProtocol.WIN_ACTION_MINIMIZE, null);
         }
         for (int wid : toClose) {
-            performWindowAction(wid, BridgeProtocol.WIN_ACTION_CLOSE, null);
+            performWindowActionInternal(wid, BridgeProtocol.WIN_ACTION_CLOSE, null, false);
         }
     }
 

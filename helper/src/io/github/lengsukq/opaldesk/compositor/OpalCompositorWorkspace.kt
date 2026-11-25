@@ -191,11 +191,14 @@ fun OpalCompositorWorkspace(
     var showAppDrawer by remember { mutableStateOf(false) }
     var showExposeOverview by remember { mutableStateOf(false) }
     var showControlCenter by remember { mutableStateOf(false) }
+    var controlCenterInitialTab by remember { mutableStateOf(0) }
     var showDpiPopover by remember { mutableStateOf(false) }
     var showNotificationCenter by remember { mutableStateOf(false) }
     val notifications by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.notificationsFlow.collectAsState()
     val liveNotificationBanner by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.bannerFlow.collectAsState()
     val notifAccessGranted by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.accessGrantedFlow.collectAsState()
+    val doNotDisturb by io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.doNotDisturbFlow.collectAsState()
+    val pinnedWindowIds by io.github.lengsukq.opaldesk.protocol.OpalWindowPinStore.pinnedIdsFlow.collectAsState()
     var showExitSlotModal by remember { mutableStateOf(false) }
     var savingOnExit by remember { mutableStateOf(false) }
     var editingAppDpiTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
@@ -209,6 +212,10 @@ fun OpalCompositorWorkspace(
     LaunchedEffect(Unit) {
         io.github.lengsukq.opaldesk.prefs.ProfileConfigStore.hydrate(ctx)
         BridgeClient.bindAppContext(ctx)
+    }
+
+    LaunchedEffect(scene.windows) {
+        io.github.lengsukq.opaldesk.protocol.OpalWindowPinStore.prune(scene.windows.map { it.windowId }.toSet())
     }
 
     fun dismissAllPopovers() {
@@ -238,6 +245,7 @@ fun OpalCompositorWorkspace(
 
     LaunchedEffect(Unit) {
         allApps = AppCatalogRepository.loadLaunchableApps(ctx)
+        scope.launch(Dispatchers.IO) { AppCatalogRepository.prewarmIcons(ctx, allApps) }
         val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
         val dateFmt = SimpleDateFormat("M/d E", Locale.getDefault())
         while (true) {
@@ -403,7 +411,7 @@ fun OpalCompositorWorkspace(
                         canvasW = canvasW,
                         canvasH = canvasH,
                         onSnapPreviewChanged = { snapPreviewRect = it },
-                        modifier = Modifier.zIndex(win.zOrder.toFloat()),
+                        modifier = Modifier.zIndex(CompositorGeometry.effectiveZOrder(win, pinnedWindowIds).toFloat()),
                     )
                 }
             }
@@ -420,6 +428,7 @@ fun OpalCompositorWorkspace(
                     showDpiPopover = showDpiPopover,
                     notificationCount = notifications.size,
                     showNotificationCenter = showNotificationCenter,
+                    doNotDisturb = doNotDisturb,
                     showPhoneTrackpadButton = canControlPhoneTrackpad,
                     phoneTrackpadVisible = phoneTrackpadVisible,
                     onTogglePhoneTrackpad = {
@@ -451,6 +460,7 @@ fun OpalCompositorWorkspace(
                     onToggleControlCenter = {
                         val next = !showControlCenter
                         dismissAllPopovers()
+                        controlCenterInitialTab = 0
                         showControlCenter = next
                     },
                     onOpenConsole = onOpenConsole,
@@ -483,6 +493,7 @@ fun OpalCompositorWorkspace(
                     onOpenControlCenter = {
                         val next = !showControlCenter
                         dismissAllPopovers()
+                        controlCenterInitialTab = 0
                         showControlCenter = next
                     },
                     modifier = Modifier
@@ -595,6 +606,7 @@ fun OpalCompositorWorkspace(
                 DesktopNotificationCenterPopover(
                     notifications = notifications,
                     accessGranted = notifAccessGranted,
+                    doNotDisturb = doNotDisturb,
                     maxHeight = ncMaxH,
                     onOpenApp = ::openNotificationApp,
                     onDismissNotification = { key ->
@@ -602,6 +614,9 @@ fun OpalCompositorWorkspace(
                     },
                     onClearAll = {
                         io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.clearAllNotifications()
+                    },
+                    onToggleDoNotDisturb = {
+                        io.github.lengsukq.opaldesk.notifications.OpalNotificationStore.toggleDoNotDisturb()
                     },
                     onRequestAccess = {
                         showNotificationCenter = false
@@ -616,7 +631,7 @@ fun OpalCompositorWorkspace(
 
             // Live Heads-Up Glass Notification Banner (suppressed during true app fullscreen)
             val activeBanner = liveNotificationBanner
-            if (activeBanner != null && !showNotificationCenter && fullscreenWin == null) {
+            if (activeBanner != null && !doNotDisturb && !showNotificationCenter && fullscreenWin == null) {
                 DesktopNotificationBanner(
                     item = activeBanner,
                     onOpenApp = ::openNotificationApp,
@@ -634,6 +649,7 @@ fun OpalCompositorWorkspace(
                 MacControlCenterPopover(
                     tray = trayInfo,
                     totalWindows = scene.windows.size,
+                    focusedWindowId = scene.focusedWindow?.windowId ?: -1,
                     canvasW = canvasW,
                     canvasH = canvasH,
                     displaySummary = displaySummary,
@@ -652,6 +668,7 @@ fun OpalCompositorWorkspace(
                     showAutoTrackpadSwitch = canControlPhoneTrackpad && !remote.hasActiveDesktopCast,
                     autoShowPhoneTrackpad = autoShowPhoneTrackpad,
                     maxHeight = ccMaxH,
+                    initialTab = controlCenterInitialTab,
                     onTogglePhoneTrackpad = {
                         showControlCenter = false
                         togglePhoneTrackpadFromExternal()
@@ -718,6 +735,7 @@ fun OpalCompositorWorkspace(
                         showControlCenter = false
                         BridgeClient.closeAllWindowsAsync(removeTasks = true)
                     },
+                    onDismissPopover = { showControlCenter = false },
                     onOpenConsole = {
                         showControlCenter = false
                         onOpenConsole()
@@ -779,7 +797,10 @@ fun OpalCompositorWorkspace(
                         WallpaperStorage.clearCustomWallpaper(ctx)
                         Toast.makeText(ctx, "已恢复默认预设壁纸", Toast.LENGTH_SHORT).show()
                     },
-                    onOpenTilingMenu = { showControlCenter = true },
+                    onOpenTilingMenu = {
+                        controlCenterInitialTab = 1
+                        showControlCenter = true
+                    },
                     onOpenAppDrawer = { showAppDrawer = true },
                     onToggleLightDark = {
                         val next = if (isCurrentlyDark) AppPrefs.THEME_LIGHT else AppPrefs.THEME_DARK

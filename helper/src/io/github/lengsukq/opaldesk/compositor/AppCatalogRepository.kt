@@ -25,7 +25,8 @@ data class InstalledAppEntry(
  * zero-jank rendering inside window headers, dock slots, and the searchable app drawer.
  */
 object AppCatalogRepository {
-    private val iconCache = object : LruCache<String, ImageBitmap>(128) {}
+    private const val TARGET_ICON_PX = 112
+    private val iconCache = object : LruCache<String, ImageBitmap>(512) {}
 
     @Volatile
     private var cachedApps: List<InstalledAppEntry> = emptyList()
@@ -60,12 +61,37 @@ object AppCatalogRepository {
         }
     }
 
+    /** O(1) non-blocking memory lookup safe to call directly during Compose scroll frames. */
+    fun getCachedIcon(pkg: String): ImageBitmap? {
+        if (pkg.isEmpty()) return null
+        return iconCache.get(pkg)
+    }
+
+    /** Decodes and caches an app icon strictly on [Dispatchers.IO] without ever blocking UI frames. */
+    suspend fun loadAppIconAsync(ctx: Context, pkg: String): ImageBitmap? {
+        if (pkg.isEmpty()) return null
+        iconCache.get(pkg)?.let { return it }
+        return withContext(Dispatchers.IO) {
+            getAppIcon(ctx, pkg)
+        }
+    }
+
+    /** Background pre-warmer so opening & scrolling the App Drawer hits 100% RAM cache at 120fps. */
+    suspend fun prewarmIcons(ctx: Context, apps: List<InstalledAppEntry>) = withContext(Dispatchers.IO) {
+        val appCtx = ctx.applicationContext
+        for (entry in apps) {
+            if (iconCache.get(entry.pkg) == null) {
+                getAppIcon(appCtx, entry.pkg)
+            }
+        }
+    }
+
     fun getAppIcon(ctx: Context, pkg: String): ImageBitmap? {
         if (pkg.isEmpty()) return null
         iconCache.get(pkg)?.let { return it }
         return try {
             val drawable = ctx.applicationContext.packageManager.getApplicationIcon(pkg)
-            drawableToImageBitmap(drawable, 96)?.also { iconCache.put(pkg, it) }
+            drawableToImageBitmap(drawable, TARGET_ICON_PX)?.also { iconCache.put(pkg, it) }
         } catch (_: Throwable) {
             null
         }
@@ -73,7 +99,12 @@ object AppCatalogRepository {
 
     private fun drawableToImageBitmap(drawable: Drawable, targetPx: Int): ImageBitmap? {
         if (drawable is BitmapDrawable && drawable.bitmap != null && !drawable.bitmap.isRecycled) {
-            return drawable.bitmap.asImageBitmap()
+            val src = drawable.bitmap
+            if (src.width <= targetPx && src.height <= targetPx) {
+                return src.asImageBitmap()
+            }
+            val scaled = Bitmap.createScaledBitmap(src, targetPx, targetPx, true)
+            return scaled.asImageBitmap()
         }
         val w = drawable.intrinsicWidth.coerceIn(48, targetPx)
         val h = drawable.intrinsicHeight.coerceIn(48, targetPx)

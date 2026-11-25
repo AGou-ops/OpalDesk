@@ -68,6 +68,7 @@ data class WorkspaceProfileConfig(
     val autoRestoreLayout: Boolean = false,
     val boundTargets: List<String> = emptyList(),
     val appCustomDpis: Map<String, Int> = emptyMap(),
+    val appTopCropDps: Map<String, Int> = emptyMap(),
     val appWindowBounds: Map<String, SavedAppWindowBounds> = emptyMap(),
     val savedLayout: List<SavedLayoutWindow> = emptyList(),
 ) {
@@ -107,6 +108,9 @@ object ProfileConfigStore {
     const val SLOT_COUNT = 5
     const val MIN_DPI = 120
     const val MAX_DPI = 560
+    const val DEFAULT_TOP_CROP_DP = 28
+    const val MIN_TOP_CROP_DP = 0
+    const val MAX_TOP_CROP_DP = 48
     private const val STORE_FILE_NAME = "opaldesk_profiles_v1.json"
 
     private val lock = Any()
@@ -343,6 +347,24 @@ object ProfileConfigStore {
         }
     }
 
+    fun setWorkingAppTopCropDp(pkg: String, dp: Int): WorkspaceProfileConfig {
+        val cleanPkg = pkg.trim()
+        if (cleanPkg.isEmpty()) return workingConfig
+        val cleanDp = dp.coerceIn(MIN_TOP_CROP_DP, MAX_TOP_CROP_DP)
+        return updateWorkingConfig { prof ->
+            val nextMap = LinkedHashMap(prof.appTopCropDps)
+            if (cleanDp <= 0) nextMap.remove(cleanPkg) else nextMap[cleanPkg] = cleanDp
+            prof.copy(appTopCropDps = nextMap)
+        }
+    }
+
+    fun toggleWorkingAppTopCrop(pkg: String): Boolean {
+        val cur = workingConfig.appTopCropDps[pkg.trim()] ?: 0
+        val enable = cur <= 0
+        setWorkingAppTopCropDp(pkg, if (enable) DEFAULT_TOP_CROP_DP else 0)
+        return enable
+    }
+
     fun mergeDaemonBoundsIntoWorking(advancedStateJson: String?): WorkspaceProfileConfig {
         if (advancedStateJson.isNullOrBlank()) return workingConfig
         return try {
@@ -495,6 +517,15 @@ object ProfileConfigStore {
             }
             append('}')
 
+            append(",\"appTopCropDps\":{")
+            var firstC = true
+            p.appTopCropDps.forEach { (k, v) ->
+                if (!firstC) append(',')
+                firstC = false
+                append(MiniJson.quote(k)).append(':').append(v)
+            }
+            append('}')
+
             append(",\"appWindowBounds\":{")
             var firstB = true
             p.appWindowBounds.forEach { (k, b) ->
@@ -553,6 +584,15 @@ object ProfileConfigStore {
                         for ((k, rawV) in dpisObj) {
                             val v = clampDpiOrAuto((rawV as? Number)?.toInt() ?: 0)
                             if (k.isNotBlank() && v > 0) dpisMap[k] = v
+                        }
+                    }
+
+                    val topCropMap = LinkedHashMap<String, Int>()
+                    val topCropObj = po.obj("appTopCropDps")
+                    if (topCropObj != null) {
+                        for ((k, rawV) in topCropObj) {
+                            val v = ((rawV as? Number)?.toInt() ?: 0).coerceIn(MIN_TOP_CROP_DP, MAX_TOP_CROP_DP)
+                            if (k.isNotBlank() && v > 0) topCropMap[k] = v
                         }
                     }
 
@@ -619,6 +659,7 @@ object ProfileConfigStore {
                         autoRestoreLayout = po.bool("autoRestoreLayout", false),
                         boundTargets = boundTargetsList,
                         appCustomDpis = dpisMap,
+                        appTopCropDps = topCropMap,
                         appWindowBounds = boundsMap,
                         savedLayout = layoutList,
                     )

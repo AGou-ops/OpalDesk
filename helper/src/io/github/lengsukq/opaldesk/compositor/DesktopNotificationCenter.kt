@@ -1,9 +1,13 @@
 package io.github.lengsukq.opaldesk.compositor
 
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,6 +16,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -22,6 +27,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -32,8 +42,12 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.lengsukq.opaldesk.notifications.DesktopNotificationItem
@@ -43,6 +57,9 @@ import io.github.lengsukq.opaldesk.ui.OpalStatusBadge
 import io.github.lengsukq.opaldesk.ui.OpalText
 import io.github.lengsukq.opaldesk.ui.liquidGlassSurface
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 @Composable
 fun DesktopBellIcon(
@@ -74,6 +91,77 @@ fun DesktopBellIcon(
     }
 }
 
+@Composable
+private fun SwipeableNotificationContainer(
+    itemKey: String,
+    swipeEnabled: Boolean,
+    onTap: () -> Unit,
+    onSwipeDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+    content: @Composable () -> Unit,
+) {
+    val density = LocalDensity.current
+    val dismissThresholdPx = with(density) { 72.dp.toPx() }
+    val flyOutPx = with(density) { 360.dp.toPx() }
+    val offsetX = remember(itemKey) { Animatable(0f) }
+    val scope = rememberCoroutineScope()
+    var isDragging by remember(itemKey) { mutableStateOf(false) }
+
+    Box(
+        modifier = modifier
+            .offset { IntOffset(offsetX.value.roundToInt(), 0) }
+            .graphicsLayer {
+                val progress = (abs(offsetX.value) / (dismissThresholdPx * 1.8f)).coerceIn(0f, 1f)
+                alpha = 1f - progress * 0.78f
+            }
+            .pointerInput(itemKey, swipeEnabled) {
+                detectTapGestures(
+                    onTap = {
+                        if (!isDragging && abs(offsetX.value) < 6f) {
+                            onTap()
+                        }
+                    },
+                )
+            }
+            .then(
+                if (swipeEnabled) {
+                    Modifier.pointerInput(itemKey) {
+                        detectHorizontalDragGestures(
+                            onDragStart = { isDragging = true },
+                            onHorizontalDrag = { change, dragAmount ->
+                                change.consume()
+                                scope.launch {
+                                    offsetX.snapTo(offsetX.value + dragAmount)
+                                }
+                            },
+                            onDragCancel = {
+                                isDragging = false
+                                scope.launch { offsetX.animateTo(0f, tween(180)) }
+                            },
+                            onDragEnd = {
+                                isDragging = false
+                                val current = offsetX.value
+                                if (abs(current) >= dismissThresholdPx) {
+                                    val target = if (current >= 0f) flyOutPx else -flyOutPx
+                                    scope.launch {
+                                        offsetX.animateTo(target, tween(160))
+                                        onSwipeDismiss()
+                                    }
+                                } else {
+                                    scope.launch { offsetX.animateTo(0f, tween(180)) }
+                                }
+                            },
+                        )
+                    }
+                } else {
+                    Modifier
+                },
+            ),
+    ) {
+        content()
+    }
+}
+
 /**
  * macOS-style translucent Liquid Glass heads-up notification toast anchored in the top-right corner
  * of the DeX desktop. Auto-dismisses after 4.5s and opens/focuses the app inside DeX when tapped.
@@ -91,23 +179,29 @@ fun DesktopNotificationBanner(
     }
 
     val shape = RoundedCornerShape(18.dp)
-    Row(
-        modifier = modifier
-            .widthIn(min = 240.dp, max = 340.dp)
-            .liquidGlassSurface(
-                shape = shape,
-                fill = OpalPalette.LiquidPopoverFill,
-                rim = OpalPalette.LiquidGlassRim,
-                elevation = 20.dp,
-            )
-            .clickable {
-                onDismiss()
-                onOpenApp(item.packageName)
-            }
-            .padding(horizontal = 13.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.Top,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    SwipeableNotificationContainer(
+        itemKey = "${item.key}:${item.postTimeMs}",
+        swipeEnabled = true,
+        onTap = {
+            onDismiss()
+            onOpenApp(item.packageName)
+        },
+        onSwipeDismiss = onDismiss,
+        modifier = modifier.widthIn(min = 240.dp, max = 340.dp),
     ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .liquidGlassSurface(
+                    shape = shape,
+                    fill = OpalPalette.LiquidPopoverFill,
+                    rim = OpalPalette.LiquidGlassRim,
+                    elevation = 20.dp,
+                )
+                .padding(horizontal = 13.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.Top,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
         Box(
             modifier = Modifier
                 .padding(top = 2.dp)
@@ -172,6 +266,7 @@ fun DesktopNotificationBanner(
         ) {
             OpalText(text = "×", fontSize = 12.sp, color = OpalPalette.TextMuted)
         }
+        }
     }
 }
 
@@ -182,10 +277,12 @@ fun DesktopNotificationBanner(
 fun DesktopNotificationCenterPopover(
     notifications: List<DesktopNotificationItem>,
     accessGranted: Boolean,
+    doNotDisturb: Boolean = false,
     maxHeight: Dp,
     onOpenApp: (String) -> Unit,
     onDismissNotification: (String) -> Unit,
     onClearAll: () -> Unit,
+    onToggleDoNotDisturb: () -> Unit = {},
     onRequestAccess: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -217,20 +314,46 @@ fun DesktopNotificationCenterPopover(
                     OpalStatusBadge(label = "${notifications.size}", color = OpalPalette.AccentBlue)
                 }
             }
-            if (notifications.any { it.clearable }) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
                 Box(
                     modifier = Modifier
                         .clip(CircleShape)
-                        .background(OpalPalette.ChipFill)
-                        .clickable(onClick = onClearAll)
+                        .background(
+                            if (doNotDisturb) OpalPalette.AccentAmber.copy(alpha = 0.20f) else OpalPalette.ChipFill,
+                        )
+                        .border(
+                            width = if (doNotDisturb) 0.75.dp else 0.dp,
+                            color = if (doNotDisturb) OpalPalette.AccentAmber.copy(alpha = 0.50f) else Color.Transparent,
+                            shape = CircleShape,
+                        )
+                        .clickable(onClick = onToggleDoNotDisturb)
                         .padding(horizontal = 10.dp, vertical = 4.dp),
                 ) {
                     OpalText(
-                        text = "清空全部",
+                        text = if (doNotDisturb) "免打扰 · 开" else "免打扰",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Medium,
-                        color = OpalPalette.TextSecondary,
+                        color = if (doNotDisturb) OpalPalette.AccentAmber else OpalPalette.TextSecondary,
                     )
+                }
+                if (notifications.any { it.clearable }) {
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(OpalPalette.ChipFill)
+                            .clickable(onClick = onClearAll)
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                    ) {
+                        OpalText(
+                            text = "清空全部",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = OpalPalette.TextSecondary,
+                        )
+                    }
                 }
             }
         }
@@ -286,17 +409,23 @@ fun DesktopNotificationCenterPopover(
             ) {
                 notifications.forEach { item ->
                     val itemShape = RoundedCornerShape(15.dp)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(itemShape)
-                            .background(OpalPalette.ChipFill)
-                            .border(0.7.dp, OpalPalette.BorderSubtle, itemShape)
-                            .clickable { onOpenApp(item.packageName) }
-                            .padding(horizontal = 11.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.Top,
-                        horizontalArrangement = Arrangement.spacedBy(9.dp),
+                    SwipeableNotificationContainer(
+                        itemKey = item.key,
+                        swipeEnabled = item.clearable,
+                        onTap = { onOpenApp(item.packageName) },
+                        onSwipeDismiss = { onDismissNotification(item.key) },
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(itemShape)
+                                .background(OpalPalette.ChipFill)
+                                .border(0.7.dp, OpalPalette.BorderSubtle, itemShape)
+                                .padding(horizontal = 11.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.Top,
+                            horizontalArrangement = Arrangement.spacedBy(9.dp),
+                        ) {
                         Box(
                             modifier = Modifier
                                 .padding(top = 2.dp)
@@ -360,6 +489,7 @@ fun DesktopNotificationCenterPopover(
                             ) {
                                 OpalText(text = "×", fontSize = 13.sp, color = OpalPalette.TextMuted)
                             }
+                        }
                         }
                     }
                 }

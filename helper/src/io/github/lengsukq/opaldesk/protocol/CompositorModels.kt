@@ -1,5 +1,9 @@
 package io.github.lengsukq.opaldesk.protocol
 
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONObject
 import kotlin.math.max
 import kotlin.math.min
@@ -362,6 +366,37 @@ object CompositorSceneParser {
 }
 
 /**
+ * Tracks user-pinned (Always-on-Top) DeX window IDs so pinned windows stay visually and
+ * hit-testably above normal floating windows even while typing in a background window.
+ */
+object OpalWindowPinStore {
+    private val _pinnedIdsFlow = MutableStateFlow<Set<Int>>(emptySet())
+    val pinnedIdsFlow: StateFlow<Set<Int>> = _pinnedIdsFlow.asStateFlow()
+
+    fun currentIds(): Set<Int> = _pinnedIdsFlow.value
+
+    fun isPinned(windowId: Int): Boolean = _pinnedIdsFlow.value.contains(windowId)
+
+    fun toggle(windowId: Int): Boolean {
+        var nowPinned = false
+        _pinnedIdsFlow.update { cur ->
+            if (cur.contains(windowId)) {
+                nowPinned = false
+                cur - windowId
+            } else {
+                nowPinned = true
+                cur + windowId
+            }
+        }
+        return nowPinned
+    }
+
+    fun prune(aliveIds: Set<Int>) {
+        _pinnedIdsFlow.update { cur -> cur.intersect(aliveIds) }
+    }
+}
+
+/**
  * Pure client-side compositor geometry helpers (unit-testable with zero Android dependencies).
  */
 object CompositorGeometry {
@@ -653,16 +688,26 @@ object CompositorGeometry {
      * whenever another visible window with strictly higher [CompositorWindow.zOrder] covers
      * the desktop canvas coordinate ([canvasX], [canvasY]).
      */
+    const val PINNED_Z_BOOST = 5000
+
+    fun effectiveZOrder(
+        window: CompositorWindow,
+        pinnedIds: Set<Int> = OpalWindowPinStore.currentIds(),
+    ): Int = if (pinnedIds.contains(window.windowId)) window.zOrder + PINNED_Z_BOOST else window.zOrder
+
     fun isPointOccludedByHigherWindow(
         target: CompositorWindow,
         canvasX: Float,
         canvasY: Float,
         visibleWindows: List<CompositorWindow>,
     ): Boolean {
+        val pinnedIds = OpalWindowPinStore.currentIds()
+        val targetZ = effectiveZOrder(target, pinnedIds)
         for (other in visibleWindows) {
             if (other.windowId == target.windowId) continue
-            if (other.zOrder > target.zOrder ||
-                (other.zOrder == target.zOrder && other.focused && !target.focused)
+            val otherZ = effectiveZOrder(other, pinnedIds)
+            if (otherZ > targetZ ||
+                (otherZ == targetZ && other.focused && !target.focused)
             ) {
                 val f = other.frame
                 if (canvasX >= f.left && canvasX <= f.right && canvasY >= f.top && canvasY <= f.bottom) {
