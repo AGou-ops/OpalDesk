@@ -1,5 +1,11 @@
 package io.github.lengsukq.opaldesk.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -34,9 +40,31 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+private const val OPALDESK_QQ_GROUP_NUMBER = "1042317917"
+
+private fun joinOpalDeskQqGroup(ctx: Context) {
+    runCatching {
+        val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        cm?.setPrimaryClip(ClipData.newPlainText("OpalDesk QQ Group", OPALDESK_QQ_GROUP_NUMBER))
+    }
+    val uri = Uri.parse(
+        "mqqapi://card/show_pslcard?src_type=internal&version=1&uin=$OPALDESK_QQ_GROUP_NUMBER&card_type=group&source=qrcode",
+    )
+    val launched = runCatching {
+        ctx.startActivity(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }.isSuccess
+    val msg = if (launched) {
+        "已复制群号 $OPALDESK_QQ_GROUP_NUMBER，正在打开 QQ…"
+    } else {
+        "已复制 QQ 群号 $OPALDESK_QQ_GROUP_NUMBER，请打开 QQ 搜索加入"
+    }
+    Toast.makeText(ctx, msg, Toast.LENGTH_SHORT).show()
+}
 
 private data class ConsoleNavItem(
     val index: Int,
@@ -73,6 +101,7 @@ fun OpalConsoleHeader(
         else -> "诊断日志" to "运行状态与问题反馈"
     }
     val isDark = OpalPalette.isDark
+    val ctx = LocalContext.current
 
     Row(
         modifier = modifier
@@ -87,7 +116,7 @@ fun OpalConsoleHeader(
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
                 OpalText(
                     text = title,
@@ -109,6 +138,22 @@ fun OpalConsoleHeader(
                             fontSize = 10.5.sp,
                             fontWeight = FontWeight.Medium,
                             color = OpalPalette.TextSecondary,
+                            maxLines = 1,
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(OpalPalette.AccentBlue.copy(alpha = if (isDark) 0.20f else 0.12f))
+                            .border(0.75.dp, OpalPalette.AccentBlue.copy(alpha = 0.42f), CircleShape)
+                            .clickable { joinOpalDeskQqGroup(ctx) }
+                            .padding(horizontal = 8.dp, vertical = 2.5.dp),
+                    ) {
+                        OpalText(
+                            text = "加QQ群",
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = OpalPalette.AccentBlue,
                             maxLines = 1,
                         )
                     }
